@@ -1,0 +1,14 @@
+py-clob-client==0.34.6
+hyperliquid-python-sdk==0.22.0
+websockets
+aiohttp
+pandas
+numpy
+python-dotenv
+requests
+fastapi[standard]
+uvicorn
+ollama
+pytest
+pytest-asyncio
+psutil

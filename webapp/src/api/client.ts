@@ -1,0 +1,567 @@
+/**
+ * api/client.ts — Typed API client that polls the FastAPI backend.
+ *
+ * All hooks auto-refresh every POLL_INTERVAL_MS milliseconds.
+ * Set VITE_API_URL in .env (or vercel environment) to point to the backend.
+ */
+import { useEffect, useState, useCallback } from "react";
+
+const BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
+const LAUNCHER_URL = import.meta.env.VITE_LAUNCHER_URL ?? "http://localhost:8081";
+const POLL_INTERVAL_MS = 5_000;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export interface DataQuality {
+  sub_token_count: number;
+  sub_rejected_count: number;
+  market_count: number;
+  fresh_book_count: number;
+  stale_book_count: number;
+  no_book_count: number;
+}
+
+export interface HealthData {
+  status: string;
+  uptime_seconds: number;
+  pm_ws_connected: boolean;
+  hl_ws_connected: boolean;
+  last_heartbeat_age_s: number | null;
+  paper_trading: boolean;
+  agent_auto: boolean;
+  bot_active: boolean;
+  data_quality: DataQuality;
+  data_issues: boolean;
+  adverse_triggers_session: number;
+  adverse_threshold_pct: number;
+  hl_max_move_pct_session: number;
+  timestamp: number;
+}
+
+export interface Position {
+  condition_id: string;
+  market_title: string;
+  market_slug?: string;
+  underlying: string;
+  side: string;
+  size_usd: number;           // legacy field — equals contracts (contract count)
+  contracts: number;          // explicit contract count (same value, better name)
+  entry_cost_usd: number;     // actual USDC capital deployed at fill
+  entry_price: number;        // YES-token price at fill
+  token_entry_price: number;  // side-adjusted entry price (NO → 1 − entry_price)
+  token_current_price?: number | null;  // side-adjusted current price
+  current_mid?: number | null;  // raw YES-token mid from live orderbook
+  unrealised_pnl_usd?: number | null;  // server-computed P&L, same formula as monitor
+  book_age_s?: number | null;  // age of PM book snapshot for this position (seconds)
+  strategy: string;
+  venue: string;
+  opened_at: string | null;
+  hl_size_coins?: number;  // only present for venue="HL" hedge rows
+  // Active bid-quote fill state (YES positions; null when no resting BID order)
+  active_bid_original_ct?: number | null;
+  active_bid_remaining_ct?: number | null;
+  active_bid_filled_ct?: number | null;
+  // Active ask-quote fill state (NO positions; null when no resting ASK order)
+  active_ask_original_ct?: number | null;
+  active_ask_remaining_ct?: number | null;
+  active_ask_filled_ct?: number | null;
+  // Stable CLOB order tracking — persists across reprices
+  order_id?: string | null;
+  // Market resolution time
+  end_date?: string | null;
+  // Profit-target progress (mispricing only; null for maker)
+  pct_of_target?: number | null;
+  profit_target_usd?: number | null;
+  stop_loss_usd?: number | null;
+  // Signal quality score 0–100 at fill time (stamped on ActiveQuote at deployment)
+  signal_score?: number | null;
+  // Live order book bid/ask for this market's YES token
+  yes_book_bid?: number | null;
+  yes_book_ask?: number | null;
+  // Entry rebates already credited from maker fills
+  pm_rebates_earned?: number | null;
+  // Estimated P&L if this leg is closed now at book (incl. rebates, net of taker fees)
+  est_close_pnl?: number | null;
+}
+
+export interface Trade {
+  market_id: string;
+  market_title?: string;     // human-readable question; may be absent on old records
+  underlying?: string;       // BTC | ETH | SOL etc. (not present for hl_perp rows)
+  market_type: string;
+  strategy: string;
+  side: string;
+  size: string;
+  price: string;
+  fees_paid: string;
+  rebates_earned: string;
+  hl_hedge_size: string;
+  hl_entry_price: string;
+  spot_price: string;   // close price for HL hedges; spot at entry for PM
+  pnl: string;
+  timestamp: string;
+  signal_score?: string;  // 0–100 signal quality score at fill time
+}
+
+export interface PnlData {
+  today: number;
+  week: number;
+  all_time: number;
+  trade_count_today: number;
+  trade_count_week: number;
+  trade_count_all: number;
+}
+
+export interface EquityPoint {
+  t: string;
+  equity: number;
+}
+
+export interface PerformanceSummary {
+  total_trades: number;
+  win_rate: number;
+  avg_pnl: number;
+  total_pnl: number;
+  total_fees: number;
+  total_rebates: number;
+  max_drawdown: number;
+  sharpe_7d: number | null;
+}
+
+export interface PerformanceData {
+  period: string;
+  no_data?: boolean;
+  summary: PerformanceSummary;
+  equity_curve: EquityPoint[];
+  by_strategy: Record<string, { pnl: number; count: number }>;
+  by_underlying: Record<string, { pnl: number; count: number }>;
+  by_market_type: Record<string, { pnl: number; count: number; win_rate: number }>;
+  pnl_histogram: Array<{ bucket_start: number; bucket_end: number; count: number }>;
+  best_trades: Trade[];
+  worst_trades: Trade[];
+  time_of_day_heatmap: Array<{ hour_hkt: number; avg_pnl: number; trade_count: number }>;
+}
+
+export interface Signal {
+  market_id: string;
+  market_title: string;
+  pm_price: number;
+  implied_prob: number;
+  deviation: number;
+  direction: string;
+  fee_hurdle: number;
+  deribit_iv: number;
+  deribit_instrument: string;
+  is_actionable: boolean;
+  score?: number;
+  signal_source?: string;
+  timestamp: number;
+  agent_decision: string | null;
+  agent_confidence?: number;
+  agent_reason?: string;
+}
+
+export interface MakerQuote {
+  market_id: string;
+  token_id: string;
+  side: string;
+  price: number;
+  size: number;
+  order_id: string | null;
+  posted_at: number;
+  age_seconds: number;
+  market_title: string;
+  underlying: string;
+}
+
+export interface MakerSignal {
+  market_id: string;
+  market_title: string;
+  market_slug: string;
+  token_id: string;
+  underlying: string;
+  mid: number;
+  bid_price: number;
+  ask_price: number;
+  half_spread: number;
+  effective_edge: number;
+  market_type: string;
+  ts: number;
+  age_seconds: number;
+  is_deployed: boolean;
+  collateral_usd: number;
+  // Partial-fill tracking (present when is_deployed=true)
+  bid_original_size?: number;
+  bid_remaining_size?: number;
+  bid_filled_size?: number;
+  ask_original_size?: number;
+  ask_remaining_size?: number;
+  ask_filled_size?: number;
+  total_original_size?: number;
+  total_remaining_size?: number;
+  total_filled_size?: number;
+  fill_pct?: number;
+  // Market resolution time
+  end_date?: string | null;
+  // Signal quality score 0–100
+  score?: number;
+}
+
+export interface CapitalData {
+  total_budget: number;
+  deployed: number;
+  in_positions: number;
+  available: number;
+  mode: string;
+  timestamp: number;
+}
+
+export interface FillEntry {
+  timestamp: string;
+  market_id: string;
+  market_title: string;
+  underlying: string;
+  order_side: string;       // BUY | SELL
+  position_side: string;    // YES | NO
+  fill_price: string;
+  contracts_filled: string;
+  fill_cost_usd: string;
+  book_bid: string;
+  book_ask: string;
+  depth_at_level: string;
+  arrival_prob: string;
+  mean_taker: string;
+  taker_size_drawn: string;
+  hl_mid: string;
+  hl_move_pct: string;
+  adverse: string;          // "True" | "False"
+  total_fills_session: string;
+}
+
+export interface RiskData {
+  pm_exposure_usd: number;
+  pm_exposure_limit: number;
+  pm_exposure_pct: number;
+  hl_notional_usd: number;
+  hl_notional_limit: number;
+  hl_notional_pct: number;
+  open_positions: number;
+  max_concurrent_positions: number;
+  max_pm_per_market?: number;
+  hard_stop_threshold: number;
+  paper_trading: boolean;
+}
+
+export interface Market {
+  condition_id: string;
+  title: string;
+  market_type: string;
+  underlying: string;
+  fees_enabled: boolean;
+  token_id_yes: string;
+  bid_price: number | null;
+  ask_price: number | null;
+  bid_source: "active_quote" | "pm_book" | null;
+  ask_source: "active_quote" | "pm_book" | null;
+  book_age_s: number | null;
+  data_warning: "stale" | "very_stale" | "no_data" | null;
+  quoted: boolean;
+}
+
+export interface FundingEntry {
+  predicted_rate: number;
+  open_interest: number;
+  fetched_at: number;
+}
+
+export interface ConfigData {
+  paper_trading: boolean;
+  agent_auto: boolean;
+  auto_approve: boolean;
+  scan_interval: number;
+  strategy_mispricing: boolean;
+  strategy_maker: boolean;
+  fill_check_interval: number;
+  paper_fill_probability: number;
+  max_buy_no_yes_price: number;
+  market_cooldown_seconds: number;
+  min_strike_distance_pct: number;
+  kalshi_enabled: boolean;
+  kalshi_require_nd2_confirmation: boolean;
+  kalshi_min_deviation: number;
+  kalshi_match_max_strike_diff: number;
+  kalshi_match_max_expiry_days: number;
+  max_concurrent_positions: number;
+  // Market-making config
+  reprice_trigger_pct: number;
+  max_quote_age_seconds: number;
+  min_edge_pct: number;
+  max_concurrent_maker_positions: number;
+  max_concurrent_mispricing_positions: number;
+  paper_fill_prob_base: number;
+  paper_fill_prob_new_market: number;
+  paper_adverse_selection_pct: number;
+  paper_adverse_fill_multiplier: number;
+  maker_coin_max_loss_usd: number;
+  maker_exit_hours: number;
+  maker_exit_tte_frac?: number;
+  maker_entry_tte_frac?: number;
+  maker_batch_size?: number;
+  maker_positions_per_underlying: number;
+  maker_quote_size_pct: number;
+  maker_quote_size_min: number;
+  maker_quote_size_max: number;
+  maker_quote_size_new_market: number;
+  hedge_threshold_usd: number;
+  hedge_rebalance_pct: number;
+  hedge_min_interval?: number;
+  hedge_debounce_secs?: number;
+  deployment_mode: string;
+  paper_capital_usd: number;
+  // Quote guards & new-market logic
+  maker_min_quote_price: number;
+  maker_min_volume_24hr: number;
+  maker_max_tte_days: number;
+  new_market_age_limit: number;
+  new_market_wide_spread: number;
+  new_market_pull_spread: number;
+  // Inventory skew
+  inventory_skew_coeff: number;
+  inventory_skew_max: number;
+  // Hedge sizing
+  max_hl_notional: number;
+  // Position monitor
+  profit_target_pct: number;
+  stop_loss_usd: number;
+  exit_days_before_resolution: number;
+  min_hold_seconds: number;
+  // Risk limits
+  max_pm_exposure_per_market: number;
+  max_total_pm_exposure: number;
+  hard_stop_drawdown: number;
+  // Signal scoring
+  min_signal_score_mispricing?: number;
+  min_signal_score_maker?: number;
+  maker_min_signal_score_5m?: number;
+  maker_min_signal_score_1h?: number;
+  maker_min_signal_score_4h?: number;
+  maker_exit_tte_frac_5m?: number;
+  score_weight_edge?: number;
+  score_weight_source?: number;
+  score_weight_timing?: number;
+  score_weight_liquidity?: number;
+  // Hedge control
+  maker_hedge_enabled?: boolean;
+  maker_max_book_age_secs?: number;
+  // Per-market imbalance skew
+  maker_imbalance_skew_coeff?: number;
+  maker_imbalance_skew_max?: number;
+  maker_imbalance_skew_min_ct?: number;
+  // CLOB depth gate
+  maker_min_depth_to_quote?: number;
+  maker_depth_thin_threshold?: number;
+  maker_depth_spread_factor_thin?: number;
+  maker_depth_spread_factor_zero?: number;
+  maker_excluded_market_types: string[];
+  timestamp: number;
+}
+
+export interface InventoryData {
+  position_delta: Record<string, number>;
+  fill_inventory: Record<string, number>;
+  coin_hedges: Record<string, { direction: string; size_coins: number; entry_price: number; notional_usd: number }>;
+  threshold_usd: number;
+  timestamp: number;
+}
+
+export interface LogEntry {
+  ts: number;
+  level: "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL";
+  module: string;
+  msg: string;
+  extras: Record<string, unknown>;
+}
+
+export type ConfigPatch = Partial<Omit<ConfigData, "timestamp">>;
+
+export async function updateConfig(patch: ConfigPatch): Promise<ConfigData> {
+  const res = await fetch(`${BASE_URL}/config`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  return json.current as ConfigData;
+}
+
+// ── Generic fetch hook ────────────────────────────────────────────────────────
+
+function usePolling<T>(
+  path: string,
+  interval: number = POLL_INTERVAL_MS,
+): { data: T | null; error: string | null; loading: boolean } {
+  const [data, setData] = useState<T | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const fetchData = useCallback(async () => {
+    try {
+      const res = await fetch(`${BASE_URL}${path}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      setData(json);
+      setError(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "fetch error");
+    } finally {
+      setLoading(false);
+    }
+  }, [path]);
+
+  useEffect(() => {
+    fetchData();
+    const timer = setInterval(fetchData, interval);
+    return () => clearInterval(timer);
+  }, [fetchData, interval]);
+
+  return { data, error, loading };
+}
+
+// ── Typed hooks ───────────────────────────────────────────────────────────────
+
+export const useHealth = () => usePolling<HealthData>("/health");
+export const useConfig = () => usePolling<ConfigData>("/config");
+export const usePositions = () => usePolling<{ positions: Position[]; count: number }>("/positions");
+export const usePnl = () => usePolling<PnlData>("/pnl");
+export const useRisk = () => usePolling<RiskData>("/risk");
+export const useMarkets = () => usePolling<{ markets: Market[]; count: number }>("/markets");
+export const useFunding = () => usePolling<{ funding: Record<string, FundingEntry> }>("/funding");
+export const useSignals = (limit = 50) =>
+  usePolling<{ signals: Signal[]; total: number }>(`/signals?limit=${limit}`);
+export const useMakerQuotes = () =>
+  usePolling<{ quotes: MakerQuote[]; count: number; strategy_enabled: boolean }>("/maker/quotes");
+export const useMakerSignals = () =>
+  usePolling<{ signals: MakerSignal[]; count: number; strategy_enabled: boolean }>("/maker/signals");
+export const useCapital = () =>
+  usePolling<CapitalData>("/maker/capital");
+export const useFills = (
+  limit = 100,
+  offset = 0,
+  underlying?: string,
+  adverseOnly = false,
+) => {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (underlying) params.set("underlying", underlying);
+  if (adverseOnly) params.set("adverse_only", "true");
+  return usePolling<{ fills: FillEntry[]; total: number }>(`/fills?${params}`);
+};
+export const useTrades = (limit = 100, offset = 0, strategy?: string, underlying?: string) => {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (strategy) params.set("strategy", strategy);
+  if (underlying) params.set("underlying", underlying);
+  return usePolling<{ trades: Trade[]; total: number }>(`/trades?${params}`);
+};
+export const usePerformance = (period: "7d" | "30d" | "all" = "all") =>
+  usePolling<PerformanceData>(`/performance?period=${period}`, 30_000);
+export const useInventory = () => usePolling<InventoryData>("/maker/inventory");
+
+export async function toggleBot(active: boolean): Promise<{ active: boolean }> {
+  const res = await fetch(`${BASE_URL}/bot`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active }),
+  });
+  if (!res.ok) throw new Error(`Bot toggle failed: ${res.status}`);
+  return res.json();
+}
+
+export async function deploySignal(tokenId: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`${BASE_URL}/maker/deploy/${encodeURIComponent(tokenId)}`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`Deploy failed: ${res.status}`);
+  return res.json();
+}
+
+export async function undeployQuote(tokenId: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`${BASE_URL}/maker/undeploy/${encodeURIComponent(tokenId)}`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`Undeploy failed: ${res.status}`);
+  return res.json();
+}
+
+export async function closePosition(marketId: string): Promise<{ ok: boolean; exit_price: number; pnl: number; sides_closed: string[]; exit_prices: Record<string, number> }> {
+  const res = await fetch(`${BASE_URL}/positions/${encodeURIComponent(marketId)}/close`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Close failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+// ── Launcher (port 8081) — process-level start/stop ───────────────────────────
+
+export interface LauncherStatus {
+  running: boolean;
+  pid: number | null;
+  exit_code: number | null;
+  timestamp: number;
+}
+
+export function useLauncherStatus(): { data: LauncherStatus | null; error: string | null; loading: boolean } {
+  const [data, setData] = useState<LauncherStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const fetchData = useCallback(async () => {
+    try {
+      const res = await fetch(`${LAUNCHER_URL}/status`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setData(await res.json());
+      setError(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "fetch error");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchData();
+    const timer = setInterval(fetchData, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [fetchData]);
+
+  return { data, error, loading };
+}
+
+export async function startBotProcess(): Promise<{ ok: boolean; pid?: number; reason?: string }> {
+  const res = await fetch(`${LAUNCHER_URL}/start`, { method: "POST" });
+  if (!res.ok) throw new Error(`Launcher start failed: ${res.status}`);
+  return res.json();
+}
+
+export async function stopBotProcess(): Promise<{ ok: boolean; exit_code?: number; reason?: string }> {
+  const res = await fetch(`${LAUNCHER_URL}/stop`, { method: "POST" });
+  if (!res.ok) throw new Error(`Launcher stop failed: ${res.status}`);
+  return res.json();
+}
+
+export const useLogs = (
+  limit = 200,
+  level = "ALL",
+  module?: string,
+  search?: string,
+) => {
+  const params = new URLSearchParams({ limit: String(limit), level });
+  if (module) params.set("module", module);
+  if (search) params.set("search", search);
+  return usePolling<{ logs: LogEntry[]; total: number; modules: string[] }>(
+    `/logs?${params}`,
+    2_000,   // poll every 2s for near-realtime feel
+  );
+};
