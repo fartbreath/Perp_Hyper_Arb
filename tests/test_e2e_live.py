@@ -273,6 +273,11 @@ class TestE2E_IsCrossed:
         token_id, snap = live_btc_book
         if snap.mid is None or snap.best_bid is None:
             pytest.skip("No mid/bid in live book")
+        if not snap.asks:
+            pytest.skip(
+                "No asks in live book — market is likely near resolution "
+                "(mid ≈ best_bid, 2-cent half-spread falls outside fill tolerance)"
+            )
         _pm, _hl, engine, strategy, monitor, simulator = _make_components()
         maker_bid = round(snap.mid - 0.02, 4)  # typical: mid minus half_spread
         if maker_bid <= 0:
@@ -613,7 +618,7 @@ class TestE2E_RepricePreservesPartialFills:
         self.simulator._pm._markets = {market.condition_id: market}
         self.simulator._pm._books = {}
 
-        bid_price = round(snap.mid - 0.01, 4)  # drift 0.01 < MAKER_ADVERSE_DRIFT_REPRICE 0.015
+        bid_price = round(snap.mid - 0.004, 4)  # drift ~0.004 well below MAKER_ADVERSE_DRIFT_REPRICE
         key = token_id
         self.strategy._active_quotes[key] = ActiveQuote(
             market_id=market.condition_id,

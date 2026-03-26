@@ -432,6 +432,10 @@ def test_max_concurrent_positions_cap():
     engine = RiskEngine()
     now = datetime.now(timezone.utc)
     config.MAX_CONCURRENT_POSITIONS = 3
+    # Ensure neither the per-strategy cap nor the per-underlying cap fires
+    # before the global cap — this test is exclusively exercising the global cap.
+    config.MAX_CONCURRENT_MAKER_POSITIONS = 10
+    config.MAX_MAKER_POSITIONS_PER_UNDERLYING = 10
     for i in range(3):
         pos = Position(
             market_id=f"mkt_{i}",

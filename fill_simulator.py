@@ -94,6 +94,18 @@ log = get_bot_logger(__name__)
 _adverse_triggers_session: int = 0
 _hl_max_move_pct_session: float = 0.0
 
+# ── Per-bucket adversity thresholds (A7) ─────────────────────────────────────
+# Short-duration markets nearing resolution are nearly fully-informational — any
+# HL move indicates adverse selection.  Longer markets tolerate larger moves.
+# Bucket types absent from this dict fall back to config.PAPER_ADVERSE_SELECTION_PCT
+# which is read fresh on every sweep so operator patches take effect immediately.
+_ADVERSITY_THRESHOLDS: dict[str, float] = {
+    "bucket_5m":  0.0001,   # any detectable move is signal near expiry
+    "bucket_15m": 0.0003,
+    "bucket_1h":  0.001,
+    "bucket_4h":  0.002,
+}
+
 
 def get_fill_session_stats() -> dict:
     """Return adverse-detection session counters for the /health endpoint."""
@@ -228,15 +240,6 @@ class FillSimulator:
             # resolution are nearly fully-informational — any HL move indicates
             # adverse selection.  Longer markets tolerate larger moves before
             # classifying a fill as adversely selected.
-            _ADVERSITY_THRESHOLDS: dict[str, float] = {
-                "bucket_5m":     0.0001,   # any detectable move is signal near expiry
-                "bucket_15m":    0.0003,
-                "bucket_1h":     0.001,
-                "bucket_4h":     0.002,
-                "bucket_daily":  config.PAPER_ADVERSE_SELECTION_PCT,
-                "bucket_weekly": config.PAPER_ADVERSE_SELECTION_PCT,
-                "milestone":     config.PAPER_ADVERSE_SELECTION_PCT,
-            }
             adverse_pct = _ADVERSITY_THRESHOLDS.get(
                 market.market_type, config.PAPER_ADVERSE_SELECTION_PCT
             )

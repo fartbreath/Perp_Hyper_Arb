@@ -39,3 +39,49 @@ def _reset_score_thresholds():
     yield
     config.MIN_SIGNAL_SCORE_MAKER = orig_maker
     config.MIN_SIGNAL_SCORE_MISPRICING = orig_mispricing
+
+
+@pytest.fixture(autouse=True)
+def _reset_production_limits():
+    """Reset position-size / exposure / capital config to test-safe defaults.
+
+    config_overrides.json carries tight production limits (e.g. $40 total PM
+    exposure, $30 paper capital, 30-contract spread cap) that are correct for
+    live operation but break any test that exercises the risk engine or maker
+    strategy size logic with realistic, larger numbers.
+
+    This fixture saves and restores the affected values so tests run against
+    the code's *documented* defaults and individual tests can still override
+    specific values as needed.
+    """
+    _keys = (
+        "MAX_PM_EXPOSURE_PER_MARKET",
+        "MAX_TOTAL_PM_EXPOSURE",
+        "MAX_CONCURRENT_POSITIONS",
+        "MAX_CONCURRENT_MAKER_POSITIONS",
+        "MAX_CONCURRENT_MISPRICING_POSITIONS",
+        "MAX_MAKER_POSITIONS_PER_UNDERLYING",
+        "PAPER_CAPITAL_USD",
+        "MAKER_SPREAD_SIZE_MAX",
+        "MAKER_SPREAD_SIZE_MIN",
+        "MAKER_SPREAD_SIZE_NEW_MARKET",
+    )
+    saved = {k: getattr(config, k) for k in _keys}
+
+    # Test-safe defaults — generous enough for unit / integration tests while
+    # still being finite so limit-enforcement tests can set lower values.
+    config.MAX_PM_EXPOSURE_PER_MARKET     = 500.0
+    config.MAX_TOTAL_PM_EXPOSURE          = 2000.0
+    config.MAX_CONCURRENT_POSITIONS       = 12
+    config.MAX_CONCURRENT_MAKER_POSITIONS = 8
+    config.MAX_CONCURRENT_MISPRICING_POSITIONS = 3
+    config.MAX_MAKER_POSITIONS_PER_UNDERLYING  = 3
+    config.PAPER_CAPITAL_USD              = 10_000.0
+    config.MAKER_SPREAD_SIZE_MAX          = 500.0   # must equal MAX_PM_EXPOSURE_PER_MARKET
+    config.MAKER_SPREAD_SIZE_MIN          = 125.0
+    config.MAKER_SPREAD_SIZE_NEW_MARKET   = 100.0
+
+    yield
+
+    for k, v in saved.items():
+        setattr(config, k, v)
