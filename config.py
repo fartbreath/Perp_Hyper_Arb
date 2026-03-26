@@ -425,9 +425,10 @@ def get_effective_config() -> dict:
 
     Reads directly from the module so post-startup patches (via POST /config)
     are reflected.  Excludes private helpers (leading underscore), imported
-    modules, and env-derived secrets.
+    modules, classes, callables, and env-derived secrets.
     """
     import sys as _sys
+    import types as _types
     _skip = {"POLY_PRIVATE_KEY", "HL_SECRET_KEY", "API_SECRET",
               "TELEGRAM_BOT_TOKEN"}
     mod = _sys.modules[__name__]
@@ -438,8 +439,13 @@ def get_effective_config() -> dict:
         if name in _skip:
             continue
         val = getattr(mod, name)
-        # Only include scalar/list config values — skip functions, modules, classes
-        if callable(val) or hasattr(val, "__module__"):
+        # Only include JSON-serialisable scalars and plain collections.
+        # Exclude: functions, classes, module objects, and anything else complex.
+        if callable(val):
+            continue
+        if isinstance(val, _types.ModuleType):
+            continue
+        if not isinstance(val, (bool, int, float, str, list, dict, type(None))):
             continue
         result[name] = val
     return result
