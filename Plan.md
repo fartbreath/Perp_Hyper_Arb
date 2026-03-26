@@ -40,55 +40,71 @@ Only applies to markets with `feesEnabled: true` deployed after activation dates
 
 ```
 Perp_Hyper_Arb/
-├── main.py               # Entry point + asyncio event loop
-├── config.py             # Constants, thresholds, flags (PAPER_TRADING etc)
-├── pm_client.py          # Polymarket CLOB + Gamma API wrapper
-├── hl_client.py          # Hyperliquid Info + Exchange wrapper
-├── maker.py              # Strategy 1: PM market making + delta hedge
-├── mispricing.py         # Strategy 2: milestone market mispricing scanner
-├── agent.py              # AI agent: signal evaluation + execution decision
-├── api_server.py         # FastAPI REST server for webapp
-├── risk.py               # Position sizing, exposure limits, P&L tracking
-├── logger.py             # File + console logging + Telegram alerts
-├── .env                  # Secrets (never committed)
+├── main.py                   # Entry point + asyncio event loop
+├── config.py                 # Constants, thresholds, flags + get_effective_config()
+├── config_overrides.json     # Runtime overrides (persisted across restarts)
+├── api_server.py             # FastAPI REST server on port 8080
+├── risk.py                   # Position sizing, exposure limits, P&L tracking
+├── monitor.py                # Position monitor (closes on expiry, loss, profit target)
+├── fill_simulator.py         # Paper trading fill simulator
+├── live_fill_handler.py      # Live fill handler + WS reconciliation
+├── agent.py                  # AI agent: signal evaluation + execution decision
+├── logger.py                 # File + console logging + Telegram alerts
+├── launcher.py               # Helper launcher script
+├── .env                      # Secrets (never committed)
+├── .env.example              # .env template
 ├── requirements.txt
-├── data/                 # CSV trade logs, paper trade records
-└── webapp/               # Vite + React monitoring dashboard (deploys to Vercel)
-    ├── src/
-    ├── public/
-    ├── index.html
-    ├── vite.config.ts
+│
+├── market_data/              # Exchange client wrappers
+│   ├── pm_client.py          # Polymarket CLOB REST + WS + Gamma API
+│   ├── hl_client.py          # Hyperliquid REST + WS
+│   ├── kalshi_client.py      # Kalshi REST (read-only, no auth)
+│   └── deribit.py            # Deribit IV / N(d₂) data
+│
+├── strategies/
+│   ├── maker/                # Strategy 1: quoting, repricing, inventory skew, hedge
+│   └── mispricing/           # Strategy 2: Kalshi + N(d₂) signal filters
+│
+├── tests/                    # Pytest suite (655 tests, 0 failing)
+├── data/                     # CSV trade logs, paper trade records
+└── webapp/                   # Vite + React monitoring dashboard
+    ├── src/pages/            # Dashboard, Trades, Positions, Performance,
+    │                         #   Signals, Risk, Markets, Fills, Logs, Settings
     ├── package.json
-    └── .env.local         # VITE_API_URL=http://localhost:8080
+    ├── vite.config.ts
+    └── .env.local            # VITE_API_URL=http://localhost:8080
 ```
 
 ---
 
 ## Environment Setup
 
-**Python 3.10** (required exactly — `hyperliquid-python-sdk` has issues on 3.11)
+**Python 3.10** (required exactly — `hyperliquid-python-sdk` has issues on 3.11+)
 
 ```bash
 python3.10 -m venv venv
 source venv/bin/activate  # or venv\Scripts\activate on Windows
 
-pip install py-clob-client==0.34.6 \
-            hyperliquid-python-sdk==0.22.0 \
-            websockets aiohttp pandas numpy \
-            python-dotenv requests \
-            fastapi uvicorn[standard] \
-            ollama
+pip install -r requirements.txt
 ```
 
 **.env file:**
 ```
+# Polymarket
 POLY_PRIVATE_KEY=0x...          # Polygon EOA private key (funded with USDC.e)
 POLY_FUNDER=0x...               # Optional: separate funder wallet
-HL_ADDRESS=0x...                # Hyperliquid main wallet
+
+# Hyperliquid
+HL_ADDRESS=0x...                # Hyperliquid main wallet address
 HL_SECRET_KEY=0x...             # Hyperliquid API wallet private key (not master key)
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
+
+# Optional: Telegram alerts
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# API server
 API_PORT=8080                   # FastAPI server port
+API_SECRET=                     # Bearer token for mutating endpoints (leave blank to disable auth)
 ```
 
 **Ollama setup (local, one-time):**

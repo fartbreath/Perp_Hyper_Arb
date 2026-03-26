@@ -217,6 +217,10 @@ CLOB-faithful elements:
 - Capital velocity scoring active — markets ranked by edge × volume run-rate × TTE attractiveness.
 - Orphaned one-sided positions fixed — the second leg is now always re-posted after a fill.
 - Hedge logging active — check the Logs tab for `"Hedge placed"` entries. Slippage alert at 0.30% rolling average.
+- `MAKER_MAX_BOOK_AGE_SECS` set to 30 — stale order book data triggers a skip rather than quoting on bad data.
+- Adversity thresholds now per-bucket type — `bucket_5m` uses tighter thresholds than `bucket_15m` and `bucket_1h`.
+- WS reconnect reconciliation active — positions are re-synced with the PM wallet on every Polymarket WS reconnect.
+- `GET /config/effective` endpoint available for inspection of the live merged config.
 
 ---
 ---
@@ -239,6 +243,7 @@ restarts via `config_overrides.json`.
 | `MAKER_MIN_VOLUME_24HR` | `5000` | Min lifetime-scaled 24h volume to quote (USD); 0 to disable |
 | `MAKER_MAX_TTE_DAYS` | `14` | Skip markets resolving more than 14 days out |
 | `MAKER_EXIT_HOURS` | `6.0` | Hours before expiry to close all positions |
+| `MAKER_MAX_BOOK_AGE_SECS` | `30` | Skip quoting if PM order book is older than this (seconds) |
 | `HEDGE_THRESHOLD_USD` | `200` | Minimum net inventory before hedging (USD) |
 | `HEDGE_REBALANCE_PCT` | `0.10` | Min fractional change to adjust existing hedge (10%) |
 | `HEDGE_DEBOUNCE_SECS` | — | Wait this many seconds for fill burst to settle before hedging |

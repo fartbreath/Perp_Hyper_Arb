@@ -1,6 +1,45 @@
-# React + TypeScript + Vite
+# Perp Hyper Arb — Monitoring Webapp
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + TypeScript dashboard for the Perp Hyper Arb trading bot. Connects to the FastAPI backend on port 8080 and provides real-time visibility into strategy state, positions, P&L, and configuration.
+
+## Pages
+
+| Route | Description |
+|-------|-------------|
+| `/` | Dashboard — bot status, P&L summary, open positions, system health |
+| `/trades` | Trade history (search / filter by market, underlying, type) |
+| `/positions` | Open positions with unrealized P&L and bot-vs-wallet reconciliation |
+| `/performance` | Analytics by market type, underlying, and strategy leg |
+| `/signals` | Mispricing signal queue and evaluation history |
+| `/risk` | Exposure utilization, per-coin inventory and hedge status |
+| `/markets` | All monitored markets with quoting status and signal scores |
+| `/fills` | Paper fill events with adversity highlighting |
+| `/logs` | Live log stream |
+| `/settings` | All config parameters, editable in-browser with live save |
+
+## Development
+
+```bash
+npm install
+npm run dev       # dev server on http://localhost:5173
+npm run build     # production build → dist/
+npm run preview   # preview production build locally
+```
+
+Configure the API URL in `.env.local`:
+
+```
+VITE_API_URL=http://localhost:8080
+```
+
+## Tech Stack
+
+- React 18 + TypeScript
+- Vite (dev server + bundler)
+- Recharts (charts)
+- React Router v6
+
+## Original Vite template notes
 
 Currently, two official plugins are available:
 
