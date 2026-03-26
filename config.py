@@ -101,6 +101,9 @@ MAKER_MAX_IMBALANCE_CONTRACTS: int = 5
 # imbalance has persisted for at least MAKER_NAKED_CLOSE_SECS seconds, the strategy
 # will taker-exit the excess quantity to eliminate directional exposure.
 # NOTE: must be >= MAKER_MAX_IMBALANCE_CONTRACTS so the hard stop fires first.
+# When MAKER_NAKED_CLOSE_ENABLED=False the detection still runs but no taker exit is
+# placed — the AI agent (or operator) can take over the close decision.
+MAKER_NAKED_CLOSE_ENABLED: bool = True
 MAKER_NAKED_CLOSE_CONTRACTS: int = 10
 MAKER_NAKED_CLOSE_SECS: float = 10.0
 # Per-leg fill cap: once a single leg (YES or NO) of a market has been filled this many

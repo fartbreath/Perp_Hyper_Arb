@@ -208,6 +208,9 @@ class MakerStrategy(BaseStrategy):
         cancel the resting quote on the heavy side and place a taker exit for the
         excess contracts to eliminate directional exposure.
         """
+        if not config.MAKER_NAKED_CLOSE_ENABLED:
+            return
+
         now = time.time()
         for market in self._pm.get_markets().values():
             yes_pos = next(

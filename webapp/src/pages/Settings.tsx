@@ -512,6 +512,15 @@ export default function Settings() {
 
             {GAP}
 
+            <Toggle
+              label="Naked-Leg Auto-Close"
+              description="When ON, imbalanced positions are taker-exited automatically once threshold + delay are met. When OFF, detection still runs and logs are written but no order is placed — the AI agent or operator decides."
+              value={data.maker_naked_close_enabled ?? true}
+              onChange={(v) => apply({ maker_naked_close_enabled: v })}
+            />
+
+            {GAP}
+
             <NumberInput
               label="Naked-Leg Close — Threshold"
               description="Taker-exit the excess when one side leads by this many contracts AND persists for the delay below."

@@ -360,6 +360,7 @@ export interface ConfigData {
   // Incentive spread gate & imbalance hard-stops
   maker_min_incentive_spread?: number;
   maker_max_imbalance_contracts?: number;
+  maker_naked_close_enabled?: boolean;
   maker_naked_close_contracts?: number;
   maker_naked_close_secs?: number;
   maker_max_fills_per_leg?: number;

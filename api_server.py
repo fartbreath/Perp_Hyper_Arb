@@ -221,6 +221,7 @@ _MUTABLE_CONFIG = {
     # Incentive spread gate & imbalance hard-stops
     "maker_min_incentive_spread":     ("MAKER_MIN_INCENTIVE_SPREAD",      float),
     "maker_max_imbalance_contracts":  ("MAKER_MAX_IMBALANCE_CONTRACTS",   int),
+    "maker_naked_close_enabled":      ("MAKER_NAKED_CLOSE_ENABLED",       bool),
     "maker_naked_close_contracts":    ("MAKER_NAKED_CLOSE_CONTRACTS",     int),
     "maker_naked_close_secs":         ("MAKER_NAKED_CLOSE_SECS",          float),
     "maker_max_fills_per_leg":        ("MAKER_MAX_FILLS_PER_LEG",         int),
@@ -324,6 +325,7 @@ class ConfigPatch(BaseModel):
     # Incentive spread gate & imbalance hard-stops
     maker_min_incentive_spread: float | None = None
     maker_max_imbalance_contracts: int | None = None
+    maker_naked_close_enabled: bool | None = None
     maker_naked_close_contracts: int | None = None
     maker_naked_close_secs: float | None = None
     maker_max_fills_per_leg: int | None = None
@@ -431,6 +433,7 @@ def get_config() -> dict:
         # Incentive spread gate & imbalance hard-stops
         "maker_min_incentive_spread":     config.MAKER_MIN_INCENTIVE_SPREAD,
         "maker_max_imbalance_contracts":  config.MAKER_MAX_IMBALANCE_CONTRACTS,
+        "maker_naked_close_enabled":      config.MAKER_NAKED_CLOSE_ENABLED,
         "maker_naked_close_contracts":    config.MAKER_NAKED_CLOSE_CONTRACTS,
         "maker_naked_close_secs":         config.MAKER_NAKED_CLOSE_SECS,
         "maker_max_fills_per_leg":        config.MAKER_MAX_FILLS_PER_LEG,
