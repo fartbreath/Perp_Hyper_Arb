@@ -357,6 +357,18 @@ export interface ConfigData {
   maker_imbalance_skew_coeff?: number;
   maker_imbalance_skew_max?: number;
   maker_imbalance_skew_min_ct?: number;
+  // Incentive spread gate & imbalance hard-stops
+  maker_min_incentive_spread?: number;
+  maker_max_imbalance_contracts?: number;
+  maker_naked_close_contracts?: number;
+  maker_naked_close_secs?: number;
+  maker_max_fills_per_leg?: number;
+  maker_max_contracts_per_market?: number;
+  // Volatility & drift guards
+  maker_vol_filter_pct?: number;
+  maker_adverse_drift_reprice?: number;
+  // Second-leg profit margin
+  min_spread_profit_margin?: number;
   // CLOB depth gate
   maker_min_depth_to_quote?: number;
   maker_depth_thin_threshold?: number;
@@ -400,7 +412,7 @@ export async function updateConfig(patch: ConfigPatch): Promise<ConfigData> {
 function usePolling<T>(
   path: string,
   interval: number = POLL_INTERVAL_MS,
-): { data: T | null; error: string | null; loading: boolean } {
+): { data: T | null; error: string | null; loading: boolean; refresh: () => void } {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -425,7 +437,7 @@ function usePolling<T>(
     return () => clearInterval(timer);
   }, [fetchData, interval]);
 
-  return { data, error, loading };
+  return { data, error, loading, refresh: fetchData };
 }
 
 // ── Typed hooks ───────────────────────────────────────────────────────────────
@@ -433,6 +445,45 @@ function usePolling<T>(
 export const useHealth = () => usePolling<HealthData>("/health");
 export const useConfig = () => usePolling<ConfigData>("/config");
 export const usePositions = () => usePolling<{ positions: Position[]; count: number }>("/positions");
+
+export interface WalletPosition {
+  token_id: string;
+  size: number;
+  avg_price: number;
+  cur_price: number;
+  outcome: string;
+  title: string;
+  condition_id: string;
+  side_guess: string;
+  end_date: string | null;
+  in_bot_state: boolean;
+  source: "pm_wallet";  // PM wallet is always the authoritative source of truth
+  payout_usd?: number;
+  won?: boolean;
+}
+
+export interface PositionDiscrepancy {
+  token_id: string;
+  type: "size_mismatch" | "unmanaged_by_bot" | "bot_ghost";
+  pm_size: number;
+  bot_size: number;
+  bot_side?: string;  // "YES" | "NO", present for bot_ghost entries
+  diff?: number;
+  title: string;
+  outcome?: string;
+}
+
+export interface LivePositionsData {
+  wallet_positions: WalletPosition[];
+  pending_redemption: WalletPosition[];
+  discrepancies: PositionDiscrepancy[];
+  wallet_count: number;
+  pending_redemption_count: number;
+  discrepancy_count: number;
+  timestamp: number;
+}
+
+export const useLivePositions = () => usePolling<LivePositionsData>("/positions/live", 15_000);
 export const usePnl = () => usePolling<PnlData>("/pnl");
 export const useRisk = () => usePolling<RiskData>("/risk");
 export const useMarkets = () => usePolling<{ markets: Market[]; count: number }>("/markets");
@@ -499,6 +550,19 @@ export async function closePosition(marketId: string): Promise<{ ok: boolean; ex
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error((body as { detail?: string }).detail ?? `Close failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function dismissGhostPosition(tokenId: string, exitPrice: number = 0.0): Promise<{ ok: boolean; market_id: string; side: string; exit_price: number; size: number; pnl: number }> {
+  const res = await fetch(`${BASE_URL}/positions/ghost/dismiss`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token_id: tokenId, exit_price: exitPrice }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Dismiss failed: ${res.status}`);
   }
   return res.json();
 }

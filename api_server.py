@@ -18,6 +18,7 @@ import csv
 import json
 import math
 import statistics
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
@@ -86,19 +87,29 @@ state = BotState()
 TRADES_CSV = Path(__file__).parent / "data" / "trades.csv"
 # Path to paper-fill log CSV written by fill_simulator.py
 FILLS_CSV = Path(__file__).parent / "data" / "fills.csv"
+# Path to order event log written by pm_client.py
+ORDERS_CSV = Path(__file__).parent / "data" / "orders.csv"
 # Path to persisted config overrides — survives bot restarts
 _OVERRIDES_FILE = Path(__file__).parent / "config_overrides.json"
 
 
-def _save_overrides() -> None:
-    """Write all mutable config values to disk so they survive a restart."""
-    snapshot: dict = {attr: getattr(config, attr) for _, (attr, _) in _MUTABLE_CONFIG.items()}
-    # Also persist BOT_ACTIVE (toggled separately via /bot)
-    snapshot["BOT_ACTIVE"] = config.BOT_ACTIVE
-    # Persist list-type config values separately (not in _MUTABLE_CONFIG)
-    snapshot["MAKER_EXCLUDED_MARKET_TYPES"] = list(config.MAKER_EXCLUDED_MARKET_TYPES)
+def _save_overrides(changes: dict) -> None:
+    """Merge only the changed key-value pairs into the on-disk overrides file.
+
+    By updating only the keys that just changed (rather than rewriting the
+    entire snapshot from in-memory values), manual edits made directly to the
+    JSON file while the bot is running are never silently overwritten by a
+    subsequent UI save.
+    """
+    existing: dict = {}
+    if _OVERRIDES_FILE.exists():
+        try:
+            existing = json.loads(_OVERRIDES_FILE.read_text())
+        except Exception:
+            pass
+    existing.update(changes)
     try:
-        _OVERRIDES_FILE.write_text(json.dumps(snapshot, indent=2))
+        _OVERRIDES_FILE.write_text(json.dumps(existing, indent=2))
     except Exception as exc:
         log.warning("Failed to save config overrides", exc=str(exc))
 
@@ -207,6 +218,23 @@ _MUTABLE_CONFIG = {
     "maker_imbalance_skew_coeff":  ("MAKER_IMBALANCE_SKEW_COEFF",  float),
     "maker_imbalance_skew_max":    ("MAKER_IMBALANCE_SKEW_MAX",    float),
     "maker_imbalance_skew_min_ct": ("MAKER_IMBALANCE_SKEW_MIN_CT", float),
+    # Incentive spread gate & imbalance hard-stops
+    "maker_min_incentive_spread":     ("MAKER_MIN_INCENTIVE_SPREAD",      float),
+    "maker_max_imbalance_contracts":  ("MAKER_MAX_IMBALANCE_CONTRACTS",   int),
+    "maker_naked_close_contracts":    ("MAKER_NAKED_CLOSE_CONTRACTS",     int),
+    "maker_naked_close_secs":         ("MAKER_NAKED_CLOSE_SECS",          float),
+    "maker_max_fills_per_leg":        ("MAKER_MAX_FILLS_PER_LEG",         int),
+    "maker_max_contracts_per_market": ("MAKER_MAX_CONTRACTS_PER_MARKET",  int),
+    # CLOB depth gate (UI existed but was non-functional — now wired up)
+    "maker_min_depth_to_quote":       ("MAKER_MIN_DEPTH_TO_QUOTE",        int),
+    "maker_depth_thin_threshold":     ("MAKER_DEPTH_THIN_THRESHOLD",      int),
+    "maker_depth_spread_factor_thin": ("MAKER_DEPTH_SPREAD_FACTOR_THIN",  float),
+    "maker_depth_spread_factor_zero": ("MAKER_DEPTH_SPREAD_FACTOR_ZERO",  float),
+    # Volatility & drift guards
+    "maker_vol_filter_pct":           ("MAKER_VOL_FILTER_PCT",            float),
+    "maker_adverse_drift_reprice":    ("MAKER_ADVERSE_DRIFT_REPRICE",     float),
+    # Second-leg profit margin
+    "min_spread_profit_margin":       ("MIN_SPREAD_PROFIT_MARGIN",        float),
 }
 
 
@@ -293,6 +321,23 @@ class ConfigPatch(BaseModel):
     maker_imbalance_skew_coeff: float | None = None
     maker_imbalance_skew_max: float | None = None
     maker_imbalance_skew_min_ct: float | None = None
+    # Incentive spread gate & imbalance hard-stops
+    maker_min_incentive_spread: float | None = None
+    maker_max_imbalance_contracts: int | None = None
+    maker_naked_close_contracts: int | None = None
+    maker_naked_close_secs: float | None = None
+    maker_max_fills_per_leg: int | None = None
+    maker_max_contracts_per_market: int | None = None
+    # CLOB depth gate
+    maker_min_depth_to_quote: int | None = None
+    maker_depth_thin_threshold: int | None = None
+    maker_depth_spread_factor_thin: float | None = None
+    maker_depth_spread_factor_zero: float | None = None
+    # Volatility & drift guards
+    maker_vol_filter_pct: float | None = None
+    maker_adverse_drift_reprice: float | None = None
+    # Second-leg profit margin
+    min_spread_profit_margin: float | None = None
     # Market type exclusion (list — handled separately in patch_config)
     maker_excluded_market_types: list[str] | None = None
 
@@ -383,6 +428,23 @@ def get_config() -> dict:
         "maker_imbalance_skew_coeff":  config.MAKER_IMBALANCE_SKEW_COEFF,
         "maker_imbalance_skew_max":    config.MAKER_IMBALANCE_SKEW_MAX,
         "maker_imbalance_skew_min_ct": config.MAKER_IMBALANCE_SKEW_MIN_CT,
+        # Incentive spread gate & imbalance hard-stops
+        "maker_min_incentive_spread":     config.MAKER_MIN_INCENTIVE_SPREAD,
+        "maker_max_imbalance_contracts":  config.MAKER_MAX_IMBALANCE_CONTRACTS,
+        "maker_naked_close_contracts":    config.MAKER_NAKED_CLOSE_CONTRACTS,
+        "maker_naked_close_secs":         config.MAKER_NAKED_CLOSE_SECS,
+        "maker_max_fills_per_leg":        config.MAKER_MAX_FILLS_PER_LEG,
+        "maker_max_contracts_per_market": config.MAKER_MAX_CONTRACTS_PER_MARKET,
+        # CLOB depth gate
+        "maker_min_depth_to_quote":       config.MAKER_MIN_DEPTH_TO_QUOTE,
+        "maker_depth_thin_threshold":     config.MAKER_DEPTH_THIN_THRESHOLD,
+        "maker_depth_spread_factor_thin": config.MAKER_DEPTH_SPREAD_FACTOR_THIN,
+        "maker_depth_spread_factor_zero": config.MAKER_DEPTH_SPREAD_FACTOR_ZERO,
+        # Volatility & drift guards
+        "maker_vol_filter_pct":           config.MAKER_VOL_FILTER_PCT,
+        "maker_adverse_drift_reprice":    config.MAKER_ADVERSE_DRIFT_REPRICE,
+        # Second-leg profit margin
+        "min_spread_profit_margin":       config.MIN_SPREAD_PROFIT_MARGIN,
         # Market type exclusion
         "maker_excluded_market_types": list(config.MAKER_EXCLUDED_MARKET_TYPES),
         "timestamp":            time.time(),
@@ -410,7 +472,16 @@ def patch_config(patch: ConfigPatch) -> dict:
         log.info("Config updated via API", key="MAKER_EXCLUDED_MARKET_TYPES",
                  value=config.MAKER_EXCLUDED_MARKET_TYPES)
     if updated:
-        _save_overrides()
+        # Build attr-name → value dict for only the keys that changed so that
+        # _save_overrides does a targeted merge (not a full overwrite).
+        attr_changes: dict = {
+            attr: getattr(config, attr)
+            for field, (attr, _) in _MUTABLE_CONFIG.items()
+            if field in updated
+        }
+        if "maker_excluded_market_types" in updated:
+            attr_changes["MAKER_EXCLUDED_MARKET_TYPES"] = list(config.MAKER_EXCLUDED_MARKET_TYPES)
+        _save_overrides(attr_changes)
     return {
         "updated": updated,
         "current": {
@@ -496,11 +567,70 @@ def patch_config(patch: ConfigPatch) -> dict:
             "maker_imbalance_skew_coeff":  config.MAKER_IMBALANCE_SKEW_COEFF,
             "maker_imbalance_skew_max":    config.MAKER_IMBALANCE_SKEW_MAX,
             "maker_imbalance_skew_min_ct": config.MAKER_IMBALANCE_SKEW_MIN_CT,
+            # Incentive spread gate & imbalance hard-stops
+            "maker_min_incentive_spread":     config.MAKER_MIN_INCENTIVE_SPREAD,
+            "maker_max_imbalance_contracts":  config.MAKER_MAX_IMBALANCE_CONTRACTS,
+            "maker_naked_close_contracts":    config.MAKER_NAKED_CLOSE_CONTRACTS,
+            "maker_naked_close_secs":         config.MAKER_NAKED_CLOSE_SECS,
+            "maker_max_fills_per_leg":        config.MAKER_MAX_FILLS_PER_LEG,
+            "maker_max_contracts_per_market": config.MAKER_MAX_CONTRACTS_PER_MARKET,
+            # CLOB depth gate
+            "maker_min_depth_to_quote":       config.MAKER_MIN_DEPTH_TO_QUOTE,
+            "maker_depth_thin_threshold":     config.MAKER_DEPTH_THIN_THRESHOLD,
+            "maker_depth_spread_factor_thin": config.MAKER_DEPTH_SPREAD_FACTOR_THIN,
+            "maker_depth_spread_factor_zero": config.MAKER_DEPTH_SPREAD_FACTOR_ZERO,
+            # Volatility & drift guards
+            "maker_vol_filter_pct":           config.MAKER_VOL_FILTER_PCT,
+            "maker_adverse_drift_reprice":    config.MAKER_ADVERSE_DRIFT_REPRICE,
+            # Second-leg profit margin
+            "min_spread_profit_margin":       config.MIN_SPREAD_PROFIT_MARGIN,
             # Market type exclusion
             "maker_excluded_market_types": list(config.MAKER_EXCLUDED_MARKET_TYPES),
         },
         "timestamp": time.time(),
     }
+
+
+@app.get("/config/effective")
+def get_effective_config_endpoint() -> dict:
+    """Return the fully-merged runtime config (defaults + overrides, post-startup patches).
+
+    This is the single source of truth for what values the bot is actually using.
+    Unlike GET /config which only shows mutable UI-facing keys, this returns every
+    named constant in config.py with its current in-memory value.
+    """
+    from config import get_effective_config
+    return {"effective_config": get_effective_config(), "timestamp": time.time()}
+
+
+@app.post("/config/reload", dependencies=[Depends(require_auth)])
+def reload_config() -> dict:
+    """Re-read config_overrides.json and apply all values to the live config.
+
+    Use this after manually editing the JSON file while the bot is running,
+    so the changes take effect without a full restart.
+    """
+    if not _OVERRIDES_FILE.exists():
+        return {"reloaded": 0, "message": "No overrides file found"}
+    try:
+        on_disk: dict = json.loads(_OVERRIDES_FILE.read_text())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read overrides file: {exc}")
+
+    _module = sys.modules[config.__name__]
+    applied: dict = {}
+    for k, v in on_disk.items():
+        if hasattr(_module, k):
+            current = getattr(_module, k)
+            try:
+                coerced = type(current)(v) if not isinstance(v, list) else v
+                setattr(_module, k, coerced)
+                applied[k] = coerced
+            except Exception:
+                pass  # Skip values that can't be coerced
+
+    log.info("Config reloaded from file", n_keys=len(applied), keys=list(applied.keys()))
+    return {"reloaded": len(applied), "applied": applied}
 
 
 # ── Bot start / stop ────────────────────────────────────────────────────
@@ -528,7 +658,7 @@ def set_bot_status(patch: BotActivePatch) -> dict:
     config.BOT_ACTIVE = patch.active
     state.bot_active = patch.active
     log.info("Bot toggled via API", active=patch.active)
-    _save_overrides()
+    _save_overrides({"BOT_ACTIVE": patch.active})
     return {
         "active": config.BOT_ACTIVE,
         "timestamp": time.time(),
@@ -587,8 +717,227 @@ def positions() -> dict:
     }
 
 
+@app.get("/positions/live")
+async def positions_live() -> dict:
+    """
+    Fetch positions directly from the Polymarket Data API (source of truth).
+
+    Returns the raw PM wallet snapshot and a reconciliation diff:
+      - 'wallet_positions': everything PM reports in the funder wallet
+      - 'bot_positions': what the bot's risk engine currently tracks (open only)
+      - 'discrepancies': tokens present in PM wallet but absent from the bot state,
+         or tokens where size differs by > 0.01 contracts
+      - 'pending_redemption': resolved tokens still sitting in the wallet
+        (curPrice = 0 or 1 but token is still listed — PM hasn't auto-distributed yet,
+         or these are winning tokens that need manual CTF redemption)
+    """
+    pm = state.pm_ref
+    if pm is None:
+        raise HTTPException(status_code=503, detail="PM client not yet initialised")
+
+    raw = await pm.get_live_positions()
+
+    # Enrich each position with market info where possible
+    markets_snap = pm.get_markets()
+    markets_by_token: dict[str, dict] = {}
+    for mkt in markets_snap.values():
+        markets_by_token[mkt.token_id_yes] = {"market_id": mkt.condition_id, "title": mkt.title, "side": "YES", "end_date": mkt.end_date.isoformat() if mkt.end_date else None}
+        markets_by_token[mkt.token_id_no]  = {"market_id": mkt.condition_id, "title": mkt.title, "side": "NO",  "end_date": mkt.end_date.isoformat() if mkt.end_date else None}
+
+    wallet_positions = []
+    pending_redemption = []
+    now_ts = time.time()
+
+    for pos in raw:
+        token_id = pos.get("asset") or pos.get("asset_id") or ""
+        size = float(pos.get("size", 0) or 0)
+        avg_price = float(pos.get("avgPrice") or pos.get("avg_price") or 0)
+        cur_price = float(pos.get("currentPrice") or pos.get("curPrice") or pos.get("cur_price") or 0)
+        outcome = pos.get("outcome", "")
+        title = pos.get("title") or pos.get("market", "")
+        condition_id = pos.get("conditionId") or pos.get("condition_id") or ""
+        mkt_info = markets_by_token.get(token_id, {})
+
+        enriched = {
+            "token_id": token_id,
+            "size": round(size, 4),
+            "avg_price": round(avg_price, 4),
+            "cur_price": round(cur_price, 4),
+            "outcome": outcome,
+            "title": title or mkt_info.get("title", ""),
+            "condition_id": condition_id or mkt_info.get("market_id", ""),
+            "side_guess": mkt_info.get("side", ""),
+            "end_date": mkt_info.get("end_date"),
+            "in_bot_state": False,  # filled in below
+            "source": "pm_wallet",  # PM wallet is the authoritative source of truth (C5)
+        }
+        wallet_positions.append(enriched)
+
+        # Settled check: cur_price ≈ 0 or ≈ 1 means market resolved (threshold avoids
+        # float precision issues where PM returns 0.9999 or 1e-5 for resolved markets)
+        if size > 0 and (cur_price < 0.01 or cur_price > 0.99):
+            payout = round(size * cur_price, 4)
+            enriched["payout_usd"] = payout
+            pending_redemption.append({**enriched, "payout_usd": payout, "won": cur_price > 0.99})
+
+    # Cross-reference with bot state
+    bot_open: dict[str, dict] = {}  # token_id → bot position info
+    if state.risk_ref is not None:
+        for pos in state.risk_ref.get_positions().values():
+            if pos.is_closed:
+                continue
+            mkt_snap = markets_snap.get(pos.market_id)
+            if mkt_snap:
+                tid = mkt_snap.token_id_yes if pos.side == "YES" else mkt_snap.token_id_no
+                bot_open[tid] = {"market_id": pos.market_id, "side": pos.side, "size": pos.size, "entry_price": pos.entry_price}
+
+    discrepancies = []
+    for wp in wallet_positions:
+        tid = wp["token_id"]
+        bot = bot_open.get(tid)
+        if bot:
+            wp["in_bot_state"] = True
+            size_diff = abs(wp["size"] - bot["size"])
+            if size_diff > 0.01:
+                discrepancies.append({
+                    "token_id": tid,
+                    "type": "size_mismatch",
+                    "pm_size": wp["size"],
+                    "bot_size": bot["size"],
+                    "diff": round(size_diff, 4),
+                    "title": wp["title"],
+                })
+        else:
+            if wp["size"] > 0:
+                discrepancies.append({
+                    "token_id": tid,
+                    "type": "unmanaged_by_bot",   # in PM wallet (authoritative) but bot is not managing it
+                    "pm_size": wp["size"],
+                    "bot_size": 0,
+                    "title": wp["title"],
+                    "outcome": wp["outcome"],
+                })
+
+    # Tokens bot tracks but not in PM wallet (position may have been sold/expired+redeemed)
+    pm_token_ids = {wp["token_id"] for wp in wallet_positions}
+    for tid, bot in bot_open.items():
+        if tid not in pm_token_ids:
+            mkt_snap = markets_snap.get(bot["market_id"])
+            discrepancies.append({
+                "token_id": tid,
+                "type": "bot_ghost",
+                "pm_size": 0,
+                "bot_size": bot["size"],
+                "bot_side": bot["side"],
+                "title": mkt_snap.title if mkt_snap else bot["market_id"],
+            })
+
+    return {
+        "wallet_positions": wallet_positions,
+        "pending_redemption": pending_redemption,
+        "discrepancies": discrepancies,
+        "wallet_count": len(wallet_positions),
+        "pending_redemption_count": len(pending_redemption),
+        "discrepancy_count": len(discrepancies),
+        "timestamp": now_ts,
+    }
+
+
+@app.post("/positions/ghost/dismiss")
+async def dismiss_ghost_position(body: dict) -> dict:
+    """
+    Force-close a ghost position — one the bot tracks but PM wallet no longer holds
+    (market resolved, tokens redeemed/expired, or position closed externally).
+
+    Accepts JSON body: {"token_id": "<token>", "exit_price": <float>}
+      - token_id:   the YES or NO token id for the ghost position
+      - exit_price: optional (default 0.0 for YES, 1.0 for NO resolved-lose)
+                    expressed in YES-probability space (same convention as entry_price)
+
+    Calls risk.close_position() at the supplied exit_price so the trade gets a
+    correct P&L entry in trades.csv and the position is removed from live state.
+    """
+    if state.risk_ref is None or state.pm_ref is None:
+        raise HTTPException(status_code=503, detail="Bot not initialised")
+
+    token_id_raw: str = body.get("token_id", "")
+    if not token_id_raw:
+        raise HTTPException(status_code=400, detail="token_id is required")
+
+    # Look up the position that corresponds to this token_id.
+    # We need to find the (market_id, side) pair.
+    markets_snap = state.pm_ref.get_markets()
+    found_market_id: str | None = None
+    found_side: str | None = None
+
+    for mkt in markets_snap.values():
+        if mkt.token_id_yes == token_id_raw:
+            found_market_id = mkt.condition_id
+            found_side = "YES"
+            break
+        if mkt.token_id_no == token_id_raw:
+            found_market_id = mkt.condition_id
+            found_side = "NO"
+            break
+
+    # If not in current market list (expired/pruned), scan risk positions directly.
+    # The risk engine stores market_id but not token_id, so we must match via
+    # the markets_snap for in-scope markets. For expired/pruned markets, we fall
+    # back to looking at what the bot_open map would have used when the market was live.
+    if found_market_id is None:
+        # Try to find any open position whose market_id maps to this token via
+        # the currently known token → market mapping stored in pm._books key space.
+        # As a last resort, expose the raw position lookup for the UI to help.
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"token_id {token_id_raw[:24]}... not found in current market snapshot. "
+                "The market may have been pruned. Restart the bot to reload expired markets "
+                "and then retry, or close the position via Polymarket.com."
+            ),
+        )
+
+    # Determine exit price.
+    # Default: 0.0 (YES token worthless = market resolved as NO, or token expired at 0).
+    # For NO ghost positions, if caller doesn't supply a price we also default 0.0
+    # (YES prob = 0 means NO won → NO exit in YES-space = 0, PnL = -(0-entry)*size = +entry*size).
+    raw_exit = body.get("exit_price")
+    if raw_exit is not None:
+        exit_price = float(raw_exit)
+    else:
+        exit_price = 0.0
+
+    closed = state.risk_ref.close_position(
+        found_market_id,
+        exit_price,
+        side=found_side,
+    )
+    if closed is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No open {found_side} position found for market {found_market_id}",
+        )
+
+    log.info(
+        "Ghost position dismissed via API",
+        market_id=found_market_id,
+        side=found_side,
+        exit_price=exit_price,
+        pnl=round(closed.realized_pnl, 4),
+    )
+
+    return {
+        "ok": True,
+        "market_id": found_market_id,
+        "side": found_side,
+        "exit_price": exit_price,
+        "size": closed.size,
+        "pnl": round(closed.realized_pnl, 4),
+    }
+
+
 @app.post("/positions/{market_id}/close", dependencies=[Depends(require_auth)])
-async def close_position_manually(market_id: str) -> dict:
+async def close_position_endpoint(market_id: str) -> dict:
     """
     Manually close ALL open positions for a market (both YES and NO legs).
 
@@ -679,6 +1028,39 @@ def trades(
         "offset": offset,
         "timestamp": time.time(),
     }
+
+
+# ── Order event log ───────────────────────────────────────────────────────────
+
+@app.get("/orders")
+def orders_endpoint(
+    limit: int = Query(default=200, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+    token_id: Optional[str] = Query(default=None),
+    order_type: Optional[str] = Query(default=None),
+    action: Optional[str] = Query(default=None),
+) -> dict:
+    """Paginated order event log from data/orders.csv (placed live orders only)."""
+    if not ORDERS_CSV.exists():
+        return {"orders": [], "total": 0, "limit": limit, "offset": offset, "timestamp": time.time()}
+    try:
+        with ORDERS_CSV.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows: list[dict] = list(reader)
+    except Exception:
+        rows = []
+
+    rows = list(reversed(rows))  # newest first
+    if token_id:
+        rows = [r for r in rows if r.get("token_id", "") == token_id]
+    if order_type:
+        rows = [r for r in rows if r.get("order_type", "").lower() == order_type.lower()]
+    if action:
+        rows = [r for r in rows if r.get("action", "").lower() == action.lower()]
+
+    total = len(rows)
+    page = rows[offset: offset + limit]
+    return {"orders": page, "total": total, "limit": limit, "offset": offset, "timestamp": time.time()}
 
 
 # ── P&L summary ───────────────────────────────────────────────────────────────
@@ -1168,7 +1550,16 @@ def _load_trades_csv() -> list[dict]:
     try:
         with TRADES_CSV.open(newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            return list(reader)
+            rows = list(reader)
+        # Guard against headerless CSVs: if the CSV was written without a header,
+        # DictReader uses the first data row as field names, producing garbage.
+        # Detect this and re-read with explicit fieldnames from risk.py.
+        if rows and "timestamp" not in rows[0]:
+            log.warning("trades.csv missing header row — re-reading with explicit fieldnames")
+            from risk import TRADES_HEADER as _TRADES_HDR
+            with TRADES_CSV.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f, fieldnames=_TRADES_HDR))
+        return rows
     except Exception as exc:
         log.error("Failed to read trades CSV", exc=str(exc))
         return []

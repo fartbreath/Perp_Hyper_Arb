@@ -19,7 +19,7 @@ import { useState, useMemo, Fragment } from "react";
 import { useTrades } from "../api/client";
 import type { Trade } from "../api/client";
 
-const UNDERLYINGS = ["", "BTC", "ETH", "SOL", "HYPE", "DOGE", "BNB"];
+const UNDERLYINGS = ["", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"];
 const TYPES       = ["", "bucket_5m", "bucket_15m", "bucket_1h", "bucket_4h", "milestone", "hl_perp"];
 const ALL_LIMIT   = 2000; // fetch enough to aggregate client-side (API cap is 5000)
 

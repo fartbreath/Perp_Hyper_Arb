@@ -97,6 +97,11 @@ class MakerStrategy(BaseStrategy):
         # market_id → unix timestamp when the imbalance was first detected.
         # Reset when balance is restored or a force-close fires.
         self._imbalance_since: dict[str, float] = {}
+        # ── Per-leg fill count tracker ─────────────────────────────────────────
+        # (market_id, "YES"|"NO") → number of fill events on that leg this session.
+        # Used by MAKER_MAX_FILLS_PER_LEG gate in _deploy_quote.
+        # Pruned in _quote_age_watchdog for markets with no remaining open positions.
+        self._leg_fill_counts: dict[tuple[str, str], int] = {}
 
     async def start(self) -> None:
         if not config.STRATEGY_MAKER_ENABLED:
@@ -177,6 +182,12 @@ class MakerStrategy(BaseStrategy):
             await self._ensure_quoted_all()
             await self._check_naked_legs()
 
+            # Prune fill counts for markets that no longer have any open positions.
+            _active_mkt_ids = {p.market_id for p in self._risk.get_open_positions()}
+            _stale_keys = [k for k in self._leg_fill_counts if k[0] not in _active_mkt_ids]
+            for _k in _stale_keys:
+                del self._leg_fill_counts[_k]
+
             coins_to_check: set[str] = {
                 pos.underlying for pos in self._risk.get_open_positions()
             }
@@ -199,10 +210,6 @@ class MakerStrategy(BaseStrategy):
         """
         now = time.time()
         for market in self._pm.get_markets().values():
-            mid = self._pm.get_mid(market.token_id_yes)
-            if mid is None:
-                continue
-
             yes_pos = next(
                 (p for p in self._risk._positions.values()
                  if not p.is_closed and p.market_id == market.condition_id and p.side == "YES"),
@@ -222,6 +229,9 @@ class MakerStrategy(BaseStrategy):
                 continue
 
             # Debounce: record when we first saw this level of imbalance.
+            # NOTE: the mid/book check is intentionally NOT here — a stale or missing
+            # order book must not prevent the timer from ticking.  We only need a price
+            # at the moment the forced-close actually fires (below).
             if market.condition_id not in self._imbalance_since:
                 self._imbalance_since[market.condition_id] = now
                 log.debug(
@@ -236,6 +246,8 @@ class MakerStrategy(BaseStrategy):
                 continue  # debounce not yet elapsed
 
             # Threshold exceeded and debounce elapsed — fire taker exit.
+            # Only now do we need a mid price (as a fallback for the exit order).
+            mid = self._pm.get_mid(market.token_id_yes)
             heavy_side = "YES" if yes_ct > no_ct else "NO"
             excess_ct = int(imbalance)
             book = self._pm.get_book(market.token_id_yes)
@@ -354,7 +366,14 @@ class MakerStrategy(BaseStrategy):
             )
             if lifecycle_frac < _exit_frac:
                 return "expiry cooldown"
-            if config.MAKER_ENTRY_TTE_FRAC > 0.0 and lifecycle_frac > (1.0 - config.MAKER_ENTRY_TTE_FRAC):
+            # Only apply opening cooldown when within the active window (lifecycle_frac ≤ 1.0).
+            # lifecycle_frac > 1.0 means the market was created in advance of its event window
+            # (Polymarket now pre-publishes bucket markets hours ahead) — let it through.
+            if (
+                config.MAKER_ENTRY_TTE_FRAC > 0.0
+                and lifecycle_frac <= 1.0
+                and lifecycle_frac > (1.0 - config.MAKER_ENTRY_TTE_FRAC)
+            ):
                 log.debug(
                     "Skipping quote — opening cooldown active",
                     market=market.condition_id[:16],
@@ -765,6 +784,30 @@ class MakerStrategy(BaseStrategy):
         if not post_ask:
             log.debug("Imbalance guard: skipping SELL YES (NO already heavy)",
                       market=signal.market_id[:16], yes=yes_contracts, no=no_contracts)
+
+        # Fill-count gate: once a leg has been filled MAKER_MAX_FILLS_PER_LEG times,
+        # stop re-posting it. Guards against both Factor A (single-side trap where one
+        # leg fills repeatedly and the other never fires) and Factor B (high fill count
+        # adverse selection on a slowly-moving book).
+        if config.MAKER_MAX_FILLS_PER_LEG > 0:
+            _yes_fills = self._leg_fill_counts.get((signal.market_id, "YES"), 0)
+            _no_fills  = self._leg_fill_counts.get((signal.market_id, "NO"), 0)
+            if _yes_fills >= config.MAKER_MAX_FILLS_PER_LEG:
+                post_bid = False
+                log.debug(
+                    "Fill count gate: skipping YES leg",
+                    market=signal.market_id[:16],
+                    yes_fills=_yes_fills,
+                    limit=config.MAKER_MAX_FILLS_PER_LEG,
+                )
+            if _no_fills >= config.MAKER_MAX_FILLS_PER_LEG:
+                post_ask = False
+                log.debug(
+                    "Fill count gate: skipping NO leg",
+                    market=signal.market_id[:16],
+                    no_fills=_no_fills,
+                    limit=config.MAKER_MAX_FILLS_PER_LEG,
+                )
         if post_bid or post_ask:
             log.debug("Imbalance-adjusted sizes",
                       market=signal.market_id[:16],
@@ -790,21 +833,52 @@ class MakerStrategy(BaseStrategy):
                 )
 
         if post_ask:
-            ask_id = await self._pm.place_limit(
-                signal.token_id, "SELL", signal.ask_price, no_size, market
-            )
-            if ask_id:
-                self._active_quotes[ask_key] = ActiveQuote(
-                    market_id=signal.market_id,
-                    token_id=signal.token_id,
-                    side="SELL",
-                    price=signal.ask_price,
-                    size=no_size,
-                    order_id=ask_id,
-                    collateral_usd=round((1.0 - signal.ask_price) * no_size, 4),
-                    original_size=no_size,
-                    score=signal.score,
+            # BUY NO at (1 - ask_price) is economically equivalent to SELL YES at
+            # ask_price but requires only USDC — no YES-token inventory needed.
+            #
+            # Post-only safety: the NO CLOB is a separate orderbook from the YES CLOB.
+            # Its best_ask does NOT always equal (1 - YES_best_bid). If our price
+            # reaches or exceeds the actual NO best_ask the CLOB rejects the order
+            # with "invalid post-only order: order crosses book", leaving ask_key
+            # absent from _active_quotes, which disables the price-idempotency guard
+            # and causes an infinite reprice loop driven by book callbacks.
+            # Fix: clamp to one tick below the real NO best_ask before placing.
+            no_buy_price = 1.0 - signal.ask_price
+            no_book = self._pm.get_book(market.token_id_no)
+            if no_book is not None and no_book.best_ask is not None:
+                tick = market.tick_size
+                no_crossing_ceiling = no_book.best_ask - tick
+                if no_buy_price >= no_book.best_ask:
+                    no_buy_price = self._pm._round_to_tick(no_crossing_ceiling, tick)
+                    log.debug(
+                        "NO buy price clamped below best_ask to avoid crossing",
+                        market=market.condition_id[:16],
+                        original=round(1.0 - signal.ask_price, 4),
+                        clamped=round(no_buy_price, 4),
+                        no_best_ask=round(no_book.best_ask, 4),
+                    )
+                    if no_buy_price < config.MAKER_MIN_QUOTE_PRICE:
+                        log.debug(
+                            "NO ask leg skipped — clamped price below min quote price",
+                            market=market.condition_id[:16],
+                        )
+                        post_ask = False
+            if post_ask:
+                ask_id = await self._pm.place_limit(
+                    market.token_id_no, "BUY", no_buy_price, no_size, market
                 )
+                if ask_id:
+                    self._active_quotes[ask_key] = ActiveQuote(
+                        market_id=signal.market_id,
+                        token_id=market.token_id_no,
+                        side="BUY",
+                        price=no_buy_price,
+                        size=no_size,
+                        order_id=ask_id,
+                        collateral_usd=round(no_buy_price * no_size, 4),
+                        original_size=no_size,
+                        score=signal.score,
+                    )
 
         self._last_hl_mids.setdefault(signal.underlying, 0.0)
 
@@ -863,6 +937,61 @@ class MakerStrategy(BaseStrategy):
                     reason=reason,
                 )
                 # Fall through — cancel and re-post at the current market price
+
+        # ── Price-idempotency guard ────────────────────────────────────────────
+        # If both legs are resting (unfilled) and the new signal would produce
+        # the same prices, skip the cancel/repost entirely.  Without this, our
+        # own order entering a thin book can shift the mid enough to exceed the
+        # drift threshold in _on_pm_price_change, causing an infinite
+        # post → price_change → reprice → post loop at identical prices.
+        _bid_q = self._active_quotes.get(bid_key)
+        _ask_q = self._active_quotes.get(ask_key)
+        if (
+            _bid_q is not None
+            and _ask_q is not None
+            and _bid_q.size >= _bid_q.original_size   # no partial fill
+            and _ask_q.size >= _ask_q.original_size
+        ):
+            _draft = self._evaluate_signal(market, mid)
+            if _draft is not None:
+                _same_bid = abs(_draft.bid_price - _bid_q.price) < 0.005
+                _same_ask = abs((1.0 - _draft.ask_price) - _ask_q.price) < 0.005
+                if _same_bid and _same_ask:
+                    log.debug(
+                        "Reprice skipped — prices unchanged",
+                        market=market.condition_id[:16],
+                        bid=round(_bid_q.price, 4),
+                        ask=round(_ask_q.price, 4),
+                    )
+                    return
+
+        # Partial-idempotency: bid resting but ask absent (prior placement failed).
+        # If the new signal would produce the same bid price, skip the cancel/repost
+        # of the bid leg — only the ask leg needs a fresh placement attempt.
+        if (
+            _bid_q is not None
+            and _ask_q is None
+            and _bid_q.size >= _bid_q.original_size
+        ):
+            _draft = self._evaluate_signal(market, mid)
+            if _draft is not None and abs(_draft.bid_price - _bid_q.price) < 0.005:
+                # Same bid — only need to re-attempt the ask leg.
+                signal = _draft
+                self._signals[bid_key] = signal
+                if config.MAKER_DEPLOYMENT_MODE == "auto":
+                    _cost_per = signal.bid_price + (1.0 - signal.ask_price)
+                    _c = min(config.MAKER_BATCH_SIZE, max(1, int(signal.quote_size / _cost_per)))
+                    needed = round(_cost_per * _c, 4)
+                    if self.available_capital >= needed:
+                        # Free + re-deploy only the ask; the bid stays in place.
+                        self._risk.free_slot(market.condition_id)
+                        await self._deploy_quote(signal, market)
+                log.debug(
+                    "Partial-reprice: bid unchanged, re-attempting ask leg only",
+                    market=market.condition_id[:16],
+                    bid=round(_bid_q.price, 4),
+                )
+                return
 
         for key in [bid_key, ask_key]:
             old = self._active_quotes.get(key)
@@ -1127,7 +1256,12 @@ class MakerStrategy(BaseStrategy):
             size = vol * config.MAKER_SPREAD_SIZE_PCT
         else:
             size = config.MAKER_SPREAD_SIZE_NEW_MARKET
-        return max(config.MAKER_SPREAD_SIZE_MIN, min(config.MAKER_SPREAD_SIZE_MAX, round(size)))
+        # Also cap at per-market exposure limit so risk.can_open() never blocks a fresh position
+        return max(config.MAKER_SPREAD_SIZE_MIN, min(
+            config.MAKER_SPREAD_SIZE_MAX,
+            config.MAX_PM_EXPOSURE_PER_MARKET,
+            round(size),
+        ))
 
     # ── Capital accounting ─────────────────────────────────────────────────────
 
@@ -1238,6 +1372,10 @@ class MakerStrategy(BaseStrategy):
         self._inventory[underlying] = self._inventory.get(underlying, 0.0) + delta
         log.debug("Inventory updated", underlying=underlying,
                   delta=delta, net=self._inventory[underlying])
+        # Increment per-leg fill counter for MAKER_MAX_FILLS_PER_LEG gate.
+        _pos_side = "YES" if "BUY" in side else "NO"
+        _fill_key: tuple[str, str] = (market_id, _pos_side)
+        self._leg_fill_counts[_fill_key] = self._leg_fill_counts.get(_fill_key, 0) + 1
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1256,6 +1394,26 @@ class MakerStrategy(BaseStrategy):
 
     def get_active_quotes(self) -> dict[str, ActiveQuote]:
         return dict(self._active_quotes)
+
+    def restore_active_quote(self, key: str, quote: ActiveQuote) -> None:
+        """Inject a restored ActiveQuote (from startup) without going through _deploy_quote.
+
+        Also reserves the risk slot so the position cap is respected while the
+        order is resting.
+        """
+        self._active_quotes[key] = quote
+        # Reserve the slot so reserve_slot() doesn't double-count when a fill
+        # arrives and tries to re-open the position.
+        market = self._find_market_by_id(quote.market_id)
+        underlying = market.underlying if market else ""
+        self._risk.reserve_slot(quote.market_id, "maker", underlying)
+        log.debug(
+            "Active quote restored",
+            key=key[:40],
+            market_id=quote.market_id[:16],
+            price=round(quote.price, 4),
+            remaining=round(quote.size, 2),
+        )
 
     def get_coin_hedges(self) -> dict[str, dict]:
         """Return a snapshot of all active HL delta hedges keyed by coin."""

@@ -155,6 +155,9 @@ class HLClient:
     # ── WebSocket ──────────────────────────────────────────────────────────────
 
     async def _ws_loop(self) -> None:
+        if not self._address and not self._paper_mode:
+            log.debug("HL WS disabled — no address configured, skipping WS loop")
+            return
         backoff = 1.0
         while self._running:
             try:

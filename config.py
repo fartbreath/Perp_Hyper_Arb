@@ -11,13 +11,13 @@ load_dotenv()
 
 # ── Polymarket ──────────────────────────────────────────────────────────────
 POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
-POLY_FUNDER: str = os.getenv("POLY_FUNDER", "")
+POLY_FUNDER: str = os.getenv("POLY_FUNDER", "") or os.getenv("POLY_ADDRESS", "")
 POLY_HOST: str = "https://clob.polymarket.com"
 GAMMA_HOST: str = "https://gamma-api.polymarket.com"
 
 # Token IDs of underlying assets tracked. Used to label markets.
 TRACKED_UNDERLYINGS: list[str] = [
-    "BTC", "ETH", "SOL", "BNB","DOGE","HYPE",
+    "BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XLP",
 ]
 
 # How often (seconds) to refresh the market list from Gamma API
@@ -38,7 +38,7 @@ HL_ADDRESS: str = os.getenv("HL_ADDRESS", "")
 HL_SECRET_KEY: str = os.getenv("HL_SECRET_KEY", "")
 HL_BASE_URL: str = "https://api.hyperliquid.xyz"
 
-HL_PERP_COINS: list[str] = ["BTC", "ETH", "SOL", "BNB","DOGE","HYPE"]
+HL_PERP_COINS: list[str] = ["BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XLP"]
 HL_DEFAULT_SLIPPAGE: float = 0.003   # 0.3% max slippage for hedge market orders
 HL_DEAD_MAN_INTERVAL: int = 300      # seconds — refresh dead man's switch every 5 min
 HL_FUNDING_POLL_INTERVAL: int = 300  # seconds
@@ -81,8 +81,8 @@ HEDGE_DEBOUNCE_SECS: float = 3.0  # NOTE: overridden in config_overrides.json
 # MAKER_SPREAD_SIZE_PCT × market 24hr volume, clamped to [MIN, MAX].
 # New markets with no recorded volume use MAKER_SPREAD_SIZE_NEW_MARKET as a conservative fallback.
 MAKER_SPREAD_SIZE_PCT: float = 0.04       # 4% of 24hr volume per spread
-MAKER_SPREAD_SIZE_MIN: float = 100.0      # floor: $100 minimum per spread
-MAKER_SPREAD_SIZE_MAX: float = 500.0      # ceiling: $500 maximum per spread
+MAKER_SPREAD_SIZE_MIN: float = 125.0      # floor: $100 minimum per spread
+MAKER_SPREAD_SIZE_MAX: float = 575.0      # ceiling: $500 maximum per spread
 MAKER_SPREAD_SIZE_NEW_MARKET: float = 100.0 # fallback for markets with no volume data
 # Safety backstop: absolute ceiling on contracts per side per order.
 # Under normal operation MAKER_BATCH_SIZE (below) is the operative per-order cap;
@@ -96,12 +96,18 @@ MAKER_MAX_CONTRACTS_PER_MARKET: int = 500
 # many contracts, block ALL new orders on the heavy side entirely.
 # Under normal operation the imbalance-aware sizing in _deploy_quote converges positions
 # to balance before this threshold is reached; this is only a last-resort circuit breaker.
-MAKER_MAX_IMBALANCE_CONTRACTS: int = 10
+MAKER_MAX_IMBALANCE_CONTRACTS: int = 5
 # Naked-leg force-close: if one side exceeds the other by this many contracts AND the
 # imbalance has persisted for at least MAKER_NAKED_CLOSE_SECS seconds, the strategy
 # will taker-exit the excess quantity to eliminate directional exposure.
-MAKER_NAKED_CLOSE_CONTRACTS: int = 25
-MAKER_NAKED_CLOSE_SECS: float = 60.0
+# NOTE: must be >= MAKER_MAX_IMBALANCE_CONTRACTS so the hard stop fires first.
+MAKER_NAKED_CLOSE_CONTRACTS: int = 10
+MAKER_NAKED_CLOSE_SECS: float = 10.0
+# Per-leg fill cap: once a single leg (YES or NO) of a market has been filled this many
+# times, stop re-posting that leg. Prevents runaway accumulation from repeated adverse
+# selection on one side (Factor A: single-side trap; Factor B: high fill count bleed).
+# 0 = disabled.
+MAKER_MAX_FILLS_PER_LEG: int = 6
 # Minimum max_incentive_spread required to post a quote.  Markets with a spread reward
 # below this floor provide insufficient edge after fees and rebates; skip them entirely.
 MAKER_MIN_INCENTIVE_SPREAD: float = 0.04
@@ -137,7 +143,7 @@ MIN_EDGE_PCT: float = 0.001  # NOTE: overridden to 0.005 in config_overrides.jso
 #   (1 - NO_entry) + current_bid   <=  1.0 - MIN_SPREAD_PROFIT_MARGIN  (YES needed)
 # This prevents negative-spread entries caused by mid drifting between fills.
 # 0.005 = require at least 0.5¢/contract combined edge before posting the missing leg.
-MIN_SPREAD_PROFIT_MARGIN: float = 0.005
+MIN_SPREAD_PROFIT_MARGIN: float = 0.010
 
 # Per-coin inventory loss limit for maker strategy (Flaw §5)
 # If total unrealised P&L across all open positions for a coin drops below
@@ -206,9 +212,9 @@ INVENTORY_SKEW_MAX: float = 0.03   # hard cap: ±3 cents (≈ 1 half-spread unit
 #   e.g. 0.0005 → 50 excess contracts → 2.5 cent tightening (capped at MAX)
 # MAKER_IMBALANCE_SKEW_MAX:   hard cap on the per-market price improvement
 # MAKER_IMBALANCE_SKEW_MIN_CT: minimum imbalance (contracts) before adjustment fires
-MAKER_IMBALANCE_SKEW_COEFF: float = 0.0005
-MAKER_IMBALANCE_SKEW_MAX:   float = 0.03    # ±3 cents, ≈ 1 half-spread unit
-MAKER_IMBALANCE_SKEW_MIN_CT: float = 10.0   # ignore tiny natural fluctuations
+MAKER_IMBALANCE_SKEW_COEFF: float = 0.0012
+MAKER_IMBALANCE_SKEW_MAX:   float = 0.05    # ±3 cents, ≈ 1 half-spread unit
+MAKER_IMBALANCE_SKEW_MIN_CT: float = 5.0   # ignore tiny natural fluctuations
 
 # ── CLOB Depth-aware quoting ──────────────────────────────────────────────────
 # Gate: minimum competing contracts at our quote level before posting.
@@ -236,7 +242,7 @@ MAKER_VOL_FILTER_PCT: float = 0.015
 # this fraction from the quote price, even if the quote is not yet stale.
 # Prevents the remaining resting size from sitting at an adversely-selected
 # price after a fast HL move. 1.5% ≈ half a typical max_incentive_spread.
-MAKER_ADVERSE_DRIFT_REPRICE: float = 0.015
+MAKER_ADVERSE_DRIFT_REPRICE: float = 0.010
 
 # ── Bot-level kill switch ─────────────────────────────────────────────────────
 # When False, the agent loop and mispricing scanner idle without opening new
@@ -315,7 +321,7 @@ EDGE_BUFFER: float = 0.002          # 0.2% risk/slippage buffer
 # ── Signal Scoring ──────────────────────────────────────────────────────────
 # Minimum score (0–100) to be considered for entry.  0.0 = no filter.
 MIN_SIGNAL_SCORE_MISPRICING: float = 0.0
-MIN_SIGNAL_SCORE_MAKER: float = 0.0
+MIN_SIGNAL_SCORE_MAKER: float = 60.0
 # Per-bucket-type score overrides. When > 0, applied in addition to MIN_SIGNAL_SCORE_MAKER.
 # e.g. set MAKER_MIN_SIGNAL_SCORE_5M = 70.0 to only quote 5m markets with strong signals.
 # 5m buckets default to 92.0: session data shows -$4.19/trade avg at lower scores due
@@ -412,3 +418,28 @@ if _OVERRIDES_FILE.exists():
     except Exception as _e:
         import warnings as _w
         _w.warn(f"[config] Failed to load {_OVERRIDES_FILE}: {_e}")
+
+
+def get_effective_config() -> dict:
+    """Return a snapshot of all current runtime config values.
+
+    Reads directly from the module so post-startup patches (via POST /config)
+    are reflected.  Excludes private helpers (leading underscore), imported
+    modules, and env-derived secrets.
+    """
+    import sys as _sys
+    _skip = {"POLY_PRIVATE_KEY", "HL_SECRET_KEY", "API_SECRET",
+              "TELEGRAM_BOT_TOKEN"}
+    mod = _sys.modules[__name__]
+    result: dict = {}
+    for name in dir(mod):
+        if name.startswith("_"):
+            continue
+        if name in _skip:
+            continue
+        val = getattr(mod, name)
+        # Only include scalar/list config values — skip functions, modules, classes
+        if callable(val) or hasattr(val, "__module__"):
+            continue
+        result[name] = val
+    return result

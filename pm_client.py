@@ -17,11 +17,13 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 
 import aiohttp
@@ -32,14 +34,67 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds,
     MarketOrderArgs,
+    OpenOrderParams,
     OrderArgs,
     OrderType,
 )
+from py_clob_client.exceptions import PolyApiException
 
 import config
 from logger import get_bot_logger
 
 log = get_bot_logger(__name__)
+
+# ── Order event log (C4) ──────────────────────────────────────────────────────
+_ORDERS_CSV = Path(__file__).parent / "data" / "orders.csv"
+_ORDERS_HEADER = [
+    "timestamp", "order_id", "market_id", "token_id",
+    "side", "price", "size", "order_type", "action",
+]
+
+
+def _ensure_orders_csv() -> None:
+    """Create orders.csv with header if it doesn't exist."""
+    _ORDERS_CSV.parent.mkdir(exist_ok=True)
+    if not _ORDERS_CSV.exists():
+        with _ORDERS_CSV.open("w", newline="") as f:
+            csv.writer(f).writerow(_ORDERS_HEADER)
+        return
+    with _ORDERS_CSV.open("r", newline="") as f:
+        try:
+            existing = next(csv.reader(f))
+        except StopIteration:
+            existing = []
+    if existing != _ORDERS_HEADER:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup = _ORDERS_CSV.with_name(f"orders_{ts}.csv.bak")
+        _ORDERS_CSV.rename(backup)
+        with _ORDERS_CSV.open("w", newline="") as f:
+            csv.writer(f).writerow(_ORDERS_HEADER)
+
+
+def _append_order_event(
+    order_id: str,
+    token_id: str,
+    side: str,
+    price: float,
+    size: float,
+    order_type: str,   # "limit" | "market"
+    action: str,       # "placed"
+    market_id: str = "",
+) -> None:
+    """Append one row to the append-only orders.csv log."""
+    try:
+        _ensure_orders_csv()
+        with _ORDERS_CSV.open("a", newline="") as f:
+            csv.writer(f).writerow([
+                datetime.now(timezone.utc).isoformat(),
+                order_id, market_id, token_id,
+                side, round(price, 6), round(size, 6),
+                order_type, action,
+            ])
+    except Exception as exc:
+        log.warning("orders.csv append failed", exc=str(exc))
 
 # Market type labels — assigned by keyword-matching the market slug/title
 _MARKET_TYPE_KEYWORDS: dict[str, list[str]] = {
@@ -104,7 +159,7 @@ _REBATE_PCT_BY_TYPE: dict[str, float] = {
 _UNDERLYING_PATTERNS: dict[str, list[str]] = {
     "BTC":  [r"\bBTC\b",     r"\bBITCOIN\b"],
     "ETH":  [r"\bETH\b",     r"\bETHEREUM\b"],
-    "SOL":  [r"\bSOL\b",     r"\bSOLANA\b"],
+   # "SOL":  [r"\bSOL\b",     r"\bSOLANA\b"],
     "XRP":  [r"\bXRP\b",     r"\bRIPPLE\b"],
     "BNB":  [r"\bBNB\b"],
     "DOGE": [r"\bDOGE\b",    r"\bDOGECOIN\b"],
@@ -118,6 +173,7 @@ _UNDERLYING_PATTERNS: dict[str, list[str]] = {
     "ARB":  [r"\bARB\b",     r"\bARBITRUM\b"],
     "OP":   [r"\bOPTIMISM\b"],         # NOT \bOP\b — too ambiguous
     "TON":  [r"\bTONCOIN\b"],          # NOT \bTON\b — matches Edmonton/ton
+    "HYPE": [r"\bHYPE\b",    r"\bHYPERLIQUID\b"],
 }
 
 # Polymarket Gamma API tag slugs for each underlying.
@@ -127,7 +183,7 @@ _UNDERLYING_PATTERNS: dict[str, list[str]] = {
 _UNDERLYING_TAG_SLUGS: dict[str, list[str]] = {
     "BTC":  ["crypto", "bitcoin"],
     "ETH":  ["crypto", "ethereum"],
-    "SOL":  ["solana"],
+  #  "SOL":  ["solana"],
     "XRP":  ["ripple", "xrp"],
     "BNB":  ["bnb", "binance"],
     "DOGE": ["dogecoin"],
@@ -141,6 +197,7 @@ _UNDERLYING_TAG_SLUGS: dict[str, list[str]] = {
     "ARB":  ["arbitrum"],
     "OP":   ["optimism"],
     "TON":  ["toncoin"],
+    "HYPE": ["hyperliquid"],
 }
 # Flat deduplicated list of all tag slugs to query
 _ALL_TAG_SLUGS: list[str] = list(dict.fromkeys(
@@ -156,6 +213,43 @@ def _detect_underlying(title: str) -> str:
             if re.search(p, t):
                 return asset
     return "UNKNOWN"
+
+
+# Matches time-range patterns like "7:20AM-7:25AM" or "11:00PM - 12:00AM"
+# used in individual bucket-market titles (e.g. "BNB Up or Down - March 26, 7:20AM-7:25AM ET").
+# Groups: (h1)(m1) dash (h2)(m2)
+_TIME_RANGE_RE = re.compile(
+    r'(\d{1,2}):(\d{2})\s*(?:AM|PM)?\s*[-\u2013]\s*(\d{1,2}):(\d{2})',
+    re.IGNORECASE,
+)
+
+
+def _detect_bucket_from_time_range(title: str) -> Optional[str]:
+    """Detect bucket market type from a HH:MM–HH:MM time-range in the title.
+
+    Handles titles like "BNB Up or Down - March 26, 7:20AM-7:25AM ET" where
+    no keyword (e.g. "5-minute") appears but the window size is encoded as a
+    clock-time range.
+
+    Returns the market_type string ("bucket_5m", "bucket_15m", "bucket_1h",
+    "bucket_4h") or None if no recognisable range is found.
+    """
+    m = _TIME_RANGE_RE.search(title)
+    if not m:
+        return None
+    h1, m1, h2, m2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    diff = (h2 * 60 + m2) - (h1 * 60 + m1)
+    if diff < 0:
+        diff += 12 * 60   # handle 12-hour format boundary (e.g. 12:55PM – 1:00PM)
+    if diff == 5:
+        return "bucket_5m"
+    if diff == 15:
+        return "bucket_15m"
+    if diff == 60:
+        return "bucket_1h"
+    if diff == 240:
+        return "bucket_4h"
+    return None
 
 
 def _classify_market(title: str) -> str:
@@ -175,6 +269,13 @@ def _classify_market(title: str) -> str:
         for kw in _MARKET_TYPE_KEYWORDS[market_type]:
             if kw in title_l:
                 return market_type
+    # Time-range fallback: detect bucket type from a clock-time window in the title,
+    # e.g. "BNB Up or Down - March 26, 7:20AM-7:25AM ET" → "bucket_5m".
+    # This handles series whose titles carry no interval keyword (like "BNB Up or Down")
+    # but whose individual market questions encode the window as a time range.
+    bucket = _detect_bucket_from_time_range(title)
+    if bucket is not None:
+        return bucket
     return "milestone"
 
 
@@ -376,9 +477,9 @@ class PMClient:
         self._pinned_tokens: set[str] = set()            # tokens that must stay WS-subscribed (open positions)
         self._price_callbacks: list[Callable] = []
         self._order_fill_callbacks: list[Callable] = []
+        self._user_ws_reconnect_callbacks: list[Callable] = []  # A1: fired after user WS reconnects
         self._api_creds: Optional[ApiCreds] = None  # populated after CLOB auth
         self._running = False
-        self._heartbeat_id: int = 0
         self._paper_mode: bool = config.PAPER_TRADING
         self._last_heartbeat_ts: float = 0.0
         # WS shards — each shard owns ≤ PM_WS_MAX_MARKETS_PER_WS tokens.
@@ -404,6 +505,22 @@ class PMClient:
     def on_order_fill(self, callback: Callable) -> None:
         """Register an async callback(order_data) called when a PM order is matched."""
         self._order_fill_callbacks.append(callback)
+
+    def on_user_ws_reconnect(self, callback: Callable) -> None:
+        """Register an async callback() called after each PM user WS reconnect.
+
+        Use this to reconcile missed fills: fetch the PM Data API and compare
+        against in-memory state — any positions in the wallet but missing from
+        the risk engine must have filled during the disconnect window.
+        """
+        self._user_ws_reconnect_callbacks.append(callback)
+
+    async def _fire_user_ws_reconnect(self) -> None:
+        for cb in self._user_ws_reconnect_callbacks:
+            try:
+                await cb()
+            except Exception as exc:
+                log.error("user_ws_reconnect callback error", exc=str(exc))
 
     async def _fire_order_fill(self, order_data: dict) -> None:
         for cb in self._order_fill_callbacks:
@@ -439,16 +556,21 @@ class PMClient:
 
     def _build_clob_client(self) -> ClobClient:
         """Build an authenticated ClobClient (Level 2)."""
+        funder = config.POLY_FUNDER or None
+        # signature_type=2: POLY_GNOSIS_SAFE — Polymarket-generated Safe wallet
+        # key = EOA private key (signer), funder = Safe address (holds USDC)
         client = ClobClient(
             host=config.POLY_HOST,
             key=self._private_key,
             chain_id=137,  # Polygon mainnet
+            signature_type=2,  # POLY_GNOSIS_SAFE
+            funder=funder,
         )
         try:
-            creds: ApiCreds = client.create_or_derive_api_creds()
+            creds: ApiCreds = client.derive_api_key()
             client.set_api_creds(creds)
             self._api_creds = creds  # stored for user WS authentication
-            log.info("CLOB client authenticated")
+            log.info("CLOB client authenticated", safe=funder, signer=client.get_address())
         except Exception as exc:
             log.warning("CLOB auth failed — running read-only", exc=str(exc))
         return client
@@ -576,15 +698,29 @@ class PMClient:
         #    4h" series has recurrence="daily" (batch created daily) but each market is
         #    a 4-hour window.  DOGE/HYPE hourly/5m/15m series also use recurrence="daily".
         # 2. series.recurrence → unambiguous mappings (hourly, 5m, 15m, weekly, monthly).
-        # 3. Individual market title keyword matching — fallback for one-off events.
+        # 3. Individual market title keyword / time-range matching — fallback for one-off
+        #    events and for series whose title carries no interval keyword (e.g. "BNB Up
+        #    or Down" without "5-minute").  Time-range detection handles titles like
+        #    "BNB Up or Down - March 26, 7:20AM-7:25AM ET" → bucket_5m.
+        #
+        # Important: step 3 is also applied when recurrence maps to "bucket_daily"
+        # because many short-interval series (5m, 15m, hourly) use recurrence="daily"
+        # (batch-created once a day).  Accepting "bucket_daily" blindly for those would
+        # give wrong lifecycle fractions and prevent quoting entirely.
         if series_title_override:
             market_type = _classify_market(series_title_override)
             if market_type == "milestone":
                 # Series title gave no specific bucket type; try recurrence next.
                 if recurrence_override and recurrence_override in _RECURRENCE_TO_MARKET_TYPE:
                     market_type = _RECURRENCE_TO_MARKET_TYPE[recurrence_override]
-                if market_type == "milestone":
-                    market_type = _classify_market(title)
+                # Also try individual title when recurrence maps to "bucket_daily" — short-
+                # interval (5m/15m/1h) series often have recurrence="daily" because they
+                # are batch-created.  The individual question title (with its time range)
+                # is the authoritative source for the actual window size in those cases.
+                if market_type in ("milestone", "bucket_daily"):
+                    title_type = _classify_market(title)
+                    if title_type != "milestone":
+                        market_type = title_type
         elif recurrence_override and recurrence_override in _RECURRENCE_TO_MARKET_TYPE:
             market_type = _RECURRENCE_TO_MARKET_TYPE[recurrence_override]
         else:
@@ -649,29 +785,81 @@ class PMClient:
 
     # ── WebSocket shards ───────────────────────────────────────────────────────
 
-    def _next_hb_id(self) -> int:
-        """Return next heartbeat ID and record the timestamp for monitoring."""
-        self._heartbeat_id += 1
-        self._last_heartbeat_ts = time.time()
-        return self._heartbeat_id
+    def _extract_hb_id_from_exc(self, exc: Exception) -> Optional[str]:
+        """Extract the correct heartbeat_id from a Polymarket 400 error response.
+        PM returns {"heartbeat_id": "<id>", "error_msg": "Invalid Heartbeat ID"}
+        when our ID is wrong — parse that to recover the session."""
+        if isinstance(exc, PolyApiException) and isinstance(exc.error_msg, dict):
+            return exc.error_msg.get("heartbeat_id") or None
+        return None
 
     async def _clob_heartbeat_loop(self) -> None:
-        """Periodically POST /heartbeat to keep open CLOB orders alive.
+        """Periodically POST /v1/heartbeats to keep open CLOB orders alive.
 
-        PM cancels all open orders if a heartbeat is not received within 10s
-        of the last one (opt-in: once you start sending heartbeats, you must
-        continue).  This is a REST call — the market WS channel does NOT accept
-        JSON heartbeat messages (returns INVALID OPERATION).  Only runs in live
-        (non-paper) mode with an authenticated ClobClient.
+        Polymarket heartbeat protocol (opt-in, stateful):
+          1. First call: heartbeat_id = "" (empty string).
+          2. Success response body contains {"heartbeat_id": "<next_id>"} — use
+             that value for every subsequent call.
+          3. On 400 "Invalid Heartbeat ID" the error body also contains
+             {"heartbeat_id": "<correct_id>"} — parse it and resume.
+          4. PM cancels all open orders if no heartbeat arrives within 10 s.
         """
+        # ── Session start: first heartbeat uses empty string ─────────────────
+        current_hb_id = ""
+        self._last_heartbeat_ts = time.time()
+        try:
+            resp = await asyncio.to_thread(self._clob.post_heartbeat, current_hb_id)
+            next_id = resp.get("heartbeat_id", "") if isinstance(resp, dict) else ""
+            log.info("CLOB heartbeat session started", next_hb_id=next_id)
+            current_hb_id = next_id
+        except PolyApiException as exc:
+            # Server may give us the correct ID even on first-call 400
+            recovered = self._extract_hb_id_from_exc(exc)
+            if recovered is not None:
+                log.info("CLOB heartbeat recovered from first-call error",
+                         correct_hb_id=recovered)
+                current_hb_id = recovered
+            else:
+                log.info("CLOB heartbeat not available for this account — skipping",
+                         exc=str(exc))
+                return
+        except Exception as exc:
+            log.info("CLOB heartbeat not available for this account — skipping",
+                     exc=str(exc))
+            return
+
+        # ── Ongoing heartbeat loop ───────────────────────────────────────────
+        consecutive_failures = 0
         while self._running:
-            try:
-                hb_id = str(self._next_hb_id())
-                await asyncio.to_thread(self._clob.post_heartbeat, hb_id)
-                log.debug("CLOB heartbeat sent", hb_id=hb_id)
-            except Exception as exc:
-                log.warning("CLOB heartbeat REST failed", exc=str(exc))
             await asyncio.sleep(config.PM_HEARTBEAT_INTERVAL)
+            self._last_heartbeat_ts = time.time()
+            try:
+                resp = await asyncio.to_thread(self._clob.post_heartbeat, current_hb_id)
+                next_id = resp.get("heartbeat_id", "") if isinstance(resp, dict) else ""
+                log.debug("CLOB heartbeat sent", next_hb_id=next_id)
+                current_hb_id = next_id
+                consecutive_failures = 0
+            except PolyApiException as exc:
+                recovered = self._extract_hb_id_from_exc(exc)
+                if recovered is not None:
+                    log.warning("CLOB heartbeat ID corrected from server error",
+                                old_hb_id=current_hb_id, new_hb_id=recovered)
+                    current_hb_id = recovered
+                    consecutive_failures = 0  # successfully recovered
+                else:
+                    consecutive_failures += 1
+                    log.warning("CLOB heartbeat REST failed", exc=str(exc),
+                                consecutive=consecutive_failures)
+                    if consecutive_failures >= 3:
+                        log.info("CLOB heartbeat stopping after 3 consecutive failures")
+                        return
+            except Exception as exc:
+                consecutive_failures += 1
+                log.warning("CLOB heartbeat REST failed", exc=str(exc),
+                             consecutive=consecutive_failures)
+                if consecutive_failures >= 3:
+                    log.info("CLOB heartbeat stopping after 3 consecutive failures")
+                    return
 
     async def _update_shards(self) -> None:
         """Stable token-to-shard assignment (GroupRegistry pattern).
@@ -914,14 +1102,56 @@ class PMClient:
                 side=side,
             )
             # post_only ensures we're always a maker (order rejected if it would cross)
-            signed = self._clob.create_order(order_args, options={"post_only": True})
-            resp = self._clob.post_order(signed, OrderType.GTC)
+            # NOTE: post_only goes to post_order(), NOT create_order() — passing a dict
+            # to create_order(options=) causes "'dict' object has no attribute 'tick_size'"
+            signed = self._clob.create_order(order_args)
+            resp = self._clob.post_order(signed, OrderType.GTC, post_only=True)
             order_id = resp.get("orderID")
             log.info("Limit order posted", token_id=token_id, side=side,
                      price=rounded_price, size=size, order_id=order_id)
+            if order_id:
+                _append_order_event(
+                    order_id=order_id,
+                    token_id=token_id,
+                    side=side,
+                    price=rounded_price,
+                    size=size,
+                    order_type="limit",
+                    action="placed",
+                    market_id=market.condition_id if market else "",
+                )
             return order_id
         except Exception as exc:
-            log.error("place_limit failed", exc=str(exc), token_id=token_id)
+            exc_str = str(exc)
+            # "crosses book" means our post-only price would immediately fill.
+            # Back off one tick (away from the inside) and retry once before giving up.
+            # This is a safety net — _deploy_quote now pre-checks the NO book, so this
+            # path should only be reached on rare race conditions (book moved between
+            # the check and the actual POST).
+            if "crosses book" in exc_str and tick > 0:
+                retry_price = self._round_to_tick(
+                    rounded_price - tick if side == "BUY" else rounded_price + tick, tick
+                )
+                if 0.0 < retry_price < 1.0 and abs(retry_price - rounded_price) >= tick * 0.5:
+                    try:
+                        order_args2 = OrderArgs(
+                            token_id=token_id, price=retry_price, size=size, side=side
+                        )
+                        signed2 = self._clob.create_order(order_args2)
+                        resp2 = self._clob.post_order(signed2, OrderType.GTC, post_only=True)
+                        order_id2 = resp2.get("orderID")
+                        log.warning(
+                            "Limit order posted with cross-adjusted price",
+                            token_id=token_id, side=side,
+                            attempted=rounded_price, actual=retry_price,
+                            size=size, order_id=order_id2,
+                        )
+                        return order_id2
+                    except Exception as exc2:
+                        log.error("place_limit failed after cross-adjustment",
+                                  exc=str(exc2), token_id=token_id)
+                        return None
+            log.error("place_limit failed", exc=exc_str, token_id=token_id)
             return None
 
     async def place_market(
@@ -964,6 +1194,17 @@ class PMClient:
             order_id = resp.get("orderID")
             log.info("Market order posted", token_id=token_id, side=side,
                      price=rounded_price, size=size, order_id=order_id)
+            if order_id:
+                _append_order_event(
+                    order_id=order_id,
+                    token_id=token_id,
+                    side=side,
+                    price=rounded_price,
+                    size=size,
+                    order_type="market",
+                    action="placed",
+                    market_id=market.condition_id if market else "",
+                )
             return order_id
         except Exception as exc:
             log.error("place_market failed", exc=str(exc), token_id=token_id)
@@ -1021,6 +1262,7 @@ class PMClient:
             "type": "user",
         })
         backoff = 1.0
+        first_connect = True
         while self._running:
             try:
                 async with websockets.connect(
@@ -1030,6 +1272,12 @@ class PMClient:
                 ) as ws:
                     await ws.send(sub_msg)
                     log.info("PM user WS connected — fill events active")
+                    if not first_connect:
+                        # Reconnect after a gap: fills may have been missed during
+                        # the disconnect window.  Fire reconciliation callbacks.
+                        log.info("PM user WS reconnected — triggering fill-gap reconciliation")
+                        await self._fire_user_ws_reconnect()
+                    first_connect = False
                     backoff = 1.0
                     async for raw in ws:
                         if not isinstance(raw, str):
@@ -1062,20 +1310,22 @@ class PMClient:
         if self._clob is None:
             return []
         try:
-            orders = await asyncio.to_thread(self._clob.get_orders, {"status": "LIVE"})
+            orders = await asyncio.to_thread(self._clob.get_orders, OpenOrderParams())
             return orders if isinstance(orders, list) else []
         except Exception as exc:
             log.error("get_live_orders failed", exc=str(exc))
             return []
 
     async def get_live_positions(self) -> list[dict]:
-        """Return open token positions from the Polymarket Data API."""
-        if self._clob is None:
-            return []
-        try:
-            address: str = await asyncio.to_thread(self._clob.get_address)
-        except Exception as exc:
-            log.error("get_live_positions: could not get wallet address", exc=str(exc))
+        """Return open token positions from the Polymarket Data API.
+
+        Positions are held by the funder (proxy) wallet, NOT the signing key.
+        clob.get_address() returns the ECDSA signer key address which is
+        different — always use config.POLY_FUNDER for the Data API query.
+        """
+        address = config.POLY_FUNDER
+        if not address:
+            log.error("get_live_positions: POLY_FUNDER not configured")
             return []
         url = f"{config.PM_DATA_API_URL}/positions"
         params = {"user": address, "sizeThreshold": "0.01"}

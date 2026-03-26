@@ -422,29 +422,22 @@ async def state_sync_loop(
                     "active_ask_filled_ct": _ask_fill,
                     "signal_score": pos.signal_score,
                 }
-            api_state.positions = positions_raw
+            # NOTE: api_state.positions is assigned once after HL hedges are
+            # also added below — a single atomic dict reference swap avoids
+            # readers ever seeing a half-built state (A3 fix).
 
-            # Keep WS subscribed/pinned for tracked markets so PM orderbook
-            # snapshots remain fresh for the UI. Previously we only pinned
-            # tokens for open positions which left many tracked markets
-            # unsubscribed and their book timestamps stale.
-            #
-            # Pin all currently discovered PM market tokens. If this becomes
-            # too heavy in production, replace with a top-N by volume or
-            # a per-underlying filter (e.g. pin only BTC markets) controlled
-            # by config.
-            all_tracked_tokens = {m.token_id_yes for m in markets_snap.values() if m is not None}
-            # Also include tokens for open positions (defensive union)
+            # Pin only tokens for currently open positions so the WS subscription
+            # filters (TTE horizon, bucket-started, volume) continue to apply to
+            # all other markets (A2 fix — was: pin all tracked tokens).
             position_tokens = {
                 mkt.token_id_yes
-                for cid, pos in positions_snap.items()
+                for pos in positions_snap.values()
                 if not pos.is_closed
-                for mkt in [markets_snap.get(cid)]
+                for mkt in [markets_snap.get(pos.market_id)]
                 if mkt is not None
             }
-            tokens_to_pin = all_tracked_tokens.union(position_tokens)
-            if tokens_to_pin:
-                pm.pin_tokens(tokens_to_pin)
+            if position_tokens:
+                pm.pin_tokens(position_tokens)
 
             # HL delta hedges from maker (coin-level, keyed as "hl_hedge_{coin}")
             for coin, hedge in coin_hedges_snap.items():
@@ -573,6 +566,12 @@ async def main() -> None:
         model=config.AGENT_MODEL,
     )
 
+    # Log the fully-resolved runtime config so the exact values in use are
+    # always visible in bot.log without needing to read two separate files.
+    from config import get_effective_config
+    _eff = get_effective_config()
+    log.info("Effective config (defaults + overrides)", **_eff)
+
     if config.PAPER_TRADING:
         log.warning("PAPER TRADING mode — no real orders will be placed")
     else:
@@ -580,10 +579,11 @@ async def main() -> None:
         missing = []
         if not config.POLY_PRIVATE_KEY:
             missing.append("POLY_PRIVATE_KEY")
-        if not config.HL_ADDRESS:
-            missing.append("HL_ADDRESS")
-        if not config.HL_SECRET_KEY:
-            missing.append("HL_SECRET_KEY")
+        if config.MAKER_HEDGE_ENABLED:
+            if not config.HL_ADDRESS:
+                missing.append("HL_ADDRESS")
+            if not config.HL_SECRET_KEY:
+                missing.append("HL_SECRET_KEY")
         if missing:
             log.critical(
                 "Live trading requires credentials — set these env vars or keep PAPER_TRADING=True",

@@ -201,8 +201,15 @@ class FillSimulator:
             if book is None:
                 continue
 
+            # BUY NO orders (ask key) are checked against the YES book using the
+            # YES-equivalent price (1 - NO_price) on the SELL side — the YES and NO
+            # books are mirrors so this gives the same depth/cross signals.
+            is_no_buy = key.endswith("_ask")
+            check_side  = "SELL" if is_no_buy else quote.side
+            check_price = (1.0 - quote.price) if is_no_buy else quote.price
+
             # ── Touch check: are we competitive at the current best price? ────
-            if not self._is_crossed(quote.side, quote.price, book):
+            if not self._is_crossed(check_side, check_price, book):
                 continue
 
             # ── Step 1: taker arrival probability ────────────────────────────
@@ -216,12 +223,30 @@ class FillSimulator:
             # Adverse-selection: informed takers arrive more often and in larger
             # sizes when the HL mid moves against our fill direction.
             hl_move = self._hl_move_pct(market.underlying)
+
+            # Per-bucket adversity threshold (A7): short-duration markets nearing
+            # resolution are nearly fully-informational — any HL move indicates
+            # adverse selection.  Longer markets tolerate larger moves before
+            # classifying a fill as adversely selected.
+            _ADVERSITY_THRESHOLDS: dict[str, float] = {
+                "bucket_5m":     0.0001,   # any detectable move is signal near expiry
+                "bucket_15m":    0.0003,
+                "bucket_1h":     0.001,
+                "bucket_4h":     0.002,
+                "bucket_daily":  config.PAPER_ADVERSE_SELECTION_PCT,
+                "bucket_weekly": config.PAPER_ADVERSE_SELECTION_PCT,
+                "milestone":     config.PAPER_ADVERSE_SELECTION_PCT,
+            }
+            adverse_pct = _ADVERSITY_THRESHOLDS.get(
+                market.market_type, config.PAPER_ADVERSE_SELECTION_PCT
+            )
+
             is_adverse = (
-                (quote.side == "BUY" and hl_move is not None
-                 and hl_move < -config.PAPER_ADVERSE_SELECTION_PCT)
+                (check_side == "BUY" and hl_move is not None
+                 and hl_move < -adverse_pct)
                 or
-                (quote.side == "SELL" and hl_move is not None
-                 and hl_move > config.PAPER_ADVERSE_SELECTION_PCT)
+                (check_side == "SELL" and hl_move is not None
+                 and hl_move > adverse_pct)
             )
 
             # Track session max HL move for /health calibration indicator
@@ -247,7 +272,7 @@ class FillSimulator:
             # Mean taker is at least 75% of our quote size (so partial fills are
             # common) and grows with depth at our level (deeper books attract
             # bigger institutional takers that can sweep through them).
-            depth = self._depth_at_level(book, quote.side, quote.price)
+            depth = self._depth_at_level(book, check_side, check_price)
             mean_taker = max(quote.size * 0.75, depth * 0.5) if depth > 0 else quote.size * 0.75
             # No size inflation for adverse moves — lower arrival_prob already accounts
             # for adverse selection; inflating taker size compounds the bias incorrectly.
@@ -391,9 +416,13 @@ class FillSimulator:
         hl_move_pct: Optional[float] = None
         if hl_mid_now is not None and hl_mid_prev is not None and hl_mid_prev > 0:
             hl_move_pct = round((hl_mid_now - hl_mid_prev) / hl_mid_prev, 6)
-            adverse = (
-                (consumed.side == "BUY" and hl_move_pct < -config.PAPER_ADVERSE_SELECTION_PCT)
-                or (consumed.side == "SELL" and hl_move_pct > config.PAPER_ADVERSE_SELECTION_PCT)
+# Use position_side for adverse direction: YES position is adverse when HL
+        # falls (YES probability drops); NO position is adverse when HL rises.
+        adverse = (
+            (result.position_side == "YES" and hl_move_pct is not None
+             and hl_move_pct < -config.PAPER_ADVERSE_SELECTION_PCT)
+            or (result.position_side == "NO" and hl_move_pct is not None
+             and hl_move_pct > config.PAPER_ADVERSE_SELECTION_PCT)
             )
 
         self._fills_total += 1

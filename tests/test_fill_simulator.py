@@ -269,11 +269,11 @@ class TestOnFillStateMachine:
         assert len(self.risk.get_open_positions()) == 0
         self.monitor.record_entry_deviation.assert_not_called()
 
-    def test_sell_creates_no_position(self):
-        """SELL fill → position side = NO."""
-        self.quote.side = "SELL"
+    def test_no_buy_creates_no_position(self):
+        """BUY NO fill (ask key with _ask suffix) → position side = NO."""
+        self.quote.side = "BUY"   # ask leg is now BUY NO, not SELL YES
         asyncio.get_event_loop().run_until_complete(
-            self.sim._on_fill("tok_yes", self.quote, self.market, 50.0)
+            self.sim._on_fill("tok_yes_ask", self.quote, self.market, 50.0)
         )
         positions = self.risk.get_open_positions()
         assert positions[0].side == "NO"
@@ -346,10 +346,13 @@ class TestCapitalBoundsEnforcement:
         # regardless of what config_overrides.json sets MAKER_SPREAD_SIZE_MAX to.
         config.MAKER_SPREAD_SIZE_MAX = 250.0
         config.MAX_PM_EXPOSURE_PER_MARKET = 250.0
+        self._orig_total = config.MAX_TOTAL_PM_EXPOSURE
+        config.MAX_TOTAL_PM_EXPOSURE = 2500.0  # well above test amounts
 
     def teardown_method(self):
         config.MAX_PM_EXPOSURE_PER_MARKET = self._orig_per_market
         config.MAKER_SPREAD_SIZE_MAX = self._orig_max
+        config.MAX_TOTAL_PM_EXPOSURE = self._orig_total
 
     def _fill_slice(self, price: float, size: float, side: str = "BUY") -> None:
         """Simulate one fill slice by calling _process_fill_slice directly."""

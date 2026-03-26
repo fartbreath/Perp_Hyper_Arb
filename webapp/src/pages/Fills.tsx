@@ -23,7 +23,7 @@ import { useState } from "react";
 import { useFills } from "../api/client";
 import type { FillEntry } from "../api/client";
 
-const UNDERLYINGS = ["", "BTC", "ETH", "SOL"];
+const UNDERLYINGS = ["", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"];
 const PAGE_SIZE   = 100;
 
 function fmtTs(ts: string) {

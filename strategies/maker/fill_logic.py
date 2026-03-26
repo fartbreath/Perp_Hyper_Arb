@@ -64,13 +64,13 @@ def open_position_from_fill(
         return None   # race condition — already consumed
 
     actual_filled = consumed.size
-    position_side = "YES" if consumed.side == "BUY" else "NO"
-    fill_cost_usd = round(
-        fill_price * actual_filled
-        if position_side == "YES"
-        else (1.0 - fill_price) * actual_filled,
-        4,
-    )
+    # Determine position side from the quote key, not the order direction:
+    #   bid key (no "_ask" suffix): BUY YES  → YES position
+    #   ask key ("_ask" suffix):    BUY NO   → NO position
+    position_side = "YES" if not key.endswith("_ask") else "NO"
+    # fill_price is always the traded token's price (YES price for bid, NO price
+    # for ask). Both represent actual USDC cost per contract.
+    fill_cost_usd = round(fill_price * actual_filled, 4)
 
     ok, reason = risk.can_open(
         consumed.market_id, fill_cost_usd, strategy="maker", underlying=market.underlying
@@ -85,6 +85,11 @@ def open_position_from_fill(
         )
         return None
 
+    # entry_price convention: always stored in YES-probability space for P&L calcs.
+    #   BUY YES: entry_price = fill_price       (YES price, already in YES-space)
+    #   BUY NO:  entry_price = 1.0 - fill_price (convert NO price to YES-equivalent)
+    entry_price_stored = fill_price if position_side == "YES" else (1.0 - fill_price)
+
     pos = Position(
         market_id=consumed.market_id,
         market_title=market.title,
@@ -92,7 +97,7 @@ def open_position_from_fill(
         underlying=market.underlying,
         side=position_side,
         size=actual_filled,
-        entry_price=fill_price,
+        entry_price=entry_price_stored,
         strategy="maker",
         opened_at=datetime.now(timezone.utc),
         entry_cost_usd=round(fill_cost_usd, 4),
@@ -103,7 +108,8 @@ def open_position_from_fill(
     risk.free_slot(consumed.market_id)
     monitor.record_entry_deviation(consumed.market_id, market.max_incentive_spread / 2)
 
-    inventory_side = "YES_BUY" if consumed.side == "BUY" else "YES_SELL"
+    # BUY YES increases net YES exposure; BUY NO decreases it (short YES equivalent)
+    inventory_side = "YES_BUY" if position_side == "YES" else "YES_SELL"
     maker.record_fill(
         consumed.market_id,
         market.underlying,
@@ -125,7 +131,7 @@ def open_position_from_fill(
     return FillResult(
         pos=pos,
         consumed=consumed,
-        fill_price=fill_price,
+        fill_price=entry_price_stored,   # always YES-space so callers can use directly
         actual_filled=actual_filled,
         position_side=position_side,
         fill_cost_usd=fill_cost_usd,

@@ -9,7 +9,7 @@
  * HL hedges: individual rows (unchanged).
  */
 import { useState } from "react";
-import { usePositions, useMakerSignals, undeployQuote, closePosition } from "../api/client";
+import { usePositions, useMakerSignals, useLivePositions, undeployQuote, closePosition, dismissGhostPosition } from "../api/client";
 import type { Position } from "../api/client";
 import { usePolymarketEventSlugs } from "../utils/usePolymarketEventSlugs";
 
@@ -645,6 +645,163 @@ export default function Positions() {
           </table>
         </div>
       )}
+
+      {/* -- PM Wallet (source of truth from Polymarket Data API) ----------- */}
+      <PMWalletPanel />
     </div>
+  );
+}
+
+function PMWalletPanel() {
+  const { data, loading, error, refresh } = useLivePositions();
+  const [dismissState, setDismissState] = useState<Record<string, string>>({});
+
+  async function handleDismiss(tokenId: string, side: string) {
+    setDismissState((s) => ({ ...s, [tokenId]: "dismissing" }));
+    try {
+      // For YES ghost: exit_price=0 (token worthless). For NO ghost: exit_price=0
+      // means YES=0 → NO won → bot records a profit. User can verify this is correct
+      // by checking Polymarket; but 0 is the safe default for an expired market.
+      const result = await dismissGhostPosition(tokenId, 0.0);
+      const pnlStr = `${result.pnl >= 0 ? "+" : ""}$${result.pnl.toFixed(2)}`;
+      setDismissState((s) => ({ ...s, [tokenId]: `${side} dismissed · P&L ${pnlStr}` }));
+      if (refresh) refresh();
+    } catch (e: unknown) {
+      setDismissState((s) => ({
+        ...s,
+        [tokenId]: e instanceof Error ? e.message : "Error",
+      }));
+    }
+  }
+
+  return (
+    <>
+      <h3 style={{ marginTop: "2.5rem", marginBottom: "0.5rem", fontSize: "0.9rem", color: "#9ca3af" }}>
+        PM Wallet (Source of Truth)
+        <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", color: "#475569", fontWeight: 400 }}>
+          &mdash; live from Polymarket Data API · refreshed every 15 s
+        </span>
+      </h3>
+
+      {error && <div className="error" style={{ marginBottom: "0.5rem" }}>Failed to load wallet: {error}</div>}
+      {loading && !data && <div className="skeleton" style={{ height: 60 }} />}
+
+      {/* Discrepancies alert */}
+      {data && data.discrepancy_count > 0 && (
+        <div style={{ background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 6, padding: "0.6rem 1rem", marginBottom: "0.75rem", fontSize: "0.82rem" }}>
+          <strong style={{ color: "#fca5a5" }}>⚠ {data.discrepancy_count} discrepanc{data.discrepancy_count === 1 ? "y" : "ies"} between PM wallet and bot state</strong>
+          <ul style={{ margin: "0.35rem 0 0 1rem", padding: 0, color: "#fca5a5" }}>
+            {data.discrepancies.map((d, i) => {
+              const isBusy = dismissState[d.token_id] === "dismissing";
+              const isDone = !!dismissState[d.token_id] && dismissState[d.token_id] !== "dismissing";
+              return (
+                <li key={i} style={{ display: "flex", alignItems: "baseline", gap: "0.5rem", marginBottom: "0.25rem", flexWrap: "wrap" }}>
+                  <span>
+                    <strong>
+                      {d.type === "unmanaged_by_bot"
+                        ? "⚠ PM wallet only (bot not managing)"
+                        : d.type === "bot_ghost"
+                        ? "👻 Ghost (bot only — not in PM wallet)"
+                        : d.type}
+                    </strong>: {d.title || d.token_id.slice(0, 16) + "..."}  PM={d.pm_size.toFixed(2)} Bot={d.bot_size.toFixed(2)}
+                    {d.diff != null && ` (Δ${d.diff.toFixed(2)})`}
+                    {d.outcome && ` [${d.outcome}]`}
+                  </span>
+                  {d.type === "bot_ghost" && (
+                    isDone ? (
+                      <span style={{ fontSize: "0.75rem", color: "#86efac" }}>{dismissState[d.token_id]}</span>
+                    ) : (
+                      <button
+                        disabled={isBusy}
+                        onClick={() => handleDismiss(d.token_id, d.bot_side ?? "?")}
+                        title="Mark this ghost position as closed at P&L=0 (market resolved, token no longer in PM wallet)"
+                        style={{
+                          padding: "1px 8px", fontSize: "0.72rem", borderRadius: 3,
+                          border: "1px solid #fca5a5", background: "transparent",
+                          color: "#fca5a5", cursor: isBusy ? "wait" : "pointer",
+                          opacity: isBusy ? 0.6 : 1, flexShrink: 0,
+                        }}
+                      >
+                        {isBusy ? "…" : "Dismiss"}
+                      </button>
+                    )
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
+      {/* Pending redemption */}
+      {data && data.pending_redemption_count > 0 && (
+        <div style={{ background: "#1c1917", border: "1px solid #a78bfa", borderRadius: 6, padding: "0.6rem 1rem", marginBottom: "0.75rem", fontSize: "0.82rem" }}>
+          <strong style={{ color: "#c4b5fd" }}>⏳ {data.pending_redemption_count} token{data.pending_redemption_count === 1 ? "" : "s"} pending redemption</strong>
+          <ul style={{ margin: "0.35rem 0 0 1rem", padding: 0, color: "#c4b5fd" }}>
+            {data.pending_redemption.map((p, i) => (
+              <li key={i}>
+                {p.won ? <span style={{ color: "#4ade80" }}>WON</span> : <span style={{ color: "#f87171" }}>LOST</span>}
+                {" "}{p.size.toFixed(2)}ct @ {(p.avg_price * 100).toFixed(1)}¢ avg — {p.title || p.token_id.slice(0, 20) + "..."}  [outcome: {p.outcome || "?"}]
+                {p.payout_usd != null && <span style={{ color: "#4ade80", marginLeft: 6 }}>payout ≈ ${p.payout_usd.toFixed(2)}</span>}
+              </li>
+            ))}
+          </ul>
+          <p style={{ margin: "0.5rem 0 0", color: "#6b7280", fontSize: "0.75rem" }}>Redeem via Polymarket.com &rarr; Positions tab.</p>
+        </div>
+      )}
+
+      {/* Full wallet table */}
+      {data && data.wallet_count > 0 && (
+        <div style={{ overflowX: "auto" }}>
+          <table className="data-table" style={{ fontSize: "0.8rem" }}>
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>Outcome</th>
+                <th>Side</th>
+                <th>Size (ct)</th>
+                <th>Avg Price</th>
+                <th>Cur Price</th>
+                <th>Value</th>
+                <th>In Bot?</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.wallet_positions.map((p) => {
+                const value = p.size * p.cur_price;
+                const isSettled = p.cur_price === 0 || p.cur_price === 1;
+                return (
+                  <tr key={p.token_id} style={{ background: isSettled ? "#0f172a88" : undefined }}>
+                    <td style={{ maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                        title={p.title}>{p.title || p.token_id.slice(0, 24) + "..."}</td>
+                    <td style={{ color: "#94a3b8" }}>{p.outcome}</td>
+                    <td><span style={{ padding: "1px 6px", borderRadius: 3, fontSize: "0.72rem", fontWeight: 600,
+                        background: p.side_guess === "YES" ? "#166534" : p.side_guess === "NO" ? "#7f1d1d" : "#374151",
+                        color: "#fff" }}>{p.side_guess || "?"}</span></td>
+                    <td style={{ fontFamily: "monospace" }}>{p.size.toFixed(2)}</td>
+                    <td style={{ fontFamily: "monospace" }}>{(p.avg_price * 100).toFixed(1)}&cent;</td>
+                    <td style={{ fontFamily: "monospace", color: isSettled ? (p.cur_price === 1 ? "#4ade80" : "#f87171") : "#94a3b8" }}>
+                      {(p.cur_price * 100).toFixed(1)}&cent;
+                      {isSettled && <span style={{ marginLeft: 4, fontSize: "0.7rem" }}>{p.cur_price === 1 ? "WON" : "LOST"}</span>}
+                    </td>
+                    <td style={{ fontFamily: "monospace", fontWeight: 600, color: value > 0.01 ? "#22c55e" : "#4b5563" }}>
+                      ${value.toFixed(2)}
+                    </td>
+                    <td style={{ textAlign: "center" }}>
+                      {p.in_bot_state
+                        ? <span style={{ color: "#4ade80", fontSize: "0.75rem" }}>✓</span>
+                        : <span style={{ color: "#ef4444", fontSize: "0.75rem" }}>✗</span>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {data && data.wallet_count === 0 && (
+        <div className="muted" style={{ paddingBottom: "1rem" }}>No positions in PM wallet.</div>
+      )}
+    </>
   );
 }

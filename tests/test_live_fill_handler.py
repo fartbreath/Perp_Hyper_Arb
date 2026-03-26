@@ -79,6 +79,7 @@ def _make_handler(paper=True, fills_csv_path=None):
     pm._pinned_tokens = set()
     pm.cancel_all = AsyncMock(return_value=True)
     pm.get_live_positions = AsyncMock(return_value=[])
+    pm.get_live_orders = AsyncMock(return_value=[])
     pm.get_markets = MagicMock(return_value={})
     pm.on_order_fill = MagicMock()
 
@@ -133,11 +134,11 @@ class TestLiveModeStartup:
     def teardown_method(self):
         config.PAPER_TRADING = True
 
-    def test_startup_restore_calls_cancel_all(self):
-        """startup_restore() must cancel all open orders first."""
+    def test_startup_restore_calls_get_live_orders(self):
+        """startup_restore() must fetch resting orders to restore them."""
         handler, pm, *_ = _make_handler(paper=False)
         asyncio.get_event_loop().run_until_complete(handler.startup_restore())
-        pm.cancel_all.assert_called_once()
+        pm.get_live_orders.assert_called_once()
 
     def test_startup_restore_calls_get_live_positions(self):
         """startup_restore() must fetch live positions after cancelling orders."""
@@ -151,24 +152,24 @@ class TestLiveModeStartup:
         asyncio.get_event_loop().run_until_complete(handler.start())
         pm.on_order_fill.assert_called_once_with(handler._on_order_fill)
 
-    def test_cancel_all_before_position_restore(self):
-        """cancel_all must be called before get_live_positions (order matters)."""
+    def test_get_live_orders_before_position_restore(self):
+        """get_live_orders must be called before get_live_positions (order matters)."""
         call_order = []
 
-        async def _cancel():
-            call_order.append("cancel_all")
-            return True
+        async def _orders():
+            call_order.append("get_live_orders")
+            return []
 
         async def _positions():
             call_order.append("get_live_positions")
             return []
 
         handler, pm, *_ = _make_handler(paper=False)
-        pm.cancel_all = _cancel
+        pm.get_live_orders = _orders
         pm.get_live_positions = _positions
 
         asyncio.get_event_loop().run_until_complete(handler.startup_restore())
-        assert call_order == ["cancel_all", "get_live_positions"]
+        assert call_order == ["get_live_orders", "get_live_positions"]
 
 
 # ── Position restore ───────────────────────────────────────────────────────────

@@ -278,6 +278,44 @@ class PositionMonitor:
             log.debug("Monitor: market not in cache", market_id=pos.market_id)
             return
 
+        now = datetime.now(timezone.utc)
+        hold_secs = (now - pos.opened_at).total_seconds()
+
+        # ── Resolution fast-path (book not required) ───────────────────────────
+        # After PM resolves a market the order book drains to empty, causing
+        # book.mid to become None.  The book guard below would then skip this
+        # position on every monitor cycle, leaving it stuck indefinitely.
+        # Check end_date FIRST so resolved positions are always closed regardless
+        # of whether live book data is still available.
+        # NOTE: MIN_HOLD_SECONDS is deliberately NOT applied here.  The hold-time
+        # guard protects against noise-driven exits on live markets; resolved
+        # markets are definitively settled and there is no noise to avoid.
+        # Skipping the guard also ensures that positions restored after a bot
+        # restart (which receive opened_at=now) are cleaned up immediately on the
+        # first monitor cycle rather than after a 60-second delay.
+        if (
+            market.end_date is not None
+            and now >= market.end_date
+        ):
+            book = self._pm._books.get(market.token_id_yes)
+            # Use last known mid if the book still has data; otherwise fall back
+            # to entry_price so round() snaps to the nearest settlement value.
+            exit_mid = (
+                book.mid
+                if book is not None and book.mid is not None
+                else pos.entry_price
+            )
+            unrealised = compute_unrealised_pnl(pos, exit_mid)
+            log.info(
+                "Monitor: resolved market — closing position",
+                market_id=pos.market_id,
+                exit_mid=round(exit_mid, 4),
+                book_available=book is not None and book.mid is not None,
+            )
+            await self._exit_position(pos, market, exit_mid, ExitReason.RESOLVED, unrealised)
+            return
+
+        # ── Standard check (live book required for all other exits) ───────────
         # Always read the YES token price — all P&L formulas are in YES-price space.
         # entry_price is stored as the YES price (pm_price at signal time) for both
         # YES and NO positions, so current_price must also be the YES token price.
@@ -296,6 +334,7 @@ class PositionMonitor:
             current_price=current_price,
             initial_deviation=initial_deviation,
             market_end_date=market.end_date,
+            now=now,
         )
 
         log.debug(
@@ -354,45 +393,47 @@ class PositionMonitor:
             expected_pnl=round(unrealised_pnl, 4),
         )
 
-        # Place exit SELL order (opposite side to entry).
-        # exit_price is in YES-price space; convert to token price for the order.
-        sell_token = (
-            market.token_id_yes if pos.side in ("YES", "BUY_YES")
-            else market.token_id_no
-        )
-        sell_order_price = exit_price if pos.side in ("YES", "BUY_YES") else (1.0 - exit_price)
-        if force_taker:
-            # Market order — crosses the spread for immediate fill (manual close).
-            order_id = await self._pm.place_market(
-                token_id=sell_token,
-                side="SELL",
-                price=sell_order_price,
-                size=pos.size,
-                market=market,
-            )
-        else:
-            # Limit order with post_only for automatic monitor exits.
-            order_id = await self._pm.place_limit(
-                token_id=sell_token,
-                side="SELL",
-                price=sell_order_price,
-                size=pos.size,
-                market=market,
-            )
-
-        # In paper mode place_limit always returns a fake ID; in live mode a
-        # failed order means we should NOT record a close (risk stays open).
-        if order_id is None and not config.PAPER_TRADING:
-            log.error(
-                "Monitor: exit order rejected — position stays open",
-                market_id=pos.market_id,
-            )
-            return
-
-        # For auto-resolved markets PM distributes directly — no trade takes place,
-        # so exit_price is the true settlement (0 or 1), fees = 0, rebates = 0.
+        # For auto-resolved markets PM distributes settlement directly — no
+        # trade takes place and the CLOB no longer accepts orders on closed
+        # markets.  Skip order placement entirely and go straight to recording
+        # the close.  exit_price is snapped to the nearest settlement value.
         if reason == ExitReason.RESOLVED:
             exit_price = float(round(exit_price))  # snap to exact 0.0 or 1.0
+        else:
+            # Place exit SELL order (opposite side to entry).
+            # exit_price is in YES-price space; convert to token price for the order.
+            sell_token = (
+                market.token_id_yes if pos.side in ("YES", "BUY_YES")
+                else market.token_id_no
+            )
+            sell_order_price = exit_price if pos.side in ("YES", "BUY_YES") else (1.0 - exit_price)
+            if force_taker:
+                # Market order — crosses the spread for immediate fill (manual close).
+                order_id = await self._pm.place_market(
+                    token_id=sell_token,
+                    side="SELL",
+                    price=sell_order_price,
+                    size=pos.size,
+                    market=market,
+                )
+            else:
+                # Limit order with post_only for automatic monitor exits.
+                order_id = await self._pm.place_limit(
+                    token_id=sell_token,
+                    side="SELL",
+                    price=sell_order_price,
+                    size=pos.size,
+                    market=market,
+                )
+
+            # In paper mode place_limit always returns a fake ID; in live mode a
+            # failed order means we should NOT record a close (risk stays open).
+            if order_id is None and not config.PAPER_TRADING:
+                log.error(
+                    "Monitor: exit order rejected — position stays open",
+                    market_id=pos.market_id,
+                )
+                return
 
         # Token price for the exit side (NO positions close in YES-price space).
         token_exit_price = exit_price if pos.side in ("YES", "BUY_YES") else (1.0 - exit_price)

@@ -382,12 +382,21 @@ class TestRepriceMarketCancels:
         risk = RiskEngine()
         return MakerStrategy(pm, hl, risk), pm
 
+    def setup_method(self):
+        # pin to 0 so absent book depth doesn't filter out quotes in reprice tests
+        self._orig_depth = config.MAKER_MIN_DEPTH_TO_QUOTE
+        config.MAKER_MIN_DEPTH_TO_QUOTE = 0
+
+    def teardown_method(self):
+        config.MAKER_MIN_DEPTH_TO_QUOTE = self._orig_depth
+
     def _make_market(self, condition_id="cond_001", spread=0.04):
         import time as t
         from unittest.mock import MagicMock
         m = MagicMock()
         m.condition_id = condition_id
         m.token_id_yes = "tok_yes_001"
+        m.token_id_no  = "tok_no_001"
         m.underlying = "BTC"
         m.is_fee_free = True
         m.fees_enabled = False
@@ -453,13 +462,14 @@ class TestRepriceMarketCancels:
 
         asyncio.get_event_loop().run_until_complete(strategy._reprice_market(market))
 
-        # The bid should be mid - NEW_MARKET_WIDE_SPREAD/2 = 0.50 - 0.04 = 0.46
-        # The ask should be mid + NEW_MARKET_WIDE_SPREAD/2 = 0.50 + 0.04 = 0.54
+        # The bid should be: BUY YES  at mid - NEW_MARKET_WIDE_SPREAD/2 = 0.50 - 0.04 = 0.46
+        # The ask should be: BUY NO   at 1 - (mid + NEW_MARKET_WIDE_SPREAD/2) = 1-0.54 = 0.46
+        # (BUY NO replaces SELL YES; NO price = 1 - YES_ask)
         calls = [call.args for call in pm.place_limit.call_args_list]
-        bid_call = next((c for c in calls if c[1] == "BUY"), None)
-        ask_call = next((c for c in calls if c[1] == "SELL"), None)
+        bid_call = next((c for c in calls if c[1] == "BUY" and c[0] == market.token_id_yes), None)
+        ask_call = next((c for c in calls if c[1] == "BUY" and c[0] == market.token_id_no), None)
         assert bid_call is not None and bid_call[2] == pytest.approx(0.46, abs=0.01)
-        assert ask_call is not None and ask_call[2] == pytest.approx(0.54, abs=0.01)
+        assert ask_call is not None and ask_call[2] == pytest.approx(0.46, abs=0.01)
 
 
 # ── Depth gate + depth-aware spread widening ──────────────────────────────────
@@ -524,11 +534,19 @@ class TestDepthGate:
             config.MAKER_DEPTH_THIN_THRESHOLD = orig_thresh
 
     def test_spread_factor_defaults_no_widening(self):
-        """Default config (factors = 1.0) → always returns 1.0."""
-        s = self._strategy()
-        assert s._depth_spread_factor(0.0)   == pytest.approx(1.0)
-        assert s._depth_spread_factor(25.0)  == pytest.approx(1.0)
-        assert s._depth_spread_factor(100.0) == pytest.approx(1.0)
+        """When factors reset to 1.0, spread factor always returns 1.0."""
+        orig_thin = config.MAKER_DEPTH_SPREAD_FACTOR_THIN
+        orig_zero = config.MAKER_DEPTH_SPREAD_FACTOR_ZERO
+        config.MAKER_DEPTH_SPREAD_FACTOR_THIN = 1.0
+        config.MAKER_DEPTH_SPREAD_FACTOR_ZERO = 1.0
+        try:
+            s = self._strategy()
+            assert s._depth_spread_factor(0.0)   == pytest.approx(1.0)
+            assert s._depth_spread_factor(25.0)  == pytest.approx(1.0)
+            assert s._depth_spread_factor(100.0) == pytest.approx(1.0)
+        finally:
+            config.MAKER_DEPTH_SPREAD_FACTOR_THIN = orig_thin
+            config.MAKER_DEPTH_SPREAD_FACTOR_ZERO = orig_zero
 
     # ── _depth_at_level ───────────────────────────────────────────────────────
 
@@ -577,22 +595,26 @@ class TestDepthGate:
         return m
 
     def test_depth_gate_disabled_by_default(self):
-        """Default MAKER_MIN_DEPTH_TO_QUOTE=0 → gate inactive, signal returned."""
-        s = self._strategy()
-        from unittest.mock import MagicMock
-        book = MagicMock()
-        book.bids = []
-        book.asks = []
-        book.best_bid = None
-        book.best_ask = None
-        s._pm.get_book = MagicMock(return_value=book)
-        s._pm.get_mid = MagicMock(return_value=0.50)
+        """When MAKER_MIN_DEPTH_TO_QUOTE=0, gate is inactive, signal returned."""
+        orig = config.MAKER_MIN_DEPTH_TO_QUOTE
+        config.MAKER_MIN_DEPTH_TO_QUOTE = 0
+        try:
+            s = self._strategy()
+            from unittest.mock import MagicMock
+            book = MagicMock()
+            book.bids = []
+            book.asks = []
+            book.best_bid = None
+            book.best_ask = None
+            s._pm.get_book = MagicMock(return_value=book)
+            s._pm.get_mid = MagicMock(return_value=0.50)
 
-        market = self._make_market(mid=0.50)
-        # With depth gate disabled, even an empty book should not block the signal
-        result = s._evaluate_signal(market, 0.50)
-        # Should not be blocked by depth gate (may pass or fail on score, but depth alone is not the reason)
-        assert config.MAKER_MIN_DEPTH_TO_QUOTE == 0  # confirm default
+            market = self._make_market(mid=0.50)
+            # With depth gate disabled, even an empty book should not block the signal
+            result = s._evaluate_signal(market, 0.50)
+            assert config.MAKER_MIN_DEPTH_TO_QUOTE == 0  # confirm pinned to 0
+        finally:
+            config.MAKER_MIN_DEPTH_TO_QUOTE = orig
 
     def test_depth_gate_blocks_empty_book_when_enabled(self):
         """MAKER_MIN_DEPTH_TO_QUOTE=1 → empty book (depth=0) blocks the signal."""
@@ -853,6 +875,14 @@ class TestCapitalAndSignals:
       deploy_signal() / undeploy_quote()
     """
 
+    def setup_method(self):
+        # pin to 0 so absent book depth doesn't filter out quotes in these tests
+        self._orig_depth = config.MAKER_MIN_DEPTH_TO_QUOTE
+        config.MAKER_MIN_DEPTH_TO_QUOTE = 0
+
+    def teardown_method(self):
+        config.MAKER_MIN_DEPTH_TO_QUOTE = self._orig_depth
+
     def _make_maker(self):
         from unittest.mock import MagicMock, AsyncMock
         pm = MagicMock()
@@ -875,6 +905,7 @@ class TestCapitalAndSignals:
         m = MagicMock()
         m.condition_id = f"cond_{underlying}"
         m.token_id_yes = f"tok_{underlying}_yes"
+        m.token_id_no  = f"tok_{underlying}_no"
         m.underlying = underlying
         m.is_fee_free = True
         m.fees_enabled = False
@@ -1040,6 +1071,13 @@ class TestSecondLegCombinedCostGate:
       3. YES already filled but current ask is cheap enough → accept
     """
 
+    def setup_method(self):
+        self._orig_depth = config.MAKER_MIN_DEPTH_TO_QUOTE
+        config.MAKER_MIN_DEPTH_TO_QUOTE = 0
+
+    def teardown_method(self):
+        config.MAKER_MIN_DEPTH_TO_QUOTE = self._orig_depth
+
     def _make_maker(self):
         pm = MagicMock()
         pm.on_price_change = MagicMock()
@@ -1059,6 +1097,7 @@ class TestSecondLegCombinedCostGate:
         m = MagicMock()
         m.condition_id = condition_id
         m.token_id_yes = "tok_test_yes"
+        m.token_id_no  = "tok_test_no"
         m.underlying = "BTC"
         m.is_fee_free = True
         m.fees_enabled = False
@@ -1201,6 +1240,7 @@ class TestImbalanceAwareSizing:
         m = MagicMock()
         m.condition_id = market_id
         m.token_id_yes = "tok_yes"
+        m.token_id_no  = "tok_no"
         m.underlying = "BTC"
         m.is_fee_free = True
         m.fees_enabled = False
@@ -1213,13 +1253,16 @@ class TestImbalanceAwareSizing:
         return m
 
     def _get_place_limit_sizes(self, pm) -> dict:
-        """Return {side: size} from place_limit call args."""
+        """Return {'YES': yes_size, 'NO': no_size} from place_limit calls.
+        BUY tok_yes → YES leg; BUY tok_no → NO leg.
+        """
         result = {}
         for call in pm.place_limit.call_args_list:
             args = call.args
-            side = args[1]   # "BUY" or "SELL"
-            size = args[3]   # contracts
-            result[side] = result.get(side, 0) + size
+            token_id = args[0]
+            size = args[3]
+            leg = "YES" if token_id == "tok_yes" else "NO"
+            result[leg] = result.get(leg, 0) + size
         return result
 
     def test_balanced_posts_equal_sizes(self):
@@ -1231,13 +1274,15 @@ class TestImbalanceAwareSizing:
             strategy._deploy_quote(signal, market)
         )
         sizes = self._get_place_limit_sizes(pm)
-        assert sizes.get("BUY") == sizes.get("SELL"), \
-            f"Expected equal sizes, got BUY={sizes.get('BUY')} SELL={sizes.get('SELL')}"
+        assert sizes.get("YES") == sizes.get("NO"), \
+            f"Expected equal sizes, got YES={sizes.get('YES')} NO={sizes.get('NO')}"
 
     def test_yes_heavy_reduces_yes_size(self):
-        """YES is 5 ahead (below hard-stop threshold of 10) → yes_size shrinks by 5, no_size stays at contracts."""
+        """YES is 5 ahead (below hard-stop threshold) → yes_size shrinks by 5, no_size stays at contracts."""
         orig_batch = config.MAKER_BATCH_SIZE
+        orig_max_imb = config.MAKER_MAX_IMBALANCE_CONTRACTS
         config.MAKER_BATCH_SIZE = 999  # don't let batch cap interfere with imbalance test
+        config.MAKER_MAX_IMBALANCE_CONTRACTS = 999  # disable hard-stop so sizing math is exercised
         try:
             strategy, pm, risk = self._make_components()
             self._seed_pos(risk, "m1", "YES", 5.0)
@@ -1247,17 +1292,20 @@ class TestImbalanceAwareSizing:
                 strategy._deploy_quote(signal, market)
             )
             sizes = self._get_place_limit_sizes(pm)
-            assert sizes.get("BUY") == 50 - 5, \
-                f"YES size should be 45, got {sizes.get('BUY')}"
-            assert sizes.get("SELL") == 50, \
-                f"NO size should be 50, got {sizes.get('SELL')}"
+            assert sizes.get("YES") == 50 - 5, \
+                f"YES size should be 45, got {sizes.get('YES')}"
+            assert sizes.get("NO") == 50, \
+                f"NO size should be 50, got {sizes.get('NO')}"
         finally:
             config.MAKER_BATCH_SIZE = orig_batch
+            config.MAKER_MAX_IMBALANCE_CONTRACTS = orig_max_imb
 
     def test_no_heavy_reduces_no_size(self):
-        """NO is 5 ahead (below hard-stop threshold of 10) → no_size shrinks by 5, yes_size stays at controls."""
+        """NO is 5 ahead (below hard-stop threshold) → no_size shrinks by 5, yes_size stays at controls."""
         orig_batch = config.MAKER_BATCH_SIZE
+        orig_max_imb = config.MAKER_MAX_IMBALANCE_CONTRACTS
         config.MAKER_BATCH_SIZE = 999  # don't let batch cap interfere with imbalance test
+        config.MAKER_MAX_IMBALANCE_CONTRACTS = 999  # disable hard-stop so sizing math is exercised
         try:
             strategy, pm, risk = self._make_components()
             self._seed_pos(risk, "m1", "NO", 5.0)
@@ -1267,18 +1315,19 @@ class TestImbalanceAwareSizing:
                 strategy._deploy_quote(signal, market)
             )
             sizes = self._get_place_limit_sizes(pm)
-            assert sizes.get("BUY") == 50, \
-                f"YES size should be 50, got {sizes.get('BUY')}"
-            assert sizes.get("SELL") == 50 - 5, \
-                f"NO size should be 45, got {sizes.get('SELL')}"
+            assert sizes.get("YES") == 50, \
+                f"YES size should be 50, got {sizes.get('YES')}"
+            assert sizes.get("NO") == 50 - 5, \
+                f"NO size should be 45, got {sizes.get('NO')}"
         finally:
             config.MAKER_BATCH_SIZE = orig_batch
+            config.MAKER_MAX_IMBALANCE_CONTRACTS = orig_max_imb
 
     def test_convergence_property(self):
         """If both new orders fill fully, total (existing + new) YES == NO."""
         strategy, pm, risk = self._make_components()
-        # Use imbalance within threshold: YES=10, NO=5 → imbalance=5 < threshold(10)
-        yes_open, no_open, base = 10.0, 5.0, 50
+        # Use imbalance (2) < MAKER_BATCH_SIZE so max(1,...) floor clamp doesn't fire.
+        yes_open, no_open, base = 4.0, 2.0, 50
         self._seed_pos(risk, "m1", "YES", yes_open)
         self._seed_pos(risk, "m1", "NO", no_open)
         signal = self._make_signal(contracts_budget=base)
@@ -1287,8 +1336,8 @@ class TestImbalanceAwareSizing:
             strategy._deploy_quote(signal, market)
         )
         sizes = self._get_place_limit_sizes(pm)
-        yes_if_full = yes_open + (sizes.get("BUY") or 0)
-        no_if_full  = no_open  + (sizes.get("SELL") or 0)
+        yes_if_full = yes_open + (sizes.get("YES") or 0)
+        no_if_full  = no_open  + (sizes.get("NO") or 0)
         assert yes_if_full == no_if_full, \
             f"Full-fill totals should be equal: YES={yes_if_full} NO={no_if_full}"
 
@@ -1306,9 +1355,9 @@ class TestImbalanceAwareSizing:
                 strategy._deploy_quote(signal, market)
             )
             sizes = self._get_place_limit_sizes(pm)
-            assert "BUY" not in sizes, \
+            assert "YES" not in sizes, \
                 f"BUY YES should be blocked when YES is {25} > threshold {20}"
-            assert "SELL" in sizes, "SELL YES (NO side) should still post"
+            assert "NO" in sizes, "BUY NO (NO side) should still post"
         finally:
             config.MAKER_MAX_IMBALANCE_CONTRACTS = orig
 
@@ -1354,6 +1403,7 @@ class TestBatchSizeCap:
         m = MagicMock()
         m.condition_id = market_id
         m.token_id_yes = "tok_yes"
+        m.token_id_no  = "tok_no"
         m.underlying = "BTC"
         m.is_fee_free = True
         m.fees_enabled = False
@@ -1366,12 +1416,14 @@ class TestBatchSizeCap:
         return m
 
     def _get_place_limit_sizes(self, pm) -> dict:
+        """Return {'YES': yes_size, 'NO': no_size} from place_limit calls."""
         result = {}
         for call in pm.place_limit.call_args_list:
             args = call.args
-            side = args[1]
+            token_id = args[0]
             size = args[3]
-            result[side] = result.get(side, 0) + size
+            leg = "YES" if token_id == "tok_yes" else "NO"
+            result[leg] = result.get(leg, 0) + size
         return result
 
     def test_batch_cap_limits_large_budget(self):
@@ -1386,11 +1438,11 @@ class TestBatchSizeCap:
                 strategy._deploy_quote(signal, market)
             )
             sizes = self._get_place_limit_sizes(pm)
-            assert sizes.get("BUY", 0) <= 30, (
-                f"BUY order should be capped at 30 (batch size), got {sizes.get('BUY')}"
+            assert sizes.get("YES", 0) <= 30, (
+                f"YES order should be capped at 30 (batch size), got {sizes.get('YES')}"
             )
-            assert sizes.get("SELL", 0) <= 30, (
-                f"SELL order should be capped at 30 (batch size), got {sizes.get('SELL')}"
+            assert sizes.get("NO", 0) <= 30, (
+                f"NO order should be capped at 30 (batch size), got {sizes.get('NO')}"
             )
         finally:
             config.MAKER_BATCH_SIZE = orig
@@ -1409,11 +1461,11 @@ class TestBatchSizeCap:
                 strategy._deploy_quote(signal, market)
             )
             sizes = self._get_place_limit_sizes(pm)
-            assert sizes.get("BUY", 0) <= 100, (
-                f"BUY should be capped by MAKER_MAX_CONTRACTS_PER_SIDE=100, got {sizes.get('BUY')}"
+            assert sizes.get("YES", 0) <= 100, (
+                f"YES should be capped by MAKER_MAX_CONTRACTS_PER_SIDE=100, got {sizes.get('YES')}"
             )
-            assert sizes.get("SELL", 0) <= 100, (
-                f"SELL should be capped by MAKER_MAX_CONTRACTS_PER_SIDE=100, got {sizes.get('SELL')}"
+            assert sizes.get("NO", 0) <= 100, (
+                f"NO should be capped by MAKER_MAX_CONTRACTS_PER_SIDE=100, got {sizes.get('NO')}"
             )
         finally:
             config.MAKER_BATCH_SIZE = orig_batch
@@ -1431,11 +1483,11 @@ class TestBatchSizeCap:
                 strategy._deploy_quote(signal, market)
             )
             sizes = self._get_place_limit_sizes(pm)
-            assert sizes.get("BUY", 0) <= 10, (
-                f"BUY should not exceed budget of 10, got {sizes.get('BUY')}"
+            assert sizes.get("YES", 0) <= 10, (
+                f"YES should not exceed budget of 10, got {sizes.get('YES')}"
             )
-            assert sizes.get("SELL", 0) <= 10, (
-                f"SELL should not exceed budget of 10, got {sizes.get('SELL')}"
+            assert sizes.get("NO", 0) <= 10, (
+                f"NO should not exceed budget of 10, got {sizes.get('NO')}"
             )
         finally:
             config.MAKER_BATCH_SIZE = orig
