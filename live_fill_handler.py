@@ -385,19 +385,34 @@ class LiveFillHandler:
                 entry_price=round(entry_price, 4),
             )
 
-        # Log bot ghosts (bot tracks, PM wallet doesn't — human should dismiss these)
+        # Auto-dismiss ghost positions — bot tracks them but PM wallet doesn't.
+        # PM wallet is the source of truth; close them immediately so the webapp
+        # reflects the correct state rather than showing a stale ghost position.
+        # This catches fills missed while the WS was disconnected (e.g. naked-leg
+        # close taker orders that resolved before the WS reconnected).
         pm_token_ids = {
             pos_data.get("asset") or pos_data.get("asset_id") or ""
             for pos_data in raw_positions
         }
         ghost_count = 0
-        for tid, _pos in bot_by_token.items():
+        for tid, pos in bot_by_token.items():
             if tid not in pm_token_ids:
                 ghost_count += 1
-                log.warning(
-                    "Reconciliation: bot tracks position absent from PM wallet (ghost) — use POST /positions/ghost/dismiss",
-                    token_id=tid[:24],
+                closed = self._risk.close_position(
+                    pos.market_id, exit_price=0.0, side=pos.side
                 )
+                if closed is not None:
+                    log.warning(
+                        "Reconciliation: auto-dismissed ghost position (absent from PM wallet)",
+                        token_id=tid[:24],
+                        market_id=pos.market_id[:24],
+                        side=pos.side,
+                    )
+                else:
+                    log.warning(
+                        "Reconciliation: ghost position already closed",
+                        token_id=tid[:24],
+                    )
 
         log.info(
             "Reconciliation complete",

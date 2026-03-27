@@ -281,6 +281,18 @@ class MakerStrategy(BaseStrategy):
                     await self._pm.place_market(
                         market.token_id_yes, "SELL", exit_price, excess_ct, market
                     )
+                    # Immediately mark the risk position closed so the webapp reflects
+                    # the exit without waiting for the async WS fill event.  PM wallet
+                    # is the source of truth; we already placed the taker sell above.
+                    self._risk.close_position(
+                        market.condition_id, exit_price=exit_price, side="YES"
+                    )
+                    log.info(
+                        "Naked-leg close: YES position force-closed in risk engine",
+                        market=market.condition_id[:16],
+                        exit_price=round(exit_price, 4),
+                        excess_ct=excess_ct,
+                    )
                 else:
                     # Cancel resting SELL YES (ask), then taker-SELL the excess NO contracts.
                     ask_key = f"{market.token_id_yes}_ask"
@@ -297,6 +309,18 @@ class MakerStrategy(BaseStrategy):
                     no_sell_price = 1.0 - yes_ask
                     await self._pm.place_market(
                         market.token_id_no, "SELL", no_sell_price, excess_ct, market
+                    )
+                    # exit_price for NO position must be in YES-probability space
+                    # (same convention as entry_price).  Selling NO at no_sell_price
+                    # is equivalent to YES at yes_ask.
+                    self._risk.close_position(
+                        market.condition_id, exit_price=yes_ask, side="NO"
+                    )
+                    log.info(
+                        "Naked-leg close: NO position force-closed in risk engine",
+                        market=market.condition_id[:16],
+                        yes_ask=round(yes_ask, 4),
+                        excess_ct=excess_ct,
                     )
             except Exception as exc:
                 log.error(

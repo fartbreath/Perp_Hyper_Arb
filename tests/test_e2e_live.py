@@ -921,6 +921,18 @@ class TestE2E_FullSweepLiveBook:
         self.pm, self.hl, self.engine, self.strategy, self.monitor, self.simulator = (
             _make_components()
         )
+        # config_overrides.json carries tight production values (MAX_PM_EXPOSURE_PER_MARKET=40,
+        # MAX_TOTAL_PM_EXPOSURE=40) that can block fills when the live BTC book is at a high
+        # probability (e.g. BTC above $100k → best_ask ≈ 0.95 → fill_cost 0.96 × 50 = $48 > $40).
+        # Temporarily raise the limits so the fill always succeeds regardless of current price.
+        self._orig_per_market = config.MAX_PM_EXPOSURE_PER_MARKET
+        self._orig_total = config.MAX_TOTAL_PM_EXPOSURE
+        config.MAX_PM_EXPOSURE_PER_MARKET = 500.0
+        config.MAX_TOTAL_PM_EXPOSURE = 500.0
+
+    def teardown_method(self):
+        config.MAX_PM_EXPOSURE_PER_MARKET = self._orig_per_market
+        config.MAX_TOTAL_PM_EXPOSURE = self._orig_total
 
     def test_sweep_fills_crossed_quote(self, live_btc_book):
         """

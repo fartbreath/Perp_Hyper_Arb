@@ -351,17 +351,25 @@ class FillSimulator:
         Using strict `price >= best_bid` wrongly excluded all maker bids that sit
         one or two ticks below the real inside (which is the normal state for a
         paper quote).
+
+        One-sided book (best_bid=None or best_ask=None): fall back to checking
+        against the opposite side's best price — a BUY above the best_ask or a
+        SELL below the best_bid is fully crossed and will fill immediately.
         """
         if side == "BUY":
             bid = book.best_bid
             if bid is None:
-                return False
+                # No bids in book — check if we cross above the ask side
+                ask = book.best_ask
+                return ask is not None and price > ask
             # Filled if we're within TOLERANCE ticks of the inside bid, or crossed
             return price >= bid - self._FILL_QUEUE_TOLERANCE
         else:  # SELL
             ask = book.best_ask
             if ask is None:
-                return False
+                # No asks in book — check if we cross below the bid side
+                bid = book.best_bid
+                return bid is not None and price < bid
             return price <= ask + self._FILL_QUEUE_TOLERANCE
 
     # ── Fill handler ───────────────────────────────────────────────────────────
