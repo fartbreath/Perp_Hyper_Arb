@@ -31,6 +31,10 @@ function momentumSkipBadge(m: MomentumDiagnosticMarket): { label: string; color:
     const min = m.min_tte_s != null ? Math.round(m.min_tte_s / 60) : "\u2014";
     return { label: `TTE ${tte}m (max ${min}m)`, color: "#60a5fa" };
   }
+  if (sr === "tte_floor") {
+    const tte = m.tte_seconds != null ? `${m.tte_seconds}s` : "\u2014";
+    return { label: `TTE ${tte} \u2014 too close (no stop-loss window)`, color: "#f97316" };
+  }
   if (sr === "out_of_band") {
     const price = m.token_price != null ? Math.round(m.token_price * 100) : "\u2014";
     const lo = m.band_lo != null ? Math.round(m.band_lo * 100) : "\u2014";

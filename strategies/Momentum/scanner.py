@@ -421,6 +421,17 @@ class MomentumScanner(BaseStrategy):
             _d["tte_seconds"] = round(tte_seconds)
             _min_tte = _min_tte_by_type.get(market.market_type, _min_tte_default)
             _d["min_tte_s"] = _min_tte
+
+            # ── TTE floor: reject entries where the market will resolve before
+            # the minimum-hold guard even expires, making any stop-loss impossible.
+            # Floor = MOMENTUM_MIN_HOLD_SECONDS + a 10-second execution buffer.
+            _tte_floor = config.MOMENTUM_MIN_HOLD_SECONDS + 10
+            if tte_seconds <= _tte_floor:
+                skipped_tte += 1
+                _d["skip_reason"] = "tte_floor"
+                scan_diags.append(_d)
+                continue
+
             # Entry window ceiling: flag markets with too much time left.
             # We do NOT continue here — vol/delta are computed regardless so that
             # the diagnostic CSV contains full empirical data for every in-band

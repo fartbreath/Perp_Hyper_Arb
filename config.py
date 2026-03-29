@@ -281,6 +281,12 @@ MOMENTUM_STOP_LOSS_YES: float = 0.55   # Exit YES position if p_yes drops below 
 MOMENTUM_STOP_LOSS_NO:  float = 0.55   # Exit NO  position if p_no  drops below this
 MOMENTUM_TAKE_PROFIT: float = 0.96     # Exit if held token rises above this
 
+# Minimum seconds to hold a momentum position before allowing any stop-loss/TP exit.
+# Kept short (momentum positions are near expiry; 60s is designed for mispricing).
+# Also used to derive the TTE entry floor:  entries with TTE < MOMENTUM_MIN_HOLD_SECONDS
+# are blocked because the stop-loss guard would expire AFTER the market resolves.
+MOMENTUM_MIN_HOLD_SECONDS: int = 10
+
 # Entry window per bucket market type — only enter when TTE ≤ this value.
 # Markets with MORE time remaining than this are outside the entry window and
 # are skipped.  Subscribe to them early so book data is ready when the window
@@ -483,7 +489,8 @@ PROFIT_TARGET_PCT: float = 0.60      # capture 60% of the initial mispricing
 STOP_LOSS_USD: float = 25.0
 # Time stop: close positions this many days before market resolution (mispricing only)
 EXIT_DAYS_BEFORE_RESOLUTION: int = 3
-# Minimum hold time before any exit is considered (prevents flip on noise)
+# Minimum hold time before any exit is considered (prevents flip on noise).
+# Applies to maker and mispricing positions.  Momentum uses MOMENTUM_MIN_HOLD_SECONDS.
 MIN_HOLD_SECONDS: int = 60
 
 # ── Runtime overrides (persisted across restarts) ───────────────────────────

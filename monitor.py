@@ -117,9 +117,16 @@ def should_exit(
     if now is None:
         now = datetime.now(timezone.utc)
 
-    # Respect minimum hold time — avoids noise-triggered exits
+    # Respect minimum hold time — avoids noise-triggered exits.
+    # Momentum uses a much shorter hold floor (positions are near expiry;
+    # MIN_HOLD_SECONDS=60 is calibrated for mispricing positions that last days).
+    _min_hold = (
+        config.MOMENTUM_MIN_HOLD_SECONDS
+        if pos.strategy == "momentum"
+        else config.MIN_HOLD_SECONDS
+    )
     hold_seconds = (now - pos.opened_at).total_seconds()
-    if hold_seconds < config.MIN_HOLD_SECONDS:
+    if hold_seconds < _min_hold:
         return False, "", 0.0
 
     unrealised = compute_unrealised_pnl(pos, current_price)

@@ -1267,6 +1267,45 @@ class PMClient:
                 )
             return order_id
         except Exception as exc:
+            err_str = str(exc)
+            # PM returns HTTP 400 "not enough balance" when the requested sell size
+            # slightly exceeds the wallet balance.  This happens because taker fees
+            # are deducted from the received tokens at fill time, so pos.size (gross
+            # matched quantity) is marginally larger than the actual holding.
+            # Parse the actual balance from the error message and retry once with
+            # that exact amount so stop-loss exits are not stuck in an infinite loop.
+            if "not enough balance" in err_str and "balance:" in err_str:
+                import re as _re
+                _m = _re.search(r"balance:\s*(\d+)", err_str)
+                _o = _re.search(r"order amount:\s*(\d+)", err_str)
+                if _m and _o:
+                    actual_bal = int(_m.group(1)) / 1_000_000  # micro-token → token
+                    order_amt  = int(_o.group(1)) / 1_000_000
+                    if 0 < actual_bal < order_amt:
+                        log.warning(
+                            "place_market: balance shortfall — retrying with actual balance",
+                            requested=round(order_amt, 6),
+                            actual=round(actual_bal, 6),
+                            token_id=token_id,
+                        )
+                        try:
+                            order_args2 = OrderArgs(
+                                token_id=token_id,
+                                price=rounded_price,
+                                size=actual_bal,
+                                side=side,
+                            )
+                            signed2 = self._clob.create_order(order_args2)
+                            resp2 = self._clob.post_order(signed2, OrderType.GTC)
+                            order_id2 = resp2.get("orderID")
+                            if order_id2:
+                                log.info(
+                                    "place_market retry succeeded",
+                                    token_id=token_id, size=actual_bal, order_id=order_id2,
+                                )
+                                return order_id2
+                        except Exception as exc2:
+                            log.error("place_market balance-retry failed", exc=str(exc2), token_id=token_id)
             log.error("place_market failed", exc=str(exc), token_id=token_id)
             return None
 
