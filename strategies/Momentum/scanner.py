@@ -788,10 +788,30 @@ class MomentumScanner(BaseStrategy):
             entry_price = raw_fill_price if signal.side == "YES" else 1.0 - raw_fill_price
             entry_size = actual_size
         else:
-            # Paper mode or API unavailable — estimate from pre-order observation.
-            # Apply same YES-space conversion so P&L formula stays consistent.
+            # Paper mode or fill data unavailable.
             entry_price = order_price if signal.side == "YES" else 1.0 - order_price
-            entry_size = size_usd
+            if not self._pm._paper_mode:
+                # Live mode: fill data was not recoverable from WS or REST.
+                # Use the CLOB token balance as the source of truth — it reflects
+                # exactly how many tokens landed in the wallet after fee deductions.
+                _clob_bal = await self._pm.get_token_balance(signal.token_id)
+                if _clob_bal and _clob_bal > 0:
+                    log.warning(
+                        "Momentum: fill data unavailable — using CLOB balance as entry size",
+                        token_id=signal.token_id[:20],
+                        clob_balance=round(_clob_bal, 6),
+                    )
+                    entry_size = _clob_bal
+                else:
+                    # Could not determine size from any source — abort rather than
+                    # record a position with a meaningless USD-budget size.
+                    log.error(
+                        "Momentum: cannot determine entry size (fill + CLOB both failed) — aborting position",
+                        token_id=signal.token_id[:20],
+                    )
+                    return False
+            else:
+                entry_size = size_usd
 
         # ── Register position with risk engine ────────────────────────────────
         pos = Position(

@@ -636,6 +636,25 @@ class PositionMonitor:
                 else market.token_id_no
             )
             sell_order_price = exit_price if pos.side in ("YES", "BUY_YES") else (1.0 - exit_price)
+
+            # CLOB wallet balance is the source of truth for sell size.
+            # pos.size may be slightly wrong (e.g. set from WS size_matched or
+            # a USD-budget fallback) because taker fees reduce the received
+            # tokens.  Proactively fetch the actual balance so the order never
+            # fails with "not enough balance".
+            sell_size = pos.size
+            if not config.PAPER_TRADING:
+                actual_bal = await self._pm.get_token_balance(sell_token)
+                if actual_bal is not None and actual_bal > 0:
+                    if abs(actual_bal - pos.size) / max(pos.size, 1e-9) > 0.05:
+                        log.warning(
+                            "Exit: pos.size diverges from CLOB balance — using balance",
+                            pos_size=round(pos.size, 6),
+                            clob_balance=round(actual_bal, 6),
+                            market_id=pos.market_id,
+                        )
+                    sell_size = actual_bal
+
             if force_taker:
                 # Market order — crosses the spread for immediate fill (stop-loss/manual).
                 # Retry up to 3 times (200 ms apart) before giving up.
@@ -645,7 +664,7 @@ class PositionMonitor:
                         token_id=sell_token,
                         side="SELL",
                         price=sell_order_price,
-                        size=pos.size,
+                        size=sell_size,
                         market=market,
                     )
                     if order_id:
@@ -670,7 +689,7 @@ class PositionMonitor:
                     token_id=sell_token,
                     side="SELL",
                     price=sell_order_price,
-                    size=pos.size,
+                    size=sell_size,
                     market=market,
                 )
 
@@ -686,7 +705,7 @@ class PositionMonitor:
                     token_id=sell_token,
                     side="SELL",
                     price=sell_order_price,
-                    size=pos.size,
+                    size=sell_size,
                     market=market,
                 )
                 if order_id is None:
