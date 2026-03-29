@@ -7,11 +7,16 @@ import { useSignals, useConfig, useMakerSignals, useCapital, useMomentumDiagnost
 import type { MomentumDiagnosticMarket } from "../api/client";
 import { usePolymarketEventSlugs } from "../utils/usePolymarketEventSlugs";
 
-const SCAN_HIDDEN = new Set(["beyond_horizon", "no_book", "empty_book"]);
+// Only hide markets that are completely outside the scanner's interest window.
+// empty_book / no_book are deliberately NOT hidden — thin/empty books still show
+// so the operator can see HYPE and other low-liquidity markets in the table.
+const SCAN_HIDDEN = new Set(["beyond_horizon"]);  // removed: no_book, empty_book
 
 function momentumSkipBadge(m: MomentumDiagnosticMarket): { label: string; color: string } {
   const sr = m.skip_reason;
   if (sr === "signal_fired") return { label: "\u2713 Fired", color: "#22c55e" };
+  if (sr === "empty_book") return { label: "Empty book", color: "#f97316" };
+  if (sr === "no_book") return { label: "No book data", color: "#f97316" };
   if (sr === "not_started") {
     const tte = m.tte_seconds != null ? Math.round(m.tte_seconds / 60) : "\u2014";
     return { label: `Not started \u2014 ${tte}m TTE`, color: "#475569" };
