@@ -376,3 +376,175 @@ class TestWSMessageHandling:
             ],
         })))
         assert "tok_007" in fired
+
+
+# ── Fill-future / recent-fills mechanics ─────────────────────────────────────
+# Covers M-3 items: WS-path resolution, early-fill race, stale-cache pruning.
+
+class TestFillFuture:
+    """Unit tests for register_fill_future / _fire_order_fill / _recent_fills."""
+
+    def setup_method(self):
+        self.client = PMClient.__new__(PMClient)
+        self.client._pending_fill_futures = {}
+        self.client._recent_fills = {}
+        self.client._order_fill_callbacks = []
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    # -- helpers --
+
+    def _make_future(self) -> asyncio.Future:
+        loop = asyncio.get_event_loop()
+        return loop.create_future()
+
+    def _fill_msg(self, order_id: str = "order_abc") -> dict:
+        return {"id": order_id, "status": "MATCHED", "size_matched": "10", "price": "0.55"}
+
+    # -- test 1 --
+
+    def test_fill_future_resolved_via_ws(self):
+        """Happy path: future registered before fill arrives is resolved by _fire_order_fill."""
+        fut = self._make_future()
+        self.client.register_fill_future("order_abc", fut)
+        assert not fut.done()
+
+        self._run(self.client._fire_order_fill(self._fill_msg("order_abc")))
+
+        assert fut.done()
+        assert fut.result()["id"] == "order_abc"
+
+    # -- test 2 --
+
+    def test_fill_future_race_early_fill(self):
+        """Race: fill event arrives before register_fill_future is called.
+
+        This happens when the REST order-placement suspends (e.g. slow network)
+        and the user WS processes the MATCHED event first.  The fill lands in
+        _recent_fills; register_fill_future must resolve the future immediately
+        from the cache rather than leaving it pending indefinitely.
+        """
+        # Fire fill first (no future registered yet)
+        self._run(self.client._fire_order_fill(self._fill_msg("order_xyz")))
+        assert "order_xyz" in self.client._recent_fills
+
+        # Now register — should resolve immediately from cache
+        fut = self._make_future()
+        self.client.register_fill_future("order_xyz", fut)
+        assert fut.done()
+        assert fut.result()["id"] == "order_xyz"
+        # Cache entry must be consumed (not left as a dangling entry)
+        assert "order_xyz" not in self.client._recent_fills
+
+    # -- test 3 --
+
+    def test_fill_future_stale_cache_pruned(self):
+        """Stale entries older than 30s are evicted by register_fill_future."""
+        import time as _time
+
+        old_ts = _time.time() - 31          # definitely stale
+        self.client._recent_fills["stale_order"] = ({"id": "stale_order"}, old_ts)
+
+        # Calling register_fill_future (for any order) triggers the prune sweep
+        fut = self._make_future()
+        self.client.register_fill_future("new_order", fut)
+
+        assert "stale_order" not in self.client._recent_fills
+
+
+# ── Auto-redeem deduplication ─────────────────────────────────────────────────
+# Covers M-3: ensure on-chain _redeem_ctf_via_safe is called exactly once per
+# token even when _redeem_ready_positions is invoked multiple times.
+
+class TestAutoRedeemDedup:
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _make_monitor(self):
+        from monitor import PositionMonitor
+        pm = MagicMock()
+        pm.get_live_positions = AsyncMock(return_value=[{
+            "asset": "tok_winning",
+            "redeemable": True,
+            "size": "50",
+            "curPrice": "1.0",
+            "conditionId": "cond_win",
+            "title": "Test market",
+        }])
+        pm.get_markets = MagicMock(return_value={})
+        pm._clob = MagicMock()
+        pm._clob.get_conditional_address = MagicMock(return_value="0xCTF")
+        pm._clob.get_collateral_address = MagicMock(return_value="0xUSDC")
+        risk = MagicMock()
+        risk.get_positions = MagicMock(return_value={})
+        mon = PositionMonitor.__new__(PositionMonitor)
+        mon._pm = pm
+        mon._risk = risk
+        mon._redeemed_tokens = set()
+        return mon
+
+    def test_auto_redeem_dedup(self):
+        """_redeem_ready_positions called twice emits on-chain tx exactly once."""
+        import monitor as monitor_mod
+        mon = self._make_monitor()
+
+        redeem_mock = AsyncMock(return_value="0xdeadbeef")
+        with patch.object(monitor_mod, "_redeem_ctf_via_safe", redeem_mock):
+            self._run(mon._redeem_ready_positions())
+            self._run(mon._redeem_ready_positions())
+
+        redeem_mock.assert_called_once()
+        assert "tok_winning" in mon._redeemed_tokens
+
+
+# ── Prefetch task cancellation ────────────────────────────────────────────────
+# Covers M-3: MomentumScanner.stop() must cancel the vol prefetch task so it
+# does not run after the scanner is stopped.
+
+class TestPrefetchTaskCancellation:
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_prefetch_task_cancelled_on_stop(self):
+        """stop() cancels the vol prefetch background task returned by start_prefetch."""
+        from strategies.Momentum.scanner import MomentumScanner
+
+        pm = MagicMock(); pm.on_price_change = MagicMock()
+        hl = MagicMock()
+        risk = MagicMock()
+        vol = MagicMock()
+
+        # start_prefetch returns a real asyncio Task wrapping a never-ending coroutine
+        async def _never_end():
+            await asyncio.sleep(3600)
+
+        loop = asyncio.get_event_loop()
+        fake_task = loop.create_task(_never_end())
+        vol.start_prefetch = MagicMock(return_value=fake_task)
+
+        scanner = MomentumScanner.__new__(MomentumScanner)
+        scanner._pm = pm
+        scanner._hl = hl
+        scanner._risk = risk
+        scanner._vol = vol
+        scanner._running = False
+        scanner._market_cooldown = {}
+        scanner._open_spot_path = ""
+        scanner._market_open_spot = {}
+        scanner._last_scan_diags = []
+        scanner._last_scan_summary = {}
+        scanner._last_scan_ts = 0.0
+        scanner._scan_event = asyncio.Event()
+        scanner._token_to_market = {}
+        scanner._vol_prefetch_task = None
+
+        # Simulate what start() does (just the prefetch assignment, no full start)
+        scanner._vol_prefetch_task = vol.start_prefetch([])
+
+        assert not fake_task.done()
+
+        self._run(scanner.stop())
+
+        assert fake_task.cancelled()
+

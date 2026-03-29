@@ -307,26 +307,26 @@ class TestIsPriorityMarketFeeAdjusted:
 
     def test_tight_spread_passes_at_mid(self):
         """1c spread: rebate model makes this viable — effective_edge = half_spread + rebate.
-        New formula: effective_edge = 0.005 + 0.20 * 0.004375 = 0.005875 > MIN_EDGE_PCT (0.001).
-        Pin MIN_EDGE_PCT to the documented baseline, not any config_overrides.json value."""
-        orig = config.MIN_EDGE_PCT
-        config.MIN_EDGE_PCT = 0.001
+        New formula: effective_edge = 0.005 + 0.20 * 0.004375 = 0.005875 > MAKER_MIN_EDGE_PCT (0.001).
+        Pin MAKER_MIN_EDGE_PCT to the documented baseline, not any config_overrides.json value."""
+        orig = config.MAKER_MIN_EDGE_PCT
+        config.MAKER_MIN_EDGE_PCT = 0.001
         try:
             market = self._make_market_with_spread(incentive_spread=0.01)
             assert _is_priority_market(market, 0.50) is True
         finally:
-            config.MIN_EDGE_PCT = orig
+            config.MAKER_MIN_EDGE_PCT = orig
 
     def test_tight_spread_passes_at_extreme(self):
         """1c spread at p=0.15: effective_edge = 0.005 + 0.20*0.002231 = 0.005446 > 0.001.
-        Pin MIN_EDGE_PCT to the documented baseline, not any config_overrides.json value."""
-        orig = config.MIN_EDGE_PCT
-        config.MIN_EDGE_PCT = 0.001
+        Pin MAKER_MIN_EDGE_PCT to the documented baseline, not any config_overrides.json value."""
+        orig = config.MAKER_MIN_EDGE_PCT
+        config.MAKER_MIN_EDGE_PCT = 0.001
         try:
             market = self._make_market_with_spread(incentive_spread=0.01)
             assert _is_priority_market(market, 0.15) is True
         finally:
-            config.MIN_EDGE_PCT = orig
+            config.MAKER_MIN_EDGE_PCT = orig
 
     def test_fee_free_always_priority(self):
         """Fee-free markets skip the edge check entirely."""
@@ -334,14 +334,14 @@ class TestIsPriorityMarketFeeAdjusted:
         assert _is_priority_market(market, 0.50) is True
 
     def test_medium_spread_mid_price(self):
-        """2c spread: effective_edge = 0.01 + 0.20*0.004375 = 0.010875 > MIN_EDGE_PCT."""
-        orig = config.MIN_EDGE_PCT
-        config.MIN_EDGE_PCT = 0.001
+        """2c spread: effective_edge = 0.01 + 0.20*0.004375 = 0.010875 > MAKER_MIN_EDGE_PCT."""
+        orig = config.MAKER_MIN_EDGE_PCT
+        config.MAKER_MIN_EDGE_PCT = 0.001
         try:
             market = self._make_market_with_spread(incentive_spread=0.02)
             assert _is_priority_market(market, 0.50) is True
         finally:
-            config.MIN_EDGE_PCT = orig
+            config.MAKER_MIN_EDGE_PCT = orig
 
     def test_rebate_is_additive_not_subtractive(self):
         """Confirm the formula adds the rebate contribution, i.e. effective_edge > half_spread."""
@@ -1156,21 +1156,21 @@ class TestSecondLegCombinedCostGate:
         assert signal is not None, "Should accept: combined cost 0.98 is profitable"
 
     def test_exact_threshold_boundary_rejected(self):
-        """Combined cost exactly at threshold (1 - MIN_SPREAD_PROFIT_MARGIN) must be rejected."""
+        """Combined cost exactly at threshold (1 - MAKER_MIN_SPREAD_PROFIT_MARGIN) must be rejected."""
         strategy, risk = self._make_maker()
         market = self._make_market(spread=0.04)
-        # We want: yes_entry + (1 - (mid + half_spread)) == 1.0 - MIN_SPREAD_PROFIT_MARGIN
+        # We want: yes_entry + (1 - (mid + half_spread)) == 1.0 - MAKER_MIN_SPREAD_PROFIT_MARGIN
         # => yes_entry + 1 - mid - 0.02 = 0.995
         # => yes_entry = 0.015 + mid
         # Use mid=0.50: yes_entry = 0.515, ask=0.52 → combined=0.515+(1-0.52)=0.995 → reject
-        orig = config.MIN_SPREAD_PROFIT_MARGIN
-        config.MIN_SPREAD_PROFIT_MARGIN = 0.005
+        orig = config.MAKER_MIN_SPREAD_PROFIT_MARGIN
+        config.MAKER_MIN_SPREAD_PROFIT_MARGIN = 0.005
         try:
             self._open_pos(risk, market.condition_id, "YES", entry_price=0.515)
             signal = strategy._evaluate_signal(market, mid=0.50)
             assert signal is None, "Combined cost at threshold must be rejected"
         finally:
-            config.MIN_SPREAD_PROFIT_MARGIN = orig
+            config.MAKER_MIN_SPREAD_PROFIT_MARGIN = orig
 
     def test_no_existing_position_gate_not_triggered(self):
         """With no open position the combined cost gate is irrelevant — normal flow."""
@@ -1715,6 +1715,13 @@ class TestNakedLegForceClose:
             underlying="BTC", side=side, size=size,
             entry_price=0.50, strategy="maker",
         )
+
+    def setup_method(self, _method=None):
+        self._orig_naked_enabled = config.MAKER_NAKED_CLOSE_ENABLED
+        config.MAKER_NAKED_CLOSE_ENABLED = True
+
+    def teardown_method(self, _method=None):
+        config.MAKER_NAKED_CLOSE_ENABLED = self._orig_naked_enabled
 
     def test_debounce_timer_starts_on_first_detection(self):
         """First call with imbalance ≥ threshold records timestamp but does NOT fire."""

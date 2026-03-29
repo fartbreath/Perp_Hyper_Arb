@@ -14,10 +14,11 @@ POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
 POLY_FUNDER: str = os.getenv("POLY_FUNDER", "") or os.getenv("POLY_ADDRESS", "")
 POLY_HOST: str = "https://clob.polymarket.com"
 GAMMA_HOST: str = "https://gamma-api.polymarket.com"
+POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
 
 # Token IDs of underlying assets tracked. Used to label markets.
 TRACKED_UNDERLYINGS: list[str] = [
-    "BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XLP",
+    "BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP", "LINK",
 ]
 
 # How often (seconds) to refresh the market list from Gamma API
@@ -38,7 +39,7 @@ HL_ADDRESS: str = os.getenv("HL_ADDRESS", "")
 HL_SECRET_KEY: str = os.getenv("HL_SECRET_KEY", "")
 HL_BASE_URL: str = "https://api.hyperliquid.xyz"
 
-HL_PERP_COINS: list[str] = ["BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XLP"]
+HL_PERP_COINS: list[str] = ["BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP", "LINK"]
 HL_DEFAULT_SLIPPAGE: float = 0.003   # 0.3% max slippage for hedge market orders
 HL_DEAD_MAN_INTERVAL: int = 300      # seconds — refresh dead man's switch every 5 min
 HL_FUNDING_POLL_INTERVAL: int = 300  # seconds
@@ -138,15 +139,15 @@ MAKER_MIN_VOLUME_24HR: float = 5000.0
 # Correct formula: effective_edge = half_spread + market.rebate_pct * taker_fee
 # (we earn the rebate, not pay the taker fee; rate varies by market type).
 # Lowered from 0.005 → 0.001 because rebate contribution is additive.
-MIN_EDGE_PCT: float = 0.001  # NOTE: overridden to 0.005 in config_overrides.json
+MAKER_MIN_EDGE_PCT: float = 0.001  # NOTE: overridden to 0.005 in config_overrides.json
 
 # Minimum profit margin (per contract) required when quoting the second leg of a
 # spread.  When one side is already filled, the second-leg quote is only posted if:
-#   YES_entry + (1 - current_ask)  <=  1.0 - MIN_SPREAD_PROFIT_MARGIN  (NO needed)
-#   (1 - NO_entry) + current_bid   <=  1.0 - MIN_SPREAD_PROFIT_MARGIN  (YES needed)
+#   YES_entry + (1 - current_ask)  <=  1.0 - MAKER_MIN_SPREAD_PROFIT_MARGIN  (NO needed)
+#   (1 - NO_entry) + current_bid   <=  1.0 - MAKER_MIN_SPREAD_PROFIT_MARGIN  (YES needed)
 # This prevents negative-spread entries caused by mid drifting between fills.
 # 0.005 = require at least 0.5¢/contract combined edge before posting the missing leg.
-MIN_SPREAD_PROFIT_MARGIN: float = 0.010
+MAKER_MIN_SPREAD_PROFIT_MARGIN: float = 0.010
 
 # Per-coin inventory loss limit for maker strategy (Flaw §5)
 # If total unrealised P&L across all open positions for a coin drops below
@@ -256,12 +257,89 @@ BOT_ACTIVE: bool = True
 # ── Strategy Toggles ────────────────────────────────────────────────────────
 STRATEGY_MISPRICING_ENABLED: bool = False   # Strategy 2: Deribit implied-prob mispricing
 STRATEGY_MAKER_ENABLED: bool = False        # Strategy 1: PM market making + HL delta hedge
+STRATEGY_MOMENTUM_ENABLED: bool = False     # Strategy 3: Momentum / price-confirmation taker
+
+# ── Strategy 3 — Momentum Scanner ─────────────────────────────────────────
+# Price band: scanner fires when held-side is in [LOW, HIGH].
+MOMENTUM_PRICE_BAND_LOW: float = 0.80
+MOMENTUM_PRICE_BAND_HIGH: float = 0.90
+
+# Maximum USDC deployed per momentum position.
+MOMENTUM_MAX_ENTRY_USD: float = 50.0
+
+# Minimum USDC depth on the ask side within 1c of best ask (thin-book guard).
+# Prevents entering markets where our order would exhaust available liquidity.
+MOMENTUM_MIN_CLOB_DEPTH: float = 200.0
+
+# Order type: "limit" = taker limit at ask+0.5c (ensures fill); "market" = immediate cross.
+MOMENTUM_ORDER_TYPE: str = "limit"
+
+# Exit thresholds — based on the HELD TOKEN'S price (not USD P&L).
+# YES stop: exit if p_yes falls below this (entered YES at band lo ~0.81).
+# NO stop:  exit if p_no  falls below this (entered NO  at band lo ~0.81).
+MOMENTUM_STOP_LOSS_YES: float = 0.55   # Exit YES position if p_yes drops below this
+MOMENTUM_STOP_LOSS_NO:  float = 0.55   # Exit NO  position if p_no  drops below this
+MOMENTUM_TAKE_PROFIT: float = 0.96     # Exit if held token rises above this
+
+# Entry window per bucket market type — only enter when TTE ≤ this value.
+# Markets with MORE time remaining than this are outside the entry window and
+# are skipped.  Subscribe to them early so book data is ready when the window
+# opens; the scan itself enforces the ceiling gate.
+# Example: bucket_daily = 900  →  only enter daily markets in the LAST 15 min.
+MOMENTUM_MIN_TTE_SECONDS: dict[str, int] = {
+    "bucket_5m":      30,    # last 30 s  (~last 10% of a 300 s market)
+    "bucket_15m":     60,    # last 60 s
+    "bucket_1h":     120,    # last 2 min
+    "bucket_4h":     300,    # last 5 min
+    "bucket_daily":  900,    # last 15 min
+    "bucket_weekly": 3_600,  # last 1 hour
+    "milestone":     1_800,  # last 30 min (no fixed duration)
+}
+# Fallback for any market type not listed above.
+MOMENTUM_MIN_TTE_SECONDS_DEFAULT: int = 120
+
+# Staleness guards: discard signals if price data is older than these thresholds.
+MOMENTUM_SPOT_MAX_AGE_SECS: float = 30.0   # HL BBO age (seconds)
+MOMENTUM_BOOK_MAX_AGE_SECS: float = 60.0   # PM book age gate: skip market if book is older than this (WS shard outage).
+
+# Volatility source / threshold config.
+# MOMENTUM_VOL_CACHE_TTL: Deribit ATM IV is cached this many seconds before re-fetch.
+# MOMENTUM_VOL_Z_SCORE: z statistic for the required delta (1.6449 ≈ 95th percentile).
+#   Raise toward 2.0 for fewer, higher-conviction entries.
+#   Lower toward 1.28 for more trades in low-vol regimes.
+MOMENTUM_VOL_CACHE_TTL: float = 300.0
+MOMENTUM_VOL_Z_SCORE: float = 1.6449
+# Per-bucket z-score overrides. Any bucket type listed here overrides
+# MOMENTUM_VOL_Z_SCORE for that bucket; unlisted buckets use the global default.
+# Example: {"bucket_daily": 1.0, "bucket_15m": 1.3}
+MOMENTUM_VOL_Z_SCORE_BY_TYPE: dict[str, float] = {}
+
+# How often to run a full scan pass over all bucket markets (seconds).
+MOMENTUM_SCAN_INTERVAL: int = 10
+
+# Maximum simultaneous open momentum positions.
+MOMENTUM_MAX_CONCURRENT: int = 3
+
+# Pre-subscription lookahead: also subscribe to bucket markets that haven't
+# started yet but are within this many additional durations of their start.
+# 0 = only started markets (safe minimum).
+# 4 = also subscribe to the next 4 bucket slots ahead (e.g. next 20 min of 5-min
+#     buckets, next 1h of 15-min buckets, etc.).  Bounded — adds ~40 extra tokens
+#     per scan cycle, not thousands.  Useful for data collection to capture
+#     price-vs-TTE curves before the entry window opens.
+MOMENTUM_PRESUB_LOOKAHEAD: int = 4
+
+# How many days of bucket markets the momentum scanner subscribes to via PM WS,
+# independently of the maker's MAKER_MAX_TTE_DAYS window.  Wider than the maker
+# window so we can watch markets that are "near certain" but not yet in the
+# maker's quoting horizon.  Increase if 76% no_book persists after market refresh.
+MOMENTUM_MAX_TTE_DAYS: int = 7
 
 # ── Strategy 2 — Mispricing Scanner ─────────────────────────────────────────
 MILESTONE_MIN_DAYS: int = 1           # Only scan markets resolving > 1 day away
 MISPRICING_THRESHOLD: float = 0.05   # Flag if |PM - options_implied| > 5%
 MISPRICING_EXTREME_THRESHOLD: float = 0.15  # Apply looser threshold at extremes
-SCAN_INTERVAL: int = 60              # seconds between full mispricing scans
+MISPRICING_SCAN_INTERVAL: int = 60   # seconds between full mispricing scans
 
 # Entry filters (derived from overnight data analysis, 2026-03-12):
 #   YES ≥ 0.90 → 0% win rate across all 78 trades; NO entries when YES is
@@ -283,7 +361,8 @@ MIN_STRIKE_DISTANCE_PCT: float = 0.08  # fraction of spot, e.g. 0.08 = 8%
 # the primary protection against persistent false signals - that is handled by
 # MAX_BUY_NO_YES_PRICE. Retro analysis showed 30 min was over-filtering:
 # price filter alone blocks the bad signals; short cooldown just deduplicates.
-MARKET_COOLDOWN_SECONDS: int = 300   # 5 minutes
+MISPRICING_MARKET_COOLDOWN_SECONDS: int = 300   # 5 minutes — mispricing strategy
+MOMENTUM_MARKET_COOLDOWN_SECONDS: int = 5     # 5 seconds — momentum strategy
 
 # ── Kalshi signal confirmation layer ──────────────────────────────────────
 # When KALSHI_ENABLED=True, the scanner fetches matching Kalshi market prices
@@ -396,6 +475,8 @@ BYPASS_AGENT: bool = True
 
 # ── Position Monitor ──────────────────────────────────────────────────────────
 MONITOR_INTERVAL: int = 30           # seconds between position checks
+# How often to poll PM wallet for redeemable settled positions (live mode only)
+REDEEM_POLL_INTERVAL: int = 60       # seconds
 # Profit target: exit when unrealised >= this fraction of (deviation * size)
 PROFIT_TARGET_PCT: float = 0.60      # capture 60% of the initial mispricing
 # Stop-loss: exit when unrealised loss exceeds this in USD

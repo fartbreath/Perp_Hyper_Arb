@@ -100,7 +100,7 @@ Kalshi markets are cached for 5 minutes (`CACHE_TTL = 300 s`).
 
 ### 1. Market Universe
 
-Each scan cycle (`SCAN_INTERVAL = 60 s`) the scanner:
+Each scan cycle (`MISPRICING_SCAN_INTERVAL = 60 s`) the scanner:
 
 - Loads all PM markets with `market_type = "milestone"` (i.e. non-bucketed, named
   strike/price markets)
@@ -257,7 +257,7 @@ from `options_implied_probability` → `deviation > fee_hurdle` → signal.*
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `SCAN_INTERVAL` | 60 s | Time between full scan passes |
+| `MISPRICING_SCAN_INTERVAL` | 60 s | Time between full scan passes |
 | `MILESTONE_MIN_DAYS` | 1 | Skip markets resolving within 1 day |
 | `MAX_PM_EXPOSURE_PER_MARKET` | $500 | Hard cap on position notional |
 | `PM_FEE_COEFF` | 0.0175 | PM fee coefficient for hurdle calc |

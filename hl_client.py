@@ -155,16 +155,13 @@ class HLClient:
     # ── WebSocket ──────────────────────────────────────────────────────────────
 
     async def _ws_loop(self) -> None:
-        if not self._address and not self._paper_mode:
-            log.debug("HL WS disabled — no address configured, skipping WS loop")
-            return
+        # Market data WS (l2Book, allMids) is public  no address required.
         backoff = 1.0
         while self._running:
             try:
                 async with websockets.connect(
                     HL_WS_URL,
-                    ping_interval=20,
-                    ping_timeout=20,
+                    ping_interval=None,
                 ) as ws:
                     self._ws = ws
                     self._ws_connected = True

@@ -23,7 +23,8 @@ import config
 # ── Paths ─────────────────────────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent / "data"
 LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / "bot.log"
+LOG_FILE    = LOG_DIR / "bot.log"
+ERRORS_FILE = LOG_DIR / "errors.log"
 
 # ── Windows-safe rotating file handler ───────────────────────────────────────
 
@@ -97,7 +98,7 @@ class RingBufferHandler(logging.Handler):
     # Modules that emit high-frequency DEBUG noise (WebSocket frame messages).
     # These are still written to console/file but suppressed from the ring buffer
     # so they don't drown out business-logic log entries from other modules.
-    _NOISY_DEBUG_MODULES = frozenset({"client", "pm_client", "hl_client"})
+    _NOISY_DEBUG_MODULES = frozenset({"client", "pm_client", "hl_client", "scanner", "strategy"})
 
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
@@ -164,6 +165,71 @@ class RingBufferHandler(logging.Handler):
 ring_buffer = RingBufferHandler()
 
 
+class WarnRingBufferHandler(logging.Handler):
+    """In-memory ring buffer for WARNING+ records only — provides longer history.
+
+    Because WARNING/ERROR/CRITICAL events are far less frequent than INFO/DEBUG,
+    this buffer can hold 20 000 entries while consuming minimal memory.  It is
+    the backing store for the webapp's "Error History" log view.
+    """
+
+    MAX = 20_000
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self._records: list[dict] = []
+        self._lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            _safe = (str, int, float, bool, type(None))
+            extras = {
+                k: v if isinstance(v, _safe) else str(v)
+                for k, v in record.__dict__.items()
+                if k not in _STANDARD_LOGRECORD_ATTRS and not k.startswith("_")
+            }
+            entry = {
+                "ts": record.created,
+                "level": record.levelname,
+                "module": record.name.split(".")[-1],
+                "msg": record.getMessage(),
+                "extras": extras,
+            }
+            with self._lock:
+                self._records.append(entry)
+                if len(self._records) > self.MAX:
+                    del self._records[: len(self._records) - self.MAX]
+        except Exception:
+            self.handleError(record)
+
+    def get_recent(
+        self,
+        limit: int = 500,
+        module: Optional[str] = None,
+        search: Optional[str] = None,
+    ) -> list[dict]:
+        with self._lock:
+            records = list(reversed(self._records))
+        if module:
+            records = [r for r in records if r["module"] == module]
+        if search:
+            sl = search.lower()
+            records = [
+                r for r in records
+                if sl in r["msg"].lower()
+                or any(sl in str(v).lower() for v in r["extras"].values())
+            ]
+        return records[:limit]
+
+    def all_modules(self) -> list[str]:
+        with self._lock:
+            return sorted({r["module"] for r in self._records})
+
+
+# Module-level singleton — imported by api_server
+warn_ring_buffer = WarnRingBufferHandler()
+
+
 # ── Root logger setup (call once at import) ───────────────────────────────────
 
 def _setup_root_logger() -> None:
@@ -173,22 +239,37 @@ def _setup_root_logger() -> None:
 
     root.setLevel(logging.DEBUG)
 
-    # In-memory ring buffer — always first so nothing is missed
+    # In-memory ring buffer (live view) — always first so nothing is missed
     root.addHandler(ring_buffer)
 
-    # Console handler
+    # In-memory ring buffer (warnings/errors only — longer history for webapp)
+    root.addHandler(warn_ring_buffer)
+
+    # Console handler — INFO and above
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(_ContextFormatter())
     root.addHandler(console)
 
-    # Rotating file handler — 5 MB per file, keep 5 backups
+    # Main rotating log file — INFO and above
+    # DEBUG is intentionally excluded: reduces file write volume significantly
+    # and keeps rotation cycles longer, giving more useful history per backup.
     file_h = _SafeRotatingFileHandler(
         LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
-    file_h.setLevel(logging.DEBUG)
+    file_h.setLevel(logging.INFO)
     file_h.setFormatter(_ContextFormatter())
     root.addHandler(file_h)
+
+    # Errors-only log file — WARNING and above, larger retention
+    # 10 MB × 20 backups ≈ 200 MB ceiling; at typical WARNING rates this is
+    # months of history, giving a long audit trail for intermittent issues.
+    errors_h = _SafeRotatingFileHandler(
+        ERRORS_FILE, maxBytes=10 * 1024 * 1024, backupCount=20, encoding="utf-8"
+    )
+    errors_h.setLevel(logging.WARNING)
+    errors_h.setFormatter(_ContextFormatter())
+    root.addHandler(errors_h)
 
 
 _setup_root_logger()

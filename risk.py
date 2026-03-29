@@ -5,8 +5,10 @@ All state is in-memory (fast) and mirrored to data/trades.csv on every update.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import dataclasses
+import json
 import math
 import threading
 from datetime import datetime, timezone
@@ -22,6 +24,7 @@ log = get_bot_logger(__name__)
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 TRADES_CSV = DATA_DIR / "trades.csv"
+OPEN_POSITIONS_JSON = DATA_DIR / "open_positions.json"
 TRADES_HEADER = [
     "timestamp", "market_id", "market_title", "market_type", "underlying", "side", "size", "price",
     "fees_paid", "rebates_earned", "hl_hedge_size", "hl_entry_price",
@@ -73,6 +76,7 @@ class Position:
     size: float               # USDC notional
     entry_price: float        # PM limit price
     strategy: str             # maker | mispricing
+    token_id: str = ""        # CLOB token_id (asset) for this side; cached so wallet cross-reference works even after market is pruned from snapshot
     opened_at: datetime = dataclasses.field(default_factory=lambda: datetime.now(timezone.utc))
 
     # HL hedge fields (populated when hedge is placed)
@@ -91,6 +95,7 @@ class Position:
     # P&L
     realized_pnl: float = 0.0
     is_closed: bool = False
+    closed_at: Optional[datetime] = None
 
     # Signal context (mispricing strategy — 0.0/"nd2_only" for maker)
     entry_deviation: float = 0.0  # |pm_price - N(d2)| at signal time
@@ -135,6 +140,11 @@ class RiskEngine:
         # is enforced at ORDER PLACEMENT time, not at fill time.
         # key: market_id  value: (strategy, underlying)
         self._deployed_slots: dict[str, tuple[str, str]] = {}
+        # Persisted token_id → strategy mapping so position restores after restart
+        # assign the correct strategy regardless of which strategies are enabled.
+        self._token_strategy: dict[str, str] = self._load_token_strategy()
+        # Lock protecting CSV file writes (used by _write_csv_row in thread pool).
+        self._csv_write_lock = threading.Lock()
         self._ensure_csv()
 
     # ── CSV ────────────────────────────────────────────────────────────────────
@@ -162,8 +172,41 @@ class RiskEngine:
                 csv.writer(f).writerow(TRADES_HEADER)
 
     def _append_csv(self, row: dict) -> None:
-        with TRADES_CSV.open("a", newline="") as f:
-            csv.DictWriter(f, fieldnames=TRADES_HEADER).writerow(row)
+        """Schedule a CSV row append.  Off-loads to a thread-pool worker when the
+        asyncio event loop is running so the hot path (event loop thread) is not
+        blocked by file I/O.  Falls back to a synchronous write otherwise (startup,
+        unit tests).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            # Fire-and-forget: the row is a plain dict, no shared mutable state.
+            loop.run_in_executor(None, self._write_csv_row, row)
+        except RuntimeError:
+            # No running event loop.
+            self._write_csv_row(row)
+
+    def _write_csv_row(self, row: dict) -> None:
+        """Write a single row to trades.csv.  Thread-safe via _csv_write_lock."""
+        with self._csv_write_lock:
+            with TRADES_CSV.open("a", newline="") as f:
+                csv.DictWriter(f, fieldnames=TRADES_HEADER).writerow(row)
+
+    def _load_token_strategy(self) -> dict[str, str]:
+        """Load persisted token_id → strategy map from disk."""
+        if OPEN_POSITIONS_JSON.exists():
+            try:
+                return json.loads(OPEN_POSITIONS_JSON.read_text())
+            except Exception:
+                pass
+        return {}
+
+    def _save_token_strategy(self) -> None:
+        """Persist token_id → strategy map. Must be called under self._lock."""
+        OPEN_POSITIONS_JSON.write_text(json.dumps(self._token_strategy))
+
+    def get_token_strategy(self, token_id: str) -> str | None:
+        """Return the strategy that opened the position for this token_id, or None."""
+        return self._token_strategy.get(token_id)
 
     # ── Checks ─────────────────────────────────────────────────────────────────
 
@@ -384,6 +427,11 @@ class RiskEngine:
                     order_id=position.order_id or "(none)",
                     strategy=position.strategy,
                 )
+            # Keep token_id → strategy map current so restores after restart
+            # assign the correct strategy even when running mixed strategies.
+            if position.token_id:
+                self._token_strategy[position.token_id] = position.strategy
+                self._save_token_strategy()
 
     def update_hedge(
         self,
@@ -414,6 +462,34 @@ class RiskEngine:
             else:
                 self._coin_hedge_notionals[coin] = notional
 
+    def reconcile_size(self, pm_size: float, *, token_id: str = "", condition_id: str = "", side: str = "") -> bool:
+        """Auto-correct Position.size from PM wallet for small fill-rounding diffs.
+
+        Called from /positions/live reconciliation when |pm_size - bot_size| < 0.05.
+        Returns True if a position was found and updated, False otherwise.
+        """
+        with self._lock:
+            pos: Optional[Position] = None
+            if condition_id and side:
+                pos = self._positions.get(self._pos_key(condition_id, side))
+            if pos is None and token_id:
+                for p in self._positions.values():
+                    if not p.is_closed and p.token_id == token_id:
+                        pos = p
+                        break
+            if pos is None or pos.is_closed:
+                return False
+            old_size = pos.size
+            pos.size = pm_size
+            log.info(
+                "Position size reconciled from PM wallet",
+                market_id=pos.market_id,
+                side=pos.side,
+                old_size=round(old_size, 4),
+                new_size=round(pm_size, 4),
+            )
+            return True
+
     def record_rebate(self, market_id: str, rebate_usd: float, side: str = "YES") -> None:
         with self._lock:
             pos = self._positions.get(self._pos_key(market_id, side))
@@ -429,6 +505,8 @@ class RiskEngine:
         fees_paid: float = 0.0,
         rebates_earned: float = 0.0,
     ) -> Optional[Position]:
+        _csv_row: Optional[dict] = None
+        _closed_pos: Optional[Position] = None
         with self._lock:
             pos = self._positions.get(self._pos_key(market_id, side))
             if pos is None or pos.is_closed:
@@ -446,6 +524,13 @@ class RiskEngine:
             pos.pm_fees_paid += fees_paid
             pos.pm_rebates_earned = total_rebates_earned
             pos.is_closed = True
+            pos.closed_at = datetime.now(timezone.utc)
+
+            # Remove from token→strategy map so a fresh position on the same
+            # token after restart isn't mis-labelled from a prior trade.
+            if pos.token_id and pos.token_id in self._token_strategy:
+                del self._token_strategy[pos.token_id]
+                self._save_token_strategy()
 
             self._realized_pnl += pnl
 
@@ -458,7 +543,7 @@ class RiskEngine:
                     threshold=-config.HARD_STOP_DRAWDOWN,
                 )
 
-            row = {
+            _csv_row = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "market_id": market_id,
                 "market_title": pos.market_title,
@@ -483,15 +568,18 @@ class RiskEngine:
                 "signal_source": pos.signal_source,
                 "signal_score": pos.signal_score,
             }
-            self._append_csv(row)
-
+            _closed_pos = pos
             log.info(
                 "Position closed",
                 market_id=market_id,
                 pnl=round(pnl, 4),
                 total_realized=round(self._realized_pnl, 4),
             )
-            return pos
+        # Write CSV outside the lock so file I/O does not extend lock-hold time.
+        # _append_csv schedules this on the thread pool when an event loop is running.
+        if _csv_row is not None:
+            self._append_csv(_csv_row)
+        return _closed_pos
 
     # ── HL hedge accounting ──────────────────────────────────────────────────
 
@@ -521,7 +609,7 @@ class RiskEngine:
 
         with self._lock:
             self._realized_pnl += pnl
-            row = {
+            _csv_row = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "market_id": f"hl_{coin}",
                 "market_title": f"HL {coin} perp hedge",
@@ -546,13 +634,14 @@ class RiskEngine:
                 "signal_source": "hl_hedge",
                 "signal_score": 0.0,
             }
-            self._append_csv(row)
             log.info(
                 "HL hedge trade recorded",
                 coin=coin, direction=direction,
                 open_price=open_price, close_price=close_price,
                 size_coins=size_coins, fees=total_fees, pnl=pnl,
             )
+        # Write CSV outside the lock — off-loaded to thread pool by _append_csv.
+        self._append_csv(_csv_row)
 
     # ── Snapshots ──────────────────────────────────────────────────────────────
 

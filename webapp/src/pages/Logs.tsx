@@ -1,9 +1,10 @@
 /**
  * Logs — Live structured bot log viewer.
  * Polls /logs every 2s. Filter by level, module, or free-text search.
+ * "Error History" tab polls /logs/errors for the long-lived WARNING+ buffer.
  */
 import { useState, useEffect, useRef } from "react";
-import { useLogs } from "../api/client";
+import { useLogs, useErrorLogs } from "../api/client";
 import type { LogEntry } from "../api/client";
 
 // ── Level styling ─────────────────────────────────────────────────────────────
@@ -17,6 +18,7 @@ const LEVEL_STYLE: Record<string, { bg: string; color: string }> = {
 };
 
 const LEVELS = ["ALL", "INFO", "WARNING", "ERROR"] as const;
+type ViewMode = "live" | "errors";
 
 // ── Single log row ────────────────────────────────────────────────────────────
 
@@ -75,6 +77,7 @@ function LogRow({ entry }: { entry: LogEntry }) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Logs() {
+  const [viewMode, setViewMode] = useState<ViewMode>("live");
   const [level, setLevel] = useState<string>("INFO");
   const [module, setModule] = useState<string>("");
   const [search, setSearch] = useState<string>("");
@@ -82,30 +85,41 @@ export default function Logs() {
   const [autoScroll, setAutoScroll] = useState(true);
   const [paused, setPaused] = useState(false);
 
+  // Reset module filter when switching view modes
+  useEffect(() => { setModule(""); }, [viewMode]);
+
   // Debounce search input
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 300);
     return () => clearTimeout(t);
   }, [search]);
 
-  const { data, error } = useLogs(
+  const liveData = useLogs(
     300,
-    paused ? "ALL" : level,         // keep fetching even when paused
+    paused ? "ALL" : level,
+    module || undefined,
+    debouncedSearch || undefined,
+  );
+  const errorData = useErrorLogs(
+    500,
     module || undefined,
     debouncedSearch || undefined,
   );
 
+  const data    = viewMode === "live" ? liveData.data    : errorData.data;
+  const error   = viewMode === "live" ? liveData.error   : errorData.error;
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to bottom (newest = top since API returns newest-first)
+  // Auto-scroll to top (newest-first)
   useEffect(() => {
     if (autoScroll && !paused && containerRef.current) {
       containerRef.current.scrollTop = 0;
     }
   }, [data, autoScroll, paused]);
 
-  const displayedLogs = paused ? data?.logs ?? [] : data?.logs ?? [];
+  const displayedLogs = data?.logs ?? [];
 
   return (
     <div className="page">
@@ -115,35 +129,56 @@ export default function Logs() {
           <span className="muted" style={{ fontSize: 12 }}>
             {data ? `${data.total} entries` : "–"}
           </span>
-          <button
-            className={`toggle-btn ${paused ? "toggle-on-danger" : "toggle-off"}`}
-            style={{ fontSize: 12, padding: "0.25rem 0.75rem" }}
-            onClick={() => setPaused((p) => !p)}
-          >
-            {paused ? "▶ Resume" : "⏸ Pause"}
-          </button>
+          {viewMode === "live" && (
+            <button
+              className={`toggle-btn ${paused ? "toggle-on-danger" : "toggle-off"}`}
+              style={{ fontSize: 12, padding: "0.25rem 0.75rem" }}
+              onClick={() => setPaused((p) => !p)}
+            >
+              {paused ? "▶ Resume" : "⏸ Pause"}
+            </button>
+          )}
         </div>
+      </div>
+
+      {/* View mode tabs */}
+      <div className="period-tabs" style={{ marginBottom: "0.5rem" }}>
+        <button
+          className={viewMode === "live" ? "active" : ""}
+          onClick={() => setViewMode("live")}
+        >
+          Live
+        </button>
+        <button
+          className={viewMode === "errors" ? "active" : ""}
+          style={viewMode === "errors" ? { background: LEVEL_STYLE.WARNING.bg, borderColor: LEVEL_STYLE.WARNING.color, color: LEVEL_STYLE.WARNING.color } : undefined}
+          onClick={() => setViewMode("errors")}
+        >
+          Error History
+        </button>
       </div>
 
       {/* Filters */}
       <div className="log-filters">
-        {/* Level tabs */}
-        <div className="period-tabs">
-          {LEVELS.map((l) => (
-            <button
-              key={l}
-              className={level === l ? "active" : ""}
-              onClick={() => setLevel(l)}
-              style={
-                l !== "ALL" && level === l
-                  ? { background: LEVEL_STYLE[l]?.bg, borderColor: LEVEL_STYLE[l]?.color, color: LEVEL_STYLE[l]?.color }
-                  : undefined
-              }
-            >
-              {l}
-            </button>
-          ))}
-        </div>
+        {/* Level tabs — only shown in live mode */}
+        {viewMode === "live" && (
+          <div className="period-tabs">
+            {LEVELS.map((l) => (
+              <button
+                key={l}
+                className={level === l ? "active" : ""}
+                onClick={() => setLevel(l)}
+                style={
+                  l !== "ALL" && level === l
+                    ? { background: LEVEL_STYLE[l]?.bg, borderColor: LEVEL_STYLE[l]?.color, color: LEVEL_STYLE[l]?.color }
+                    : undefined
+                }
+              >
+                {l}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Module filter */}
         <select
@@ -167,16 +202,24 @@ export default function Logs() {
         />
 
         {/* Auto-scroll toggle */}
-        <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: 12, color: "#94a3b8", whiteSpace: "nowrap" }}>
-          <input
-            type="checkbox"
-            checked={autoScroll}
-            onChange={(e) => setAutoScroll(e.target.checked)}
-            style={{ accentColor: "#6366f1" }}
-          />
-          Auto-scroll
-        </label>
+        {viewMode === "live" && (
+          <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: 12, color: "#94a3b8", whiteSpace: "nowrap" }}>
+            <input
+              type="checkbox"
+              checked={autoScroll}
+              onChange={(e) => setAutoScroll(e.target.checked)}
+              style={{ accentColor: "#6366f1" }}
+            />
+            Auto-scroll
+          </label>
+        )}
       </div>
+
+      {viewMode === "errors" && (
+        <div className="muted" style={{ fontSize: 12, marginBottom: "0.5rem" }}>
+          Showing WARNING+ entries from the long-lived error buffer (up to 20 000 entries, refreshed every 10 s).
+        </div>
+      )}
 
       {error && <div className="error">Log API error: {error}</div>}
 

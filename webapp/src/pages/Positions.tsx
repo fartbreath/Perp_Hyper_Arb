@@ -9,8 +9,8 @@
  * HL hedges: individual rows (unchanged).
  */
 import { useState } from "react";
-import { usePositions, useMakerSignals, useLivePositions, undeployQuote, closePosition, dismissGhostPosition } from "../api/client";
-import type { Position } from "../api/client";
+import { usePositions, useMakerSignals, useLivePositions, useConfig, undeployQuote, closePosition, dismissGhostPosition, redeemPosition } from "../api/client";
+import type { Position, RedeemResult } from "../api/client";
 import { usePolymarketEventSlugs } from "../utils/usePolymarketEventSlugs";
 
 function timeSince(iso: string | null | undefined): string {
@@ -72,6 +72,8 @@ interface SpreadRowProps {
 
 function SpreadRow({ marketId, yes, no, closeState, onClose, marketUrl }: SpreadRowProps) {
   const rep = yes ?? no!;  // at least one is defined
+  const isClosed = !!(rep.is_closed);
+  const closedPnl = (yes?.realized_pnl ?? 0) + (no?.realized_pnl ?? 0);
 
   // Entry prices in token-space (YES token and NO token cents)
   const entryYesCents = yes ? yes.entry_price * 100 : null;
@@ -141,7 +143,11 @@ function SpreadRow({ marketId, yes, no, closeState, onClose, marketUrl }: Spread
 
       {/* Spread status */}
       <td>
-        {isComplete ? (
+        {isClosed ? (
+          <span style={{ padding: "2px 7px", borderRadius: 4, fontSize: "0.75rem", fontWeight: 600, background: "#1f2937", color: "#6b7280" }}>
+            CLOSED
+          </span>
+        ) : isComplete ? (
           <span style={{ padding: "2px 7px", borderRadius: 4, fontSize: "0.75rem", fontWeight: 600, background: "#1e3a5f", color: "#60a5fa" }}>
             SPREAD
           </span>
@@ -276,7 +282,11 @@ function SpreadRow({ marketId, yes, no, closeState, onClose, marketUrl }: Spread
 
       {/* Action */}
       <td>
-        {hasDone ? (
+        {isClosed ? (
+          <span style={{ fontSize: "0.78rem", fontWeight: 600, color: pnlColor(closedPnl) }}>
+            {pnlStr(closedPnl)} realized
+          </span>
+        ) : hasDone ? (
           <span style={{ fontSize: "0.75rem", color: "#94a3b8", display: "block", maxWidth: 120 }}>
             {closeState}
           </span>
@@ -300,6 +310,115 @@ function SpreadRow({ marketId, yes, no, closeState, onClose, marketUrl }: Spread
   );
 }
 
+// -- MomentumRow ---------------------------------------------------------------
+
+function MomentumRow({
+  pos,
+  closeState,
+  onClose,
+  marketUrl,
+  stopLoss,
+  takeProfit,
+}: {
+  pos: Position;
+  closeState: string | undefined;
+  onClose: (id: string) => void;
+  marketUrl: string | null;
+  stopLoss: number;
+  takeProfit: number;
+}) {
+  const tokenEntry = pos.token_entry_price ?? (pos.side === "NO" ? 1 - pos.entry_price : pos.entry_price);
+  const tokenCurrent = pos.token_current_price ??
+    (pos.current_mid == null ? null : (pos.side === "NO" ? 1 - pos.current_mid : pos.current_mid));
+  const unrealizedPnl = pos.unrealised_pnl_usd ??
+    (tokenCurrent != null ? (tokenCurrent - tokenEntry) * pos.contracts : null);
+  const contracts = pos.contracts ?? pos.size_usd;
+
+  // Stop/TP proximity bar — 0 = at stop, 100 = at TP
+  const proximityPct = tokenCurrent != null
+    ? Math.max(0, Math.min(100, ((tokenCurrent - stopLoss) / (takeProfit - stopLoss)) * 100))
+    : null;
+  const proxColor = proximityPct == null ? "#64748b"
+    : proximityPct < 15 ? "#ef4444"
+    : proximityPct < 35 ? "#f59e0b"
+    : proximityPct >= 85 ? "#22c55e"
+    : "#94a3b8";
+
+  const isBusy = closeState === "closing";
+  const hasDone = !!closeState && closeState !== "closing";
+
+  return (
+    <tr>
+      <td title={pos.market_title} style={{ maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {marketUrl ? (
+          <a href={marketUrl} target="_blank" rel="noopener noreferrer">{pos.market_title}</a>
+        ) : pos.market_title}
+      </td>
+      <td><strong>{pos.underlying}</strong></td>
+      <td>
+        <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: "0.8rem", fontWeight: 600, background: sideBg(pos.side), color: "#fff" }}>
+          {pos.side}
+        </span>
+      </td>
+      {/* Entry price */}
+      <td style={{ fontFamily: "monospace" }}>{(tokenEntry * 100).toFixed(1)}&cent;</td>
+      {/* Current price */}
+      <td style={{ fontFamily: "monospace", color: "#94a3b8" }}>
+        {tokenCurrent != null ? `${(tokenCurrent * 100).toFixed(1)}\u00A2` : "\u2014"}
+        {pos.book_age_s != null && pos.book_age_s > 60 && (
+          <span style={{ color: "#ef4444", marginLeft: 4, fontSize: "0.75rem" }} title={`Book is ${pos.book_age_s}s old`}>⚠</span>
+        )}
+      </td>
+      {/* Stop / TP proximity */}
+      <td title={tokenCurrent != null
+          ? `Stop: ${(stopLoss * 100).toFixed(0)}¢  |  Current: ${(tokenCurrent * 100).toFixed(1)}¢  |  TP: ${(takeProfit * 100).toFixed(0)}¢`
+          : "Price unavailable"}
+          style={{ minWidth: 80 }}>
+        {proximityPct != null ? (
+          <div>
+            <div style={{ height: 6, background: "#1e293b", borderRadius: 3, overflow: "hidden", marginBottom: 2 }}>
+              <div style={{ height: "100%", width: `${proximityPct}%`, background: proxColor, transition: "width 0.4s" }} />
+            </div>
+            <span style={{ fontFamily: "monospace", fontSize: "0.72rem", color: proxColor }}>
+              {proximityPct.toFixed(0)}%
+            </span>
+          </div>
+        ) : <span style={{ color: "#4b5563" }}>&mdash;</span>}
+      </td>
+      {/* USD deployed */}
+      <td style={{ fontFamily: "monospace", color: "#f59e0b", fontWeight: 600 }}
+          title={`${contracts.toFixed(0)} contracts`}>
+        ${(pos.entry_cost_usd ?? 0).toFixed(2)}
+      </td>
+      {/* Unrealised P&L */}
+      <td style={{ fontFamily: "monospace", fontWeight: 700, color: pnlColor(unrealizedPnl) }}>
+        {pnlStr(unrealizedPnl)}
+      </td>
+      {/* Opened */}
+      <td className="muted">{timeSince(pos.opened_at)}</td>
+      {/* Ends */}
+      <td style={{ fontFamily: "monospace", fontWeight: 600, color: timeUntilEnd(pos.end_date).color }}
+          title={pos.end_date ? new Date(pos.end_date).toLocaleString() : undefined}>
+        {timeUntilEnd(pos.end_date).label}
+      </td>
+      {/* Action */}
+      <td>
+        {hasDone ? (
+          <span style={{ fontSize: "0.78rem", color: "#94a3b8", display: "block", maxWidth: 120 }}>{closeState}</span>
+        ) : (
+          <button
+            disabled={isBusy}
+            onClick={() => onClose(pos.condition_id)}
+            style={{ padding: "3px 10px", fontSize: "0.78rem", borderRadius: 4, border: "1px solid #ef4444", background: "transparent", color: "#ef4444", cursor: isBusy ? "wait" : "pointer", opacity: isBusy ? 0.5 : 1 }}
+          >
+            {isBusy ? "Closing..." : "Close"}
+          </button>
+        )}
+      </td>
+    </tr>
+  );
+}
+
 // -- Main component ------------------------------------------------------------
 
 export default function Positions() {
@@ -307,8 +426,12 @@ export default function Positions() {
   const slugMap = usePolymarketEventSlugs();
   const [closeState, setCloseState] = useState<Record<string, string>>({});
   const { data: signalsData } = useMakerSignals();
+  const { data: cfg } = useConfig();
   const [orderPending, setOrderPending] = useState<string | null>(null);
   const openOrders = (signalsData?.signals ?? []).filter((s) => s.is_deployed);
+
+  const stopLoss = cfg?.momentum_stop_loss ?? 0.55;
+  const takeProfit = cfg?.momentum_take_profit ?? 0.96;
 
   const handleClose = async (marketId: string) => {
     setCloseState((s) => ({ ...s, [marketId]: "closing" }));
@@ -337,17 +460,23 @@ export default function Positions() {
   const pmPositions = all.filter((p) => p.venue === "PM");
   const hlHedges = all.filter((p) => p.venue === "HL");
 
-  // Split PM positions into maker and mispricing
+  // Split PM positions into maker and mispricing (open only for mispricing)
   const makerPositions = pmPositions.filter((p) => p.strategy === "maker");
-  const mispricingPositions = pmPositions.filter((p) => p.strategy !== "maker");
+  const mispricingPositions = pmPositions.filter((p) => p.strategy === "mispricing" && !p.is_closed);
+  const momentumPositions = pmPositions.filter((p) => p.strategy === "momentum" && !p.is_closed);
+  // Positions whose strategy could not be determined on restore (no open_positions.json entry)
+  const unknownPositions = pmPositions.filter((p) => p.strategy === "unknown" && !p.is_closed);
 
   // Group maker positions by condition_id -> Map<condition_id, {yes?, no?}>
+  // Open and recently-closed spreads are kept separate so closed ones render last.
   const makerSpreads = new Map<string, { yes?: Position; no?: Position }>();
+  const closedSpreads = new Map<string, { yes?: Position; no?: Position }>();
   for (const pos of makerPositions) {
-    const existing = makerSpreads.get(pos.condition_id) ?? {};
+    const target = pos.is_closed ? closedSpreads : makerSpreads;
+    const existing = target.get(pos.condition_id) ?? {};
     if (pos.side === "YES") existing.yes = pos;
     else existing.no = pos;
-    makerSpreads.set(pos.condition_id, existing);
+    target.set(pos.condition_id, existing);
   }
 
   return (
@@ -357,7 +486,10 @@ export default function Positions() {
         {data && (
           <span className="muted" style={{ fontSize: "0.85rem", marginLeft: "0.75rem" }}>
             {makerSpreads.size} maker spread{makerSpreads.size !== 1 ? "s" : ""}
+            {closedSpreads.size > 0 && ` · ${closedSpreads.size} recently closed`}
             {mispricingPositions.length > 0 && ` \u00B7 ${mispricingPositions.length} mispricing`}
+            {momentumPositions.length > 0 && ` \u00B7 ${momentumPositions.length} momentum`}
+            {unknownPositions.length > 0 && ` \u00B7 ${unknownPositions.length} unknown`}
             {" · "}{hlHedges.length} HL hedge{hlHedges.length !== 1 ? "s" : ""}
           </span>
         )}
@@ -405,6 +537,32 @@ export default function Positions() {
                     no={no}
                     closeState={closeState[marketId]}
                     onClose={handleClose}
+                    marketUrl={marketUrl}
+                  />
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* -- Recently closed maker spreads (grace period: 5 min) ------------- */}
+      {closedSpreads.size > 0 && (
+        <div style={{ overflowX: "auto", opacity: 0.65 }}>
+          <table className="data-table" style={{ borderTop: "1px dashed #374151" }}>
+            <tbody>
+              {Array.from(closedSpreads.entries()).map(([marketId, { yes, no }]) => {
+                const rep = yes ?? no!;
+                const slug = rep.market_slug || slugMap[marketId];
+                const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+                return (
+                  <SpreadRow
+                    key={marketId}
+                    marketId={marketId}
+                    yes={yes}
+                    no={no}
+                    closeState={undefined}
+                    onClose={() => {}}
                     marketUrl={marketUrl}
                   />
                 );
@@ -495,6 +653,128 @@ export default function Positions() {
                           style={{ padding: "3px 10px", fontSize: "0.78rem", borderRadius: 4, border: "1px solid #ef4444", background: "transparent", color: "#ef4444", cursor: closeState[marketId] === "closing" ? "wait" : "pointer", opacity: closeState[marketId] === "closing" ? 0.5 : 1 }}
                         >
                           {closeState[marketId] === "closing" ? "Closing..." : "Close"}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {/* -- Momentum positions -------------------------------- */}
+      <h3 style={{ marginTop: "2rem", marginBottom: "0.5rem", fontSize: "0.9rem", color: "#9ca3af" }}>
+        Momentum Positions
+      </h3>
+      {!loading && momentumPositions.length === 0 && (
+        <div className="muted" style={{ paddingBottom: "1rem" }}>No open momentum positions.</div>
+      )}
+      {momentumPositions.length > 0 && (
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>Underlying</th>
+              <th>Side</th>
+              <th title="Entry token price (side-adjusted)" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Entry</th>
+              <th title="Current live token price" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Current</th>
+              <th title="Stop/TP proximity — 0% = at stop, 100% = at take-profit" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Stop … TP</th>
+              <th title="USDC capital deployed at entry" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Deployed</th>
+              <th title="Unrealised P&L at current price">Unrealised P&L</th>
+              <th>Opened</th>
+              <th>Ends</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {momentumPositions.map((pos) => {
+              const slug = pos.market_slug || slugMap[pos.condition_id];
+              const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+              return (
+                <MomentumRow
+                  key={pos.condition_id + pos.side}
+                  pos={pos}
+                  closeState={closeState[pos.condition_id]}
+                  onClose={handleClose}
+                  marketUrl={marketUrl}
+                  stopLoss={stopLoss}
+                  takeProfit={takeProfit}
+                />
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+
+      {/* -- Unknown strategy positions (no open_positions.json entry) ------- */}
+      {unknownPositions.length > 0 && (
+        <>
+          <h3 style={{ marginTop: "2rem", marginBottom: "0.5rem", fontSize: "0.9rem", color: "#f59e0b" }}>
+            ⚠ Unknown Strategy
+            <span style={{ fontWeight: 400, marginLeft: "0.5rem", fontSize: "0.8rem", color: "#94a3b8" }}>
+              — strategy could not be determined on restore; close or reassign manually
+            </span>
+          </h3>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>Underlying</th>
+                <th>Side</th>
+                <th>Entry</th>
+                <th>Current</th>
+                <th>Deployed</th>
+                <th>Unrealised P&amp;L</th>
+                <th>Opened</th>
+                <th>Ends</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {unknownPositions.map((pos) => {
+                const slug = pos.market_slug || slugMap[pos.condition_id];
+                const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+                const tokenPrice = pos.token_entry_price ?? (pos.side === "NO" ? 1 - pos.entry_price : pos.entry_price);
+                const currentTokenPrice = pos.token_current_price ?? (pos.current_mid == null ? null : pos.side === "NO" ? 1 - pos.current_mid : pos.current_mid);
+                const unrealizedPnl = pos.unrealised_pnl_usd ?? (currentTokenPrice != null ? (currentTokenPrice - tokenPrice) * pos.contracts : null);
+                return (
+                  <tr key={pos.condition_id + pos.side}>
+                    <td title={pos.market_title} style={{ maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {marketUrl ? <a href={marketUrl} target="_blank" rel="noopener noreferrer">{pos.market_title}</a> : pos.market_title}
+                    </td>
+                    <td>{pos.underlying}</td>
+                    <td>
+                      <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: "0.8rem", fontWeight: 600, background: sideBg(pos.side), color: "#fff" }}>
+                        {pos.side}
+                      </span>
+                    </td>
+                    <td style={{ fontFamily: "monospace" }}>{(tokenPrice * 100).toFixed(2)}&cent;</td>
+                    <td style={{ fontFamily: "monospace", color: "#94a3b8" }}>
+                      {currentTokenPrice != null ? `${(currentTokenPrice * 100).toFixed(1)}\u00A2` : "\u2014"}
+                    </td>
+                    <td style={{ fontFamily: "monospace", color: "#f59e0b", fontWeight: 600 }}>
+                      ${(pos.entry_cost_usd ?? 0).toFixed(2)}
+                    </td>
+                    <td style={{ fontFamily: "monospace", fontWeight: 600, color: pnlColor(unrealizedPnl) }}>
+                      {pnlStr(unrealizedPnl)}
+                    </td>
+                    <td className="muted">{timeSince(pos.opened_at)}</td>
+                    <td style={{ fontFamily: "monospace", fontWeight: 600, color: timeUntilEnd(pos.end_date).color }}
+                        title={pos.end_date ? new Date(pos.end_date).toLocaleString() : undefined}>
+                      {timeUntilEnd(pos.end_date).label}
+                    </td>
+                    <td>
+                      {closeState[pos.condition_id] && closeState[pos.condition_id] !== "closing" ? (
+                        <span style={{ fontSize: "0.78rem", color: "#94a3b8" }}>{closeState[pos.condition_id]}</span>
+                      ) : (
+                        <button
+                          disabled={closeState[pos.condition_id] === "closing"}
+                          onClick={() => handleClose(pos.condition_id)}
+                          style={{ padding: "3px 10px", fontSize: "0.78rem", borderRadius: 4, border: "1px solid #ef4444", background: "transparent", color: "#ef4444", cursor: closeState[pos.condition_id] === "closing" ? "wait" : "pointer", opacity: closeState[pos.condition_id] === "closing" ? 0.5 : 1 }}
+                        >
+                          {closeState[pos.condition_id] === "closing" ? "Closing..." : "Close"}
                         </button>
                       )}
                     </td>
@@ -655,6 +935,7 @@ export default function Positions() {
 function PMWalletPanel() {
   const { data, loading, error, refresh } = useLivePositions();
   const [dismissState, setDismissState] = useState<Record<string, string>>({});
+  const [redeemState, setRedeemState] = useState<Record<string, string>>({});
 
   async function handleDismiss(tokenId: string, side: string) {
     setDismissState((s) => ({ ...s, [tokenId]: "dismissing" }));
@@ -671,6 +952,27 @@ function PMWalletPanel() {
         ...s,
         [tokenId]: e instanceof Error ? e.message : "Error",
       }));
+    }
+  }
+
+  async function handleRedeem(tokenId: string, conditionId: string, won: boolean, payoutUsd: number) {
+    const key = tokenId;
+    setRedeemState((s) => ({ ...s, [key]: won ? "Redeeming on-chain…" : "Dismissing…" }));
+    try {
+      const result: RedeemResult = await redeemPosition(tokenId, conditionId, won, payoutUsd);
+      if (result.ok) {
+        const msg = result.tx_hash
+          ? `Submitted ✓ tx: ${result.tx_hash.slice(0, 10)}…`
+          : won ? "Closed ✓ — USDC pending" : "Dismissed ✓";
+        setRedeemState((s) => ({ ...s, [key]: msg }));
+        if (refresh) refresh();
+      } else if (result.requires_manual_claim) {
+        setRedeemState((s) => ({ ...s, [key]: `Manual: ${result.error ?? "go to Polymarket.com"}` }));
+      } else {
+        setRedeemState((s) => ({ ...s, [key]: result.error ?? "Error" }));
+      }
+    } catch (e: unknown) {
+      setRedeemState((s) => ({ ...s, [key]: e instanceof Error ? e.message : "Error" }));
     }
   }
 
@@ -733,20 +1035,70 @@ function PMWalletPanel() {
         </div>
       )}
 
-      {/* Pending redemption */}
-      {data && data.pending_redemption_count > 0 && (
-        <div style={{ background: "#1c1917", border: "1px solid #a78bfa", borderRadius: 6, padding: "0.6rem 1rem", marginBottom: "0.75rem", fontSize: "0.82rem" }}>
-          <strong style={{ color: "#c4b5fd" }}>⏳ {data.pending_redemption_count} token{data.pending_redemption_count === 1 ? "" : "s"} pending redemption</strong>
-          <ul style={{ margin: "0.35rem 0 0 1rem", padding: 0, color: "#c4b5fd" }}>
-            {data.pending_redemption.map((p, i) => (
-              <li key={i}>
-                {p.won ? <span style={{ color: "#4ade80" }}>WON</span> : <span style={{ color: "#f87171" }}>LOST</span>}
-                {" "}{p.size.toFixed(2)}ct @ {(p.avg_price * 100).toFixed(1)}¢ avg — {p.title || p.token_id.slice(0, 20) + "..."}  [outcome: {p.outcome || "?"}]
-                {p.payout_usd != null && <span style={{ color: "#4ade80", marginLeft: 6 }}>payout ≈ ${p.payout_usd.toFixed(2)}</span>}
+      {/* Awaiting settlement — market ended, but on-chain CTF resolution not yet published */}
+      {data && (data.awaiting_settlement_count ?? 0) > 0 && (
+        <div style={{ background: "#1c1917", border: "1px solid #78716c", borderRadius: 6, padding: "0.6rem 1rem", marginBottom: "0.75rem", fontSize: "0.82rem" }}>
+          <strong style={{ color: "#a8a29e" }}>⏳ {data.awaiting_settlement_count} token{data.awaiting_settlement_count === 1 ? "" : "s"} awaiting on-chain settlement</strong>
+          <ul style={{ margin: "0.35rem 0 0 1rem", padding: 0, color: "#a8a29e", listStyle: "none" }}>
+            {(data.awaiting_settlement ?? []).map((p: { won: boolean; size: number; avg_price: number; title: string; token_id: string; outcome: string; payout_usd?: number }, i: number) => (
+              <li key={i} style={{ display: "flex", alignItems: "center", gap: "0.5rem", padding: "0.2rem 0" }}>
+                {p.won
+                  ? <span style={{ color: "#86efac", fontWeight: 700, minWidth: 36 }}>WON</span>
+                  : <span style={{ color: "#fca5a5", fontWeight: 700, minWidth: 36 }}>LOST</span>}
+                <span style={{ flex: 1 }}>
+                  {p.size.toFixed(2)}ct @ {(p.avg_price * 100).toFixed(1)}¢ —{" "}
+                  {p.title || p.token_id.slice(0, 20) + "…"}{" "}
+                  <span style={{ color: "#57534e" }}>[{p.outcome || "?"}]</span>
+                  {p.payout_usd != null && p.payout_usd > 0 && (
+                    <span style={{ color: "#86efac", marginLeft: 6 }}>≈ ${p.payout_usd.toFixed(2)}</span>
+                  )}
+                </span>
+                <span style={{ fontSize: "0.7rem", color: "#78716c", whiteSpace: "nowrap" }}>Oracle pending…</span>
               </li>
             ))}
           </ul>
-          <p style={{ margin: "0.5rem 0 0", color: "#6b7280", fontSize: "0.75rem" }}>Redeem via Polymarket.com &rarr; Positions tab.</p>
+          <p style={{ margin: "0.35rem 0 0", color: "#57534e", fontSize: "0.72rem" }}>UMA/oracle resolution not yet published on-chain. Redeem button will appear once ready.</p>
+        </div>
+      )}
+
+      {/* Pending redemption — redeemable=true from data API, CTF resolved on-chain */}
+      {data && data.pending_redemption_count > 0 && (
+        <div style={{ background: "#1c1917", border: "1px solid #a78bfa", borderRadius: 6, padding: "0.6rem 1rem", marginBottom: "0.75rem", fontSize: "0.82rem" }}>
+          <strong style={{ color: "#c4b5fd" }}>✅ {data.pending_redemption_count} token{data.pending_redemption_count === 1 ? "" : "s"} ready to redeem</strong>
+          <ul style={{ margin: "0.35rem 0 0 1rem", padding: 0, color: "#c4b5fd", listStyle: "none" }}>
+            {data.pending_redemption.map((p, i) => {
+              const key = p.token_id;
+              const status = redeemState[key];
+              return (
+                <li key={i} style={{ display: "flex", alignItems: "center", gap: "0.5rem", padding: "0.25rem 0" }}>
+                  {p.won
+                    ? <span style={{ color: "#4ade80", fontWeight: 700, minWidth: 36 }}>WON</span>
+                    : <span style={{ color: "#f87171", fontWeight: 700, minWidth: 36 }}>LOST</span>}
+                  <span style={{ flex: 1 }}>
+                    {p.size.toFixed(2)}ct @ {(p.avg_price * 100).toFixed(1)}¢ —{" "}
+                    {p.title || p.token_id.slice(0, 20) + "…"}{" "}
+                    <span style={{ color: "#6b7280" }}>[{p.outcome || "?"}]</span>
+                    {p.payout_usd != null && p.payout_usd > 0 && (
+                      <span style={{ color: "#4ade80", marginLeft: 6 }}>≈ ${p.payout_usd.toFixed(2)}</span>
+                    )}
+                  </span>
+                  {status ? (
+                    <span style={{ fontSize: "0.72rem", color: "#9ca3af", maxWidth: 220 }}>{status}</span>
+                  ) : p.won ? (
+                    <span style={{ fontSize: "0.72rem", color: "#6b7280", fontStyle: "italic" }}>Bot redeeming…</span>
+                  ) : (
+                    <button
+                      onClick={() => handleRedeem(p.token_id, p.condition_id, false, 0)}
+                      style={{ padding: "2px 10px", fontSize: "0.72rem", borderRadius: 4, border: "none", cursor: "pointer", background: "#374151", color: "#d1d5db" }}
+                    >
+                      Dismiss
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          <p style={{ margin: "0.35rem 0 0", color: "#57534e", fontSize: "0.72rem" }}>Won positions are redeemed automatically by the bot.</p>
         </div>
       )}
 
@@ -776,7 +1128,8 @@ function PMWalletPanel() {
                         title={p.title}>{p.title || p.token_id.slice(0, 24) + "..."}</td>
                     <td style={{ color: "#94a3b8" }}>{p.outcome}</td>
                     <td><span style={{ padding: "1px 6px", borderRadius: 3, fontSize: "0.72rem", fontWeight: 600,
-                        background: p.side_guess === "YES" ? "#166534" : p.side_guess === "NO" ? "#7f1d1d" : "#374151",
+                        background: p.side_guess === "YES" ? "#166534" : p.side_guess === "NO" ? "#7f1d1d"
+                          : p.side_guess ? (p.cur_price >= 0.5 ? "#166534" : "#7f1d1d") : "#374151",
                         color: "#fff" }}>{p.side_guess || "?"}</span></td>
                     <td style={{ fontFamily: "monospace" }}>{p.size.toFixed(2)}</td>
                     <td style={{ fontFamily: "monospace" }}>{(p.avg_price * 100).toFixed(1)}&cent;</td>

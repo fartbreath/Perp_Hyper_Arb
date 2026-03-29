@@ -1000,6 +1000,48 @@ class TestExitTriggers:
         )
         assert flag and reason == ExitReason.RESOLVED
 
+    # ── Unknown strategy ──────────────────────────────────────────────────────
+
+    def test_unknown_strategy_no_triggers_near_expiry_large_loss(self):
+        """'unknown' positions fire no triggers regardless of P&L or proximity to expiry."""
+        config.MIN_HOLD_SECONDS = 60
+        config.STOP_LOSS_USD = 25.0
+        config.EXIT_DAYS_BEFORE_RESOLUTION = 3
+        now = self.FAR_FUTURE
+        end_date = now + timedelta(days=1)   # 1 day left — would fire mispricing TIME_STOP
+        pos = _yes("m", entry_price=0.80, size=100.0, strategy="unknown")
+        # Unrealised loss of $79 — well past stop-loss threshold
+        flag, _, _ = should_exit(
+            pos, 0.01, initial_deviation=0.10,
+            market_end_date=end_date, now=now
+        )
+        assert not flag, "'unknown' must not trigger TIME_STOP or STOP_LOSS"
+
+    def test_unknown_strategy_resolved_global_fires(self):
+        """RESOLVED fires for 'unknown' positions — it is the only permitted exit."""
+        config.MIN_HOLD_SECONDS = 60
+        now = self.FAR_FUTURE
+        end_date = now - timedelta(seconds=1)  # market already resolved
+        pos = _yes("m", entry_price=0.50, size=100.0, strategy="unknown")
+        flag, reason, _ = should_exit(
+            pos, 0.50, initial_deviation=0.10,
+            market_end_date=end_date, now=now
+        )
+        assert flag and reason == ExitReason.RESOLVED
+
+    def test_unrecognised_strategy_label_no_triggers(self):
+        """Any label that isn't a known strategy behaves like 'unknown' — no triggers."""
+        config.MIN_HOLD_SECONDS = 60
+        config.STOP_LOSS_USD = 25.0
+        now = self.FAR_FUTURE
+        end_date = now + timedelta(days=1)
+        pos = _yes("m", entry_price=0.80, size=100.0, strategy="legacy_arb")
+        flag, _, _ = should_exit(
+            pos, 0.01, initial_deviation=0.10,
+            market_end_date=end_date, now=now
+        )
+        assert not flag, "unrecognised strategy label must not trigger exits"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # K  Exit fee model — three distinct regimes

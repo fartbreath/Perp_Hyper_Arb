@@ -37,9 +37,11 @@ Thumbs.db
 
 # Project runtime / generated data
 data/
-market_data/
 *.log
 *.jsonl
+
+# Analysis / one-off research helpers
+scripts/
 
 # Gstack
 .gstack/

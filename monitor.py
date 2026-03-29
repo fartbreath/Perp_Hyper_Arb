@@ -2,12 +2,29 @@
 monitor.py — Position exit monitor.
 
 Runs as an asyncio task, checking all open positions every MONITOR_INTERVAL
-seconds and closing them when any exit condition is met:
+seconds.  Exit logic is **strategy-isolated**: each strategy has its own
+explicit exit conditions and no position can be exited by a rule belonging to
+a different strategy.
 
-  1. Profit target  — unrealised P&L >= PROFIT_TARGET_PCT * initial_deviation * size
-  2. Stop-loss      — unrealised P&L <= -STOP_LOSS_USD
-  3. Time stop      — market end_date within EXIT_DAYS_BEFORE_RESOLUTION days
-  4. Resolved stop  — market end_date has passed (prevent holding into resolution)
+Strategy exit rules
+-------------------
+  * **maker**   — TIME_STOP for non-bucket (milestone/daily) markets within
+                  MAKER_EXIT_HOURS of expiry.  Bucket positions hold to
+                  RESOLVED.  No per-position profit target or stop-loss.
+  * **momentum** — token-price exits (MOMENTUM_STOP_LOSS / MOMENTUM_TAKE_PROFIT).
+                  No time-stop; the min-TTE entry gate already places entries
+                  close to expiry.
+  * **mispricing** — EXIT_DAYS_BEFORE_RESOLUTION time-stop, PROFIT_TARGET and
+                  STOP_LOSS in USD P&L space.
+  * **unknown** / any other label — NO triggers at all.  The position is held
+                  until the market resolves.
+
+Global action (all strategies)
+-------------------------------
+  RESOLVED: once ``now >= market.end_date`` the position is recorded as closed
+  in the risk engine (price snapped to 0.0 or 1.0).  The ``_auto_redeem_loop``
+  background task then polls the PM wallet for ``redeemable=True`` and submits
+  the on-chain CTF redemption transaction when the oracle is ready.
 
 Usage:
     monitor = PositionMonitor(pm, risk_engine)
@@ -24,6 +41,7 @@ import config
 from logger import get_bot_logger
 from risk import RiskEngine, Position
 from market_data.pm_client import PMClient, _MARKET_TYPE_DURATION_SECS
+from ctf_utils import _redeem_ctf_via_safe
 
 log = get_bot_logger(__name__)
 
@@ -31,11 +49,13 @@ log = get_bot_logger(__name__)
 # ── Exit reason constants ─────────────────────────────────────────────────────
 
 class ExitReason:
-    PROFIT_TARGET    = "profit_target"
-    STOP_LOSS        = "stop_loss"
-    TIME_STOP        = "time_stop"
-    RESOLVED         = "resolved"
-    COIN_LOSS_LIMIT  = "coin_loss_limit"  # maker: aggregate coin P&L exceeded threshold
+    PROFIT_TARGET       = "profit_target"
+    STOP_LOSS           = "stop_loss"
+    TIME_STOP           = "time_stop"
+    RESOLVED            = "resolved"
+    COIN_LOSS_LIMIT     = "coin_loss_limit"      # maker: aggregate coin P&L exceeded threshold
+    MOMENTUM_STOP_LOSS  = "momentum_stop_loss"   # momentum: held token fell below MOMENTUM_STOP_LOSS
+    MOMENTUM_TAKE_PROFIT= "momentum_take_profit" # momentum: held token rose above MOMENTUM_TAKE_PROFIT
 
 
 # ── Pure helpers (easily unit-tested) ────────────────────────────────────────
@@ -64,9 +84,29 @@ def should_exit(
     """
     Decide whether a position should be exited.
 
+    Strategy dispatch is **explicit**: each recognised strategy has its own
+    exit block with an explicit ``return`` so there is no unintended fall-
+    through between strategies.  The rules are:
+
+      * **Global (all strategies)**: RESOLVED fires once ``now >= end_date``.
+        This is also checked as a fast-path in ``_check_position`` before this
+        function is reached, so the check here mainly serves unit tests.
+      * **unknown** (position restored without a strategy label): no triggers
+        at all — the position is held until the market resolves, then the
+        auto-redeem loop handles on-chain redemption.
+      * **maker**: TIME_STOP fires for non-bucket (milestone/daily) markets
+        within MAKER_EXIT_HOURS of expiry.  Bucket positions are held to
+        RESOLVED.  No per-position profit target or stop-loss.
+      * **momentum**: token-price exits (MOMENTUM_STOP_LOSS / MOMENTUM_TAKE_PROFIT)
+        in YES-price space.  No time-stop — the min-TTE entry gate already
+        places entries close to expiry, so holding to RESOLVED is correct.
+      * **mispricing**: EXIT_DAYS_BEFORE_RESOLUTION time-stop, plus per-position
+        PROFIT_TARGET and STOP_LOSS in USD P&L space.
+      * **any other label**: treated as unknown — no triggers, hold to RESOLVED.
+
     Args:
         pos:                Open position to evaluate.
-        current_price:      Current mid price of the held token.
+        current_price:      Current mid price of the YES token.
         initial_deviation:  |PM price - implied prob| at entry (always > 0).
         market_end_date:    When the market resolves (UTC). None = unknown.
         now:                Override for current time (for testing).
@@ -84,44 +124,66 @@ def should_exit(
 
     unrealised = compute_unrealised_pnl(pos, current_price)
 
-    # ── Resolved stop (market already past end_date) ──────────────────────────
+    # ── Global: resolved stop (market past end_date) ──────────────────────────
     if market_end_date is not None and now >= market_end_date:
-        return True, ExitReason.RESOLVED, unrealised
+        # Return 0.0 P&L: the position is fully settled at oracle price;
+        # any stale mid-market unrealised figure would be misleading in logs.
+        return True, ExitReason.RESOLVED, 0.0
 
-    # ── Time stop ─────────────────────────────────────────────────────────────
-    if market_end_date is not None:
-        days_to_expiry = (market_end_date - now).total_seconds() / 86_400
-        if pos.strategy == "maker":
-            # Bucket markets (5m, 15m, …) have a full lifespan shorter than
-            # MAKER_EXIT_HOURS so the hours-based gate would fire immediately
-            # for every bucket fill.  Bucket positions should be held to free
-            # settlement (RESOLVED), not force-exited via taker.  Only apply
-            # MAKER_EXIT_HOURS to markets with no fixed duration (milestone/daily).
-            is_bucket = pos.market_type in _MARKET_TYPE_DURATION_SECS
-            if not is_bucket:
-                maker_exit_days = config.MAKER_EXIT_HOURS / 24
-                if maker_exit_days > 0 and days_to_expiry <= maker_exit_days:
-                    return True, ExitReason.TIME_STOP, unrealised
-        else:
-            if days_to_expiry <= config.EXIT_DAYS_BEFORE_RESOLUTION:
+    # ── Unknown strategy: no triggers — hold to RESOLVED only ────────────────
+    # Positions restored from wallet without a saved strategy label are tagged
+    # "unknown".  We never force-exit them; the auto-redeem loop handles on-chain
+    # redemption once the market settles.
+    if pos.strategy == "unknown":
+        return False, "", unrealised
+
+    # ── Time-to-expiry (computed once; used by maker + mispricing) ────────────
+    days_to_expiry = (
+        (market_end_date - now).total_seconds() / 86_400
+        if market_end_date is not None
+        else float("inf")
+    )
+
+    # ── Maker exits ───────────────────────────────────────────────────────────
+    if pos.strategy == "maker":
+        # Bucket markets (5m, 15m, …) have a full lifespan shorter than
+        # MAKER_EXIT_HOURS so the hours-based gate would fire immediately for
+        # every bucket fill.  Bucket positions are held to RESOLVED via free
+        # settlement — never force-exited via taker.
+        is_bucket = pos.market_type in _MARKET_TYPE_DURATION_SECS
+        if not is_bucket:
+            maker_exit_days = config.MAKER_EXIT_HOURS / 24
+            if maker_exit_days > 0 and days_to_expiry <= maker_exit_days:
                 return True, ExitReason.TIME_STOP, unrealised
+        return False, "", unrealised
 
-    # ── Profit target — mispricing strategy only (Flaw §6) ───────────────────
-    # Maker P&L is aggregate rebate flow, not per-position reversion.
-    # Exiting via profit target forces unnecessary taker fees on maker fills.
-    if pos.strategy != "maker":
+    # ── Momentum exits — token-price based (not USD P&L) ─────────────────────
+    if pos.strategy == "momentum":
+        if pos.side in ("YES", "BUY_YES"):
+            token_price = current_price
+            stop_loss = config.MOMENTUM_STOP_LOSS_YES
+        else:
+            token_price = 1.0 - current_price
+            stop_loss = config.MOMENTUM_STOP_LOSS_NO
+        if token_price <= stop_loss:
+            return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
+        if token_price >= config.MOMENTUM_TAKE_PROFIT:
+            return True, ExitReason.MOMENTUM_TAKE_PROFIT, unrealised
+        # No time-stop — min-TTE entry gate means position is near expiry already.
+        return False, "", unrealised
+
+    # ── Mispricing exits ──────────────────────────────────────────────────────
+    if pos.strategy == "mispricing":
+        if days_to_expiry <= config.EXIT_DAYS_BEFORE_RESOLUTION:
+            return True, ExitReason.TIME_STOP, unrealised
         profit_target_usd = initial_deviation * config.PROFIT_TARGET_PCT * pos.size
         if unrealised >= profit_target_usd:
             return True, ExitReason.PROFIT_TARGET, unrealised
-
-    # ── Stop-loss — mispricing strategy only (Flaw §6) ───────────────────────
-    # A hard stop on maker positions guarantees realised losses — the opposite of
-    # what a maker should do. Inventory should be flattened passively, not panic-exited
-    # via taker. Portfolio-level loss is tracked per coin via MAKER_COIN_MAX_LOSS_USD.
-    if pos.strategy != "maker":
         if unrealised <= -config.STOP_LOSS_USD:
             return True, ExitReason.STOP_LOSS, unrealised
+        return False, "", unrealised
 
+    # ── Any other strategy label: no triggers (hold to RESOLVED) ─────────────
     return False, "", unrealised
 
 
@@ -154,6 +216,12 @@ class PositionMonitor:
         # Stores the initial |deviation| for each market_id; used for profit target
         self._initial_deviations: dict[str, float] = {}
         self._running = False
+        # Token IDs for which an on-chain redemption has already been submitted
+        # this session (avoids re-submitting on every poll cycle).
+        self._redeemed_tokens: set[str] = set()
+        # Tracks positions currently being exited to prevent double-exit races
+        # between the poll loop and the event-driven on_price_update path.
+        self._exiting_positions: set[str] = set()  # "market_id:side"
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -171,7 +239,13 @@ class PositionMonitor:
 
     async def start(self) -> None:
         self._running = True
+        # Event-driven stop-loss: check open momentum positions on every WS tick.
+        # This eliminates the 30 s polling lag for stop-loss and take-profit exits.
+        # Non-momentum strategies (maker / mispricing) have hold windows of hours
+        # or days so the slower poll loop is adequate for them.
+        self._pm.on_price_change(self._on_price_update)
         log.info("PositionMonitor started", interval=self._interval)
+        asyncio.create_task(self._auto_redeem_loop())
         while self._running:
             await asyncio.sleep(self._interval)
             try:
@@ -182,14 +256,142 @@ class PositionMonitor:
     async def stop(self) -> None:
         self._running = False
 
+    # ── Event-driven price callback ───────────────────────────────────────────
+
+    async def _on_price_update(self, token_id: str, mid: float) -> None:
+        """Triggered on every WS book/price_change tick.
+
+        Checks open momentum positions whose market's YES *or* NO token just
+        updated.  Fires ``_check_position`` immediately so stop-loss and take-
+        profit exits are detected within one WS round-trip (~100-500 ms) rather
+        than waiting for the 30-second poll cycle.
+
+        Only momentum positions are evaluated here because:
+          * maker / mispricing positions have hold windows of hours/days, where
+            30 s polling lag is negligible.
+          * checking every strategy on every tick would add unnecessary latency
+            to the WS message-processing path.
+        """
+        for pos in self._risk.get_open_positions():
+            if pos.strategy != "momentum":
+                continue
+            market = self._pm._markets.get(pos.market_id)
+            if market is None:
+                continue
+            # React to either the YES or NO token updating for this market.
+            if token_id not in (market.token_id_yes, market.token_id_no):
+                continue
+            key = f"{pos.market_id}:{pos.side}"
+            if key in self._exiting_positions:
+                continue  # exit already in progress for this leg
+            await self._check_position(pos)
+
+    # ── Auto-redemption ───────────────────────────────────────────────────────
+
+    async def _auto_redeem_loop(self) -> None:
+        """Periodically fetch PM wallet positions and redeem any that are ready.
+
+        Runs every REDEEM_POLL_INTERVAL seconds (default 60 s).  Only active in
+        live mode (PAPER_TRADING=False) and when POLY_PRIVATE_KEY + POLY_FUNDER
+        are configured.  Each token is redeemed at most once per session; the
+        `_redeemed_tokens` set prevents duplicate on-chain submissions.
+        """
+        # Short initial delay so startup restore completes first
+        await asyncio.sleep(30)
+        while self._running:
+            if not config.PAPER_TRADING and config.POLY_PRIVATE_KEY and config.POLY_FUNDER:
+                try:
+                    await self._redeem_ready_positions()
+                except Exception as exc:
+                    log.error("Auto-redeem loop error", exc=str(exc))
+            await asyncio.sleep(config.REDEEM_POLL_INTERVAL)
+
+    async def _redeem_ready_positions(self) -> None:
+        """Fetch wallet positions and submit on-chain redemption for each redeemable token."""
+        raw = await self._pm.get_live_positions()
+        if not raw:
+            return
+
+        for pos_data in raw:
+            token_id: str = pos_data.get("asset") or ""
+            if not token_id or token_id in self._redeemed_tokens:
+                continue
+            if not pos_data.get("redeemable", False):
+                continue
+
+            size = float(pos_data.get("size", 0) or 0)
+            cur_price = float(pos_data.get("curPrice") or pos_data.get("currentPrice") or pos_data.get("cur_price") or 0)
+            won = cur_price > 0.99
+            condition_id: str = pos_data.get("conditionId") or pos_data.get("condition_id") or ""
+            payout = round(size * cur_price, 4)
+            title = pos_data.get("title") or token_id[:20]
+
+            log.info(
+                "Auto-redeem: redeemable position found",
+                token_id=token_id[:20],
+                title=title[:60],
+                won=won,
+                size=round(size, 2),
+                payout_usd=payout,
+            )
+
+            # Mark immediately so a crash mid-call doesn't cause a double-submit
+            self._redeemed_tokens.add(token_id)
+
+            # For losing positions (payout=0): just close bot tracking, skip on-chain call
+            settlement_price = 1.0 if won else 0.0
+            markets_snap = self._pm.get_markets()
+            target_market_id: Optional[str] = None
+            for mkt in markets_snap.values():
+                if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
+                    target_market_id = mkt.condition_id
+                    break
+            if target_market_id:
+                for rp in list(self._risk.get_positions().values()):
+                    if rp.market_id == target_market_id and not rp.is_closed:
+                        self._risk.close_position(
+                            target_market_id, exit_price=settlement_price, side=rp.side
+                        )
+
+            if not won:
+                log.info("Auto-redeem: lost position dismissed (payout=0)", token_id=token_id[:20])
+                continue
+
+            if not condition_id:
+                log.warning("Auto-redeem: no condition_id — skipping on-chain call", token_id=token_id[:20])
+                continue
+
+            try:
+                ctf_address = self._pm._clob.get_conditional_address()
+                collateral_address = self._pm._clob.get_collateral_address()
+                tx_hash = await _redeem_ctf_via_safe(
+                    ctf_address=ctf_address,
+                    collateral=collateral_address,
+                    condition_id=condition_id,
+                    index_sets=[1, 2],  # YES=1, NO=2 for binary markets
+                    private_key=config.POLY_PRIVATE_KEY,
+                    safe_address=config.POLY_FUNDER,
+                )
+                log.info(
+                    "Auto-redeem: on-chain redemption submitted ✓",
+                    tx_hash=tx_hash,
+                    condition_id=condition_id,
+                    payout_usd=payout,
+                )
+            except Exception as exc:
+                # Remove from redeemed set so it can be retried next cycle
+                self._redeemed_tokens.discard(token_id)
+                log.warning(
+                    "Auto-redeem: on-chain call failed — will retry next cycle",
+                    exc=str(exc),
+                    condition_id=condition_id,
+                )
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _check_all_positions(self) -> None:
         """Iterate all open positions and apply exit logic."""
-        open_positions = [
-            p for p in self._risk._positions.values()
-            if not p.is_closed
-        ]
+        open_positions = self._risk.get_open_positions()
         if not open_positions:
             return
 
@@ -350,6 +552,15 @@ class PositionMonitor:
         )
 
         if exit_flag:
+            # Guard: prevent double-exit when both the poll loop and the
+            # event-driven _on_price_update path reach this point concurrently.
+            # asyncio is single-threaded but cooperative: a second call can arrive
+            # during an await inside _exit_position before pos.is_closed is set.
+            key = f"{pos.market_id}:{pos.side}"
+            if key in self._exiting_positions:
+                return  # another path is already handling this exit
+            self._exiting_positions.add(key)
+
             if reason == ExitReason.RESOLVED:
                 # Use mid for both legs on resolution.  best_bid and best_ask straddle
                 # 0.50 near expiry: bid rounds down to 0 while ask rounds up to 1,
@@ -365,7 +576,18 @@ class PositionMonitor:
             else:
                 # NO close: sell NO at NO_bid = 1 − YES_ask (P&L formula in YES space).
                 taker_exit_price = book.best_ask if book.best_ask is not None else current_price
-            await self._exit_position(pos, market, taker_exit_price, reason, unrealised)
+
+            # Stop-loss exits must fill immediately — use a market (taker) order.
+            # post_only limit orders on stop exits cause two problems:
+            #   1. A SELL at best_bid always crosses the book → rejected → retry
+            #      backs off one tick and posts a resting maker order that may
+            #      never fill before resolution.
+            #   2. The position is recorded as closed even if the CLOB order
+            #      never fills, leaving an unhedged live position.
+            is_stop = reason in (ExitReason.MOMENTUM_STOP_LOSS, ExitReason.STOP_LOSS,
+                                 ExitReason.COIN_LOSS_LIMIT)
+            await self._exit_position(pos, market, taker_exit_price, reason, unrealised,
+                                      force_taker=is_stop)
 
     async def _exit_position(
         self,
@@ -408,14 +630,33 @@ class PositionMonitor:
             )
             sell_order_price = exit_price if pos.side in ("YES", "BUY_YES") else (1.0 - exit_price)
             if force_taker:
-                # Market order — crosses the spread for immediate fill (manual close).
-                order_id = await self._pm.place_market(
-                    token_id=sell_token,
-                    side="SELL",
-                    price=sell_order_price,
-                    size=pos.size,
-                    market=market,
-                )
+                # Market order — crosses the spread for immediate fill (stop-loss/manual).
+                # Retry up to 3 times (200 ms apart) before giving up.
+                order_id = None
+                for _attempt in range(3):
+                    order_id = await self._pm.place_market(
+                        token_id=sell_token,
+                        side="SELL",
+                        price=sell_order_price,
+                        size=pos.size,
+                        market=market,
+                    )
+                    if order_id:
+                        break
+                    if not config.PAPER_TRADING:
+                        log.warning(
+                            "Monitor: market exit rejected — retrying",
+                            market_id=pos.market_id,
+                            attempt=_attempt + 1,
+                        )
+                        await asyncio.sleep(0.2)
+                if order_id is None and not config.PAPER_TRADING:
+                    log.error(
+                        "EXIT_ORDER_FAILED — manual intervention required",
+                        market_id=pos.market_id, side=pos.side, reason=reason,
+                    )
+                    self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
+                    return
             else:
                 # Limit order with post_only for automatic monitor exits.
                 order_id = await self._pm.place_limit(
@@ -427,13 +668,27 @@ class PositionMonitor:
                 )
 
             # In paper mode place_limit always returns a fake ID; in live mode a
-            # failed order means we should NOT record a close (risk stays open).
+            # failed post_only order (e.g. "crosses book" near settlement) is
+            # retried once as a market order before giving up.
             if order_id is None and not config.PAPER_TRADING:
-                log.error(
-                    "Monitor: exit order rejected — position stays open",
+                log.warning(
+                    "Monitor: post_only exit rejected — retrying as market order",
                     market_id=pos.market_id,
                 )
-                return
+                order_id = await self._pm.place_market(
+                    token_id=sell_token,
+                    side="SELL",
+                    price=sell_order_price,
+                    size=pos.size,
+                    market=market,
+                )
+                if order_id is None:
+                    log.error(
+                        "EXIT_ORDER_FAILED — manual intervention required",
+                        market_id=pos.market_id, side=pos.side, reason=reason,
+                    )
+                    self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
+                    return
 
         # Token price for the exit side (NO positions close in YES-price space).
         token_exit_price = exit_price if pos.side in ("YES", "BUY_YES") else (1.0 - exit_price)
@@ -469,6 +724,10 @@ class PositionMonitor:
             rebates_earned=total_rebates,
         )
 
+        # Release the exit guard so the slot can be reused if the same market
+        # re-opens (e.g. after a restart or a new bucket round).
+        self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
+
         if closed:
             log.info(
                 "Monitor: position closed ✓",
@@ -482,6 +741,9 @@ class PositionMonitor:
             self._initial_deviations.pop(pos.market_id, None)
             if self._on_close_callback is not None:
                 try:
-                    self._on_close_callback(pos.market_id)
+                    result = self._on_close_callback(pos.market_id)
+                    # Support both sync and async callbacks
+                    if asyncio.iscoroutine(result):
+                        asyncio.create_task(result)
                 except Exception as exc:
                     log.warning("on_close_callback raised", exc=str(exc))

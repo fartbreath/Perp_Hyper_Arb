@@ -12,6 +12,23 @@ In live mode it:
 Note: HL hedge calls are intentionally omitted here.  Initial live tests will
 use small contract sizes that do not cross HL_HEDGE_THRESHOLD.  Hedge support
 can be added to _process_fill_slice() once the live fill path is validated.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SOURCE OF TRUTH: THE PM DATA API IS ALWAYS RIGHT.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If the Polymarket Data API says a position exists, it exists — regardless of
+what the bot's internal state says, and regardless of whether fields like
+avgPrice are zero or missing.  DO NOT filter out positions based on missing
+cost-basis data.  The only valid reason to skip a position record is:
+
+  1. size <= 0  (PM says we hold nothing)
+  2. token_id is absent/empty (malformed record)
+
+Everything else — avgPrice, curPrice, redeemable, outcome — is supplementary
+data for display or automation.  Never use it as a gate on whether to restore
+a position.  Keep this logic simple.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 from __future__ import annotations
 
@@ -222,7 +239,9 @@ class LiveFillHandler:
             except (TypeError, ValueError):
                 continue
 
-            if size <= 0 or avg_price <= 0 or not token_id:
+            # SOURCE OF TRUTH: PM says we hold it → we hold it.
+            # Only skip truly empty/malformed records. Never filter on avgPrice.
+            if size <= 0 or not token_id:
                 continue
 
             market = markets_by_token.get(token_id)
@@ -251,14 +270,19 @@ class LiveFillHandler:
                 is_yes = token_id == market.token_id_yes
             side = "YES" if is_yes else "NO"
 
-            # entry_price is always stored in YES-probability space (mirrors fill_logic):
-            #   YES: entry_price = avg_price              (already YES-space)
-            #   NO:  entry_price = 1.0 − avg_price        (PM returns YES-prob for all positions)
-            # entry_cost_usd = token price * size:
-            #   YES: avg_price * size  (you paid avg_price per YES contract)
-            #   NO:  (1 − avg_price) * size  (you paid (1−avg_price) per NO contract)
-            entry_price = avg_price if is_yes else (1.0 - avg_price)
+            # entry_price is in YES-probability space. avg_price=0 means the PM
+            # Data API didn't populate cost-basis (common for older/external fills).
+            # We still restore the position — size is what matters for risk tracking.
+            if avg_price > 0:
+                entry_price = avg_price if is_yes else (1.0 - avg_price)
+            else:
+                entry_price = 0.0
             entry_cost = entry_price * size
+
+            # Look up strategy from the persisted token→strategy map written by
+            # the risk engine when the position was originally opened.  Fall back
+            # to "unknown" so the webapp shows a clear signal rather than wrong data.
+            saved_strategy = self._risk.get_token_strategy(token_id) or "unknown"
 
             pos = Position(
                 market_id=market.condition_id,
@@ -268,9 +292,10 @@ class LiveFillHandler:
                 side=side,
                 size=size,
                 entry_price=entry_price,
-                strategy="maker",
+                strategy=saved_strategy,
                 opened_at=datetime.now(timezone.utc),
                 entry_cost_usd=round(entry_cost, 4),
+                token_id=token_id,
             )
             self._risk.open_position(pos)
             # Pin so WS subscription survives the next market-refresh sweep.
@@ -336,7 +361,9 @@ class LiveFillHandler:
             except (TypeError, ValueError):
                 continue
 
-            if size <= 0 or avg_price <= 0 or not token_id:
+            # SOURCE OF TRUTH: PM says we hold it → we hold it.
+            # Only skip truly empty/malformed records. Never filter on avgPrice.
+            if size <= 0 or not token_id:
                 continue
             if token_id in bot_by_token:
                 continue  # already tracked
@@ -358,10 +385,14 @@ class LiveFillHandler:
             else:
                 is_yes = token_id == market.token_id_yes
             side = "YES" if is_yes else "NO"
-            entry_price = avg_price if is_yes else (1.0 - avg_price)
+            if avg_price > 0:
+                entry_price = avg_price if is_yes else (1.0 - avg_price)
+            else:
+                entry_price = 0.0
             entry_cost = entry_price * size
 
             from risk import Position
+            saved_strategy = self._risk.get_token_strategy(token_id) or "unknown"
             pos = Position(
                 market_id=market.condition_id,
                 market_title=market.title,
@@ -370,9 +401,10 @@ class LiveFillHandler:
                 side=side,
                 size=size,
                 entry_price=entry_price,
-                strategy="maker",
+                strategy=saved_strategy,
                 opened_at=datetime.now(timezone.utc),
                 entry_cost_usd=round(entry_cost, 4),
+                token_id=token_id,
             )
             self._risk.open_position(pos)
             self._pm._pinned_tokens.add(token_id)

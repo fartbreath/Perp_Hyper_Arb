@@ -26,13 +26,14 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
+import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Header, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import config
-from logger import get_bot_logger, ring_buffer
+from logger import get_bot_logger, ring_buffer, warn_ring_buffer
 
 log = get_bot_logger(__name__)
 
@@ -67,6 +68,10 @@ class BotState:
     # Maker signals (filled by maker strategy) — token_id → signal dict
     maker_signals: dict = field(default_factory=dict)
     maker_ref: Any = None  # live MakerStrategy instance; set by main.py
+
+    # Momentum signals (appended by momentum scanner) — list of MomentumSignal dicts
+    momentum_signals: list = field(default_factory=list)
+    momentum_ref: Any = None  # live MomentumScanner instance; set by main.py
 
     # Agent shadow log (filled by agent)
     agent_shadow_log: list = field(default_factory=list)
@@ -139,13 +144,14 @@ _MUTABLE_CONFIG = {
     "paper_trading":              ("PAPER_TRADING",              bool),
     "agent_auto":                 ("AGENT_AUTO",                 bool),
     "auto_approve":               ("AUTO_APPROVE",               bool),
-    "scan_interval":              ("SCAN_INTERVAL",              int),
+    "mispricing_scan_interval":    ("MISPRICING_SCAN_INTERVAL",    int),
     "strategy_mispricing":        ("STRATEGY_MISPRICING_ENABLED", bool),
     "strategy_maker":             ("STRATEGY_MAKER_ENABLED",      bool),
     "fill_check_interval":        ("FILL_CHECK_INTERVAL",         int),
     "paper_fill_probability":     ("PAPER_FILL_PROBABILITY",      float),
     "max_buy_no_yes_price":       ("MAX_BUY_NO_YES_PRICE",        float),
-    "market_cooldown_seconds":    ("MARKET_COOLDOWN_SECONDS",     int),
+    "mispricing_market_cooldown_seconds": ("MISPRICING_MARKET_COOLDOWN_SECONDS", int),
+    "momentum_market_cooldown_seconds":   ("MOMENTUM_MARKET_COOLDOWN_SECONDS",   int),
     "min_strike_distance_pct":    ("MIN_STRIKE_DISTANCE_PCT",     float),
     "kalshi_enabled":             ("KALSHI_ENABLED",              bool),
     "kalshi_require_nd2_confirmation": ("KALSHI_REQUIRE_ND2_CONFIRMATION", bool),
@@ -156,7 +162,7 @@ _MUTABLE_CONFIG = {
     # Market-making config
     "reprice_trigger_pct":         ("REPRICE_TRIGGER_PCT",          float),
     "max_quote_age_seconds":       ("MAX_QUOTE_AGE_SECONDS",        int),
-    "min_edge_pct":                ("MIN_EDGE_PCT",                 float),
+    "maker_min_edge_pct":           ("MAKER_MIN_EDGE_PCT",           float),
     "max_concurrent_maker_positions":     ("MAX_CONCURRENT_MAKER_POSITIONS",     int),
     "max_concurrent_mispricing_positions": ("MAX_CONCURRENT_MISPRICING_POSITIONS", int),
     "paper_fill_prob_base":        ("PAPER_FILL_PROB_BASE",         float),
@@ -235,7 +241,24 @@ _MUTABLE_CONFIG = {
     "maker_vol_filter_pct":           ("MAKER_VOL_FILTER_PCT",            float),
     "maker_adverse_drift_reprice":    ("MAKER_ADVERSE_DRIFT_REPRICE",     float),
     # Second-leg profit margin
-    "min_spread_profit_margin":       ("MIN_SPREAD_PROFIT_MARGIN",        float),
+    "maker_min_spread_profit_margin": ("MAKER_MIN_SPREAD_PROFIT_MARGIN",  float),
+    # Strategy 3 — Momentum Scanner
+    "strategy_momentum":              ("STRATEGY_MOMENTUM_ENABLED",        bool),
+    "momentum_price_band_low":        ("MOMENTUM_PRICE_BAND_LOW",          float),
+    "momentum_price_band_high":       ("MOMENTUM_PRICE_BAND_HIGH",         float),
+    "momentum_max_entry_usd":         ("MOMENTUM_MAX_ENTRY_USD",           float),
+    "momentum_min_clob_depth":        ("MOMENTUM_MIN_CLOB_DEPTH",          float),
+    "momentum_order_type":            ("MOMENTUM_ORDER_TYPE",              str),
+    "momentum_stop_loss_yes":          ("MOMENTUM_STOP_LOSS_YES",           float),
+    "momentum_stop_loss_no":           ("MOMENTUM_STOP_LOSS_NO",            float),
+    "momentum_take_profit":            ("MOMENTUM_TAKE_PROFIT",             float),
+    "momentum_min_tte_default":        ("MOMENTUM_MIN_TTE_SECONDS_DEFAULT",         int),
+    "momentum_spot_max_age_secs":     ("MOMENTUM_SPOT_MAX_AGE_SECS",       float),
+    "momentum_book_max_age_secs":     ("MOMENTUM_BOOK_MAX_AGE_SECS",       float),
+    "momentum_vol_cache_ttl":         ("MOMENTUM_VOL_CACHE_TTL",           float),
+    "momentum_vol_z_score":           ("MOMENTUM_VOL_Z_SCORE",             float),
+    "momentum_scan_interval":         ("MOMENTUM_SCAN_INTERVAL",           int),
+    "momentum_max_concurrent":        ("MOMENTUM_MAX_CONCURRENT",          int),
 }
 
 
@@ -243,13 +266,14 @@ class ConfigPatch(BaseModel):
     paper_trading: bool | None = None
     agent_auto: bool | None = None
     auto_approve: bool | None = None
-    scan_interval: int | None = None
+    mispricing_scan_interval: int | None = None
     strategy_mispricing: bool | None = None
     strategy_maker: bool | None = None
     fill_check_interval: int | None = None
     paper_fill_probability: float | None = None
     max_buy_no_yes_price: float | None = None
-    market_cooldown_seconds: int | None = None
+    mispricing_market_cooldown_seconds: int | None = None
+    momentum_market_cooldown_seconds: int | None = None
     min_strike_distance_pct: float | None = None
     kalshi_enabled: bool | None = None
     kalshi_require_nd2_confirmation: bool | None = None
@@ -260,7 +284,7 @@ class ConfigPatch(BaseModel):
     # Market-making config
     reprice_trigger_pct: float | None = None
     max_quote_age_seconds: int | None = None
-    min_edge_pct: float | None = None
+    maker_min_edge_pct: float | None = None
     max_concurrent_maker_positions: int | None = None
     max_concurrent_mispricing_positions: int | None = None
     paper_fill_prob_base: float | None = None
@@ -339,9 +363,38 @@ class ConfigPatch(BaseModel):
     maker_vol_filter_pct: float | None = None
     maker_adverse_drift_reprice: float | None = None
     # Second-leg profit margin
-    min_spread_profit_margin: float | None = None
+    maker_min_spread_profit_margin: float | None = None
     # Market type exclusion (list — handled separately in patch_config)
     maker_excluded_market_types: list[str] | None = None
+    # Strategy 3 — Momentum Scanner
+    strategy_momentum: bool | None = None
+    momentum_price_band_low: float | None = None
+    momentum_price_band_high: float | None = None
+    momentum_max_entry_usd: float | None = None
+    momentum_min_clob_depth: float | None = None
+    momentum_order_type: str | None = None
+    momentum_stop_loss_yes: float | None = None
+    momentum_stop_loss_no: float | None = None
+    momentum_take_profit: float | None = None
+    momentum_min_tte_5m: int | None = None
+    momentum_min_tte_15m: int | None = None
+    momentum_min_tte_1h: int | None = None
+    momentum_min_tte_4h: int | None = None
+    momentum_min_tte_daily: int | None = None
+    momentum_min_tte_weekly: int | None = None
+    momentum_min_tte_milestone: int | None = None
+    momentum_min_tte_default: int | None = None
+    momentum_spot_max_age_secs: float | None = None
+    momentum_book_max_age_secs: float | None = None
+    momentum_vol_cache_ttl: float | None = None
+    momentum_vol_z_score: float | None = None
+    momentum_vol_z_score_5m: float | None = None
+    momentum_vol_z_score_15m: float | None = None
+    momentum_vol_z_score_1h: float | None = None
+    momentum_vol_z_score_4h: float | None = None
+    momentum_vol_z_score_daily: float | None = None
+    momentum_scan_interval: int | None = None
+    momentum_max_concurrent: int | None = None
 
 
 @app.get("/config")
@@ -351,13 +404,15 @@ def get_config() -> dict:
         "paper_trading":        config.PAPER_TRADING,
         "agent_auto":           config.AGENT_AUTO,
         "auto_approve":         config.AUTO_APPROVE,
-        "scan_interval":        config.SCAN_INTERVAL,
+        "mispricing_scan_interval": config.MISPRICING_SCAN_INTERVAL,
         "strategy_mispricing":  config.STRATEGY_MISPRICING_ENABLED,
         "strategy_maker":       config.STRATEGY_MAKER_ENABLED,
+        "strategy_momentum":    config.STRATEGY_MOMENTUM_ENABLED,
         "fill_check_interval":  config.FILL_CHECK_INTERVAL,
         "paper_fill_probability": config.PAPER_FILL_PROBABILITY,
         "max_buy_no_yes_price": config.MAX_BUY_NO_YES_PRICE,
-        "market_cooldown_seconds": config.MARKET_COOLDOWN_SECONDS,
+        "mispricing_market_cooldown_seconds": config.MISPRICING_MARKET_COOLDOWN_SECONDS,
+        "momentum_market_cooldown_seconds":   config.MOMENTUM_MARKET_COOLDOWN_SECONDS,
         "min_strike_distance_pct": config.MIN_STRIKE_DISTANCE_PCT,
         "kalshi_enabled": config.KALSHI_ENABLED,
         "kalshi_require_nd2_confirmation": config.KALSHI_REQUIRE_ND2_CONFIRMATION,
@@ -368,7 +423,7 @@ def get_config() -> dict:
         # Market-making config
         "reprice_trigger_pct":    config.REPRICE_TRIGGER_PCT,
         "max_quote_age_seconds":  config.MAX_QUOTE_AGE_SECONDS,
-        "min_edge_pct":           config.MIN_EDGE_PCT,
+        "maker_min_edge_pct":      config.MAKER_MIN_EDGE_PCT,
         "max_concurrent_maker_positions":      config.MAX_CONCURRENT_MAKER_POSITIONS,
         "max_concurrent_mispricing_positions": config.MAX_CONCURRENT_MISPRICING_POSITIONS,
         "paper_fill_prob_base":   config.PAPER_FILL_PROB_BASE,
@@ -447,9 +502,37 @@ def get_config() -> dict:
         "maker_vol_filter_pct":           config.MAKER_VOL_FILTER_PCT,
         "maker_adverse_drift_reprice":    config.MAKER_ADVERSE_DRIFT_REPRICE,
         # Second-leg profit margin
-        "min_spread_profit_margin":       config.MIN_SPREAD_PROFIT_MARGIN,
+        "maker_min_spread_profit_margin": config.MAKER_MIN_SPREAD_PROFIT_MARGIN,
         # Market type exclusion
         "maker_excluded_market_types": list(config.MAKER_EXCLUDED_MARKET_TYPES),
+        # Strategy 3 — Momentum Scanner
+        "momentum_price_band_low":        config.MOMENTUM_PRICE_BAND_LOW,
+        "momentum_price_band_high":       config.MOMENTUM_PRICE_BAND_HIGH,
+        "momentum_max_entry_usd":         config.MOMENTUM_MAX_ENTRY_USD,
+        "momentum_min_clob_depth":        config.MOMENTUM_MIN_CLOB_DEPTH,
+        "momentum_order_type":            config.MOMENTUM_ORDER_TYPE,
+        "momentum_stop_loss_yes":          config.MOMENTUM_STOP_LOSS_YES,
+        "momentum_stop_loss_no":           config.MOMENTUM_STOP_LOSS_NO,
+        "momentum_take_profit":            config.MOMENTUM_TAKE_PROFIT,
+        "momentum_min_tte_5m":             config.MOMENTUM_MIN_TTE_SECONDS.get("bucket_5m",      config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT),
+        "momentum_min_tte_15m":            config.MOMENTUM_MIN_TTE_SECONDS.get("bucket_15m",     config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT),
+        "momentum_min_tte_1h":             config.MOMENTUM_MIN_TTE_SECONDS.get("bucket_1h",      config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT),
+        "momentum_min_tte_4h":             config.MOMENTUM_MIN_TTE_SECONDS.get("bucket_4h",      config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT),
+        "momentum_min_tte_daily":          config.MOMENTUM_MIN_TTE_SECONDS.get("bucket_daily",   config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT),
+        "momentum_min_tte_weekly":         config.MOMENTUM_MIN_TTE_SECONDS.get("bucket_weekly",  config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT),
+        "momentum_min_tte_milestone":      config.MOMENTUM_MIN_TTE_SECONDS.get("milestone",      config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT),
+        "momentum_min_tte_default":        config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT,
+        "momentum_spot_max_age_secs":     config.MOMENTUM_SPOT_MAX_AGE_SECS,
+        "momentum_book_max_age_secs":     config.MOMENTUM_BOOK_MAX_AGE_SECS,
+        "momentum_vol_cache_ttl":         config.MOMENTUM_VOL_CACHE_TTL,
+        "momentum_vol_z_score":           config.MOMENTUM_VOL_Z_SCORE,
+        "momentum_vol_z_score_5m":         config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_5m",    config.MOMENTUM_VOL_Z_SCORE),
+        "momentum_vol_z_score_15m":        config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_15m",   config.MOMENTUM_VOL_Z_SCORE),
+        "momentum_vol_z_score_1h":         config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_1h",    config.MOMENTUM_VOL_Z_SCORE),
+        "momentum_vol_z_score_4h":         config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_4h",    config.MOMENTUM_VOL_Z_SCORE),
+        "momentum_vol_z_score_daily":      config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_daily",  config.MOMENTUM_VOL_Z_SCORE),
+        "momentum_scan_interval":         config.MOMENTUM_SCAN_INTERVAL,
+        "momentum_max_concurrent":        config.MOMENTUM_MAX_CONCURRENT,
         "timestamp":            time.time(),
     }
 
@@ -474,6 +557,36 @@ def patch_config(patch: ConfigPatch) -> dict:
         updated["maker_excluded_market_types"] = config.MAKER_EXCLUDED_MARKET_TYPES
         log.info("Config updated via API", key="MAKER_EXCLUDED_MARKET_TYPES",
                  value=config.MAKER_EXCLUDED_MARKET_TYPES)
+    # Per-type momentum Min TTE — written directly into the dict
+    _tte_map = {
+        "momentum_min_tte_5m":        "bucket_5m",
+        "momentum_min_tte_15m":       "bucket_15m",
+        "momentum_min_tte_1h":        "bucket_1h",
+        "momentum_min_tte_4h":        "bucket_4h",
+        "momentum_min_tte_daily":     "bucket_daily",
+        "momentum_min_tte_weekly":    "bucket_weekly",
+        "momentum_min_tte_milestone": "milestone",
+    }
+    for field, bucket_key in _tte_map.items():
+        v = getattr(patch, field)
+        if v is not None:
+            config.MOMENTUM_MIN_TTE_SECONDS[bucket_key] = int(v)
+            updated[field] = int(v)
+            log.info("Config updated via API", key=f"MOMENTUM_MIN_TTE_SECONDS[{bucket_key}]", value=int(v))
+    # Per-type momentum vol z-score — written directly into the dict
+    _z_score_map = {
+        "momentum_vol_z_score_5m":    "bucket_5m",
+        "momentum_vol_z_score_15m":   "bucket_15m",
+        "momentum_vol_z_score_1h":    "bucket_1h",
+        "momentum_vol_z_score_4h":    "bucket_4h",
+        "momentum_vol_z_score_daily": "bucket_daily",
+    }
+    for field, bucket_key in _z_score_map.items():
+        v = getattr(patch, field)
+        if v is not None:
+            config.MOMENTUM_VOL_Z_SCORE_BY_TYPE[bucket_key] = float(v)
+            updated[field] = float(v)
+            log.info("Config updated via API", key=f"MOMENTUM_VOL_Z_SCORE_BY_TYPE[{bucket_key}]", value=float(v))
     if updated:
         # Build attr-name → value dict for only the keys that changed so that
         # _save_overrides does a targeted merge (not a full overwrite).
@@ -484,6 +597,12 @@ def patch_config(patch: ConfigPatch) -> dict:
         }
         if "maker_excluded_market_types" in updated:
             attr_changes["MAKER_EXCLUDED_MARKET_TYPES"] = list(config.MAKER_EXCLUDED_MARKET_TYPES)
+        # Persist the whole per-type dict whenever any entry changed
+        if any(f in updated for f in _tte_map) or "momentum_min_tte_default" in updated:
+            attr_changes["MOMENTUM_MIN_TTE_SECONDS"] = dict(config.MOMENTUM_MIN_TTE_SECONDS)
+            attr_changes["MOMENTUM_MIN_TTE_SECONDS_DEFAULT"] = config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
+        if any(f in updated for f in _z_score_map):
+            attr_changes["MOMENTUM_VOL_Z_SCORE_BY_TYPE"] = dict(config.MOMENTUM_VOL_Z_SCORE_BY_TYPE)
         _save_overrides(attr_changes)
     return {
         "updated": updated,
@@ -491,13 +610,14 @@ def patch_config(patch: ConfigPatch) -> dict:
             "paper_trading":       config.PAPER_TRADING,
             "agent_auto":          config.AGENT_AUTO,
             "auto_approve":        config.AUTO_APPROVE,
-            "scan_interval":       config.SCAN_INTERVAL,
+            "mispricing_scan_interval": config.MISPRICING_SCAN_INTERVAL,
             "strategy_mispricing": config.STRATEGY_MISPRICING_ENABLED,
             "strategy_maker":      config.STRATEGY_MAKER_ENABLED,
             "fill_check_interval": config.FILL_CHECK_INTERVAL,
             "paper_fill_probability": config.PAPER_FILL_PROBABILITY,
             "max_buy_no_yes_price": config.MAX_BUY_NO_YES_PRICE,
-            "market_cooldown_seconds": config.MARKET_COOLDOWN_SECONDS,
+            "mispricing_market_cooldown_seconds": config.MISPRICING_MARKET_COOLDOWN_SECONDS,
+            "momentum_market_cooldown_seconds":   config.MOMENTUM_MARKET_COOLDOWN_SECONDS,
             "min_strike_distance_pct": config.MIN_STRIKE_DISTANCE_PCT,
             "kalshi_enabled": config.KALSHI_ENABLED,
             "kalshi_require_nd2_confirmation": config.KALSHI_REQUIRE_ND2_CONFIRMATION,
@@ -508,7 +628,7 @@ def patch_config(patch: ConfigPatch) -> dict:
             # Market-making config
             "reprice_trigger_pct":    config.REPRICE_TRIGGER_PCT,
             "max_quote_age_seconds":  config.MAX_QUOTE_AGE_SECONDS,
-            "min_edge_pct":           config.MIN_EDGE_PCT,
+            "maker_min_edge_pct":      config.MAKER_MIN_EDGE_PCT,
             "max_concurrent_maker_positions":      config.MAX_CONCURRENT_MAKER_POSITIONS,
             "max_concurrent_mispricing_positions": config.MAX_CONCURRENT_MISPRICING_POSITIONS,
             "paper_fill_prob_base":   config.PAPER_FILL_PROB_BASE,
@@ -586,7 +706,7 @@ def patch_config(patch: ConfigPatch) -> dict:
             "maker_vol_filter_pct":           config.MAKER_VOL_FILTER_PCT,
             "maker_adverse_drift_reprice":    config.MAKER_ADVERSE_DRIFT_REPRICE,
             # Second-leg profit margin
-            "min_spread_profit_margin":       config.MIN_SPREAD_PROFIT_MARGIN,
+            "maker_min_spread_profit_margin": config.MAKER_MIN_SPREAD_PROFIT_MARGIN,
             # Market type exclusion
             "maker_excluded_market_types": list(config.MAKER_EXCLUDED_MARKET_TYPES),
         },
@@ -626,9 +746,20 @@ def reload_config() -> dict:
         if hasattr(_module, k):
             current = getattr(_module, k)
             try:
-                coerced = type(current)(v) if not isinstance(v, list) else v
-                setattr(_module, k, coerced)
-                applied[k] = coerced
+                if isinstance(current, dict) and isinstance(v, dict):
+                    # Dict config values (e.g. MOMENTUM_MIN_TTE_SECONDS): merge
+                    # the saved dict into the in-memory one so any keys present
+                    # in config.py defaults but absent from the file are kept.
+                    merged = {**current, **v}
+                    setattr(_module, k, merged)
+                    applied[k] = merged
+                elif isinstance(v, list):
+                    setattr(_module, k, v)
+                    applied[k] = v
+                else:
+                    coerced = type(current)(v)
+                    setattr(_module, k, coerced)
+                    applied[k] = coerced
             except Exception:
                 pass  # Skip values that can't be coerced
 
@@ -738,6 +869,8 @@ async def positions_live() -> dict:
     if pm is None:
         raise HTTPException(status_code=503, detail="PM client not yet initialised")
 
+    # ALWAYS READ OFFICIAL API SPECS — Polymarket Data API: https://docs.polymarket.com/#data-api
+    # Response fields: asset, size, avgPrice, currentPrice, redeemable, outcome, conditionId, title
     raw = await pm.get_live_positions()
 
     # Enrich each position with market info where possible
@@ -748,7 +881,8 @@ async def positions_live() -> dict:
         markets_by_token[mkt.token_id_no]  = {"market_id": mkt.condition_id, "title": mkt.title, "side": "NO",  "end_date": mkt.end_date.isoformat() if mkt.end_date else None}
 
     wallet_positions = []
-    pending_redemption = []
+    pending_redemption = []   # redeemable=True from data API → can claim on-chain NOW
+    awaiting_settlement = []  # market ended + price settled, but on-chain CTF resolution still pending
     now_ts = time.time()
 
     for pos in raw:
@@ -756,91 +890,210 @@ async def positions_live() -> dict:
         size = float(pos.get("size", 0) or 0)
         avg_price = float(pos.get("avgPrice") or pos.get("avg_price") or 0)
         cur_price = float(pos.get("currentPrice") or pos.get("curPrice") or pos.get("cur_price") or 0)
+        # redeemable is set by the Polymarket data API when the CTF condition has been
+        # resolved on-chain and tokens can actually be redeemed via redeemPositions().
+        # This is DIFFERENT from the market merely being closed/ended.
+        redeemable: bool = bool(pos.get("redeemable", False))
         outcome = pos.get("outcome", "")
         title = pos.get("title") or pos.get("market", "")
         condition_id = pos.get("conditionId") or pos.get("condition_id") or ""
         mkt_info = markets_by_token.get(token_id, {})
+
+        # Derive canonical YES/NO side from PM outcome label.
+        # PM Data API returns: 'Yes'/'No' for standard binary markets;
+        # 'Up'/'Down' for directional bucket markets.
+        # 'Up' = YES side (above strike wins); 'Down' = NO side.
+        # This derivation is AUTHORITATIVE — it must never depend on the
+        # market snapshot being present, because resolved markets are pruned.
+        outcome_lower = (outcome or "").strip().lower()
+        side_canonical = "YES" if outcome_lower in ("yes", "up") else "NO"
 
         enriched = {
             "token_id": token_id,
             "size": round(size, 4),
             "avg_price": round(avg_price, 4),
             "cur_price": round(cur_price, 4),
+            "redeemable": redeemable,
             "outcome": outcome,
             "title": title or mkt_info.get("title", ""),
             "condition_id": condition_id or mkt_info.get("market_id", ""),
-            "side_guess": mkt_info.get("side", ""),
+            # side_guess: always YES/NO — used by webapp's 'Side' column.
+            # Derived from the outcome label so it works even when the market
+            # is resolved and pruned from the local snapshot cache.
+            "side_guess": mkt_info.get("side", "") or side_canonical,
+            # side_canonical stored explicitly for cross-reference logic below.
+            "side_canonical": side_canonical,
             "end_date": mkt_info.get("end_date"),
             "in_bot_state": False,  # filled in below
             "source": "pm_wallet",  # PM wallet is the authoritative source of truth (C5)
         }
         wallet_positions.append(enriched)
 
-        # Settled check: cur_price ≈ 0 or ≈ 1 means market resolved (threshold avoids
-        # float precision issues where PM returns 0.9999 or 1e-5 for resolved markets)
         if size > 0 and (cur_price < 0.01 or cur_price > 0.99):
             payout = round(size * cur_price, 4)
             enriched["payout_usd"] = payout
-            pending_redemption.append({**enriched, "payout_usd": payout, "won": cur_price > 0.99})
+            entry = {**enriched, "payout_usd": payout, "won": cur_price > 0.99}
+            if redeemable:
+                # CTF resolved on-chain — tokens can be redeemed right now
+                pending_redemption.append(entry)
+            else:
+                # Only flag as awaiting settlement when the market has actually ended.
+                # A token can trade near 0 or 1 on a LIVE market (e.g. a NO token at
+                # 99¢ two hours before expiry).  Checking end_date prevents active
+                # positions from appearing in the "Oracle pending" settlement banner.
+                # If end_date is absent the market has likely been pruned (resolved),
+                # so we keep the original behaviour and include it.
+                end_date_str = enriched.get("end_date")
+                if end_date_str:
+                    try:
+                        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                        market_ended = end_dt <= datetime.now(timezone.utc)
+                    except Exception:
+                        market_ended = False
+                else:
+                    market_ended = True  # not in cache → assume resolved/pruned
+                if market_ended:
+                    # Market ended + price settled but UMA/oracle resolution not yet on-chain
+                    awaiting_settlement.append(entry)
 
-    # Cross-reference with bot state
-    bot_open: dict[str, dict] = {}  # token_id → bot position info
+    # ── SOURCE OF TRUTH cross-reference ──────────────────────────────────────
+    # Architecture principle: PM Data API is the authority.  Bot state is a
+    # SHADOW of PM reality.  The only legitimate discrepancy is a token that
+    # PM says you hold but the risk engine has NO record of.
+    #
+    # Cross-reference key priority:
+    #   1. condition_id + canonical side  (from PM conditionId + outcome label)
+    #      → works even when the market is resolved and pruned from the cache.
+    #   2. token_id via pos.token_id      (cached at open time; survives prune)
+    #   3. token_id via live market snap  (only works while market is in cache)
+    # Any successful match → in_bot_state = True, no discrepancy.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Build lookup structures from bot's open positions (two independent indexes)
+    # Index A: (condition_id, side) → bot info  — primary, snapshot-independent
+    bot_by_cond_side: dict[tuple[str, str], dict] = {}
+    # Index B: token_id → bot info              — fallback when condition_id absent
+    bot_by_token: dict[str, dict] = {}
+
     if state.risk_ref is not None:
         for pos in state.risk_ref.get_positions().values():
             if pos.is_closed:
                 continue
-            mkt_snap = markets_snap.get(pos.market_id)
-            if mkt_snap:
-                tid = mkt_snap.token_id_yes if pos.side == "YES" else mkt_snap.token_id_no
-                bot_open[tid] = {"market_id": pos.market_id, "side": pos.side, "size": pos.size, "entry_price": pos.entry_price}
+            bot_info = {
+                "market_id": pos.market_id,
+                "side": pos.side,
+                "size": pos.size,
+                "entry_price": pos.entry_price,
+                "market_title": getattr(pos, "market_title", ""),
+            }
+            # Index A: condition_id + side (always populated; persists after market prune)
+            bot_by_cond_side[(pos.market_id, pos.side)] = bot_info
+            # Index B-1: token_id cached on Position at open time
+            if pos.token_id:
+                bot_by_token[pos.token_id] = bot_info
+            # Index B-2: token_id from current live market snapshot (best-effort)
+            mkt_snap_pos = markets_snap.get(pos.market_id)
+            if mkt_snap_pos:
+                tid_live = mkt_snap_pos.token_id_yes if pos.side == "YES" else mkt_snap_pos.token_id_no
+                bot_by_token[tid_live] = bot_info
 
     discrepancies = []
     for wp in wallet_positions:
-        tid = wp["token_id"]
-        bot = bot_open.get(tid)
+        cond_id = wp["condition_id"]
+        side    = wp["side_canonical"]
+        tid     = wp["token_id"]
+
+        # Try match in priority order
+        bot = (
+            bot_by_cond_side.get((cond_id, side))
+            if cond_id else None
+        ) or bot_by_token.get(tid)
+
         if bot:
             wp["in_bot_state"] = True
             size_diff = abs(wp["size"] - bot["size"])
             if size_diff > 0.01:
-                discrepancies.append({
-                    "token_id": tid,
-                    "type": "size_mismatch",
-                    "pm_size": wp["size"],
-                    "bot_size": bot["size"],
-                    "diff": round(size_diff, 4),
-                    "title": wp["title"],
-                })
+                if size_diff < 0.05 and state.risk_ref is not None:
+                    # Small diff (<0.05 ct) — almost certainly a CLOB partial-fill
+                    # rounding artifact.  Auto-correct Position.size from PM wallet
+                    # (source of truth) silently; no error discrepancy raised.
+                    state.risk_ref.reconcile_size(
+                        wp["size"],
+                        token_id=tid,
+                        condition_id=cond_id or "",
+                        side=side or "",
+                    )
+                else:
+                    discrepancies.append({
+                        "token_id": tid,
+                        "type": "size_mismatch",
+                        "pm_size": wp["size"],
+                        "bot_size": bot["size"],
+                        "diff": round(size_diff, 4),
+                        "title": wp["title"],
+                    })
         else:
             if wp["size"] > 0:
                 discrepancies.append({
                     "token_id": tid,
-                    "type": "unmanaged_by_bot",   # in PM wallet (authoritative) but bot is not managing it
+                    "type": "unmanaged_by_bot",
                     "pm_size": wp["size"],
                     "bot_size": 0,
                     "title": wp["title"],
                     "outcome": wp["outcome"],
                 })
 
-    # Tokens bot tracks but not in PM wallet (position may have been sold/expired+redeemed)
-    pm_token_ids = {wp["token_id"] for wp in wallet_positions}
-    for tid, bot in bot_open.items():
-        if tid not in pm_token_ids:
-            mkt_snap = markets_snap.get(bot["market_id"])
-            discrepancies.append({
-                "token_id": tid,
-                "type": "bot_ghost",
-                "pm_size": 0,
-                "bot_size": bot["size"],
-                "bot_side": bot["side"],
-                "title": mkt_snap.title if mkt_snap else bot["market_id"],
-            })
+    # Ghost detection: bot tracks a position that PM wallet no longer holds.
+    # Build the set of (condition_id, side) pairs in the PM wallet.
+    pm_cond_sides: set[tuple[str, str]] = {
+        (wp["condition_id"], wp["side_canonical"])
+        for wp in wallet_positions
+        if wp["condition_id"]  # only include entries where condition_id was returned
+    }
+    pm_token_ids: set[str] = {wp["token_id"] for wp in wallet_positions}
+
+    if state.risk_ref is not None:
+        for pos in state.risk_ref.get_positions().values():
+            if pos.is_closed:
+                continue
+            matched = (
+                (pos.market_id, pos.side) in pm_cond_sides
+                or (pos.token_id and pos.token_id in pm_token_ids)
+                or (
+                    markets_snap.get(pos.market_id) is not None
+                    and (
+                        markets_snap[pos.market_id].token_id_yes
+                        if pos.side == "YES"
+                        else markets_snap[pos.market_id].token_id_no
+                    ) in pm_token_ids
+                )
+            )
+            if not matched:
+                mkt_snap_g = markets_snap.get(pos.market_id)
+                fallback_tid = pos.token_id or (
+                    (mkt_snap_g.token_id_yes if pos.side == "YES" else mkt_snap_g.token_id_no)
+                    if mkt_snap_g else ""
+                )
+                discrepancies.append({
+                    "token_id": fallback_tid,
+                    "type": "bot_ghost",
+                    "pm_size": 0,
+                    "bot_size": pos.size,
+                    "bot_side": pos.side,
+                    "title": (
+                        mkt_snap_g.title if mkt_snap_g
+                        else getattr(pos, "market_title", "") or pos.market_id
+                    ),
+                })
 
     return {
         "wallet_positions": wallet_positions,
         "pending_redemption": pending_redemption,
+        "awaiting_settlement": awaiting_settlement,
         "discrepancies": discrepancies,
         "wallet_count": len(wallet_positions),
         "pending_redemption_count": len(pending_redemption),
+        "awaiting_settlement_count": len(awaiting_settlement),
         "discrepancy_count": len(discrepancies),
         "timestamp": now_ts,
     }
@@ -967,13 +1220,35 @@ async def close_position_endpoint(market_id: str) -> dict:
     if not all_pos:
         raise HTTPException(status_code=404, detail="Position not found or already closed")
 
-    market = pm.get_markets().get(market_id)
-    if market is None:
-        raise HTTPException(status_code=404, detail="Market not found in cache")
-
-    book = pm.get_book(market.token_id_yes)
     total_pnl = 0.0
     exit_prices: dict[str, float] = {}
+
+    market = pm.get_markets().get(market_id)
+    if market is None:
+        # Market has been pruned from cache (resolved / expired).
+        # No CLOB orders are possible; close risk-engine tracking directly.
+        for pos in all_pos:
+            unrealised = compute_unrealised_pnl(pos, pos.entry_price)
+            exit_prices[pos.side] = round(pos.entry_price, 4)
+            total_pnl += unrealised
+            risk_engine.close_position(market_id, exit_price=pos.entry_price, side=pos.side)
+            if monitor._on_close_callback is not None:
+                try:
+                    monitor._on_close_callback(pos.market_id)
+                except Exception:
+                    pass
+        primary = exit_prices.get("YES") or exit_prices.get("NO") or 0.0
+        return {
+            "ok": True,
+            "market_id": market_id,
+            "sides_closed": list(exit_prices.keys()),
+            "exit_prices": exit_prices,
+            "exit_price": primary,
+            "pnl": round(total_pnl, 4),
+            "timestamp": time.time(),
+        }
+
+    book = pm.get_book(market.token_id_yes)
 
     for pos in all_pos:
         # Market order: YES exits at best bid (taker sell), NO exits at best ask
@@ -1002,6 +1277,128 @@ async def close_position_endpoint(market_id: str) -> dict:
         "pnl": round(total_pnl, 4),
         "timestamp": time.time(),
     }
+
+
+# ── CTF on-chain redemption ───────────────────────────────────────────────────
+# Helpers live in ctf_utils.py so monitor.py can import them without creating
+# a circular dependency (api_server → monitor → api_server).
+from ctf_utils import _build_redeem_calldata, _redeem_ctf_via_safe  # noqa: E402
+
+
+class RedeemRequest(BaseModel):
+    token_id: str
+    condition_id: str
+    won: bool
+    payout_usd: float = 0.0
+
+
+@app.post("/positions/redeem", dependencies=[Depends(require_auth)])
+async def redeem_position_endpoint(req: RedeemRequest) -> dict:
+    """Redeem a settled Polymarket CTF position.
+
+    For winning positions (won=True): submits an on-chain redeemPositions()
+    call through the user's Gnosis Safe proxy wallet and closes bot tracking.
+
+    For losing positions (won=False): closes bot tracking at exit_price=0.0.
+    No on-chain call is needed — losing tokens pay out 0 USDC.
+
+    Returns {ok, tx_hash (winning only), payout_usd, requires_manual_claim}.
+    """
+    pm = state.pm_ref
+    risk_engine = state.risk_ref
+    if pm is None or risk_engine is None:
+        raise HTTPException(status_code=503, detail="Bot components not yet initialised")
+
+    # Close any matching open bot position at the settlement price
+    settlement_price = 1.0 if req.won else 0.0
+    closed_count = 0
+    markets_snap = pm.get_markets()
+    target_market_id: Optional[str] = None
+
+    # Find which market this token belongs to
+    for mkt in markets_snap.values():
+        if mkt.token_id_yes == req.token_id:
+            target_market_id = mkt.condition_id
+            break
+        if mkt.token_id_no == req.token_id:
+            target_market_id = mkt.condition_id
+            break
+
+    if target_market_id:
+        for pos in list(risk_engine.get_positions().values()):
+            if pos.market_id == target_market_id and not pos.is_closed:
+                risk_engine.close_position(target_market_id, exit_price=settlement_price, side=pos.side)
+                closed_count += 1
+
+    # For losing positions, nothing further to do on-chain
+    if not req.won:
+        return {
+            "ok": True,
+            "won": False,
+            "payout_usd": 0.0,
+            "bot_positions_closed": closed_count,
+            "requires_manual_claim": False,
+        }
+
+    # For winning positions, attempt on-chain CTF redemption via Gnosis Safe
+    private_key = config.POLY_PRIVATE_KEY
+    safe_address = config.POLY_FUNDER
+
+    if not private_key:
+        return {
+            "ok": False,
+            "error": "POLY_PRIVATE_KEY not configured",
+            "requires_manual_claim": True,
+            "payout_usd": req.payout_usd,
+        }
+    if not safe_address:
+        return {
+            "ok": False,
+            "error": "POLY_FUNDER (Safe address) not configured",
+            "requires_manual_claim": True,
+            "payout_usd": req.payout_usd,
+        }
+    if not req.condition_id:
+        return {
+            "ok": False,
+            "error": "condition_id required for on-chain redemption",
+            "requires_manual_claim": True,
+            "payout_usd": req.payout_usd,
+        }
+
+    try:
+        # ALWAYS READ OFFICIAL API SPECS — py-clob-client: https://github.com/Polymarket/py-clob-client
+        ctf_address = pm._clob.get_conditional_address()
+        collateral_address = pm._clob.get_collateral_address()
+
+        # Redeem both outcome slots — CTF will pay the winning ones
+        tx_hash = await _redeem_ctf_via_safe(
+            ctf_address=ctf_address,
+            collateral=collateral_address,
+            condition_id=req.condition_id,
+            index_sets=[1, 2],   # YES=1, NO=2 for binary markets
+            private_key=private_key,
+            safe_address=safe_address,
+        )
+        log.info("CTF redemption submitted", tx_hash=tx_hash, condition_id=req.condition_id)
+        return {
+            "ok": True,
+            "won": True,
+            "tx_hash": tx_hash,
+            "payout_usd": req.payout_usd,
+            "bot_positions_closed": closed_count,
+            "requires_manual_claim": False,
+        }
+    except Exception as exc:
+        log.warning("CTF on-chain redemption failed", exc=str(exc), condition_id=req.condition_id)
+        return {
+            "ok": False,
+            "won": True,
+            "error": str(exc),
+            "payout_usd": req.payout_usd,
+            "bot_positions_closed": closed_count,
+            "requires_manual_claim": True,
+        }
 
 
 # ── Trades ────────────────────────────────────────────────────────────────────
@@ -1376,6 +1773,83 @@ def signals(limit: int = Query(default=50, ge=1, le=500)) -> dict:
     }
 
 
+@app.get("/momentum/signals")
+def momentum_signals(limit: int = Query(default=50, ge=1, le=500)) -> dict:
+    """Recent Strategy 3 momentum signals — most recent first."""
+    recent = list(reversed(state.momentum_signals))[:limit]
+    return {
+        "signals": recent,
+        "total": len(state.momentum_signals),
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/momentum/diagnostics")
+async def momentum_diagnostics() -> dict:
+    """Return per-market momentum diagnostics from the last completed scan pass.
+
+    Shape:
+      scan_ts  — unix timestamp of the last scan (0 if no scan has run yet)
+      markets  — one dict per bucket market with: skip_reason, p_yes, p_no,
+                 book_age_s, side, token_price, spot, spot_age_s, strike,
+                 tte_seconds, sigma_ann, sigma_tau, threshold_pct, delta_pct,
+                 gap_pct (delta-threshold; negative = below threshold),
+                 observed_z, vol_source, ask_depth_usd, cooldown_remaining_s,
+                 dist_to_band, plus config context fields (configured_z,
+                 band_lo/hi, min_tte_s, book/spot_max_age_s, min_clob_depth).
+      summary  — skip-count breakdown (bucket_markets, signals_fired,
+                 skipped_band, skipped_delta, skipped_vol, etc.)
+    """
+    if state.momentum_ref is None:
+        raise HTTPException(status_code=503, detail="Momentum scanner not initialised")
+    result = await state.momentum_ref.diagnostics()
+    result["timestamp"] = time.time()
+    return result
+
+
+@app.get("/momentum/scan_summary")
+async def momentum_scan_summary() -> dict:
+    """Return just the skip-count summary from the last momentum scan pass.
+
+    Lightweight alternative to /momentum/diagnostics when you only need
+    aggregate skip counts (e.g., for dashboards or quick health checks).
+    """
+    if state.momentum_ref is None:
+        raise HTTPException(status_code=503, detail="Momentum scanner not initialised")
+    d = await state.momentum_ref.diagnostics()
+    return {
+        "scan_ts": d.get("scan_ts", 0),
+        "summary": d.get("summary", {}),
+        "timestamp": time.time(),
+    }
+
+
+# ── Proxy ────────────────────────────────────────────────────────────────────
+
+_GAMMA_EVENTS_URL = (
+    "https://gamma-api.polymarket.com/events"
+    "?limit=500&active=true&closed=false&order=volume24hr&ascending=false"
+)
+
+
+@app.get("/proxy/polymarket/events")
+async def proxy_polymarket_events() -> list:
+    """Proxy Polymarket gamma-API events list to avoid browser CORS restrictions.
+
+    Returns the raw list of active events sorted by 24-h volume, identical to
+    what the frontend would fetch directly but routed server-side where there
+    are no CORS constraints.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(_GAMMA_EVENTS_URL)
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else data.get("events", [])
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Polymarket API error: {exc}") from exc
+
+
 # ── Risk ──────────────────────────────────────────────────────────────────────
 
 @app.get("/risk")
@@ -1452,7 +1926,7 @@ def markets() -> dict:
         book_age_s = round(time.time() - book_ts, 1) if book_ts else None
 
         # Data warning level for this market's price feed
-        if book_ts is None:
+        if book_age_s is None:
             data_warning = "no_data"
         elif book_age_s > 120:
             data_warning = "very_stale"
@@ -1504,6 +1978,26 @@ def logs(
         "logs": entries,
         "total": len(entries),
         "modules": ring_buffer.all_modules(),
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/logs/errors")
+def logs_errors(
+    limit: int = Query(default=500, ge=1, le=5000),
+    module: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+) -> dict:
+    """WARNING+ entries from the long-lived error ring buffer (up to 20 000 entries).
+
+    Provides historical warning/error visibility beyond the main ring buffer's
+    recency window — useful for tracking intermittent issues over longer periods.
+    """
+    entries = warn_ring_buffer.get_recent(limit=limit, module=module, search=search)
+    return {
+        "logs": entries,
+        "total": len(entries),
+        "modules": warn_ring_buffer.all_modules(),
         "timestamp": time.time(),
     }
 

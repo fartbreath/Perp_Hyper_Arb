@@ -1,6 +1,8 @@
-# Polymarket × Hyperliquid Market Making & Mispricing Bot
+# Polymarket × Hyperliquid Multi-Strategy Bot
 
-**TL;DR:** Build a semi-automated bot that operates primarily as a market maker on Polymarket crypto bucket markets (earning maker rebates + the spread) while hedging net delta exposure via HL perps. A secondary module monitors Deribit-implied probabilities for longer-dated milestone markets and flags mispricings when the deviation exceeds the fee hurdle. The bot starts paper-trading, graduates to live with $50–200 size, and is designed to hand back to human approval on large positions.
+**TL;DR:** Build a semi-automated bot with three strategies: (1) market making on Polymarket crypto buckets with HL perp hedging, (2) PM-vs-Kalshi mispricing detection for milestone markets, and (3) a momentum scanner that takes high-probability entries when token-price and spot-direction signals align. The bot starts paper-trading, graduates to live with $50–200 size, and is designed to hand back to human approval on large positions.
+
+> Historical note: this document started as the original market-making + mispricing launch plan. Momentum strategy details now live in `strategies/Momentum/MomentumStrategy.md`.
 
 ---
 
@@ -63,9 +65,10 @@ Perp_Hyper_Arb/
 │
 ├── strategies/
 │   ├── maker/                # Strategy 1: quoting, repricing, inventory skew, hedge
-│   └── mispricing/           # Strategy 2: Kalshi + N(d₂) signal filters
+│   ├── mispricing/           # Strategy 2: Kalshi + N(d₂) signal filters
+│   └── Momentum/             # Strategy 3: momentum scanner + taker execution
 │
-├── tests/                    # Pytest suite (655 tests, 0 failing)
+├── tests/                    # Pytest suite (672 passed, 7 skipped)
 ├── data/                     # CSV trade logs, paper trade records
 └── webapp/                   # Vite + React monitoring dashboard
     ├── src/pages/            # Dashboard, Trades, Positions, Performance,
@@ -414,4 +417,5 @@ Start alongside bot: `asyncio.create_task(run_api_server(port=API_PORT))`
 5. **Sports market books:** Cancelled at game start. Don't accidentally quote sports markets.
 6. **HL expiresAfter stale cancellations:** Stale expiresAfter cancellations consume **5× normal rate limit**. Set dead man's switch time carefully.
 7. **HL Python 3.10 only:** `hyperliquid-python-sdk` has dependency issues on 3.11+.
-8. **HK location advantage:** Polygon's primary servers are `eu-west-2`. HL latency from HK is reportedly good. For < 150ms to HL, local machine is likely fine. If PM latency becomes an issue, Hetzner Singapore (~$5/mo) is the VPS upgrade path.
+8. **HK location advantage:** Polygon's primary servers are `eu-west-2`. HL latency from HK is reportedly good. For <150ms to HL, local machine is likely fine. If PM latency becomes an issue, Hetzner Singapore (~$5/mo) is the VPS upgrade path.
+

@@ -58,7 +58,7 @@ def _is_priority_market(market: PMMarket, mid: float) -> bool:
         taker_fee_at_mid = config.PM_FEE_COEFF * mid * (1.0 - mid)
         # We EARN a rebate on top of capturing half the spread.
         effective_edge = market.max_incentive_spread / 2 + market.rebate_pct * taker_fee_at_mid
-        if effective_edge < config.MIN_EDGE_PCT:
+        if effective_edge < config.MAKER_MIN_EDGE_PCT:
             return False
     return True
 
@@ -93,6 +93,10 @@ class MakerStrategy(BaseStrategy):
         self._pending_hedge_tasks: dict[str, asyncio.Task] = {}  # coin → in-flight debounce task
         # ── Hedge execution quality ring-buffer (most-recent-first) ───────────
         self._hedge_quality: deque = deque(maxlen=200)
+        # ── Per-market reprice lock ────────────────────────────────────────────
+        # Prevents concurrent reprice coroutines for the same market, which would
+        # cancel/repost the same orders twice → duplicate orders on PM CLOB.
+        self._reprice_locks: dict[str, asyncio.Lock] = {}
         # ── Naked-leg debounce (Fix B) ─────────────────────────────────────────
         # market_id → unix timestamp when the imbalance was first detected.
         # Reset when balance is restored or a force-close fires.
@@ -102,6 +106,12 @@ class MakerStrategy(BaseStrategy):
         # Used by MAKER_MAX_FILLS_PER_LEG gate in _deploy_quote.
         # Pruned in _quote_age_watchdog for markets with no remaining open positions.
         self._leg_fill_counts: dict[tuple[str, str], int] = {}
+        # ── PM price-change reprice debounce ──────────────────────────────────
+        # Token_id → unix timestamp of the last triggered reprice.  Prevents a
+        # burst of WS ticks (all dispatched as concurrent tasks via C2) from
+        # spawning multiple concurrent REST reprice round-trips for the same
+        # market.  50 ms is short enough to not miss meaningful price moves.
+        self._last_pm_reprice_ts: dict[str, float] = {}
 
     async def start(self) -> None:
         if not config.STRATEGY_MAKER_ENABLED:
@@ -132,6 +142,13 @@ class MakerStrategy(BaseStrategy):
         drift = abs(new_mid - quote.price)
         market = self._find_market_for_token(token_id)
         if market and drift > market.max_incentive_spread / 2:
+            # Debounce: skip if a reprice was already triggered for this token
+            # within the last 50 ms.  Rapid WS ticks (now dispatched as concurrent
+            # tasks) would otherwise pile up REST round-trips for the same market.
+            _now = time.time()
+            if _now - self._last_pm_reprice_ts.get(token_id, 0.0) < 0.05:
+                return
+            self._last_pm_reprice_ts[token_id] = _now
             try:
                 await self._reprice_market(market)
             except Exception as exc:
@@ -455,7 +472,7 @@ class MakerStrategy(BaseStrategy):
                 return f"risk: {reason}"
         else:
             _half = market.max_incentive_spread / 2
-            _threshold = 1.0 - config.MIN_SPREAD_PROFIT_MARGIN
+            _threshold = 1.0 - config.MAKER_MIN_SPREAD_PROFIT_MARGIN
             for _p in self._risk._positions.values():
                 if _p.is_closed or _p.market_id != market.condition_id:
                     continue
@@ -910,6 +927,15 @@ class MakerStrategy(BaseStrategy):
         self._last_hl_mids.setdefault(signal.underlying, 0.0)
 
     async def _reprice_market(self, market: PMMarket) -> None:
+        lock = self._reprice_locks.setdefault(market.condition_id, asyncio.Lock())
+        if lock.locked():
+            # Another reprice is already in-flight for this market.  Skip to avoid
+            # the cancel→post→cancel→post race that leaves duplicate orders on PM.
+            return
+        async with lock:
+            await self._reprice_market_locked(market)
+
+    async def _reprice_market_locked(self, market: PMMarket) -> None:
         mid = self._pm.get_mid(market.token_id_yes)
         if mid is None:
             return
@@ -1158,8 +1184,8 @@ class MakerStrategy(BaseStrategy):
             log.debug("Hedge skipped — MAKER_HEDGE_ENABLED is False", coin=coin)
             return
         net_delta = self._position_delta_usd(coin)
-        log.info("Hedge check", coin=coin, net_capital_usd=round(net_delta, 2),
-                 threshold=config.HEDGE_THRESHOLD_USD)
+        log.debug("Hedge check", coin=coin, net_capital_usd=round(net_delta, 2),
+                  threshold=config.HEDGE_THRESHOLD_USD)
 
         if abs(net_delta) < config.HEDGE_THRESHOLD_USD:
             if coin in self._coin_hedges:

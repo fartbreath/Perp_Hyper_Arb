@@ -60,7 +60,7 @@ class MispricingScanner(BaseStrategy):
 
     async def start(self) -> None:
         self._running = True
-        log.info("MispricingScanner started", interval=config.SCAN_INTERVAL)
+        log.info("MispricingScanner started", interval=config.MISPRICING_SCAN_INTERVAL)
         await self._kalshi.refresh_markets()
         asyncio.create_task(self._scan_loop())
 
@@ -87,7 +87,7 @@ class MispricingScanner(BaseStrategy):
                 await self._scan_once()
             except Exception as exc:
                 log.error("Scan loop error", exc=str(exc))
-            interval = config.SCAN_INTERVAL
+            interval = config.MISPRICING_SCAN_INTERVAL
             log.debug("Scan sleeping", seconds=interval)
             await asyncio.sleep(interval)
 
@@ -227,10 +227,10 @@ class MispricingScanner(BaseStrategy):
                 # Per-market cooldown
                 last_ts = self._market_last_traded.get(market.condition_id, 0.0)
                 secs_since = time.time() - last_ts
-                if secs_since < config.MARKET_COOLDOWN_SECONDS:
+                if secs_since < config.MISPRICING_MARKET_COOLDOWN_SECONDS:
                     log.info("Scan skip: market cooldown active",
                              market=market.title[:60],
-                             cooldown_remaining=round(config.MARKET_COOLDOWN_SECONDS - secs_since))
+                             cooldown_remaining=round(config.MISPRICING_MARKET_COOLDOWN_SECONDS - secs_since))
                     continue
 
                 # Kalshi confirmation layer

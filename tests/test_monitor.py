@@ -235,6 +235,98 @@ class TestShouldExit:
         )
         assert not exit_flag
 
+    def test_momentum_stop_loss_triggered(self):
+        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MOMENTUM_STOP_LOSS_NO = 0.55
+        config.MIN_HOLD_SECONDS = 60
+        pos = _make_position(
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.50,          # p_yes = 0.50 ≤ MOMENTUM_STOP_LOSS_YES=0.55
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert exit_flag
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_momentum_stop_loss_triggered_no_side(self):
+        # NO position entered at p_yes=0.15 → p_no=0.85; stop fires if p_no ≤ 0.55
+        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MOMENTUM_STOP_LOSS_NO = 0.55
+        config.MIN_HOLD_SECONDS = 60
+        pos = _make_position(
+            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.50,          # p_no = 1 - 0.50 = 0.50 ≤ MOMENTUM_STOP_LOSS_NO=0.55
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert exit_flag
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_momentum_stop_loss_no_not_triggered_when_price_favourable(self):
+        # NO position: p_yes falls (NO token rises) — should NOT stop out
+        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MOMENTUM_STOP_LOSS_NO = 0.55
+        config.MOMENTUM_TAKE_PROFIT = 0.96
+        config.MIN_HOLD_SECONDS = 60
+        pos = _make_position(
+            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.10,          # p_no = 1 - 0.10 = 0.90 → well above stop
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert not exit_flag
+
+    def test_momentum_take_profit_triggered(self):
+        config.MOMENTUM_TAKE_PROFIT = 0.96
+        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MIN_HOLD_SECONDS = 60
+        pos = _make_position(
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.97,          # p_yes = 0.97 ≥ MOMENTUM_TAKE_PROFIT=0.96
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert exit_flag
+        assert reason == ExitReason.MOMENTUM_TAKE_PROFIT
+
+    def test_momentum_no_time_stop_for_bucket_market(self):
+        # Bucket market: TTE is 10 minutes (< EXIT_DAYS_BEFORE_RESOLUTION=3 days).
+        # Prior to the fix, the else-branch would TIME_STOP any non-maker position.
+        # The fix guards with `pos.strategy != "momentum"` so this must NOT exit.
+        config.EXIT_DAYS_BEFORE_RESOLUTION = 3
+        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MOMENTUM_STOP_LOSS_NO = 0.55
+        config.MOMENTUM_TAKE_PROFIT = 0.96
+        config.MIN_HOLD_SECONDS = 60
+        pos = _make_position(
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.87,          # within stop/TP band — no exit
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert not exit_flag
+        assert reason != ExitReason.TIME_STOP
+
 
 # ── PositionMonitor ───────────────────────────────────────────────────────────
 
@@ -243,6 +335,8 @@ def _make_monitor():
     pm._markets = {}
     pm._books = {}
     pm.place_limit = AsyncMock(return_value="paper_order_001")
+    pm.place_market = AsyncMock(return_value="paper_mkt_001")
+    pm.on_price_change = MagicMock()  # called by PositionMonitor.start()
     risk = RiskEngine()
     monitor = PositionMonitor(pm=pm, risk=risk, interval=30)
     return monitor, pm, risk
@@ -511,3 +605,124 @@ class TestCheckAllPositions:
         _run(monitor._check_all_positions())
 
         assert not risk._positions["mkt_btc_1:YES"].is_closed, "pos should stay open below limit"
+
+
+# ── Event-driven stop-loss (_on_price_update) ─────────────────────────────────
+
+class TestEventDrivenStopLoss:
+    """Tests for PositionMonitor._on_price_update (event-driven exit path)."""
+
+    def _make_market(self, market_id="mkt_001", token_yes="tok_yes", token_no="tok_no",
+                     end_date=None):
+        mkt = MagicMock()
+        mkt.condition_id = market_id
+        mkt.token_id_yes = token_yes
+        mkt.token_id_no = token_no
+        mkt.fees_enabled = False
+        mkt.end_date = end_date
+        mkt.title = "Will BTC exceed $100k?"
+        return mkt
+
+    def _make_book(self, mid, bid=None, ask=None):
+        book = MagicMock()
+        book.mid = mid
+        book.best_bid = bid if bid is not None else mid
+        book.best_ask = ask if ask is not None else mid
+        return book
+
+    def test_stop_loss_triggered_via_price_event(self):
+        """YES momentum position exits when price drops below stop via WS tick."""
+        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MIN_HOLD_SECONDS = 0
+
+        monitor, pm, risk = _make_monitor()
+        pos = _make_position(
+            strategy="momentum", side="YES", entry_price=0.80,
+            size=100.0, seconds_ago=120,
+        )
+        risk.open_position(pos)
+
+        mkt = self._make_market()
+        pm._markets = {"mkt_001": mkt}
+        pm._books = {"tok_yes": self._make_book(mid=0.50)}  # below stop
+
+        # Simulate a WS tick on the YES token
+        _run(monitor._on_price_update("tok_yes", 0.50))
+
+        assert risk._positions["mkt_001:YES"].is_closed, "Position should be closed by event-driven stop-loss"
+        pm.place_market.assert_called_once()  # exit used market (force_taker) order
+
+    def test_no_exit_for_non_momentum_strategy(self):
+        """Event-driven path ignores maker/mispricing positions."""
+        monitor, pm, risk = _make_monitor()
+        pos = _make_position(
+            strategy="mispricing", side="YES", entry_price=0.80,
+            size=100.0, seconds_ago=120,
+        )
+        risk.open_position(pos)
+
+        mkt = self._make_market()
+        pm._markets = {"mkt_001": mkt}
+        pm._books = {"tok_yes": self._make_book(mid=0.10)}
+
+        # Even with price at 0.10 (far below any stop), mispricing is not checked here
+        _run(monitor._on_price_update("tok_yes", 0.10))
+
+        assert not risk._positions["mkt_001:YES"].is_closed, "Mispricing position should NOT be closed by event-driven path"
+
+    def test_no_exit_for_unrelated_token(self):
+        """Tick on an unrelated token_id does not affect open positions."""
+        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MIN_HOLD_SECONDS = 0
+
+        monitor, pm, risk = _make_monitor()
+        pos = _make_position(strategy="momentum", side="YES", entry_price=0.80, seconds_ago=120)
+        risk.open_position(pos)
+
+        mkt = self._make_market()
+        pm._markets = {"mkt_001": mkt}
+        pm._books = {"tok_yes": self._make_book(mid=0.50)}
+
+        # Tick for a completely different token
+        _run(monitor._on_price_update("tok_unrelated", 0.50))
+
+        assert not risk._positions["mkt_001:YES"].is_closed
+
+    def test_double_exit_prevented_by_exiting_guard(self):
+        """Second _on_price_update call while first exit is in-flight is silently skipped."""
+        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MIN_HOLD_SECONDS = 0
+
+        monitor, pm, risk = _make_monitor()
+        pos = _make_position(strategy="momentum", side="YES", entry_price=0.80, seconds_ago=120)
+        risk.open_position(pos)
+
+        mkt = self._make_market()
+        pm._markets = {"mkt_001": mkt}
+        pm._books = {"tok_yes": self._make_book(mid=0.50)}
+
+        # Pre-populate the exiting set to simulate an in-flight exit
+        monitor._exiting_positions.add("mkt_001:YES")
+
+        _run(monitor._on_price_update("tok_yes", 0.50))
+
+        # No second order should have been placed
+        pm.place_market.assert_not_called()
+
+    def test_no_trigger_fires_on_no_token_too(self):
+        """A WS tick on the NO token also triggers the check for that market's position."""
+        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MIN_HOLD_SECONDS = 0
+
+        monitor, pm, risk = _make_monitor()
+        pos = _make_position(strategy="momentum", side="YES", entry_price=0.80, seconds_ago=120)
+        risk.open_position(pos)
+
+        mkt = self._make_market(token_yes="tok_yes", token_no="tok_no")
+        pm._markets = {"mkt_001": mkt}
+        # YES book shows mid=0.50 — below stop even though we fired via NO token
+        pm._books = {"tok_yes": self._make_book(mid=0.50)}
+
+        _run(monitor._on_price_update("tok_no", 0.50))
+
+        assert risk._positions["mkt_001:YES"].is_closed, "NO-token tick should trigger check and close YES position"

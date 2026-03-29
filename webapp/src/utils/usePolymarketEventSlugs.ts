@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { BASE_URL } from "../api/client";
 
 /**
  * Fetches active Polymarket events (sorted by 24h volume) and returns a map
@@ -9,9 +10,7 @@ export function usePolymarketEventSlugs() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(
-      "https://gamma-api.polymarket.com/events?limit=500&active=true&closed=false&order=volume24hr&ascending=false"
-    )
+    fetch(`${BASE_URL}/proxy/polymarket/events`)
       .then((r) => r.json())
       .then((json) => {
         if (cancelled) return;

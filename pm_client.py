@@ -159,7 +159,7 @@ _REBATE_PCT_BY_TYPE: dict[str, float] = {
 _UNDERLYING_PATTERNS: dict[str, list[str]] = {
     "BTC":  [r"\bBTC\b",     r"\bBITCOIN\b"],
     "ETH":  [r"\bETH\b",     r"\bETHEREUM\b"],
-   # "SOL":  [r"\bSOL\b",     r"\bSOLANA\b"],
+    "SOL":  [r"\bSOL\b",     r"\bSOLANA\b"],
     "XRP":  [r"\bXRP\b",     r"\bRIPPLE\b"],
     "BNB":  [r"\bBNB\b"],
     "DOGE": [r"\bDOGE\b",    r"\bDOGECOIN\b"],
@@ -183,7 +183,7 @@ _UNDERLYING_PATTERNS: dict[str, list[str]] = {
 _UNDERLYING_TAG_SLUGS: dict[str, list[str]] = {
     "BTC":  ["crypto", "bitcoin"],
     "ETH":  ["crypto", "ethereum"],
-  #  "SOL":  ["solana"],
+    "SOL":  ["solana"],
     "XRP":  ["ripple", "xrp"],
     "BNB":  ["bnb", "binance"],
     "DOGE": ["dogecoin"],
@@ -475,9 +475,17 @@ class PMClient:
         self._markets: dict[str, PMMarket] = {}          # condition_id → PMMarket
         self._books: dict[str, OrderBookSnapshot] = {}   # token_id → snapshot
         self._pinned_tokens: set[str] = set()            # tokens that must stay WS-subscribed (open positions)
+        self._extra_tokens: set[str] = set()             # tokens registered by non-maker strategies (e.g. momentum)
         self._price_callbacks: list[Callable] = []
         self._order_fill_callbacks: list[Callable] = []
         self._user_ws_reconnect_callbacks: list[Callable] = []  # A1: fired after user WS reconnects
+        # One-shot futures resolved by _fire_order_fill so callers can await
+        # fill confirmation without polling (replaces asyncio.sleep(1.0)).
+        self._pending_fill_futures: dict[str, asyncio.Future] = {}
+        # Brief cache for fill events that arrive before register_fill_future()
+        # is called (race: fill completes during REST order-placement round-trip).
+        # Entries are (msg, timestamp); pruned lazily on each new fill event.
+        self._recent_fills: dict[str, tuple[dict, float]] = {}
         self._api_creds: Optional[ApiCreds] = None  # populated after CLOB auth
         self._running = False
         self._paper_mode: bool = config.PAPER_TRADING
@@ -496,15 +504,42 @@ class PMClient:
         self._price_callbacks.append(callback)
 
     async def _fire_price_change(self, token_id: str, mid: float) -> None:
+        # Dispatch each callback as an independent asyncio task so a slow or
+        # blocking callback (e.g. maker reprice REST round-trip) does not delay
+        # subsequent callbacks (e.g. monitor stop-loss check) for the same tick.
         for cb in self._price_callbacks:
-            try:
-                await cb(token_id, mid)
-            except Exception as exc:
-                log.error("price_change callback error", exc=str(exc))
+            task = asyncio.create_task(cb(token_id, mid))
+            task.add_done_callback(
+                lambda t: log.error("price_change callback raised", exc=str(t.exception()))
+                if not t.cancelled() and t.exception() is not None else None
+            )
 
     def on_order_fill(self, callback: Callable) -> None:
         """Register an async callback(order_data) called when a PM order is matched."""
         self._order_fill_callbacks.append(callback)
+
+    def register_fill_future(
+        self, order_id: str, future: "asyncio.Future[dict]"
+    ) -> None:
+        """Register a one-shot Future resolved when order_id receives a MATCHED event.
+
+        If the fill already arrived during the REST order-placement round-trip
+        (a real race in asyncio: place_market suspends, event loop runs user WS),
+        the future is resolved immediately from the recent-fill cache.
+        """
+        # Prune stale cached fills so this dict doesn't grow if callers never
+        # arrive (e.g. order placed then timed out before register_fill_future).
+        _now = time.time()
+        if self._recent_fills:
+            cutoff = _now - 30.0
+            self._recent_fills = {
+                k: v for k, v in self._recent_fills.items() if v[1] > cutoff
+            }
+        cached = self._recent_fills.pop(order_id, None)
+        if cached is not None and not future.done():
+            future.set_result(cached[0])  # cached is (msg, timestamp)
+            return
+        self._pending_fill_futures[order_id] = future
 
     def on_user_ws_reconnect(self, callback: Callable) -> None:
         """Register an async callback() called after each PM user WS reconnect.
@@ -523,6 +558,31 @@ class PMClient:
                 log.error("user_ws_reconnect callback error", exc=str(exc))
 
     async def _fire_order_fill(self, order_data: dict) -> None:
+        # Prune stale cached fills (older than 30 s) to prevent unbounded growth.
+        _now = time.time()
+        if self._recent_fills:
+            cutoff = _now - 30.0
+            self._recent_fills = {
+                k: v for k, v in self._recent_fills.items() if v[1] > cutoff
+            }
+
+        # Resolve any registered one-shot future for this order.
+        order_id = order_data.get("id") or order_data.get("order_id", "")
+        if order_id:
+            fut = self._pending_fill_futures.pop(order_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result(order_data)
+            elif fut is not None:
+                # fut.done() is True — the future already timed out (scanner moved to
+                # REST fallback).  The fill event is intentionally dropped here; the
+                # REST path already retrieved the fill details independently.
+                pass
+            else:
+                # fut is None — no waiter registered yet.  Park the event so
+                # register_fill_future() can resolve it immediately if called
+                # shortly after (race: fill arrived during REST round-trip).
+                self._recent_fills[order_id] = (order_data, _now)
+
         for cb in self._order_fill_callbacks:
             try:
                 await cb(order_data)
@@ -772,8 +832,8 @@ class PMClient:
             self._books.pop(mkt.token_id_yes, None)
             self._books.pop(mkt.token_id_no,  None)
         if to_remove:
-            log.info("Pruned expired markets",
-                     count=len(to_remove), remaining=len(self._markets))
+            log.debug("Pruned expired markets",
+                      count=len(to_remove), remaining=len(self._markets))
         return len(to_remove)
 
     async def _market_refresh_loop(self) -> None:
@@ -926,7 +986,7 @@ class PMClient:
             market_tokens.extend(mkt.token_ids())
         pinned = sorted(self._pinned_tokens)
         others = [t for t in market_tokens if t not in self._pinned_tokens]
-        tokens_wanted: set[str] = set(pinned + others)
+        tokens_wanted: set[str] = set(pinned + others) | self._extra_tokens
 
         N = config.PM_WS_MAX_MARKETS_PER_WS
 
@@ -981,17 +1041,17 @@ class PMClient:
                 self._shards[sid] = shard
                 for t in chunk:
                     self._token_shard_map[t] = sid
-                log.info("PM WS shard started", shard_id=sid, tokens=len(chunk))
+                log.debug("PM WS shard started", shard_id=sid, tokens=len(chunk))
 
         # ── Cleanup empty shards ───────────────────────────────────────────────
         empty = [sid for sid, s in self._shards.items() if len(s._tokens) == 0]
         for sid in empty:
             await self._shards.pop(sid).stop()
-            log.info("PM WS shard stopped (empty)", shard_id=sid)
+            log.debug("PM WS shard stopped (empty)", shard_id=sid)
 
-        log.info("PM WS shards updated",
-                 shards=len(self._shards), total_tokens=len(self._token_shard_map),
-                 max_per_shard=N)
+        log.debug("PM WS shards updated",
+                  shards=len(self._shards), total_tokens=len(self._token_shard_map),
+                  max_per_shard=N)
 
     async def _handle_ws_message(self, raw: str) -> None:
         try:
@@ -1210,6 +1270,48 @@ class PMClient:
             log.error("place_market failed", exc=str(exc), token_id=token_id)
             return None
 
+    async def get_order_fill_rest(self, order_id: str) -> Optional[tuple[float, float]]:
+        """Fetch fill details from the REST CLOB without the 1-second sleep.
+
+        Used as the fallback when a WS fill future times out or returns a
+        MATCHED message without price/size_matched fields.  The caller is
+        responsible for ensuring the order is sufficiently settled before
+        calling (e.g. after a WS MATCHED event or a >5 s timeout).
+        """
+        if self._paper_mode or self._clob is None:
+            return None
+        try:
+            order = await asyncio.to_thread(self._clob.get_order, order_id)
+            if not order:
+                log.warning("get_order_fill_rest: order not found", order_id=order_id[:20])
+                return None
+            size_matched = float(order.get("size_matched") or 0)
+            if size_matched <= 0:
+                return None
+            trade_ids: list = order.get("associate_trades") or []
+            if not trade_ids:
+                log.warning("get_order_fill_rest: no associate_trades", order_id=order_id[:20])
+                return None
+            from py_clob_client.clob_types import TradeParams
+            params = TradeParams(id=trade_ids[0])
+            trades = await asyncio.to_thread(self._clob.get_trades, params)
+            if not trades:
+                return None
+            fill_price = float(trades[0].get("price") or 0)
+            fill_size = float(trades[0].get("size") or size_matched)
+            if fill_price <= 0:
+                return None
+            log.info(
+                "Order fill confirmed from CLOB (REST fallback)",
+                order_id=order_id[:20],
+                fill_price=fill_price,
+                fill_size=fill_size,
+            )
+            return fill_price, fill_size
+        except Exception as exc:
+            log.warning("get_order_fill_rest: failed", order_id=order_id[:20], exc=str(exc))
+            return None
+
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a single resting order by ID. Tolerates 404 (already filled/cancelled)."""
         if self._paper_mode:
@@ -1376,6 +1478,13 @@ class PMClient:
         """Ensure these token IDs remain WS-subscribed regardless of market refresh.
         Call with the YES token IDs of all open positions."""
         self._pinned_tokens = token_ids
+
+    def register_for_book_updates(self, token_ids: set[str]) -> None:
+        """Register additional tokens for WS book subscriptions, bypassing the maker
+        TTE/volume filters.  Used by non-maker strategies (e.g. momentum) to subscribe
+        to a broader set of bucket markets.  Replaces the previous set on each call;
+        the next ``_update_shards`` cycle will add/remove shards as needed."""
+        self._extra_tokens = token_ids
 
     def fee_free_markets(self) -> list[PMMarket]:
         return [m for m in self._markets.values() if m.is_fee_free]

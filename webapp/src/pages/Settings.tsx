@@ -224,6 +224,73 @@ function Note({ children }: { children: ReactNode }) {
   );
 }
 
+/**
+ * Collapsible strategy section — wraps all the cards for one strategy.
+ * Shows a header bar with the strategy name + enabled badge that toggles
+ * the body open/closed.
+ */
+function StrategySection({
+  title,
+  enabled,
+  defaultOpen = false,
+  children,
+}: {
+  title: string;
+  enabled: boolean;
+  defaultOpen?: boolean;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div
+      style={{
+        border: "1px solid #1e293b",
+        borderRadius: 8,
+        marginTop: "1rem",
+        overflow: "hidden",
+      }}
+    >
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          gap: "0.75rem",
+          background: open ? "#0f172a" : "#090e1a",
+          border: "none",
+          borderBottom: open ? "1px solid #1e293b" : "none",
+          padding: "0.8rem 1.25rem",
+          cursor: "pointer",
+          textAlign: "left",
+        }}
+      >
+        <span style={{ color: "#64748b", fontSize: "0.75rem" }}>
+          {open ? "▾" : "▸"}
+        </span>
+        <span style={{ color: "#e2e8f0", fontWeight: 600, fontSize: "1rem", flex: 1 }}>
+          {title}
+        </span>
+        <span
+          style={{
+            fontSize: "0.72rem",
+            fontWeight: 400,
+            padding: "2px 8px",
+            borderRadius: 3,
+            background: enabled ? "#14532d" : "#1e293b",
+            color: enabled ? "#86efac" : "#64748b",
+          }}
+        >
+          {enabled ? "enabled" : "disabled"}
+        </span>
+      </button>
+      {open && (
+        <div style={{ padding: "0.25rem 0" }}>{children}</div>
+      )}
+    </div>
+  );
+}
+
 const GAP = <div style={{ height: "0.75rem" }} />;
 
 // ── Page ──────────────────────────────────────────────────────────────────────
@@ -265,6 +332,7 @@ export default function Settings() {
 
   const makerOn = data.strategy_maker;
   const mispricingOn = data.strategy_mispricing;
+  const momentumOn = data.strategy_momentum ?? false;
   const nakedClose = data.maker_naked_close_contracts ?? 15;
   const maxImbalance = data.maker_max_imbalance_contracts ?? 5;
   const bookAge = data.maker_max_book_age_secs ?? 0;
@@ -351,6 +419,15 @@ export default function Settings() {
           value={data.strategy_mispricing}
           onChange={(v) => apply({ strategy_mispricing: v })}
         />
+
+        {GAP}
+
+        <Toggle
+          label="Momentum Scanner (Strategy 3)"
+          description="Price-confirmation taker — buys into momentum when price exceeds vol-adjusted threshold."
+          value={momentumOn}
+          onChange={(v) => apply({ strategy_momentum: v })}
+        />
       </div>
 
       {/* ── 3. Market Types ──────────────────────────────────────────── */}
@@ -402,9 +479,8 @@ export default function Settings() {
       </div>
 
       {/* ═════════════ STRATEGY 1 — MARKET MAKING ══════════════════════ */}
-      {makerOn && (
-        <>
-          {/* ── 4. Risk Limits ─────────────────────────────────────────── */}
+      <StrategySection title="Strategy 1 — Market Making" enabled={makerOn} defaultOpen={makerOn}>
+        {/* ── 4. Risk Limits ─────────────────────────────────────────── */}
           <div className="card">
             <h3>Risk Limits</h3>
 
@@ -556,10 +632,10 @@ export default function Settings() {
             <FloatInput
               label="Min Spread Profit Margin"
               description="Minimum combined edge when quoting the 2nd leg. Prevents negative-spread entries when mid drifts between the YES and NO fill."
-              value={data.min_spread_profit_margin ?? 0.005}
+              value={data.maker_min_spread_profit_margin ?? 0.005}
               step={0.001}
               unit=""
-              onSubmit={(v) => apply({ min_spread_profit_margin: v })}
+              onSubmit={(v) => apply({ maker_min_spread_profit_margin: v })}
             />
           </div>
 
@@ -676,10 +752,10 @@ export default function Settings() {
               <FloatInput
                 label="Min Edge"
                 description="Minimum fee-adjusted spread edge before quoting a market."
-                value={+(data.min_edge_pct * 100).toFixed(3)}
+                value={+(data.maker_min_edge_pct * 100).toFixed(3)}
                 step={0.01}
                 unit="%"
-                onSubmit={(v) => apply({ min_edge_pct: v / 100 })}
+                onSubmit={(v) => apply({ maker_min_edge_pct: v / 100 })}
               />
               {GAP}
               <NumberInput
@@ -1129,30 +1205,11 @@ export default function Settings() {
               </Advanced>
             </div>
           )}
-        </>
-      )}
+      </StrategySection>
 
       {/* ═════════════ STRATEGY 2 — MISPRICING ═════════════════════════ */}
-      <div
-        className="card"
-        style={{ opacity: mispricingOn ? 1 : 0.55 }}
-      >
-        <h3>
-          Strategy 2 — Mispricing
-          <span
-            style={{
-              fontSize: "0.72rem",
-              fontWeight: 400,
-              marginLeft: "0.6rem",
-              padding: "2px 8px",
-              borderRadius: 3,
-              background: mispricingOn ? "#14532d" : "#1e293b",
-              color: mispricingOn ? "#86efac" : "#64748b",
-            }}
-          >
-            {mispricingOn ? "enabled" : "disabled — enable above"}
-          </span>
-        </h3>
+      <StrategySection title="Strategy 2 — Mispricing" enabled={mispricingOn} defaultOpen={mispricingOn}>
+        <div className="card" style={{ opacity: mispricingOn ? 1 : 0.55 }}>
 
         {!mispricingOn && (
           <p className="settings-desc">
@@ -1165,12 +1222,12 @@ export default function Settings() {
             <NumberInput
               label="Scan Interval"
               description="How often the scanner runs a full sweep."
-              value={data.scan_interval}
+              value={data.mispricing_scan_interval}
               step={10}
               unit="s"
-              onSubmit={(v) => apply({ scan_interval: v })}
+              onSubmit={(v) => apply({ mispricing_scan_interval: v })}
             />
-            {data.scan_interval < 60 && (
+            {data.mispricing_scan_interval < 60 && (
               <Note>ℹ️ Intervals below 60s may hit Deribit rate limits.</Note>
             )}
 
@@ -1225,10 +1282,10 @@ export default function Settings() {
             <NumberInput
               label="Per-Market Cooldown"
               description="After a signal fires for a market, suppress re-entry for this long. Deduplicates adjacent scans; the entry price filter handles persistent false signals."
-              value={data.market_cooldown_seconds ?? 300}
+              value={data.mispricing_market_cooldown_seconds ?? 300}
               step={60}
               unit="s"
-              onSubmit={(v) => apply({ market_cooldown_seconds: v })}
+              onSubmit={(v) => apply({ mispricing_market_cooldown_seconds: v })}
             />
 
             <SectionHead title="Kalshi Signal Source" />
@@ -1300,13 +1357,359 @@ export default function Settings() {
             />
           </>
         )}
-      </div>
+        </div>
+      </StrategySection>
 
       {saving && (
         <div className="muted" style={{ textAlign: "center", padding: "0.5rem" }}>
           Saving…
         </div>
       )}
+
+      {/* ═════════════ STRATEGY 3 — MOMENTUM SCANNER ══════════════════ */}
+      <StrategySection title="Strategy 3 — Momentum" enabled={momentumOn} defaultOpen={momentumOn}>
+        {!momentumOn && (
+          <div className="card" style={{ opacity: 0.55 }}>
+            <p className="settings-desc">Enable the strategy above to configure it.</p>
+          </div>
+        )}
+
+        {momentumOn && (
+          <>
+          <div className="card">
+            <h3>Momentum — Entry Parameters</h3>
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Controls which markets qualify and how entries are sized.
+            </p>
+
+            <SectionHead title="Price Band" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Only markets with one side in this range are eligible. Typical: 0.80–0.90
+              (the pre-resolution compression zone).
+            </p>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0" }}>
+              <FloatInput
+                label="Band Low"
+                description="Token price floor of the momentum window."
+                value={data.momentum_price_band_low ?? 0.80}
+                step={0.01}
+                unit=""
+                onSubmit={(v) => apply({ momentum_price_band_low: v })}
+              />
+              <FloatInput
+                label="Band High"
+                description="Token price ceiling of the momentum window."
+                value={data.momentum_price_band_high ?? 0.90}
+                step={0.01}
+                unit=""
+                onSubmit={(v) => apply({ momentum_price_band_high: v })}
+              />
+            </div>
+
+            <SectionHead title="Execution" />
+
+            <FloatInput
+              label="Max Entry (USD)"
+              description="Maximum USDC collateral per momentum position."
+              value={data.momentum_max_entry_usd ?? 50}
+              step={5}
+              unit="USD"
+              onSubmit={(v) => apply({ momentum_max_entry_usd: v })}
+            />
+
+            {GAP}
+
+            <FloatInput
+              label="Min CLOB Depth"
+              description="Minimum total ask-side depth (USD) required before entering. Prevents entering illiquid markets."
+              value={data.momentum_min_clob_depth ?? 200}
+              step={25}
+              unit="USD"
+              onSubmit={(v) => apply({ momentum_min_clob_depth: v })}
+            />
+
+            {GAP}
+
+            <SectionHead title="Entry Window by Market Type" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Entry window per market type — only enter when the market has <em>at most</em> this many seconds remaining.
+              Markets with more time left are skipped until the window opens.
+              e.g. set Daily to 900 to restrict entries to the final 15 minutes before settlement.
+            </p>
+
+            <NumberInput
+              label="5-Minute"
+              description="bucket_5m — only enter in the final N seconds before expiry."
+              value={data.momentum_min_tte_5m ?? 30}
+              step={10}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_min_tte_5m: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="15-Minute"
+              description="bucket_15m — only enter in the final N seconds before expiry."
+              value={data.momentum_min_tte_15m ?? 60}
+              step={15}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_min_tte_15m: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="1-Hour"
+              description="bucket_1h — only enter in the final N seconds before expiry."
+              value={data.momentum_min_tte_1h ?? 120}
+              step={30}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_min_tte_1h: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="4-Hour"
+              description="bucket_4h — only enter in the final N seconds before expiry."
+              value={data.momentum_min_tte_4h ?? 300}
+              step={60}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_min_tte_4h: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="Daily"
+              description="bucket_daily — e.g. 900 = only enter in the final 15 minutes before settlement."
+              value={data.momentum_min_tte_daily ?? 900}
+              step={60}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_min_tte_daily: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="Weekly"
+              description="bucket_weekly — e.g. 3600 = only enter in the final hour before settlement."
+              value={data.momentum_min_tte_weekly ?? 3600}
+              step={300}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_min_tte_weekly: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="Milestone"
+              description="milestone — only enter in the final N seconds before expiry."
+              value={data.momentum_min_tte_milestone ?? 1800}
+              step={300}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_min_tte_milestone: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="Default (fallback)"
+              description="Applied to any market type not listed above — only enter in the final N seconds."
+              value={data.momentum_min_tte_default ?? 120}
+              step={30}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_min_tte_default: v })}
+            />
+
+            <SectionHead title="Scanner" />
+
+            <NumberInput
+              label="Scan Interval"
+              description="How often the momentum scanner sweeps all eligible markets."
+              value={data.momentum_scan_interval ?? 10}
+              step={5}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_scan_interval: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="Per-Market Cooldown"
+              description="After touching a market, suppress re-entry for this long. Prevents duplicate entries across adjacent scans."
+              value={data.momentum_market_cooldown_seconds ?? 300}
+              step={30}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_market_cooldown_seconds: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="Max Concurrent"
+              description="Hard cap on simultaneously open momentum positions."
+              value={data.momentum_max_concurrent ?? 3}
+              step={1}
+              unit=""
+              onSubmit={(v) => apply({ momentum_max_concurrent: v })}
+            />
+          </div>
+
+          <div className="card">
+            <h3>Momentum — Exit Thresholds</h3>
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Positions are held until the held-token price crosses one of these thresholds
+              (no time-based exit — holds to resolution or exit trigger).
+            </p>
+
+            <FloatInput
+              label="Stop Loss — YES"
+              description="Exit a YES position if p_yes falls below this (e.g. 0.60 = exit if YES token drops to 60¢)."
+              value={data.momentum_stop_loss_yes ?? 0.55}
+              step={0.01}
+              unit=""
+              onSubmit={(v) => apply({ momentum_stop_loss_yes: v })}
+            />
+
+            {GAP}
+
+            <FloatInput
+              label="Stop Loss — NO"
+              description="Exit a NO position if p_no falls below this (e.g. 0.60 = exit if NO token drops to 60¢, i.e. p_yes rises above 40¢)."
+              value={data.momentum_stop_loss_no ?? 0.55}
+              step={0.01}
+              unit=""
+              onSubmit={(v) => apply({ momentum_stop_loss_no: v })}
+            />
+
+            {GAP}
+
+            <FloatInput
+              label="Take Profit"
+              description="Exit if the held token's price rises above this. Set near 1.0 to hold to near-resolution."
+              value={data.momentum_take_profit ?? 0.96}
+              step={0.01}
+              unit=""
+              onSubmit={(v) => apply({ momentum_take_profit: v })}
+            />
+          </div>
+
+          <div className="card">
+            <h3>Momentum — Volatility &amp; Staleness</h3>
+
+            <SectionHead title="Vol Signal" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Dynamic threshold = σ_ann × z / √(8760 / TTE_hours). Deribit ATM IV is used
+              for BTC/ETH/SOL; HL rolling realized vol is used as fallback.
+            </p>
+
+            <FloatInput
+              label="Vol Z-Score (global default)"
+              description="Multiplier applied to σ_ann to compute the required delta. 1.645 ≈ 95th percentile one-tailed. Per-bucket overrides below take precedence when set."
+              value={data.momentum_vol_z_score ?? 1.6449}
+              step={0.05}
+              unit="σ"
+              onSubmit={(v) => apply({ momentum_vol_z_score: v })}
+            />
+
+            <SectionHead title="Per-Bucket Z-Score Overrides" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Each market type can use a different signal strength threshold.
+              Lower = more trades (weaker confirmation); Higher = fewer, higher-conviction trades.
+              Set a bucket to match the global default to effectively disable its override.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0" }}>
+              <FloatInput
+                label="5-Min Bucket"
+                description="5-min markets. Few signals even at 1.6 — keep strict. Recommended: 1.6."
+                value={data.momentum_vol_z_score_5m ?? data.momentum_vol_z_score ?? 1.6449}
+                step={0.05}
+                unit="σ"
+                onSubmit={(v) => apply({ momentum_vol_z_score_5m: v })}
+              />
+              <FloatInput
+                label="15-Min Bucket"
+                description="15-min markets. Most near-miss signals here. Recommended: 1.3."
+                value={data.momentum_vol_z_score_15m ?? data.momentum_vol_z_score ?? 1.6449}
+                step={0.05}
+                unit="σ"
+                onSubmit={(v) => apply({ momentum_vol_z_score_15m: v })}
+              />
+              <FloatInput
+                label="1-Hour Bucket"
+                description="1-hour markets. Good hit rate around 1.3. Recommended: 1.3."
+                value={data.momentum_vol_z_score_1h ?? data.momentum_vol_z_score ?? 1.6449}
+                step={0.05}
+                unit="σ"
+                onSubmit={(v) => apply({ momentum_vol_z_score_1h: v })}
+              />
+              <FloatInput
+                label="4-Hour Bucket"
+                description="4-hour markets. Illiquid — z rarely blocks here. Recommended: 1.6."
+                value={data.momentum_vol_z_score_4h ?? data.momentum_vol_z_score ?? 1.6449}
+                step={0.05}
+                unit="σ"
+                onSubmit={(v) => apply({ momentum_vol_z_score_4h: v })}
+              />
+            </div>
+            {GAP}
+            <FloatInput
+              label="Daily Bucket"
+              description="Daily markets rarely reach 1.6 — max observed z in 12h of data was 1.1. Set to 1.0 to trade them. Recommended: 1.0."
+              value={data.momentum_vol_z_score_daily ?? data.momentum_vol_z_score ?? 1.6449}
+              step={0.05}
+              unit="σ"
+              onSubmit={(v) => apply({ momentum_vol_z_score_daily: v })}
+            />
+
+            {GAP}
+
+            <FloatInput
+              label="Vol Cache TTL"
+              description="How long Deribit ATM IV is cached before a fresh fetch. Higher = fewer API calls."
+              value={data.momentum_vol_cache_ttl ?? 300}
+              step={30}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_vol_cache_ttl: v })}
+            />
+
+            <SectionHead title="Staleness Guards" />
+
+            <FloatInput
+              label="Max Spot Age"
+              description="Maximum age of the HL spot BBO before the scan skips the market."
+              value={data.momentum_spot_max_age_secs ?? 30}
+              step={5}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_spot_max_age_secs: v })}
+            />
+
+            {GAP}
+
+            <FloatInput
+              label="Max Book Age"
+              description="Maximum age of the PM CLOB book before the scan skips the market."
+              value={data.momentum_book_max_age_secs ?? 60}
+              step={5}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_book_max_age_secs: v })}
+            />
+
+            <Advanced>
+              <Toggle
+                label="Use Market Orders"
+                description="When ON: fills immediately at best ask. When OFF: limit order placed at ask +0.5¢."
+                value={(data.momentum_order_type ?? "limit") === "market"}
+                onChange={(v) => apply({ momentum_order_type: v ? "market" : "limit" })}
+              />
+            </Advanced>
+          </div>
+          </>
+        )}
+      </StrategySection>
     </div>
   );
 }

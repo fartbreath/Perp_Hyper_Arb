@@ -1,6 +1,6 @@
 # Perp Hyper Arb
 
-A semi-automated crypto trading bot that operates as a **market maker on Polymarket** prediction markets, hedging net delta exposure on **Hyperliquid** perpetuals. A secondary strategy monitors Kalshi for cross-venue mispricings on identical crypto milestone markets.
+A semi-automated crypto trading bot that runs three complementary strategies: market making on Polymarket, mispricing detection against Kalshi, and momentum-based taker entries on high-probability buckets. Net delta exposure is hedged via Hyperliquid perpetuals.
 
 ---
 
@@ -10,7 +10,9 @@ A semi-automated crypto trading bot that operates as a **market maker on Polymar
 
 **Strategy 2 — Mispricing Scanner:** Scans Polymarket milestone markets against matching Kalshi markets. When both venues list the same crypto event (e.g. "Will BTC close above $90k on March 31?"), any price divergence above the fee hurdle is a candidate trade. Deribit N(d₂) can optionally be used as a second-layer confirmation signal.
 
-Both strategies start in **paper trading mode** (no real funds). Switching to live is a single config change.
+**Strategy 3 — Momentum Scanner:** Runs a price-confirmation taker strategy that enters high-probability contracts when Polymarket token prices and spot movement jointly confirm momentum. It supports volatility-aware thresholds, per-market cooldowns, and stop-loss / take-profit exits.
+
+All strategies start in **paper trading mode** (no real funds). Switching to live is a single config change.
 
 ---
 
@@ -39,9 +41,10 @@ Perp_Hyper_Arb/
 │
 ├── strategies/
 │   ├── maker/                # Strategy 1: quoting, repricing, inventory skew, hedge
-│   └── mispricing/           # Strategy 2: signal generation, Kalshi + N(d₂) filters
+│   ├── mispricing/           # Strategy 2: signal generation, Kalshi + N(d₂) filters
+│   └── Momentum/             # Strategy 3: momentum scanner + taker execution
 │
-├── tests/                    # Pytest suite (655 tests, 0 failing)
+├── tests/                    # Pytest suite (672 passed, 7 skipped)
 ├── data/                     # CSV trade logs, paper trade records
 │
 └── webapp/                   # Vite + React monitoring dashboard (port 5173)
@@ -55,6 +58,7 @@ Perp_Hyper_Arb/
 pm_client.run()           ← Polymarket WS + heartbeat
 hl_client.run()           ← Hyperliquid WS + dead-man's switch
 maker_strategy.start()    ← quoting sweep + hedge debounce
+momentum_scanner.start()  ← scan every 10 s + direct taker execution
 mispricing_scanner.start()← scan every 300 s
 agent_loop()              ← consumes signal queue from scanner
 api_server                ← FastAPI REST for webapp
@@ -155,7 +159,9 @@ Key parameters:
 | `PAPER_TRADING` | `True` | Paper mode — no real orders placed |
 | `STRATEGY_MAKER_ENABLED` | `False` | Enable the market making strategy |
 | `STRATEGY_MISPRICING_ENABLED` | `False` | Enable the mispricing scanner |
+| `STRATEGY_MOMENTUM_ENABLED` | `False` | Enable the momentum scanner |
 | `HEDGE_THRESHOLD_USD` | `200` | Net inventory before a perp hedge fires (USD) |
+| `MOMENTUM_SCAN_INTERVAL` | `10` | Seconds between momentum scan passes |
 | `MAX_QUOTE_AGE_SECONDS` | `30` | Backstop reprice interval |
 | `MAKER_EXIT_HOURS` | `6.0` | Hours before expiry to exit all positions |
 | `MAX_PM_EXPOSURE_PER_MARKET` | `500` | Max USD deployed per market |
@@ -187,6 +193,8 @@ The API server runs on port 8080. Read-only endpoints are open; mutating endpoin
 | `GET /risk` | Exposure and risk metrics |
 | `GET /markets` | Monitored Polymarket markets |
 | `GET /signals` | Mispricing signal history |
+| `GET /momentum/signals` | Momentum signal history |
+| `GET /momentum/diagnostics` | Momentum scanner diagnostics and skip reasons |
 | `GET /maker/quotes` | Active resting quotes |
 | `GET /maker/signals` | Maker signal evaluation history |
 | `GET /maker/capital` | Capital allocation per market |
@@ -194,6 +202,8 @@ The API server runs on port 8080. Read-only endpoints are open; mutating endpoin
 | `GET /hedge-quality` | Hedge execution quality (rolling slippage) |
 | `GET /funding` | Hyperliquid funding rates |
 | `GET /logs` | Recent log entries |
+| `GET /logs/errors` | Long-lived WARNING/ERROR log buffer |
+| `GET /proxy/polymarket/events` | Backend proxy for Polymarket event slugs |
 | `GET /fills` | Paper fill history |
 
 ### Mutating (require auth)
@@ -204,7 +214,8 @@ The API server runs on port 8080. Read-only endpoints are open; mutating endpoin
 | `POST /config/reload` | Reload `config_overrides.json` from disk |
 | `POST /bot` | Pause / resume the bot |
 | `POST /positions/{market_id}/close` | Manually close a position |
-| `POST /positions/ghost/dismiss` | Dismiss a wallet/bot discrepancy |
+| `POST /positions/redeem` | Redeem a resolved CTF position on Polygon |
+| `POST /positions/ghost/dismiss` | Manual fallback to dismiss a wallet/bot discrepancy |
 | `POST /maker/deploy/{token_id}` | Manually deploy quotes to a specific market |
 | `POST /maker/undeploy/{token_id}` | Manually remove quotes from a market |
 
@@ -218,14 +229,14 @@ The React dashboard at `http://localhost:5173` gives real-time visibility into e
 |------|-------------|
 | **Dashboard** | Bot status, P&L summary, open positions, system health |
 | **Trades** | Full trade history with search / filter |
-| **Positions** | Open positions with unrealized P&L, bot-vs-wallet reconciliation |
+| **Positions** | Open positions, momentum positions, recently closed spreads, and settlement/redemption state |
 | **Performance** | Analytics breakdowns by market type, underlying, and strategy leg |
-| **Signals** | Mispricing signals queue and evaluation history |
+| **Signals** | Strategy 1/2/3 panel: maker opportunities, mispricing queue, and live momentum scan diagnostics |
 | **Risk** | Exposure utilization, per-coin inventory, hedge status |
 | **Markets** | All monitored markets with quoting status and signal scores |
 | **Fills** | Paper fill events with adversity highlighting |
-| **Logs** | Live log stream |
-| **Settings** | All config parameters, editable in-browser with live save |
+| **Logs** | Live stream plus Error History (long-lived WARNING/ERROR buffer) |
+| **Settings** | Runtime config editor, including full momentum strategy controls |
 
 ---
 
@@ -242,7 +253,7 @@ pytest tests/test_maker.py -v
 pytest --cov=. --cov-report=term-missing
 ```
 
-**655 tests, 6 skipped, 0 failing** as of the current release.
+**672 tests passed, 7 skipped, 0 failing** as of the current release.
 
 Test files:
 - `tests/test_maker.py` — strategy quoting, repricing, inventory skew, edge filters
@@ -251,7 +262,7 @@ Test files:
 - `tests/test_risk.py` — position sizing, exposure caps, P&L tracking
 - `tests/test_e2e_live.py` — live market end-to-end (skipped without live connection)
 - `tests/test_api_server.py` — all API endpoints, auth, serialization
-- Plus 9 additional test modules
+- Plus additional integration/support modules
 
 ---
 
@@ -273,7 +284,9 @@ Test files:
 |------|----------|
 | [MAKER_STRATEGY.md](MAKER_STRATEGY.md) | Full market making strategy spec: quoting, repricing, hedging, fills, paper mode, config reference |
 | [MISPRICING_STRATEGY.md](MISPRICING_STRATEGY.md) | Mispricing strategy: Kalshi + N(d₂) signal layers, known flaws, config reference |
+| [strategies/Momentum/MomentumStrategy.md](strategies/Momentum/MomentumStrategy.md) | Momentum strategy spec: entry gates, volatility model, cooldowns, exits, diagnostics |
 | [Plan.md](Plan.md) | Original project plan: fee analysis, architecture rationale, environment setup |
+| [webapp/README.md](webapp/README.md) | Webapp routes, API hooks, and local development notes |
 | [design.md](design.md) | UI/UX design spec for the webapp (founding document, March 2026) |
 | [engineering.md](engineering.md) | Engineering plan for SELECTIVE EXPANSION features |
 | [engineering_test_plan.md](engineering_test_plan.md) | Test plan for SELECTIVE EXPANSION changes |

@@ -211,15 +211,17 @@ CLOB-faithful elements:
 
 ## Current Status (March 2026)
 
-- Both strategies off by default. Enable via the Settings page.
+- All strategies are off by default. Enable what you need from the Settings page.
 - Paper trading mode active — no real funds at risk.
 - All critical bugs fixed (see Appendix F).
 - Capital velocity scoring active — markets ranked by edge × volume run-rate × TTE attractiveness.
 - Orphaned one-sided positions fixed — the second leg is now always re-posted after a fill.
+- One-sided order-book fill handling fixed — crossed quotes now still fill when one side of the book is temporarily empty.
 - Hedge logging active — check the Logs tab for `"Hedge placed"` entries. Slippage alert at 0.30% rolling average.
 - `MAKER_MAX_BOOK_AGE_SECS` set to 30 — stale order book data triggers a skip rather than quoting on bad data.
 - Adversity thresholds now per-bucket type — `bucket_5m` uses tighter thresholds than `bucket_15m` and `bucket_1h`.
 - WS reconnect reconciliation active — positions are re-synced with the PM wallet on every Polymarket WS reconnect.
+- Ghost positions are auto-dismissed during reconciliation when PM wallet state proves the leg is gone.
 - `GET /config/effective` endpoint available for inspection of the live merged config.
 
 ---
@@ -234,7 +236,8 @@ restarts via `config_overrides.json`.
 |-----------|---------|-------------|
 | `STRATEGY_MAKER_ENABLED` | `False` | Enable/disable the strategy |
 | `MAKER_MIN_QUOTE_PRICE` | `0.05` | Skip markets where mid < 5c or > 95c |
-| `MIN_EDGE_PCT` | `0.001` | Minimum fee-adjusted edge to post (0.1%); overridden to 0.005 |
+| `MAKER_MIN_EDGE_PCT` | `0.001` | Minimum fee-adjusted edge to post (0.1%); overridden to 0.005 |
+| `MAKER_MIN_SPREAD_PROFIT_MARGIN` | `0.010` | Minimum locked-in spread edge for one-sided close logic |
 | `PM_FEE_COEFF` | `0.0175` | Polymarket taker fee coefficient (~1.75% peak) |
 | `REPRICE_TRIGGER_PCT` | `0.002` | HL BBO move that triggers full reprice (0.2%) |
 | `MAX_QUOTE_AGE_SECONDS` | `30` | Backstop reprice interval (seconds) |
@@ -278,7 +281,7 @@ failing check returns `None` (no quote posted):
 
 1. Market has a valid `end_date`
 2. TTE within `[MAKER_EXIT_HOURS, MAKER_MAX_TTE_DAYS × 24h]`
-3. Fee-adjusted edge passes `MIN_EDGE_PCT` (see formula below)
+3. Fee-adjusted edge passes `MAKER_MIN_EDGE_PCT` (see formula below)
 4. Underlying HL move over the **adaptive vol window** ≤ `MAKER_VOL_FILTER_PCT` (1.5%)
 5. Risk capacity check — `can_open()` (skipped for markets with an already-open one-sided position to avoid false-blocking the missing leg)
 6. Mid within `[MAKER_MIN_QUOTE_PRICE, 1 − MAKER_MIN_QUOTE_PRICE]`
@@ -291,7 +294,7 @@ failing check returns `None` (no quote posted):
 taker_fee_at_mid = PM_FEE_COEFF * mid * (1 - mid)   # peaks at ~0.44% when p=0.5
 effective_edge   = half_spread + market.rebate_pct * taker_fee_at_mid
 # Rebate is earned, not paid — it is additive to the spread
-if effective_edge < MIN_EDGE_PCT:
+if effective_edge < MAKER_MIN_EDGE_PCT:
     skip market
 ```
 
@@ -600,3 +603,5 @@ because the fill simulator cannot model queue position precisely.
 | Hedge over-firing on small inventory changes | Rebalanced on any notional change | Guard: skip if change < `HEDGE_REBALANCE_PCT` (10%) of current notional |
 | Vol filter window too wide for short-duration buckets | Fixed 300 s window for all market types | Adaptive: `min(300, market_duration / 4)` — bucket_5m uses 75 s |
 | `stop()` left pending hedge tasks running | `stop()` only logged; debounce tasks continued | `stop()` now cancels all in-flight `_pending_hedge_tasks` |
+| One-sided-book crossed quotes did not fill | Fill simulator returned `False` when one side of the PM book was missing | Added opposite-side fallback: BUY crosses `best_ask`; SELL crosses `best_bid` when only one side exists |
+| Ghost positions persisted until manual cleanup | Reconciliation only logged wallet/bot mismatch and required manual dismiss | Reconciliation now auto-dismisses ghosts by closing stale risk positions immediately |

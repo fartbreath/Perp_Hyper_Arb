@@ -6,7 +6,7 @@
  */
 import { useEffect, useState, useCallback } from "react";
 
-const BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
+export const BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
 const LAUNCHER_URL = import.meta.env.VITE_LAUNCHER_URL ?? "http://localhost:8081";
 const POLL_INTERVAL_MS = 5_000;
 
@@ -82,6 +82,10 @@ export interface Position {
   pm_rebates_earned?: number | null;
   // Estimated P&L if this leg is closed now at book (incl. rebates, net of taker fees)
   est_close_pnl?: number | null;
+  // Recently-closed visibility (present only during grace period after close)
+  is_closed?: boolean;
+  closed_at?: string | null;
+  realized_pnl?: number | null;
 }
 
 export interface Trade {
@@ -274,17 +278,37 @@ export interface FundingEntry {
   fetched_at: number;
 }
 
+export interface MomentumSignal {
+  market_id: string;
+  market_title: string;
+  underlying: string;
+  market_type: string;
+  side: string;          // "YES" | "NO"
+  token_id: string;
+  token_price: number;   // 0-1 YES-token price for the high side
+  p_yes: number;         // raw YES mid
+  delta_pct: number;     // % spot move toward winning direction
+  threshold_pct: number; // dynamic vol threshold that was crossed
+  spot: number;          // HL spot at signal time
+  strike: number;        // parsed strike from market title
+  tte_seconds: number;   // seconds to resolution
+  sigma_ann: number;     // annualised vol used
+  vol_source: string;    // "deribit_atm" | "hl_realized"
+  timestamp: number;
+}
+
 export interface ConfigData {
   paper_trading: boolean;
   agent_auto: boolean;
   auto_approve: boolean;
-  scan_interval: number;
+  mispricing_scan_interval: number;
   strategy_mispricing: boolean;
   strategy_maker: boolean;
   fill_check_interval: number;
   paper_fill_probability: number;
   max_buy_no_yes_price: number;
-  market_cooldown_seconds: number;
+  mispricing_market_cooldown_seconds: number;
+  momentum_market_cooldown_seconds?: number;
   min_strike_distance_pct: number;
   kalshi_enabled: boolean;
   kalshi_require_nd2_confirmation: boolean;
@@ -295,7 +319,7 @@ export interface ConfigData {
   // Market-making config
   reprice_trigger_pct: number;
   max_quote_age_seconds: number;
-  min_edge_pct: number;
+  maker_min_edge_pct: number;
   max_concurrent_maker_positions: number;
   max_concurrent_mispricing_positions: number;
   paper_fill_prob_base: number;
@@ -369,7 +393,7 @@ export interface ConfigData {
   maker_vol_filter_pct?: number;
   maker_adverse_drift_reprice?: number;
   // Second-leg profit margin
-  min_spread_profit_margin?: number;
+  maker_min_spread_profit_margin?: number;
   // CLOB depth gate
   maker_min_depth_to_quote?: number;
   maker_depth_thin_threshold?: number;
@@ -377,6 +401,34 @@ export interface ConfigData {
   maker_depth_spread_factor_zero?: number;
   maker_excluded_market_types: string[];
   timestamp: number;
+  // Strategy 3 — Momentum Scanner
+  strategy_momentum?: boolean;
+  momentum_price_band_low?: number;
+  momentum_price_band_high?: number;
+  momentum_max_entry_usd?: number;
+  momentum_min_clob_depth?: number;
+  momentum_order_type?: string;
+  momentum_stop_loss?: number;
+  momentum_take_profit?: number;
+  momentum_min_tte_5m?: number;
+  momentum_min_tte_15m?: number;
+  momentum_min_tte_1h?: number;
+  momentum_min_tte_4h?: number;
+  momentum_min_tte_daily?: number;
+  momentum_min_tte_weekly?: number;
+  momentum_min_tte_milestone?: number;
+  momentum_min_tte_default?: number;
+  momentum_spot_max_age_secs?: number;
+  momentum_book_max_age_secs?: number;
+  momentum_vol_cache_ttl?: number;
+  momentum_vol_z_score?: number;
+  momentum_vol_z_score_5m?: number;
+  momentum_vol_z_score_15m?: number;
+  momentum_vol_z_score_1h?: number;
+  momentum_vol_z_score_4h?: number;
+  momentum_vol_z_score_daily?: number;
+  momentum_scan_interval?: number;
+  momentum_max_concurrent?: number;
 }
 
 export interface InventoryData {
@@ -481,6 +533,8 @@ export interface LivePositionsData {
   wallet_count: number;
   pending_redemption_count: number;
   discrepancy_count: number;
+  awaiting_settlement_count?: number;
+  awaiting_settlement?: { won: boolean; size: number; avg_price: number; title: string; token_id: string; outcome: string; payout_usd?: number }[];
   timestamp: number;
 }
 
@@ -497,6 +551,52 @@ export const useMakerSignals = () =>
   usePolling<{ signals: MakerSignal[]; count: number; strategy_enabled: boolean }>("/maker/signals");
 export const useCapital = () =>
   usePolling<CapitalData>("/maker/capital");
+export const useMomentumSignals = (limit = 50) =>
+  usePolling<{ signals: MomentumSignal[]; total: number }>(`/momentum/signals?limit=${limit}`);
+
+export interface MomentumDiagnosticMarket {
+  market_id: string;
+  market_title: string;
+  underlying: string;
+  market_type: string;
+  skip_reason: string;
+  // Prices (may be null if market hasn't reached price gate)
+  p_yes: number | null;
+  p_no: number | null;
+  token_price: number | null;
+  side: string | null;
+  // Movement
+  delta_pct: number | null;
+  threshold_pct: number | null;
+  gap_pct: number | null;        // delta - threshold (negative = below)
+  observed_z: number | null;
+  // Timing
+  tte_seconds: number | null;
+  // Vol
+  sigma_ann: number | null;
+  vol_source: string | null;
+  // Liquidity
+  ask_depth_usd: number | null;
+  // Config snapshot for the row
+  configured_z: number | null;
+  band_lo: number | null;
+  band_hi: number | null;
+  min_tte_s: number | null;
+  min_clob_depth: number | null;
+  // Optional extras
+  cooldown_remaining_s?: number | null;
+  dist_to_band?: number | null;
+}
+
+export interface MomentumDiagnosticsResponse {
+  scan_ts: number;
+  markets: MomentumDiagnosticMarket[];
+  summary: Record<string, number>;
+  timestamp: number;
+}
+
+export const useMomentumDiagnostics = () =>
+  usePolling<MomentumDiagnosticsResponse>("/momentum/diagnostics", 15_000);
 export const useFills = (
   limit = 100,
   offset = 0,
@@ -552,6 +652,31 @@ export async function closePosition(marketId: string): Promise<{ ok: boolean; ex
     const body = await res.json().catch(() => ({}));
     throw new Error((body as { detail?: string }).detail ?? `Close failed: ${res.status}`);
   }
+  return res.json();
+}
+
+export interface RedeemResult {
+  ok: boolean;
+  won?: boolean;
+  tx_hash?: string;
+  payout_usd?: number;
+  bot_positions_closed?: number;
+  requires_manual_claim?: boolean;
+  error?: string;
+}
+
+export async function redeemPosition(
+  tokenId: string,
+  conditionId: string,
+  won: boolean,
+  payoutUsd: number,
+): Promise<RedeemResult> {
+  const res = await fetch(`${BASE_URL}/positions/redeem`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token_id: tokenId, condition_id: conditionId, won, payout_usd: payoutUsd }),
+  });
+  // Always return body — backend returns meaningful data even on partial failure
   return res.json();
 }
 
@@ -628,5 +753,19 @@ export const useLogs = (
   return usePolling<{ logs: LogEntry[]; total: number; modules: string[] }>(
     `/logs?${params}`,
     2_000,   // poll every 2s for near-realtime feel
+  );
+};
+
+export const useErrorLogs = (
+  limit = 500,
+  module?: string,
+  search?: string,
+) => {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (module) params.set("module", module);
+  if (search) params.set("search", search);
+  return usePolling<{ logs: LogEntry[]; total: number; modules: string[] }>(
+    `/logs/errors?${params}`,
+    10_000,  // poll every 10s — warnings/errors are low-frequency
   );
 };

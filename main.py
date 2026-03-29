@@ -54,6 +54,8 @@ from risk import RiskEngine, Position
 from strategies.maker.strategy import MakerStrategy
 from strategies.mispricing.strategy import MispricingScanner
 from strategies.mispricing.signals import MispricingSignal
+from strategies.Momentum.scanner import MomentumScanner
+from strategies.Momentum.vol_fetcher import VolFetcher
 from agent import AgentDecisionLayer, AgentDecision
 from monitor import PositionMonitor, compute_unrealised_pnl
 from fill_simulator import FillSimulator
@@ -285,10 +287,18 @@ async def state_sync_loop(
             api_state.bot_active = config.BOT_ACTIVE
 
             # Positions from risk engine
+            # Recently-closed positions remain visible for CLOSED_GRACE_SECONDS so
+            # the webapp doesn't immediately lose track of them on close.
+            _CLOSED_GRACE_SECONDS = 300
+            _now_time = time.time()
             positions_raw = {}
             for cid, pos in positions_snap.items():
                 if pos.is_closed:
-                    continue
+                    if pos.closed_at is None:
+                        continue  # closed before closed_at tracking; hide immediately
+                    _age = _now_time - pos.closed_at.timestamp()
+                    if _age > _CLOSED_GRACE_SECONDS:
+                        continue
                 _mkt = markets_snap.get(pos.market_id)  # cid is now a composite key; use pos.market_id
                 # Get current order book mid from live WebSocket feed
                 _book = pm.get_book(_mkt.token_id_yes) if _mkt else None
@@ -421,6 +431,10 @@ async def state_sync_loop(
                     "active_ask_remaining_ct": _ask_rem,
                     "active_ask_filled_ct": _ask_fill,
                     "signal_score": pos.signal_score,
+                    # Closed-position visibility (present only when recently closed)
+                    "is_closed": pos.is_closed,
+                    "closed_at": pos.closed_at.isoformat() if pos.closed_at else None,
+                    "realized_pnl": round(pos.realized_pnl, 4) if pos.is_closed else None,
                 }
             # NOTE: api_state.positions is assigned once after HL hedges are
             # also added below — a single atomic dict reference swap avoids
@@ -598,9 +612,20 @@ async def main() -> None:
     pm = PMClient()
     hl = HLClient()
     maker = MakerStrategy(pm, hl, risk_engine)
-    scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.SCAN_INTERVAL)
+    scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL)
     agent = AgentDecisionLayer(risk_engine)
     monitor = PositionMonitor(pm, risk_engine, on_close_callback=scanner.record_trade_close)
+    # Strategy 3 — Momentum scanner (direct execution, no agent loop)
+    vol_fetcher = VolFetcher()
+    vol_fetcher.register(hl)   # registers BBO callback for rolling realized-vol buffer
+
+    def _on_momentum_signal(sig_dict: dict) -> None:
+        api_state.momentum_signals.append(sig_dict)
+        # Cap in-memory list to last 200 signals
+        if len(api_state.momentum_signals) > 200:
+            api_state.momentum_signals = api_state.momentum_signals[-200:]
+
+    momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, on_signal=_on_momentum_signal)
     fill_sim = FillSimulator(pm, maker, risk_engine, monitor)
     live_fill_handler = LiveFillHandler(pm, maker, risk_engine, monitor)
 
@@ -608,6 +633,7 @@ async def main() -> None:
     api_state.monitor_ref = monitor
     api_state.pm_ref = pm
     api_state.risk_ref = risk_engine
+    api_state.momentum_ref = momentum_scanner
 
     # ── Connect clients ──────────────────────────────────────────────────────
     log.info("Connecting PM client…")
@@ -626,6 +652,7 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(maker.start(), name="maker"),
         asyncio.create_task(scanner.start(), name="scanner"),
+        asyncio.create_task(momentum_scanner.start(), name="momentum"),
         asyncio.create_task(
             agent_loop(pm, agent, monitor, risk_engine),
             name="agent_loop",

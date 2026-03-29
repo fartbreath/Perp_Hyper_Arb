@@ -1,6 +1,6 @@
 # Perp Hyper Arb — Monitoring Webapp
 
-React + TypeScript dashboard for the Perp Hyper Arb trading bot. Connects to the FastAPI backend on port 8080 and provides real-time visibility into strategy state, positions, P&L, and configuration.
+React + TypeScript dashboard for the Perp Hyper Arb trading bot. Connects to the FastAPI backend on port 8080 and provides real-time visibility into strategy state, positions, P&L, diagnostics, logs, and runtime configuration.
 
 ## Pages
 
@@ -8,14 +8,14 @@ React + TypeScript dashboard for the Perp Hyper Arb trading bot. Connects to the
 |-------|-------------|
 | `/` | Dashboard — bot status, P&L summary, open positions, system health |
 | `/trades` | Trade history (search / filter by market, underlying, type) |
-| `/positions` | Open positions with unrealized P&L and bot-vs-wallet reconciliation |
+| `/positions` | Open positions, momentum positions, recently-closed spreads, and settlement/redemption panels |
 | `/performance` | Analytics by market type, underlying, and strategy leg |
-| `/signals` | Mispricing signal queue and evaluation history |
+| `/signals` | Strategy 1/2/3 view: maker opportunities, mispricing queue, and live momentum scan diagnostics |
 | `/risk` | Exposure utilization, per-coin inventory and hedge status |
 | `/markets` | All monitored markets with quoting status and signal scores |
 | `/fills` | Paper fill events with adversity highlighting |
-| `/logs` | Live log stream |
-| `/settings` | All config parameters, editable in-browser with live save |
+| `/logs` | Live log stream plus Error History (long-lived WARNING/ERROR buffer) |
+| `/settings` | All runtime config parameters, including full momentum scanner controls |
 
 ## Development
 
@@ -31,6 +31,18 @@ Configure the API URL in `.env.local`:
 ```
 VITE_API_URL=http://localhost:8080
 ```
+
+## API Hooks and Endpoints
+
+The API client lives in `src/api/client.ts` and exports a shared `BASE_URL` used by all hooks.
+
+Notable hooks and routes added in the latest release:
+
+- `useMomentumSignals(limit?)` → `GET /momentum/signals`
+- `useMomentumDiagnostics()` → `GET /momentum/diagnostics`
+- `useErrorLogs(limit?, module?, search?)` → `GET /logs/errors`
+- `redeemPosition()` → `POST /positions/redeem`
+- `usePolymarketEventSlugs()` now fetches via backend proxy: `GET /proxy/polymarket/events`
 
 ## Tech Stack
 

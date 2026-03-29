@@ -103,6 +103,7 @@ def open_position_from_fill(
         entry_cost_usd=round(fill_cost_usd, 4),
         order_id=consumed.order_id or "",
         signal_score=round(consumed.score, 2),
+        token_id=market.token_id_yes if position_side == "YES" else market.token_id_no,
     )
     risk.open_position(pos)
     risk.free_slot(consumed.market_id)
