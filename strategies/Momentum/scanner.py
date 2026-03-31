@@ -63,6 +63,11 @@ class MomentumScanner(BaseStrategy):
         self._on_signal: Any = on_signal  # optional callback(signal_dict) for API state
         # Per-market cooldown after any open/close/failed entry
         self._market_cooldown: dict[str, float] = {}   # market_id → unix timestamp of last touch
+        # Persist cooldowns to disk so restarts honour the full cooldown window.
+        self._cooldown_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "data", "momentum_cooldowns.json"
+        )
+        self._market_cooldown: dict[str, float] = _load_cooldowns(self._cooldown_path)
         # Open-spot cache for "Up or Down" directional markets.
         # key: condition_id  value: HL spot price at the moment the window opened.
         # Persisted to disk so restarts don't lose recorded opens mid-window.
@@ -75,6 +80,8 @@ class MomentumScanner(BaseStrategy):
         self._last_scan_diags: list[dict] = []
         self._last_scan_summary: dict = {}
         self._last_scan_ts: float = 0.0
+        self._last_pm_feed_health: str = "unknown"   # "ok" | "degraded" | "unknown"
+        self._last_stale_book_ratio: float = 0.0     # fraction of markets with stale books
         # Event-driven entry: set when a price tick enters the signal band.
         # Allows the scan loop to wake immediately rather than waiting the full
         # MOMENTUM_SCAN_INTERVAL (default 10 s) before acting on a fresh signal.
@@ -109,6 +116,20 @@ class MomentumScanner(BaseStrategy):
         self._running = False
         if self._vol_prefetch_task and not self._vol_prefetch_task.done():
             self._vol_prefetch_task.cancel()
+
+    def record_trade_close(self, market_id: str) -> None:
+        """Refresh per-market cooldown when any momentum position closes.
+
+        Resets BOTH the YES and NO side cooldown clocks for the market.  When
+        one side closes (stop-loss or take-profit), the market is considered
+        recently active and neither side should be re-entered until the full
+        MOMENTUM_MARKET_COOLDOWN_SECONDS window expires.
+        """
+        now = time.time()
+        self._market_cooldown[f"{market_id}:YES"] = now
+        self._market_cooldown[f"{market_id}:NO"] = now
+        _save_cooldowns(self._cooldown_path, self._market_cooldown)
+        log.info("Momentum cooldown reset on close", market_id=market_id[:22])
 
     def get_signals(self) -> list[dict]:
         """Return an empty list — momentum signals execute immediately (no queue)."""
@@ -291,13 +312,20 @@ class MomentumScanner(BaseStrategy):
                     scan_diags.append(_d)
                     continue
 
-            # ── Cooldown guard ───────────────────────────────────────────────
-            last_touch = self._market_cooldown.get(market.condition_id, 0.0)
-            if now_ts - last_touch < config.MOMENTUM_MARKET_COOLDOWN_SECONDS:
+            # ── Cooldown pre-filter ──────────────────────────────────────────
+            # YES and NO each have independent cooldown clocks (keyed by
+            # condition_id:side).  Skip the market early only when BOTH sides
+            # are still cooling — saves fetching two books for no reason.
+            _cd_yes = now_ts - self._market_cooldown.get(f"{market.condition_id}:YES", 0.0)
+            _cd_no  = now_ts - self._market_cooldown.get(f"{market.condition_id}:NO",  0.0)
+            if _cd_yes < config.MOMENTUM_MARKET_COOLDOWN_SECONDS and \
+               _cd_no  < config.MOMENTUM_MARKET_COOLDOWN_SECONDS:
                 skipped_cooldown += 1
                 _d["skip_reason"] = "cooldown"
+                # Report how long until the sooner cooldown expires.
                 _d["cooldown_remaining_s"] = round(
-                    config.MOMENTUM_MARKET_COOLDOWN_SECONDS - (now_ts - last_touch), 1)
+                    min(config.MOMENTUM_MARKET_COOLDOWN_SECONDS - _cd_yes,
+                        config.MOMENTUM_MARKET_COOLDOWN_SECONDS - _cd_no), 1)
                 scan_diags.append(_d)
                 continue
 
@@ -313,7 +341,6 @@ class MomentumScanner(BaseStrategy):
             _book_age = round(now_ts - book_yes.timestamp, 1)
             _d["book_age_s"] = _book_age
             _d["p_yes"] = round(book_yes.mid, 4)
-            _d["p_no"] = round(1.0 - book_yes.mid, 4)
 
             # ── Stale book gate ──────────────────────────────────────────────
             # If the WS shard for this token has silently stopped delivering
@@ -337,7 +364,29 @@ class MomentumScanner(BaseStrategy):
                 continue
 
             p_yes = book_yes.mid
-            p_no = 1.0 - p_yes
+            # Fetch actual NO CLOB book mid — evaluate the NO band against the
+            # NO token's own orderbook, not a value derived from the YES side.
+            # Fall back to derivation only if the NO book is unavailable (rare:
+            # both tokens are subscribed; this typically only occurs during WS
+            # reconnect within the first few seconds of startup).
+            book_no = self._pm.get_book(market.token_id_no)
+            if book_no is not None and book_no.mid is not None:
+                p_no = book_no.mid
+            else:
+                # NO book unavailable (WS reconnect / startup race).
+                # Do NOT derive from the YES side — YES and NO are independent
+                # CLOBs and 1-p_yes ≠ p_no in general.  Skip this market for
+                # this scan cycle; it will be re-evaluated on the next tick.
+                log.debug(
+                    "MomentumScanner: NO book unavailable — skipping market this scan",
+                    market_id=market.condition_id[:22],
+                    p_yes=round(p_yes, 4),
+                )
+                skipped_stale_book += 1
+                _d["skip_reason"] = "no_book_missing"
+                scan_diags.append(_d)
+                continue
+            _d["p_no"] = round(p_no, 4)
 
             # ── Find which side is in the signal band ────────────────────────
             if band_lo <= p_yes <= band_hi:
@@ -364,6 +413,18 @@ class MomentumScanner(BaseStrategy):
 
             _d["side"] = high_side
             _d["token_price"] = round(token_price, 4)
+
+            # ── Per-side cooldown check ──────────────────────────────────────
+            # The early pre-filter above skips only when BOTH sides are cooling.
+            # Now that we know which side is in-band, gate on that side's clock.
+            _side_key = f"{market.condition_id}:{high_side}"
+            if now_ts - self._market_cooldown.get(_side_key, 0.0) < config.MOMENTUM_MARKET_COOLDOWN_SECONDS:
+                skipped_cooldown += 1
+                _d["skip_reason"] = "cooldown"
+                _d["cooldown_remaining_s"] = round(
+                    config.MOMENTUM_MARKET_COOLDOWN_SECONDS - (now_ts - self._market_cooldown.get(_side_key, 0.0)), 1)
+                scan_diags.append(_d)
+                continue
 
             # ── HL spot ──────────────────────────────────────────────────────
             bbo = self._hl.get_bbo(market.underlying)
@@ -467,8 +528,15 @@ class MomentumScanner(BaseStrategy):
                 delta_pct = (strike - spot) / strike * 100
 
             _d["delta_pct"]  = round(delta_pct, 6)
-            _d["gap_pct"]    = round(delta_pct - y, 6)   # +ve = above threshold, -ve = below
+            _d["gap_pct"]    = round(delta_pct - y, 6)   # +ve = above vol-scaled threshold, -ve = below
             _d["observed_z"] = round(delta_pct / (sigma_tau * 100), 4) if sigma_tau > 0 else None
+
+            # Effective threshold: vol-scaled y or the configured absolute floor,
+            # whichever is larger.  Recorded so diagnostics reflect the actual gate.
+            _effective_threshold = max(y, config.MOMENTUM_MIN_DELTA_PCT)
+            _d["min_delta_floor"]      = round(config.MOMENTUM_MIN_DELTA_PCT, 6)
+            _d["effective_threshold"]  = round(_effective_threshold, 6)
+            _d["effective_gap_pct"]    = round(delta_pct - _effective_threshold, 6)  # +ve = passed gate
 
             # Now gate on TTE — all diag fields are populated above for research.
             if _blocked_by_tte:
@@ -477,7 +545,13 @@ class MomentumScanner(BaseStrategy):
                 continue
 
             # ── Gate: delta must exceed threshold ────────────────────────────
-            if delta_pct < y:
+            # max() enforces an absolute floor independent of time bucket.
+            # The floor guards against tick risk: if the spot-to-strike gap is
+            # too small, a single adverse tick can flip the position from winning
+            # to losing before expiry — regardless of how strong the vol-scaled
+            # z-signal looks.  This risk is the same whether it's a 5m, 15m, or
+            # 1h market; the absolute price distance determines survival, not TTE.
+            if delta_pct < _effective_threshold:
                 skipped_delta += 1
                 _d["skip_reason"] = "delta_below_threshold"
                 scan_diags.append(_d)
@@ -492,10 +566,17 @@ class MomentumScanner(BaseStrategy):
                 continue
 
             # ── Concurrent position cap ──────────────────────────────────────
-            if open_momentum >= config.MOMENTUM_MAX_CONCURRENT:
+            # Use a live count from the risk engine rather than the snapshot taken
+            # at the start of the scan pass — event-driven entries (via
+            # _on_price_update_entry waking _scan_loop early) may have added
+            # positions during the awaits above, making the snapshot stale.
+            _live_momentum = sum(
+                1 for p in self._risk.get_open_positions() if p.strategy == "momentum"
+            )
+            if _live_momentum >= config.MOMENTUM_MAX_CONCURRENT:
                 skipped_cap += 1
                 _d["skip_reason"] = "concurrent_cap"
-                _d["open_momentum"] = open_momentum
+                _d["open_momentum"] = _live_momentum
                 scan_diags.append(_d)
                 continue
 
@@ -546,6 +627,7 @@ class MomentumScanner(BaseStrategy):
                 tte_seconds=tte_seconds,
                 sigma_ann=sigma_ann,
                 vol_source=vol_src,
+                vol_z_score=_vol_z,
             )
             _d["skip_reason"] = "signal_fired"
             scan_diags.append(_d)
@@ -557,11 +639,18 @@ class MomentumScanner(BaseStrategy):
             if self._on_signal is not None:
                 self._on_signal(_signal_log_dict(signal) | {"timestamp": time.time()})
             executed = await self._execute_signal(signal, market)
+            # Always mark cooldown after evaluating any signal — whether the order
+            # was placed or was rejected (ask moved out of band, duplicate race, etc).
+            # Without this, a mid that stays in-band but with a spiked ask causes
+            # the event-driven path to re-trigger _scan_once every few milliseconds
+            # in a tight loop, spamming identical "price moved out of band" log lines.
+            self._market_cooldown[f"{market.condition_id}:{high_side}"] = now_ts
+            _save_cooldowns(self._cooldown_path, self._market_cooldown)
             if executed:
                 signals_fired += 1
-                open_momentum += 1
-                # Mark cooldown immediately to prevent duplicate within same scan pass
-                self._market_cooldown[market.condition_id] = now_ts
+                # NB: open_momentum counter is NOT incremented here.
+                # The cap check above re-queries the risk engine on every
+                # iteration (live count), so no manual bookkeeping is needed.
 
         # ── HL outage detection ───────────────────────────────────────────────
         # If more than half of all scanned markets are being skipped for stale
@@ -613,6 +702,18 @@ class MomentumScanner(BaseStrategy):
             "skipped_cap":             skipped_cap,
         }
         self._last_scan_ts = now_ts
+        # ── PM feed health ────────────────────────────────────────────────────
+        # If >50% of subscribed (non-horizon-filtered) markets have a stale PM
+        # book, it is more likely a WS shard outage than normal market activity.
+        _total = len(bucket_markets)
+        _stale = sum(
+            1 for d in scan_diags
+            if d.get("skip_reason") in ("stale_book", "empty_book")
+        )
+        self._last_stale_book_ratio = round(_stale / _total, 3) if _total > 0 else 0.0
+        self._last_pm_feed_health = (
+            "degraded" if _total > 0 and self._last_stale_book_ratio > 0.5 else "ok"
+        )
 
     # ── Event-driven entry ────────────────────────────────────────────────────
 
@@ -632,21 +733,24 @@ class MomentumScanner(BaseStrategy):
         market = self._token_to_market.get(token_id)
         if market is None:
             return
-        # Use the YES-token book as the canonical price source.
-        # (All gate logic runs in YES-price space; mid of either token triggers
-        # a chain of YES-book updates so get_book(YES) is always current.)
-        book_yes = self._pm.get_book(market.token_id_yes)
-        if book_yes is None or book_yes.mid is None:
-            return
-        p_yes = book_yes.mid
+        # Each side (YES / NO) is evaluated against its own CLOB book mid.
+        # The token_id that fired tells us which side updated; use that book's
+        # mid directly — do not derive the opposite side's price from 1.0 - mid.
         band_lo = config.MOMENTUM_PRICE_BAND_LOW
         band_hi = config.MOMENTUM_PRICE_BAND_HIGH
-        if not (band_lo <= p_yes <= band_hi) and not (band_lo <= 1.0 - p_yes <= band_hi):
-            return  # neither side in band — skip
-        # Skip if still in per-market cooldown (avoids waking on repeated ticks
-        # for a market that just had a signal or is waiting out a cooldown window).
-        if (time.time() - self._market_cooldown.get(market.condition_id, 0.0)
-                < config.MOMENTUM_MARKET_COOLDOWN_SECONDS):
+        now = time.time()
+        if token_id == market.token_id_yes:
+            # YES token fired — mid is the YES CLOB mid.
+            if not (band_lo <= mid <= band_hi):
+                return  # YES not in band
+            side_key = f"{market.condition_id}:YES"
+        else:
+            # NO token fired — mid is the actual NO CLOB mid.
+            if not (band_lo <= mid <= band_hi):
+                return  # NO not in band
+            side_key = f"{market.condition_id}:NO"
+        # Skip if this side is still in cooldown.
+        if now - self._market_cooldown.get(side_key, 0.0) < config.MOMENTUM_MARKET_COOLDOWN_SECONDS:
             return
         # Signal the scan loop to wake up and run a full evaluation now.
         self._scan_event.set()
@@ -670,6 +774,8 @@ class MomentumScanner(BaseStrategy):
             "scan_ts": self._last_scan_ts,
             "markets": self._last_scan_diags,
             "summary": self._last_scan_summary,
+            "pm_feed_health": self._last_pm_feed_health,
+            "stale_book_ratio": self._last_stale_book_ratio,
         }
 
     # ── Execution ─────────────────────────────────────────────────────────────
@@ -715,6 +821,14 @@ class MomentumScanner(BaseStrategy):
             return False
 
         size_usd = config.MOMENTUM_MAX_ENTRY_USD
+        _edge = signal.edge_pct
+        _anchor = config.MOMENTUM_EDGE_SIZE_ANCHOR
+        if _anchor > 0 and _edge > 0:
+            _fraction = min(1.0, _edge / _anchor)
+            size_usd = max(
+                config.MOMENTUM_MIN_ENTRY_USD,
+                round(_fraction * config.MOMENTUM_MAX_ENTRY_USD, 2),
+            )
 
         # ── Place order ───────────────────────────────────────────────────────
         order_id: Optional[str] = None
@@ -749,10 +863,11 @@ class MomentumScanner(BaseStrategy):
             return False
 
         # ── Record execution from PM source of truth ──────────────────────────
-        # YES and NO are independent CLOBs.  Convert fill price to YES-probability
-        # space for consistent Position storage:
-        #   YES token: entry_price = fill_price          (already in YES-space)
-        #   NO  token: entry_price = 1.0 - fill_price   (NO CLOB price → YES-space)
+        # YES and NO are independent CLOBs.  entry_price is the actual token fill
+        # price for both sides — no YES-space conversion.
+        #   YES token: entry_price = fill_price (e.g. 0.83 if buying YES at 0.83)
+        #   NO  token: entry_price = fill_price (e.g. 0.83 if buying NO  at 0.83)
+        # P&L = (exit_price - entry_price) × size  — same formula for both sides.
         #
         # Fill detection strategy (fastest first):
         #   1. Register a one-shot Future before awaiting anything else.  If the
@@ -785,11 +900,11 @@ class MomentumScanner(BaseStrategy):
 
         if actual_fill is not None:
             raw_fill_price, actual_size = actual_fill
-            entry_price = raw_fill_price if signal.side == "YES" else 1.0 - raw_fill_price
+            entry_price = raw_fill_price  # actual token fill price for both YES and NO
             entry_size = actual_size
         else:
             # Paper mode or fill data unavailable.
-            entry_price = order_price if signal.side == "YES" else 1.0 - order_price
+            entry_price = order_price  # actual token price for both sides
             if not self._pm._paper_mode:
                 # Live mode: fill data was not recoverable from WS or REST.
                 # Use the CLOB token balance as the source of truth — it reflects
@@ -811,9 +926,16 @@ class MomentumScanner(BaseStrategy):
                     )
                     return False
             else:
-                entry_size = size_usd
+                # Paper mode: convert USD budget → token count so that
+                # P&L calculations (exit_price - entry_price) * size are correct.
+                entry_size = round(size_usd / order_price, 6)
 
         # ── Register position with risk engine ────────────────────────────────
+        _entry_cost = round(entry_price * entry_size, 6)
+        # excess_z: how many annualized-vol standard deviations above the threshold
+        # the signal is.  Uses sigma_ann (not sigma_tau) so the value is stable
+        # across TTE — near-expiry signals won't artificially inflate it.
+        _excess_z = (signal.delta_pct - signal.threshold_pct) / (signal.sigma_ann * 100 + 1e-9)
         pos = Position(
             market_id=signal.market_id,
             market_type=market.market_type,
@@ -821,10 +943,20 @@ class MomentumScanner(BaseStrategy):
             side=signal.side,
             size=entry_size,
             entry_price=entry_price,
+            entry_cost_usd=_entry_cost,
             strategy="momentum",
             token_id=signal.token_id,
             market_title=market.title,
             order_id=order_id,
+            # Signal metadata — stored so trades.csv supports TTE/z-score analysis
+            # without requiring a join to the heavy scanner_samples diagnostic CSV.
+            tte_years=signal.tte_seconds / (365.25 * 86400),
+            spot_price=signal.spot,
+            strike=signal.strike,
+            # signal_score = excess_z (sigma_ann-normalised), not the tau-normalised
+            # observed_z that inflates near expiry.  Positive means delta exceeded
+            # the z-score threshold; higher = stronger signal relative to annual vol.
+            signal_score=round(_excess_z, 4),
         )
         self._risk.open_position(pos)
 
@@ -834,7 +966,7 @@ class MomentumScanner(BaseStrategy):
             side=signal.side,
             token_price=current_ask,
             order_price=order_price,
-            entry_price_yes_space=round(entry_price, 4),
+            entry_price=round(entry_price, 4),
             entry_size=entry_size,
             fill_from_clob=actual_fill is not None,
             delta_pct=round(signal.delta_pct, 3),
@@ -880,6 +1012,26 @@ def _save_open_spots(path: str, cache: dict[str, float]) -> None:
             json.dump(cache, f)
     except Exception:
         pass  # non-critical — we just lose the cache on restart for this market
+
+
+def _load_cooldowns(path: str) -> dict[str, float]:
+    """Load persisted cooldown timestamps from disk, or return empty dict on error."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return {k: float(v) for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _save_cooldowns(path: str, cache: dict[str, float]) -> None:
+    """Persist cooldown timestamps to disk (best-effort, never raises)."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass  # non-critical — cooldown continues in-memory; only loses persistence on restart
 
 
 def _extract_strike(title: str, spot: float) -> Optional[float]:

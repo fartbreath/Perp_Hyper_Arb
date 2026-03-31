@@ -77,6 +77,7 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_VOL_CACHE_TTL` | `300` | Seconds to cache Deribit ATM IV before re-fetching |
 | `MOMENTUM_VOL_Z_SCORE` | `1.6449` | Global z-score for the probability threshold (1.6449 ≈ 95th percentile) |
 | `MOMENTUM_VOL_Z_SCORE_BY_TYPE` | `{}` | Per-bucket-type z-score overrides; unlisted types use the global default. Example: `{"bucket_daily": 1.0, "bucket_15m": 1.3}` |
+| `MOMENTUM_MIN_DELTA_PCT` | `0.0` | Absolute minimum spot-to-strike gap (%) required to enter, independent of time bucket or vol regime. See [Absolute Floor Principle](#absolute-floor-principle). |
 | `MOMENTUM_MAX_CONCURRENT` | `3` | Maximum simultaneous momentum positions |
 | `MOMENTUM_MARKET_COOLDOWN_SECONDS` | `300` | Seconds to suppress re-entry after any open/close/failed attempt in a market (deduplication guard) |
 | `MOMENTUM_MAX_TTE_DAYS` | `7` | Days of bucket markets subscribed for WS book data (independent of maker window) |
@@ -155,6 +156,59 @@ y = 1.6449 * 0.00481 * 100 = 0.79%
 
 With a static table this would have been fixed at +0.65%. Dynamic vol correctly raises the bar
 when the market is volatile, protecting against false entries in noisy conditions.
+
+---
+
+## Absolute Floor Principle
+
+`MOMENTUM_MIN_DELTA_PCT` sets a hard minimum on the spot-to-strike gap, **independent of time bucket, vol regime, or z-score**.
+
+### Why the z-gate alone isn't enough
+
+The vol-scaled threshold `y = z × sigma_tau × 100` shrinks with both TTE and annualized vol:
+
+```
+sigma_tau = sigma_ann * sqrt(TTE_s / 31_536_000)
+y = z * sigma_tau * 100
+```
+
+A low-vol coin (e.g. XRP with sigma_ann ≈ 0.28) at short TTE can produce a threshold as low as 0.065%.
+A delta of 0.076% exceeds that threshold — the z-gate passes the trade — yet a single adverse tick
+might be 0.02-0.05% on a thin asset. The position is one tick from going underwater at entry.
+
+### The principle
+
+**The absolute gap between spot and strike determines whether the position can survive a single
+adverse tick. That tick risk is the same regardless of whether it's a 5m, 15m, or 1h market.**
+
+A 0.05% spot-to-strike gap carries identical snap risk in a 5m bucket and a 15m bucket.
+The time bucket changes how likely a reversal is over the full remaining window; it does not
+change how close you are to the strike *right now*. The floor is not a TTE safeguard — it is
+a minimum viable signal distance.
+
+### Calibration
+
+Set the floor to just above the smallest delta observed on a losing trade:
+
+| Observed (March 31 2026 data) | Detail |
+|-------------------------------|--------|
+| Smallest losing delta | 0.076% (XRP, 5m bucket, TTE=63s) |
+| Smallest winning delta | 0.084% (multiple assets) |
+| **Recommended floor** | **0.08%** |
+
+At 0.08%, the XRP loss above is blocked. All observed winners (minimum 0.084%) are preserved.
+
+### Effective threshold
+
+The scanner uses `max(y, MOMENTUM_MIN_DELTA_PCT)` as the effective gate:
+
+```python
+_effective_threshold = max(y, config.MOMENTUM_MIN_DELTA_PCT)
+```
+
+When vol is high (BTC at 80%+ IV), `y` will far exceed the floor and the floor has no effect.
+When vol is low or TTE is short, the floor becomes the binding constraint — which is exactly when
+thin-gap entries are most dangerous.
 
 ---
 
@@ -386,6 +440,7 @@ Before entering, check all open positions across ALL strategies:
 | HL WS feed silently stops delivering | HL outage detection: log warning if >50% markets skipped for stale spot | Operator alerted to investigate |
 | Deribit IV cached from high-vol period | Cache TTL 5 min; stale vol widens threshold | Conservative; may miss some trades |
 | Vol regime spikes 3x (black swan) | z-score scales threshold with vol | Naturally filters out noisy markets |
+| Low-vol coin passes z-gate with tiny gap | `MOMENTUM_MIN_DELTA_PCT` absolute floor (independent of bucket) | Blocks trades where a single tick would cross strike; see [Absolute Floor Principle](#absolute-floor-principle) |
 | Concurrent position cap hit | `MOMENTUM_MAX_CONCURRENT` gate | Signal dropped until slot opens |
 | Per-bucket vol bar too strict | `MOMENTUM_VOL_Z_SCORE_BY_TYPE` override for that type | Tune per-type without affecting others |
 
