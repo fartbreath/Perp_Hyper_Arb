@@ -479,3 +479,113 @@ class TestFillSessionStatsReset:
             "start() must call reset_fill_session_stats() to clear prior session data"
         )
         assert s["hl_max_move_pct_session"] == 0.0
+
+
+# ── YES/NO CLOB independence: fill_simulator._sweep ──────────────────────────
+
+class TestNoOrderBookIndependence:
+    """
+    _sweep must fetch the NO CLOB book for BUY NO orders, not mirror the YES
+    book via a `1.0 - price` derivation.
+
+    Key invariant: YES_mid=0.30 and NO_mid=0.82 are independent.
+    A BUY NO quote at 0.82 should cross the NO book (best_ask=0.82), not
+    the YES book (which would require a derived price of 0.18 to cross).
+    """
+
+    def _make_no_buy_quote(
+        self,
+        market_id="mkt_001",
+        price=0.82,
+        size=50.0,
+    ) -> ActiveQuote:
+        """Return a BUY NO quote.  The key used in get_active_quotes must end
+        with '_ask' so that is_no_buy=True in _sweep."""
+        return ActiveQuote(
+            market_id=market_id,
+            token_id="tok_no",
+            side="BUY",
+            price=price,
+            size=size,
+            order_id="paper-no-001",
+        )
+
+    def test_no_buy_order_uses_no_book_for_touch_check(self):
+        """BUY NO order must cross against the NO CLOB book, not the YES book."""
+        sim, pm, maker, risk, monitor = _make_simulator(fill_prob_base=0.99)
+        market = _make_market()
+        pm._markets = {"mkt_001": market}
+
+        # YES book: best_ask = 0.31 (irrelevant for NO order)
+        yes_book = _make_book(best_bid=0.29, best_ask=0.31)
+        # NO book: best_ask = 0.82 — the BUY NO quote at 0.82 should cross this
+        no_book = _make_book(best_bid=0.80, best_ask=0.82)
+        pm._books = {"tok_yes": yes_book, "tok_no": no_book}
+
+        quote = self._make_no_buy_quote(price=0.82)
+        # Key ends with '_ask' → interpreted as BUY NO by _sweep
+        maker.get_active_quotes = MagicMock(return_value={"tok_no_ask": quote})
+        maker.consume_fill = MagicMock(return_value=quote)
+        maker.record_fill = MagicMock()
+        maker.schedule_hedge_rebalance = MagicMock()
+        maker.get_hl_mid = MagicMock(return_value=None)
+        maker._reprice_market = AsyncMock()
+
+        asyncio.get_event_loop().run_until_complete(sim._sweep())
+
+        # Fill should have been processed using the real NO book
+        maker.consume_fill.assert_called_once(), "NO order must be filled via NO CLOB touch-check"
+
+    def test_no_buy_order_skips_when_no_book_missing(self):
+        """When the NO CLOB book is absent, BUY NO order must be skipped entirely
+        (no fill, no derivation)."""
+        sim, pm, maker, risk, monitor = _make_simulator(fill_prob_base=0.99)
+        market = _make_market()
+        pm._markets = {"mkt_001": market}
+
+        # Only YES book present; NO book absent
+        yes_book = _make_book(best_bid=0.29, best_ask=0.31)
+        pm._books = {"tok_yes": yes_book}   # tok_no intentionally absent
+
+        quote = self._make_no_buy_quote(price=0.82)
+        maker.get_active_quotes = MagicMock(return_value={"tok_no_ask": quote})
+        maker.consume_fill = MagicMock(return_value=quote)
+        maker.record_fill = MagicMock()
+
+        asyncio.get_event_loop().run_until_complete(sim._sweep())
+
+        # No fill should occur because the NO book is absent
+        maker.consume_fill.assert_not_called(), "BUY NO order must be skipped when NO book is absent"
+        assert len(risk.get_open_positions()) == 0
+
+    def test_no_buy_does_not_use_derived_yes_price(self):
+        """Regression: price 1 - 0.82 = 0.18 must NEVER be used against the YES book.
+        If YES best_ask is 0.31 and a derived price of 0.18 were used on the SELL side,
+        it would NOT cross (0.18 < 0.31) and the order would be skipped even when the
+        actual NO book WOULD cross.  Test that the order fills correctly via the real
+        NO book even when the derived price would have failed the touch check."""
+        sim, pm, maker, risk, monitor = _make_simulator(fill_prob_base=0.99)
+        market = _make_market()
+        pm._markets = {"mkt_001": market}
+
+        # YES book: best_ask=0.31 — derived price 0.18 would fail the SELL check here
+        yes_book = _make_book(best_bid=0.29, best_ask=0.31)
+        # NO book: best_ask=0.82 — actual NO quote at 0.82 crosses this
+        no_book = _make_book(best_bid=0.80, best_ask=0.82)
+        pm._books = {"tok_yes": yes_book, "tok_no": no_book}
+
+        quote = self._make_no_buy_quote(price=0.82)
+        maker.get_active_quotes = MagicMock(return_value={"tok_no_ask": quote})
+        maker.consume_fill = MagicMock(return_value=quote)
+        maker.record_fill = MagicMock()
+        maker.schedule_hedge_rebalance = MagicMock()
+        maker.get_hl_mid = MagicMock(return_value=None)
+        maker._reprice_market = AsyncMock()
+
+        asyncio.get_event_loop().run_until_complete(sim._sweep())
+
+        # If derivation were used, the order would be skipped (derived 0.18 < YES best_ask 0.31).
+        # With the fix, the NO book is checked directly and the order fills.
+        maker.consume_fill.assert_called_once(), (
+            "BUY NO at 0.82 must fill via NO book — not be skipped due to derived YES price check"
+        )

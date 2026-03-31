@@ -49,13 +49,14 @@ log = get_bot_logger(__name__)
 # ── Exit reason constants ─────────────────────────────────────────────────────
 
 class ExitReason:
-    PROFIT_TARGET       = "profit_target"
-    STOP_LOSS           = "stop_loss"
-    TIME_STOP           = "time_stop"
-    RESOLVED            = "resolved"
-    COIN_LOSS_LIMIT     = "coin_loss_limit"      # maker: aggregate coin P&L exceeded threshold
-    MOMENTUM_STOP_LOSS  = "momentum_stop_loss"   # momentum: held token fell below MOMENTUM_STOP_LOSS
-    MOMENTUM_TAKE_PROFIT= "momentum_take_profit" # momentum: held token rose above MOMENTUM_TAKE_PROFIT
+    PROFIT_TARGET          = "profit_target"
+    STOP_LOSS              = "stop_loss"
+    TIME_STOP              = "time_stop"
+    RESOLVED               = "resolved"
+    COIN_LOSS_LIMIT        = "coin_loss_limit"       # maker: aggregate coin P&L exceeded threshold
+    MOMENTUM_STOP_LOSS     = "momentum_stop_loss"    # momentum: held token fell below MOMENTUM_STOP_LOSS
+    MOMENTUM_TAKE_PROFIT   = "momentum_take_profit"  # momentum: held token rose above MOMENTUM_TAKE_PROFIT
+    MOMENTUM_NEAR_EXPIRY   = "momentum_near_expiry"  # momentum: near expiry and in loss territory
 
 
 # ── Pure helpers (easily unit-tested) ────────────────────────────────────────
@@ -64,14 +65,11 @@ def compute_unrealised_pnl(pos: Position, current_price: float) -> float:
     """
     Unrealised P&L in USD for an open position.
 
-    YES side: profit when price rises (bought low, priced higher now).
-    NO  side: profit when price falls (bought NO at entry_price means
-              we expect YES to fail, so we gain as YES price falls).
+    current_price is the actual mid price of the HELD token from its own
+    CLOB book (YES mid for YES positions, NO mid for NO positions).
+    Both sides use the same formula: profit when price rises above entry.
     """
-    if pos.side in ("YES", "BUY_YES"):
-        return (current_price - pos.entry_price) * pos.size
-    else:
-        return (pos.entry_price - current_price) * pos.size
+    return (current_price - pos.entry_price) * pos.size
 
 
 def should_exit(
@@ -80,6 +78,8 @@ def should_exit(
     initial_deviation: float,
     market_end_date: Optional[datetime],
     now: Optional[datetime] = None,
+    current_token_price: Optional[float] = None,
+    tte_seconds: Optional[float] = None,
 ) -> tuple[bool, str, float]:
     """
     Decide whether a position should be exited.
@@ -97,19 +97,30 @@ def should_exit(
       * **maker**: TIME_STOP fires for non-bucket (milestone/daily) markets
         within MAKER_EXIT_HOURS of expiry.  Bucket positions are held to
         RESOLVED.  No per-position profit target or stop-loss.
-      * **momentum**: token-price exits (MOMENTUM_STOP_LOSS / MOMENTUM_TAKE_PROFIT)
-        in YES-price space.  No time-stop — the min-TTE entry gate already
-        places entries close to expiry, so holding to RESOLVED is correct.
+      * **momentum**: token-price exits evaluated against the **held token's
+        own CLOB mid** (``current_token_price``), not a price derived from the
+        opposite side.  MOMENTUM_STOP_LOSS fires when the token falls below
+        threshold; MOMENTUM_TAKE_PROFIT fires near certainty; MOMENTUM_NEAR_EXPIRY
+        fires when TTE is very short and the position is in loss territory to
+        avoid a binary snap to zero.
       * **mispricing**: EXIT_DAYS_BEFORE_RESOLUTION time-stop, plus per-position
         PROFIT_TARGET and STOP_LOSS in USD P&L space.
       * **any other label**: treated as unknown — no triggers, hold to RESOLVED.
 
     Args:
-        pos:                Open position to evaluate.
-        current_price:      Current mid price of the YES token.
-        initial_deviation:  |PM price - implied prob| at entry (always > 0).
-        market_end_date:    When the market resolves (UTC). None = unknown.
-        now:                Override for current time (for testing).
+        pos:                  Open position to evaluate.
+        current_price:        Current mid price of the YES token (YES-space; used
+                              for P&L calculation and non-momentum exits).
+        initial_deviation:    |PM price - implied prob| at entry (always > 0).
+        market_end_date:      When the market resolves (UTC). None = unknown.
+        now:                  Override for current time (for testing).
+        current_token_price:  Actual mid price of the HELD token from its own
+                              CLOB book.  For YES positions this equals
+                              ``current_price``; for NO positions it is the
+                              NO CLOB mid, not ``1.0 - current_price``.  When
+                              None the function falls back to the derived value.
+        tte_seconds:          Seconds until market resolution.  Required for the
+                              near-expiry stop.  ``None`` disables that check.
 
     Returns:
         (should_exit, reason, unrealised_pnl_usd)
@@ -164,19 +175,34 @@ def should_exit(
                 return True, ExitReason.TIME_STOP, unrealised
         return False, "", unrealised
 
-    # ── Momentum exits — token-price based (not USD P&L) ─────────────────────
+    # ── Momentum exits — token-price based, evaluated on each side's own CLOB ──
     if pos.strategy == "momentum":
         if pos.side in ("YES", "BUY_YES"):
-            token_price = current_price
+            # Use actual YES CLOB mid; fall back to YES-space current_price.
+            token_price = current_token_price if current_token_price is not None else current_price
             stop_loss = config.MOMENTUM_STOP_LOSS_YES
         else:
-            token_price = 1.0 - current_price
+            # Use actual NO CLOB mid.  Do NOT derive from the YES side —
+            # YES and NO are independent CLOBs and 1-p_yes ≠ p_no in general.
+            # If the NO book is unavailable, skip exit checks this tick.
+            if current_token_price is None:
+                return False, "", unrealised
+            token_price = current_token_price
             stop_loss = config.MOMENTUM_STOP_LOSS_NO
+        # Recompute unrealised against the actual held-token price.
+        unrealised = compute_unrealised_pnl(pos, token_price)
         if token_price <= stop_loss:
             return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
         if token_price >= config.MOMENTUM_TAKE_PROFIT:
             return True, ExitReason.MOMENTUM_TAKE_PROFIT, unrealised
-        # No time-stop — min-TTE entry gate means position is near expiry already.
+        # Near-expiry stop: if very close to resolution and already in loss
+        # territory, exit via taker to avoid a binary snap to zero.
+        if (
+            tte_seconds is not None
+            and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
+            and token_price <= config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD
+        ):
+            return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
         return False, "", unrealised
 
     # ── Mispricing exits ──────────────────────────────────────────────────────
@@ -291,7 +317,7 @@ class PositionMonitor:
             key = f"{pos.market_id}:{pos.side}"
             if key in self._exiting_positions:
                 continue  # exit already in progress for this leg
-            await self._check_position(pos)
+            await self._check_position(pos, triggering_token_id=token_id, triggering_mid=mid)
 
     # ── Auto-redemption ───────────────────────────────────────────────────────
 
@@ -327,11 +353,27 @@ class PositionMonitor:
                 continue
 
             size = float(pos_data.get("size", 0) or 0)
-            cur_price = float(pos_data.get("curPrice") or pos_data.get("currentPrice") or pos_data.get("cur_price") or 0)
-            won = cur_price > 0.99
+            cur_price = float(pos_data.get("currentPrice") or pos_data.get("curPrice") or pos_data.get("cur_price") or 0)
+            # The `outcome` field labels WHICH TOKEN the user holds ("Yes"/"No"/"Up"/"Down"),
+            # NOT whether that token won the market.  The correct signal is currentPrice:
+            # winning tokens settle at 1.0, losing tokens at 0.0.
+            won = cur_price > 0.5
             condition_id: str = pos_data.get("conditionId") or pos_data.get("condition_id") or ""
             payout = round(size * cur_price, 4)
             title = pos_data.get("title") or token_id[:20]
+
+            # For losing positions (payout=0): just close bot tracking, skip on-chain call.
+            # Mark in _redeemed_tokens immediately so we don't re-log every poll cycle.
+            settlement_price = 1.0 if won else 0.0
+            markets_snap = self._pm.get_markets()
+            target_market_id: Optional[str] = None
+            for mkt in markets_snap.values():
+                if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
+                    target_market_id = mkt.condition_id
+                    break
+
+            # Fallback: API sometimes omits conditionId; use the market cache entry.
+            condition_id = condition_id or target_market_id or ""
 
             log.info(
                 "Auto-redeem: redeemable position found",
@@ -340,19 +382,9 @@ class PositionMonitor:
                 won=won,
                 size=round(size, 2),
                 payout_usd=payout,
+                condition_id=condition_id[:20] if condition_id else "(missing)",
             )
 
-            # Mark immediately so a crash mid-call doesn't cause a double-submit
-            self._redeemed_tokens.add(token_id)
-
-            # For losing positions (payout=0): just close bot tracking, skip on-chain call
-            settlement_price = 1.0 if won else 0.0
-            markets_snap = self._pm.get_markets()
-            target_market_id: Optional[str] = None
-            for mkt in markets_snap.values():
-                if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
-                    target_market_id = mkt.condition_id
-                    break
             if target_market_id:
                 for rp in list(self._risk.get_positions().values()):
                     if rp.market_id == target_market_id and not rp.is_closed:
@@ -361,13 +393,18 @@ class PositionMonitor:
                         )
 
             if not won:
+                # Nothing to redeem on-chain for a losing position — suppress future re-logging.
+                self._redeemed_tokens.add(token_id)
                 log.info("Auto-redeem: lost position dismissed (payout=0)", token_id=token_id[:20])
                 continue
 
             if not condition_id:
-                log.warning("Auto-redeem: no condition_id — skipping on-chain call", token_id=token_id[:20])
+                # Do NOT mark as redeemed — allow retry next cycle when condition_id arrives.
+                log.warning("Auto-redeem: no condition_id — will retry next cycle", token_id=token_id[:20])
                 continue
 
+            # Mark BEFORE the async call so a crash doesn't cause a double-submit.
+            self._redeemed_tokens.add(token_id)
             try:
                 ctf_address = self._pm._clob.get_conditional_address()
                 collateral_address = self._pm._clob.get_collateral_address()
@@ -428,7 +465,18 @@ class PositionMonitor:
                     market_id=pos.market_id, coin=coin,
                 )
                 continue
-            unrealised = compute_unrealised_pnl(pos, book.mid)
+            if pos.side in ("YES", "BUY_YES"):
+                cur_price = book.mid
+            else:
+                book_no = self._pm._books.get(market.token_id_no)
+                if book_no is None or book_no.mid is None:
+                    log.debug(
+                        "Monitor: no NO book for coin-loss aggregation — treating as 0 unrealised",
+                        market_id=pos.market_id, coin=coin,
+                    )
+                    continue
+                cur_price = book_no.mid
+            unrealised = compute_unrealised_pnl(pos, cur_price)
             coin_unrealised[coin] = coin_unrealised.get(coin, 0.0) + unrealised
 
         # Track which market_ids are being closed by coin-loss so we skip them below
@@ -455,12 +503,19 @@ class PositionMonitor:
                         )
                         exit_mid = pos.entry_price
                     else:
-                        # Taker exit: YES position sells at best_bid; NO position buys YES at best_ask.
-                        # Using mid would overstate P&L by half the spread on every close.
+                        # Taker exit: YES sells at best_bid; NO sells at NO CLOB best_bid.
                         if pos.side in ("YES", "BUY_YES"):
                             exit_mid = book.best_bid if book.best_bid is not None else book.mid
-                        else:  # NO — close by selling NO = buying YES at best_ask
-                            exit_mid = book.best_ask if book.best_ask is not None else book.mid
+                        else:
+                            book_no_cl = self._pm._books.get(market.token_id_no)
+                            if book_no_cl is not None and book_no_cl.best_bid is not None:
+                                exit_mid = book_no_cl.best_bid
+                            else:
+                                log.warning(
+                                    "Monitor: NO book unavailable for coin-loss exit — using entry price",
+                                    market_id=pos.market_id,
+                                )
+                                exit_mid = pos.entry_price
                     try:
                         await self._exit_position(
                             pos, market, exit_mid,
@@ -480,8 +535,19 @@ class PositionMonitor:
             except Exception as exc:
                 log.error("Error checking position", market_id=pos.market_id, exc=str(exc))
 
-    async def _check_position(self, pos: Position) -> None:
-        """Evaluate exit conditions for a single position."""
+    async def _check_position(
+        self,
+        pos: Position,
+        *,
+        triggering_token_id: Optional[str] = None,
+        triggering_mid: Optional[float] = None,
+    ) -> None:
+        """Evaluate exit conditions for a single position.
+
+        triggering_token_id / triggering_mid: when supplied (event-driven path),
+        the fresh WS tick value is used directly as current_token_price for the
+        matching held token, bypassing a potentially-stale book re-fetch.
+        """
         market = self._pm._markets.get(pos.market_id)
         if market is None:
             log.debug("Monitor: market not in cache", market_id=pos.market_id)
@@ -507,13 +573,27 @@ class PositionMonitor:
             and now >= market.end_date
         ):
             book = self._pm._books.get(market.token_id_yes)
-            # Use last known mid if the book still has data; otherwise fall back
-            # to entry_price so round() snaps to the nearest settlement value.
-            exit_mid = (
-                book.mid
-                if book is not None and book.mid is not None
-                else pos.entry_price
-            )
+            # Use last known mid for the held token; fall back to entry_price.
+            if pos.side in ("YES", "BUY_YES"):
+                exit_mid = (
+                    book.mid
+                    if book is not None and book.mid is not None
+                    else pos.entry_price
+                )
+            else:
+                book_no_res = self._pm._books.get(market.token_id_no)
+                if book_no_res is not None and book_no_res.mid is not None:
+                    exit_mid = book_no_res.mid
+                else:
+                    # NO book gone at resolution — cannot derive the outcome from
+                    # the YES book (YES and NO are independent CLOBs).  Fall back
+                    # to entry_price (zero P&L); the risk engine still closes the
+                    # position and records the trade.
+                    log.warning(
+                        "Monitor: NO book gone at resolution — using entry_price (zero P&L)",
+                        market_id=pos.market_id,
+                    )
+                    exit_mid = pos.entry_price
             unrealised = compute_unrealised_pnl(pos, exit_mid)
             log.info(
                 "Monitor: resolved market — closing position",
@@ -525,17 +605,54 @@ class PositionMonitor:
             return
 
         # ── Standard check (live book required for all other exits) ───────────
-        # Always read the YES token price — all P&L formulas are in YES-price space.
-        # entry_price is stored as the YES price (pm_price at signal time) for both
-        # YES and NO positions, so current_price must also be the YES token price.
+        # current_price is always the YES-token mid — used for the P&L formula
+        # and non-momentum exit conditions (both store entry_price in YES-space).
+        # For momentum exits on NO positions we additionally fetch the actual
+        # NO CLOB book so stop-loss / take-profit trigger on the correct price.
         book = self._pm._books.get(market.token_id_yes)
         if book is None or book.mid is None:
             log.debug("Monitor: no book data yet", market_id=pos.market_id, token_id=market.token_id_yes)
             return
 
-        current_price = book.mid  # mid used for trigger-condition evaluation only
+        current_price = book.mid  # YES-space mid; used for P&L formula
         initial_deviation = self._initial_deviations.get(
             pos.market_id, config.MISPRICING_THRESHOLD
+        )
+
+        # For momentum positions evaluate exit triggers against the HELD token's
+        # own CLOB mid, not a price derived from the opposite side's book.
+        current_token_price: Optional[float] = None
+        book_no = None
+        if pos.strategy == "momentum":
+            if pos.side in ("YES", "BUY_YES"):
+                current_token_price = book.mid  # YES CLOB mid
+            else:
+                book_no = self._pm._books.get(market.token_id_no)
+                if book_no is not None and book_no.mid is not None:
+                    current_token_price = book_no.mid
+                else:
+                    # NO book unavailable — leave current_token_price as None.
+                    # should_exit will skip momentum exit checks this tick rather
+                    # than firing on a price derived from the independent YES side.
+                    log.debug(
+                        "Monitor: NO book unavailable — skipping exit check this tick",
+                        market_id=pos.market_id,
+                    )
+
+        # E3: if triggered by a live WS tick on the held token, override the
+        # book-fetched current_token_price with the fresh value directly.
+        # pos.token_id is the CLOB token ID of the held side (YES or NO).
+        if (
+            pos.strategy == "momentum"
+            and triggering_token_id is not None
+            and triggering_mid is not None
+            and triggering_token_id == pos.token_id
+        ):
+            current_token_price = triggering_mid
+
+        tte_seconds: Optional[float] = (
+            (market.end_date - now).total_seconds()
+            if market.end_date is not None else None
         )
 
         exit_flag, reason, unrealised = should_exit(
@@ -544,6 +661,8 @@ class PositionMonitor:
             initial_deviation=initial_deviation,
             market_end_date=market.end_date,
             now=now,
+            current_token_price=current_token_price,
+            tte_seconds=tte_seconds,
         )
 
         log.debug(
@@ -581,8 +700,19 @@ class PositionMonitor:
                 # Pre-expiry taker exit: YES sell crosses the spread at best_bid.
                 taker_exit_price = book.best_bid if book.best_bid is not None else current_price
             else:
-                # NO close: sell NO at NO_bid = 1 − YES_ask (P&L formula in YES space).
-                taker_exit_price = book.best_ask if book.best_ask is not None else current_price
+                # NO close: sell NO tokens at the actual NO CLOB best_bid.
+                # YES and NO are independent CLOBs — never derive NO price from YES.
+                if book_no is not None and book_no.best_bid is not None:
+                    taker_exit_price = book_no.best_bid
+                else:
+                    # NO book unavailable — defer to the next monitor tick rather
+                    # than deriving a price from the YES book.
+                    log.warning(
+                        "Monitor: NO book unavailable for pre-expiry exit — deferring to next tick",
+                        market_id=pos.market_id, reason=reason,
+                    )
+                    self._exiting_positions.discard(key)
+                    return
 
             # Stop-loss exits must fill immediately — use a market (taker) order.
             # post_only limit orders on stop exits cause two problems:
@@ -592,7 +722,8 @@ class PositionMonitor:
             #   2. The position is recorded as closed even if the CLOB order
             #      never fills, leaving an unhedged live position.
             is_stop = reason in (ExitReason.MOMENTUM_STOP_LOSS, ExitReason.STOP_LOSS,
-                                 ExitReason.COIN_LOSS_LIMIT)
+                                 ExitReason.COIN_LOSS_LIMIT, ExitReason.MOMENTUM_NEAR_EXPIRY,
+                                 ExitReason.MOMENTUM_TAKE_PROFIT)
             await self._exit_position(pos, market, taker_exit_price, reason, unrealised,
                                       force_taker=is_stop)
 
@@ -635,7 +766,7 @@ class PositionMonitor:
                 market.token_id_yes if pos.side in ("YES", "BUY_YES")
                 else market.token_id_no
             )
-            sell_order_price = exit_price if pos.side in ("YES", "BUY_YES") else (1.0 - exit_price)
+            sell_order_price = exit_price  # actual token price for both YES and NO
 
             # CLOB wallet balance is the source of truth for sell size.
             # pos.size may be slightly wrong (e.g. set from WS size_matched or
@@ -716,15 +847,12 @@ class PositionMonitor:
                     self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
                     return
 
-        # Token price for the exit side (NO positions close in YES-price space).
-        token_exit_price = exit_price if pos.side in ("YES", "BUY_YES") else (1.0 - exit_price)
-
         # Fee model depends on exit type:
         #   RESOLVED    — auto-distribution, no trade → zero fees/rebates.
         #   post-only   — we are the maker on exit: earn rebate, pay no taker fee.
         #   force_taker — market order: we are the taker, pay full fee, earn no rebate.
         fee_base = (
-            pos.size * token_exit_price * config.PM_FEE_COEFF * (1.0 - token_exit_price)
+            pos.size * exit_price * config.PM_FEE_COEFF * (1.0 - exit_price)
             if market.fees_enabled else 0.0
         )
         if reason == ExitReason.RESOLVED or not market.fees_enabled:

@@ -64,9 +64,9 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_MAX_ENTRY_USD` | `50.0` | Maximum USDC deployed per position |
 | `MOMENTUM_MIN_CLOB_DEPTH` | `200.0` | Minimum USDC depth on the ask side within 1c of best ask (thin-book guard) |
 | `MOMENTUM_ORDER_TYPE` | `"limit"` | `"limit"` = taker limit at ask+0.5c; `"market"` = market order |
-| `MOMENTUM_STOP_LOSS_YES` | `0.55` | Exit YES position if p_yes drops below this |
-| `MOMENTUM_STOP_LOSS_NO` | `0.55` | Exit NO position if p_no drops below this |
-| `MOMENTUM_TAKE_PROFIT` | `0.96` | Exit if held token rises above this |
+| `MOMENTUM_STOP_LOSS_YES` | `0.50` | Exit YES position if YES token price drops below this |
+| `MOMENTUM_STOP_LOSS_NO` | `0.50` | Exit NO position if NO token price drops below this |
+| `MOMENTUM_TAKE_PROFIT` | `0.999` | Exit if held token rises above this |
 | `MOMENTUM_MIN_TTE_SECONDS` | see below | Per-bucket-type dict of entry-window ceilings (seconds to expiry); markets with more TTE are outside the entry window and skipped |
 | `MOMENTUM_MIN_TTE_SECONDS_DEFAULT` | `120` | Fallback TTE ceiling for any market type not listed in the dict |
 | `MOMENTUM_PRICE_BAND_LOW` | `0.80` | Lower bound of the signal price band |
@@ -77,6 +77,7 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_VOL_CACHE_TTL` | `300` | Seconds to cache Deribit ATM IV before re-fetching |
 | `MOMENTUM_VOL_Z_SCORE` | `1.6449` | Global z-score for the probability threshold (1.6449 ≈ 95th percentile) |
 | `MOMENTUM_VOL_Z_SCORE_BY_TYPE` | `{}` | Per-bucket-type z-score overrides; unlisted types use the global default. Example: `{"bucket_daily": 1.0, "bucket_15m": 1.3}` |
+| `MOMENTUM_MIN_DELTA_PCT` | `0.0` | Absolute minimum spot-to-strike gap (%) required to enter, independent of time bucket or vol regime. See [Absolute Floor Principle](#absolute-floor-principle). |
 | `MOMENTUM_MAX_CONCURRENT` | `3` | Maximum simultaneous momentum positions |
 | `MOMENTUM_MARKET_COOLDOWN_SECONDS` | `300` | Seconds to suppress re-entry after any open/close/failed attempt in a market (deduplication guard) |
 | `MOMENTUM_MAX_TTE_DAYS` | `7` | Days of bucket markets subscribed for WS book data (independent of maker window) |
@@ -158,6 +159,59 @@ when the market is volatile, protecting against false entries in noisy condition
 
 ---
 
+## Absolute Floor Principle
+
+`MOMENTUM_MIN_DELTA_PCT` sets a hard minimum on the spot-to-strike gap, **independent of time bucket, vol regime, or z-score**.
+
+### Why the z-gate alone isn't enough
+
+The vol-scaled threshold `y = z × sigma_tau × 100` shrinks with both TTE and annualized vol:
+
+```
+sigma_tau = sigma_ann * sqrt(TTE_s / 31_536_000)
+y = z * sigma_tau * 100
+```
+
+A low-vol coin (e.g. XRP with sigma_ann ≈ 0.28) at short TTE can produce a threshold as low as 0.065%.
+A delta of 0.076% exceeds that threshold — the z-gate passes the trade — yet a single adverse tick
+might be 0.02-0.05% on a thin asset. The position is one tick from going underwater at entry.
+
+### The principle
+
+**The absolute gap between spot and strike determines whether the position can survive a single
+adverse tick. That tick risk is the same regardless of whether it's a 5m, 15m, or 1h market.**
+
+A 0.05% spot-to-strike gap carries identical snap risk in a 5m bucket and a 15m bucket.
+The time bucket changes how likely a reversal is over the full remaining window; it does not
+change how close you are to the strike *right now*. The floor is not a TTE safeguard — it is
+a minimum viable signal distance.
+
+### Calibration
+
+Set the floor to just above the smallest delta observed on a losing trade:
+
+| Observed (March 31 2026 data) | Detail |
+|-------------------------------|--------|
+| Smallest losing delta | 0.076% (XRP, 5m bucket, TTE=63s) |
+| Smallest winning delta | 0.084% (multiple assets) |
+| **Recommended floor** | **0.08%** |
+
+At 0.08%, the XRP loss above is blocked. All observed winners (minimum 0.084%) are preserved.
+
+### Effective threshold
+
+The scanner uses `max(y, MOMENTUM_MIN_DELTA_PCT)` as the effective gate:
+
+```python
+_effective_threshold = max(y, config.MOMENTUM_MIN_DELTA_PCT)
+```
+
+When vol is high (BTC at 80%+ IV), `y` will far exceed the floor and the floor has no effect.
+When vol is low or TTE is short, the floor becomes the binding constraint — which is exactly when
+thin-gap entries are most dangerous.
+
+---
+
 ## Stale Signal Guards
 
 Eight independent checks must all pass before a signal is acted upon.
@@ -202,7 +256,9 @@ For each open bucket market M:
     if not book_yes.bids and not book_yes.asks: continue  # empty book
 
     p_yes = book_yes.mid
-    p_no  = 1.0 - p_yes
+    book_no = pm.get_book(M.token_id_no)
+    if book_no is None or book_no.mid is None: continue
+    p_no = book_no.mid
 
     # ── Find which side is in the target band ─────────────────────────────
     if MOMENTUM_PRICE_BAND_LOW <= p_yes <= MOMENTUM_PRICE_BAND_HIGH:
@@ -337,19 +393,20 @@ not USD P&L (unlike the mispricing strategy):
 
 | Condition | Config Key | Default | Action | Rationale |
 |-----------|-----------|---------|--------|-----------|
-| YES position: p_yes drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_YES` | 0.55 | Market-sell YES token | Cap loss at ~30c on an 85c entry; tail reversal confirmed |
-| NO position: p_no drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_NO` | 0.55 | Market-sell NO token | Symmetric stop on the NO side |
-| Token price >= take-profit | `MOMENTUM_TAKE_PROFIT` | 0.96 | Market-sell held token | Lock in 6-16c gain; last 4c has poor risk/reward |
-| Expiry | — | — | Hold to resolution | If neither trigger fires, let the market resolve on-chain |
+| YES position: YES token drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_YES` | 0.50 | Taker-sell YES token | Cap downside if the held YES token fails |
+| NO position: NO token drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_NO` | 0.50 | Taker-sell NO token | Symmetric stop on NO token price |
+| Token price >= take-profit | `MOMENTUM_TAKE_PROFIT` | 0.999 | Taker-sell held token | Capture near-certainty gains |
+| Near expiry + weak token | `MOMENTUM_NEAR_EXPIRY_*` | 60s / 0.60 | Taker-sell held token | Avoid binary snap when close to resolution and in loss zone |
+| Expiry | — | — | Hold to resolution | If no other trigger fires, let the market resolve |
 
 **Token price mapping (monitor):**
 
 - YES position: token_price = current YES mid
-- NO position: token_price = 1 - current YES mid
+- NO position: token_price = current NO mid
 
 > Exits are handled by `monitor.py` in `should_exit()` under `pos.strategy == "momentum"`.
-> No time-stop is applied to momentum positions — the min-TTE gate at entry means all
-> positions have at least 2 minutes of life; letting them resolve is always the right default.
+> Momentum has no generic time-stop, but does include a dedicated near-expiry protective
+> stop (`MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS` + `MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD`).
 
 ---
 
@@ -383,6 +440,7 @@ Before entering, check all open positions across ALL strategies:
 | HL WS feed silently stops delivering | HL outage detection: log warning if >50% markets skipped for stale spot | Operator alerted to investigate |
 | Deribit IV cached from high-vol period | Cache TTL 5 min; stale vol widens threshold | Conservative; may miss some trades |
 | Vol regime spikes 3x (black swan) | z-score scales threshold with vol | Naturally filters out noisy markets |
+| Low-vol coin passes z-gate with tiny gap | `MOMENTUM_MIN_DELTA_PCT` absolute floor (independent of bucket) | Blocks trades where a single tick would cross strike; see [Absolute Floor Principle](#absolute-floor-principle) |
 | Concurrent position cap hit | `MOMENTUM_MAX_CONCURRENT` gate | Signal dropped until slot opens |
 | Per-bucket vol bar too strict | `MOMENTUM_VOL_Z_SCORE_BY_TYPE` override for that type | Tune per-type without affecting others |
 
@@ -441,7 +499,7 @@ MomentumScanner._on_signal cb ────→ GET /momentum/signals
 3. **No queue** — direct execution prevents stale signals accumulating.
 4. **Re-check at execution** — price is re-validated right before order placement to guard against fast moves between detection and execution.
 5. **WS fill detection** — a one-shot `asyncio.Future` is registered before awaiting anything; the MATCHED WS event resolves it (~0 ms, zero REST calls). REST fallback fires only on timeout (5 s).
-6. **YES-space entry price** — NO token fill prices are converted to YES-space (`1.0 - fill_price`) before `risk.open_position()`, keeping P&L arithmetic consistent.
+6. **Token-native entry price** — both YES and NO entries are stored as the held token's actual fill price (no YES-space conversion).
 7. **Shared risk engine** — `risk.open_position()` and `risk.get_positions()` are shared with maker/mispricing, ensuring cap enforcement is global.
 8. **Shared monitor** — `PositionMonitor` handles momentum exits via `pos.strategy == "momentum"` branch in `should_exit()`. No separate monitor loop needed.
 9. **`_blocked_by_tte` pattern** — the TTE gate does not short-circuit the pipeline; vol and delta are computed for all in-band markets regardless, so the diagnostics CSV contains full price-vs-TTE empirical data even for markets outside the entry window.

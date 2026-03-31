@@ -270,13 +270,14 @@ class LiveFillHandler:
                 is_yes = token_id == market.token_id_yes
             side = "YES" if is_yes else "NO"
 
-            # entry_price is in YES-probability space. avg_price=0 means the PM
-            # Data API didn't populate cost-basis (common for older/external fills).
+            # PM Data API returns avgPrice.  The actual semantics (whether it is
+            # in YES-probability space or native NO-token price space) are not
+            # confirmed by official PM API docs.  We store it as-is for both sides.
+            # TODO: verify PM Data API spec for NO avgPrice encoding and update
+            #       entry_price accordingly if it is confirmed to be YES-space.
+            # avg_price=0 means the API didn't populate cost-basis (older/external fills).
             # We still restore the position — size is what matters for risk tracking.
-            if avg_price > 0:
-                entry_price = avg_price if is_yes else (1.0 - avg_price)
-            else:
-                entry_price = 0.0
+            entry_price = avg_price if avg_price > 0 else 0.0
             entry_cost = entry_price * size
 
             # Look up strategy from the persisted token→strategy map written by
@@ -385,13 +386,13 @@ class LiveFillHandler:
             else:
                 is_yes = token_id == market.token_id_yes
             side = "YES" if is_yes else "NO"
-            if avg_price > 0:
-                entry_price = avg_price if is_yes else (1.0 - avg_price)
-            else:
-                entry_price = 0.0
+            # PM Data API returns avgPrice.  The actual semantics (whether it is
+            # in YES-probability space or native NO-token price space) are not
+            # confirmed by official PM API docs.  We store it as-is for both sides.
+            # TODO: verify PM Data API spec for NO avgPrice encoding and update
+            #       entry_price accordingly if it is confirmed to be YES-space.
+            entry_price = avg_price if avg_price > 0 else 0.0
             entry_cost = entry_price * size
-
-            from risk import Position
             saved_strategy = self._risk.get_token_strategy(token_id) or "unknown"
             pos = Position(
                 market_id=market.condition_id,

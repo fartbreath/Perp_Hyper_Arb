@@ -1615,6 +1615,24 @@ export default function Settings() {
               onSubmit={(v) => apply({ momentum_vol_z_score: v })}
             />
 
+            <FloatInput
+              label="Minimum Spot Move Floor"
+              description={
+                "Absolute minimum spot-to-strike gap required to enter, independent of time bucket or vol regime. " +
+                "The z-score gate can still pass a trade when the absolute gap is dangerously small (e.g. low-vol coins " +
+                "compress the vol-scaled threshold down near zero). " +
+                "This floor asks: even if the signal is technically valid, is the spot far enough from strike that " +
+                "a single adverse tick won't flip the position from winning to losing? " +
+                "That tick risk is the same whether it's a 5m, 15m, or 1h market — the absolute price distance determines survival. " +
+                "0.08 means spot must have moved at least 0.08% in the winning direction. " +
+                "Set to 0 to rely solely on the z-score filter."
+              }
+              value={data.momentum_min_delta_pct ?? 0}
+              step={0.01}
+              unit="%"
+              onSubmit={(v) => apply({ momentum_min_delta_pct: v })}
+            />
+
             <SectionHead title="Per-Bucket Z-Score Overrides" />
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
               Each market type can use a different signal strength threshold.
