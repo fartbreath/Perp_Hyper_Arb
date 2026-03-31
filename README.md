@@ -59,7 +59,7 @@ pm_client.run()           ← Polymarket WS + heartbeat
 hl_client.run()           ← Hyperliquid WS + dead-man's switch
 maker_strategy.start()    ← quoting sweep + hedge debounce
 momentum_scanner.start()  ← scan every 10 s + direct taker execution
-mispricing_scanner.start()← scan every 300 s
+mispricing_scanner.start()← scan every 60 s
 agent_loop()              ← consumes signal queue from scanner
 api_server                ← FastAPI REST for webapp
 state_sync_loop()         ← pushes bot state to API layer
@@ -160,10 +160,10 @@ Key parameters:
 | `STRATEGY_MAKER_ENABLED` | `False` | Enable the market making strategy |
 | `STRATEGY_MISPRICING_ENABLED` | `False` | Enable the mispricing scanner |
 | `STRATEGY_MOMENTUM_ENABLED` | `False` | Enable the momentum scanner |
-| `HEDGE_THRESHOLD_USD` | `200` | Net inventory before a perp hedge fires (USD) |
+| `HEDGE_THRESHOLD_USD` | `100` | Net inventory before a perp hedge fires (USD) |
 | `MOMENTUM_SCAN_INTERVAL` | `10` | Seconds between momentum scan passes |
 | `MAX_QUOTE_AGE_SECONDS` | `30` | Backstop reprice interval |
-| `MAKER_EXIT_HOURS` | `6.0` | Hours before expiry to exit all positions |
+| `MAKER_EXIT_HOURS` | `0.0` | Non-bucket time-stop (hours before expiry); `0.0` disables this gate |
 | `MAX_PM_EXPOSURE_PER_MARKET` | `500` | Max USD deployed per market |
 | `MAX_TOTAL_PM_EXPOSURE` | `5000` | Total PM exposure cap (USD) |
 | `KALSHI_ENABLED` | `True` | Require Kalshi confirmation for mispricing signals |
@@ -253,7 +253,7 @@ pytest tests/test_maker.py -v
 pytest --cov=. --cov-report=term-missing
 ```
 
-**672 tests passed, 7 skipped, 0 failing** as of the current release.
+**741 tests passed, 7 skipped, 0 failing** as of the current release.
 
 Test files:
 - `tests/test_maker.py` — strategy quoting, repricing, inventory skew, edge filters

@@ -197,17 +197,18 @@ Once a position is open, `monitor.py` checks every 30 seconds (with a minimum ho
 
 | Exit | Condition | Rationale |
 |------|-----------|-----------|
-| **Profit target** | `unrealised_pnl ≥ deviation × PROFIT_TARGET_PCT × size` | Capture 60% of the initial edge; avoid mean-reversion risk |
+| **Profit target** | `unrealised_pnl ≥ entry_deviation × PROFIT_TARGET_PCT × size` | Capture 60% of the initial edge; avoid mean-reversion risk |
 | **Stop-loss** | `unrealised_pnl ≤ −STOP_LOSS_USD` | Hard stop at **−$25** regardless of size |
 | **Time stop** | `days_to_expiry ≤ EXIT_DAYS_BEFORE_RESOLUTION = 3` | Avoid binary resolution risk and low-liquidity close to expiry |
 | **Resolved stop** | `now ≥ market_end_date` | Market has already resolved; exit immediately |
 
-P&L is always computed in **YES-price space**:
+In the current implementation, mispricing unrealised P&L is evaluated by:
 
 ```
-unrealised_pnl = (current_yes_price − entry_yes_price) × size        # YES position
-unrealised_pnl = (entry_yes_price − current_yes_price) × size        # NO position
+unrealised_pnl = (current_reference_price - entry_price) * size
 ```
+
+`current_reference_price` comes from the monitor's price feed for that position.
 
 ---
 

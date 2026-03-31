@@ -64,9 +64,9 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_MAX_ENTRY_USD` | `50.0` | Maximum USDC deployed per position |
 | `MOMENTUM_MIN_CLOB_DEPTH` | `200.0` | Minimum USDC depth on the ask side within 1c of best ask (thin-book guard) |
 | `MOMENTUM_ORDER_TYPE` | `"limit"` | `"limit"` = taker limit at ask+0.5c; `"market"` = market order |
-| `MOMENTUM_STOP_LOSS_YES` | `0.55` | Exit YES position if p_yes drops below this |
-| `MOMENTUM_STOP_LOSS_NO` | `0.55` | Exit NO position if p_no drops below this |
-| `MOMENTUM_TAKE_PROFIT` | `0.96` | Exit if held token rises above this |
+| `MOMENTUM_STOP_LOSS_YES` | `0.50` | Exit YES position if YES token price drops below this |
+| `MOMENTUM_STOP_LOSS_NO` | `0.50` | Exit NO position if NO token price drops below this |
+| `MOMENTUM_TAKE_PROFIT` | `0.999` | Exit if held token rises above this |
 | `MOMENTUM_MIN_TTE_SECONDS` | see below | Per-bucket-type dict of entry-window ceilings (seconds to expiry); markets with more TTE are outside the entry window and skipped |
 | `MOMENTUM_MIN_TTE_SECONDS_DEFAULT` | `120` | Fallback TTE ceiling for any market type not listed in the dict |
 | `MOMENTUM_PRICE_BAND_LOW` | `0.80` | Lower bound of the signal price band |
@@ -202,7 +202,9 @@ For each open bucket market M:
     if not book_yes.bids and not book_yes.asks: continue  # empty book
 
     p_yes = book_yes.mid
-    p_no  = 1.0 - p_yes
+    book_no = pm.get_book(M.token_id_no)
+    if book_no is None or book_no.mid is None: continue
+    p_no = book_no.mid
 
     # ── Find which side is in the target band ─────────────────────────────
     if MOMENTUM_PRICE_BAND_LOW <= p_yes <= MOMENTUM_PRICE_BAND_HIGH:
@@ -337,19 +339,20 @@ not USD P&L (unlike the mispricing strategy):
 
 | Condition | Config Key | Default | Action | Rationale |
 |-----------|-----------|---------|--------|-----------|
-| YES position: p_yes drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_YES` | 0.55 | Market-sell YES token | Cap loss at ~30c on an 85c entry; tail reversal confirmed |
-| NO position: p_no drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_NO` | 0.55 | Market-sell NO token | Symmetric stop on the NO side |
-| Token price >= take-profit | `MOMENTUM_TAKE_PROFIT` | 0.96 | Market-sell held token | Lock in 6-16c gain; last 4c has poor risk/reward |
-| Expiry | — | — | Hold to resolution | If neither trigger fires, let the market resolve on-chain |
+| YES position: YES token drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_YES` | 0.50 | Taker-sell YES token | Cap downside if the held YES token fails |
+| NO position: NO token drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_NO` | 0.50 | Taker-sell NO token | Symmetric stop on NO token price |
+| Token price >= take-profit | `MOMENTUM_TAKE_PROFIT` | 0.999 | Taker-sell held token | Capture near-certainty gains |
+| Near expiry + weak token | `MOMENTUM_NEAR_EXPIRY_*` | 60s / 0.60 | Taker-sell held token | Avoid binary snap when close to resolution and in loss zone |
+| Expiry | — | — | Hold to resolution | If no other trigger fires, let the market resolve |
 
 **Token price mapping (monitor):**
 
 - YES position: token_price = current YES mid
-- NO position: token_price = 1 - current YES mid
+- NO position: token_price = current NO mid
 
 > Exits are handled by `monitor.py` in `should_exit()` under `pos.strategy == "momentum"`.
-> No time-stop is applied to momentum positions — the min-TTE gate at entry means all
-> positions have at least 2 minutes of life; letting them resolve is always the right default.
+> Momentum has no generic time-stop, but does include a dedicated near-expiry protective
+> stop (`MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS` + `MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD`).
 
 ---
 
@@ -441,7 +444,7 @@ MomentumScanner._on_signal cb ────→ GET /momentum/signals
 3. **No queue** — direct execution prevents stale signals accumulating.
 4. **Re-check at execution** — price is re-validated right before order placement to guard against fast moves between detection and execution.
 5. **WS fill detection** — a one-shot `asyncio.Future` is registered before awaiting anything; the MATCHED WS event resolves it (~0 ms, zero REST calls). REST fallback fires only on timeout (5 s).
-6. **YES-space entry price** — NO token fill prices are converted to YES-space (`1.0 - fill_price`) before `risk.open_position()`, keeping P&L arithmetic consistent.
+6. **Token-native entry price** — both YES and NO entries are stored as the held token's actual fill price (no YES-space conversion).
 7. **Shared risk engine** — `risk.open_position()` and `risk.get_positions()` are shared with maker/mispricing, ensuring cap enforcement is global.
 8. **Shared monitor** — `PositionMonitor` handles momentum exits via `pos.strategy == "momentum"` branch in `should_exit()`. No separate monitor loop needed.
 9. **`_blocked_by_tte` pattern** — the TTE gate does not short-circuit the pipeline; vol and delta are computed for all in-band markets regardless, so the diagnostics CSV contains full price-vs-TTE empirical data even for markets outside the entry window.

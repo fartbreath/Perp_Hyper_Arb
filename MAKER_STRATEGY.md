@@ -103,7 +103,7 @@ nothing because it's just adjusting within the same spread window.
 
 ## Units & Invariants
 - **Canonical unit for inventory and hedge sizing:** USD of capital deployed (`entry_cost_usd`), not contract count or face value.
-- **Token price vs YES probability:** `YES` token price = PM YES probability (`p`); `NO` token price = `1 - p`.
+- **YES/NO price integrity:** YES and NO are independent CLOB books. Maker logic reads prices from the held token's own book; it does not derive NO as `1 - YES`.
 - **Inventory accounting:** Inventory updates are recorded in USD (see Appendix D "Inventory accounting").
 - **Hedging and thresholds:** All hedging and risk thresholds operate on USD capital units (e.g. `HEDGE_THRESHOLD_USD`, `HEDGE_REBALANCE_USD`).
 
@@ -114,7 +114,8 @@ Once that cap is hit, no new fills are opened for that coin until an existing on
 
 ## The Hedge
 
-Once our net position on a coin exceeds **$200**, we place a live perp trade on
+Once our net position on a coin exceeds the configured threshold (`HEDGE_THRESHOLD_USD`,
+default **$100**, often overridden to **$200** in `config_overrides.json`), we place a live perp trade on
 **Hyperliquid** in the opposite direction:
 
 - We’re net long YES on BTC markets → we short BTC perp on Hyperliquid
@@ -138,24 +139,23 @@ If the rolling 20-trade average slippage exceeds 0.30%, a warning is logged sugg
 spread widening or reduced hedge frequency.
 
 The hedge is re-evaluated on every HL price move and every new fill. If inventory
-drops back below $200, the hedge is removed.
+drops back below the configured threshold, the hedge is removed.
 
 ---
 
 ## When Positions Close
 
-Every 30 seconds the monitor checks all open positions and closes them if:
+Every 30 seconds the monitor checks all open positions. For maker positions, exits are:
 
 | Reason | Detail |
 |--------|--------|
-| **Near expiry** | Less than 6 hours to resolution  gamma spikes; time to exit |
+| **Near expiry (non-bucket only)** | `days_to_expiry <= MAKER_EXIT_HOURS/24` when `MAKER_EXIT_HOURS > 0` |
 | **Market resolved** | The contract has settled |
-| **Per-position loss** | A single position is down more than $25 |
 | **Coin-level loss** | All positions on one coin are collectively down more than $75 |
-| **Profit target** | A position has hit its target profit |
+| **Per-position stop/profit** | Not used for maker positions |
 
-The 6-hour early exit is the key protection against the extreme price sensitivity that
-binary markets develop in their final hours.
+By default (`MAKER_EXIT_HOURS = 0.0`) the non-bucket near-expiry gate is disabled.
+Bucket maker positions hold to resolution unless closed by coin-level risk limits.
 
 ---
 
@@ -175,8 +175,8 @@ CLOB-faithful elements:
 - **Fill price** — always the maker's quoted price (not the mid). This is what the
   live CLOB guarantees: a maker order fills at its limit price, not at a worse price.
 - **Exit price** — when the position monitor closes a position it uses the live book
-  `best_bid` (for YES position exits, simulating a taker sell) or `best_ask` (for NO
-  position exits, simulating a taker buy). Using mid would incorrectly award the full
+  `best_bid` on the held token's own book for taker exits (YES sell at YES bid,
+  NO sell at NO bid). Using mid would incorrectly award the full
   half-spread to every close, inflating P&L relative to live trading.
 - **Inventory units** — tracked in USD (`entry_cost_usd`), matching the canonical unit
   for hedge sizing and inventory-skew. Tracking contracts would overshoot the skew
@@ -196,8 +196,9 @@ CLOB-faithful elements:
    periods.
 
 2. **Gamma blowup near expiry**  short-dated binary markets can swing from 30 to
-   90 in minutes as the candle close approaches. Managed by closing all positions
-   6 hours before resolution.
+  90 in minutes as the candle close approaches. Managed primarily by coin-level
+  loss caps and inventory/hedge controls; optional non-bucket time-stop is
+  controlled by `MAKER_EXIT_HOURS`.
 
 3. **Correlated one-sided fills**  during a BTC flash crash, we might get filled on
    Long YES across 5 BTC markets simultaneously before any reprice fires.
@@ -591,7 +592,7 @@ because the fill simulator cannot model queue position precisely.
 | Inventory skew absent | Mid always centred; inventory not reflected in quotes | Skewed mid (1c per $100, hard cap ±3c) |
 | Unhandled WS callback exceptions | Bare `await` in callbacks kills asyncio task | `try/except` wrapping both callbacks |
 | Strategies on by default | Defaults `True`; first scan opens positions before UI seen | Both strategies default `False` |
-| Exit price used mid not bid/ask | Monitor closed positions at `book.mid` (gave free half-spread) | YES exits at `best_bid`; NO exits at `best_ask` |
+| Exit price used mid not bid/ask | Monitor closed positions at `book.mid` (gave free half-spread) | YES exits at YES `best_bid`; NO exits at NO `best_bid` |
 | Inventory tracked in contracts | `record_fill()` received contract count not USD; skew overshooting | Passes `fill_cost_usd` (price × contracts) |
 | Auto-consume of sub-min remainders | Non-CLOB: simulator flushed remainders below MIN immediately | Removed; reprice cycle cancels small remainders |
 | Entry rebate double-counted | Monitor credited entry+exit rebates; fill_simulator now credits entry | Monitor credits exit-leg rebate only |
