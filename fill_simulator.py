@@ -209,18 +209,19 @@ class FillSimulator:
             if market is None:
                 continue
 
-            book = self._pm._books.get(market.token_id_yes)
+            # BUY YES orders use the YES CLOB book; BUY NO orders use the NO CLOB book.
+            # YES and NO are independent CLOBs — never derive one price from the other.
+            is_no_buy = key.endswith("_ask")
+            if is_no_buy:
+                book = self._pm._books.get(market.token_id_no)
+            else:
+                book = self._pm._books.get(market.token_id_yes)
             if book is None:
                 continue
 
-            # BUY NO orders (ask key) are checked against the YES book using the
-            # YES-equivalent price (1 - NO_price) on the SELL side — the YES and NO
-            # books are mirrors so this gives the same depth/cross signals.
-            is_no_buy = key.endswith("_ask")
-            check_side  = "SELL" if is_no_buy else quote.side
-            check_price = (1.0 - quote.price) if is_no_buy else quote.price
-
             # ── Touch check: are we competitive at the current best price? ────
+            check_side  = quote.side  # both BUY YES and BUY NO use their own book side
+            check_price = quote.price  # actual token price (e.g. NO=0.82, YES=0.82)
             if not self._is_crossed(check_side, check_price, book):
                 continue
 
@@ -234,7 +235,11 @@ class FillSimulator:
 
             # Adverse-selection: informed takers arrive more often and in larger
             # sizes when the HL mid moves against our fill direction.
+            # For BUY NO, adverse selection occurs when HL goes UP (NO value falls);
+            # for BUY YES, it occurs when HL goes DOWN.  Use a separate adverse_side
+            # variable so it is independent of the CLOB book side used for touch-check.
             hl_move = self._hl_move_pct(market.underlying)
+            adverse_side = "SELL" if is_no_buy else check_side
 
             # Per-bucket adversity threshold (A7): short-duration markets nearing
             # resolution are nearly fully-informational — any HL move indicates
@@ -245,10 +250,10 @@ class FillSimulator:
             )
 
             is_adverse = (
-                (check_side == "BUY" and hl_move is not None
+                (adverse_side == "BUY" and hl_move is not None
                  and hl_move < -adverse_pct)
                 or
-                (check_side == "SELL" and hl_move is not None
+                (adverse_side == "SELL" and hl_move is not None
                  and hl_move > adverse_pct)
             )
 

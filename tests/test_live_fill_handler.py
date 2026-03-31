@@ -225,7 +225,7 @@ class TestPositionRestore:
                 "asset": "tok_no",
                 "outcome": "No",
                 "size": 30.0,
-                "avgPrice": 0.60,   # cost to buy one NO token
+                "avgPrice": 0.60,
                 "closed": False,
             }
         ]
@@ -235,8 +235,9 @@ class TestPositionRestore:
         pos = next(iter(risk._positions.values()))
         assert pos.side == "NO"
         assert pos.size == 30.0
-        # entry_cost = (1 - 0.60) * 30 = 12.0
-        assert abs(pos.entry_cost_usd - (1.0 - 0.60) * 30.0) < 1e-4
+        # avgPrice is stored as-is (no derivation): entry_price=0.60, entry_cost=0.60*30=18.0
+        assert abs(pos.entry_price - 0.60) < 1e-6
+        assert abs(pos.entry_cost_usd - 0.60 * 30.0) < 1e-4
 
     def test_token_pinned_for_restored_position(self):
         """Token is added to pm._pinned_tokens on restore."""
@@ -551,3 +552,104 @@ class TestProcessFillSlice:
             )
 
         assert handler._fills_total == 3
+
+
+# ── YES/NO entry price independence: restore paths ──────────────────────────
+
+class TestYesNoEntryPriceRestore:
+    """
+    startup_restore and _reconcile_after_reconnect must store avgPrice as-is
+    for both YES and NO positions — never derive `1.0 - avg_price` for NO.
+
+    YES and NO are independent CLOBs.  PM avgPrice semantics for NO tokens
+    are not confirmed to be in YES-space.  Storing raw avgPrice is always
+    safer than deriving a potentially-wrong entry_price.
+    """
+
+    def setup_method(self):
+        config.PAPER_TRADING = False
+
+    def teardown_method(self):
+        config.PAPER_TRADING = True
+
+    def _run_restore(self, positions_data, markets=None):
+        handler, pm, maker, risk, monitor = _make_handler(paper=False)
+        pm.get_live_positions = AsyncMock(return_value=positions_data)
+        if markets is not None:
+            pm.get_markets = MagicMock(return_value=markets)
+        asyncio.get_event_loop().run_until_complete(handler._restore_positions())
+        return handler, pm, risk
+
+    def _run_reconcile(self, positions_data, markets=None):
+        from live_fill_handler import LiveFillHandler
+        handler, pm, maker, risk, monitor = _make_handler(paper=False)
+        pm.get_live_positions = AsyncMock(return_value=positions_data)
+        if markets is not None:
+            pm.get_markets = MagicMock(return_value=markets)
+        asyncio.get_event_loop().run_until_complete(handler._reconcile_after_reconnect())
+        return handler, pm, risk
+
+    def test_startup_restore_no_entry_price_not_derived(self):
+        """avg_price=0.18 for a NO position must be stored as entry_price=0.18,
+        not derived as 1.0 - 0.18 = 0.82."""
+        mkt = _make_market()
+        markets = {mkt.condition_id: mkt}
+        pos_data = [
+            {
+                "asset": "tok_no",
+                "outcome": "No",
+                "size": 20.0,
+                "avgPrice": 0.18,   # raw PM avgPrice for NO token
+                "closed": False,
+            }
+        ]
+        handler, pm, risk = self._run_restore(pos_data, markets)
+
+        pos = next(iter(risk._positions.values()))
+        assert pos.side == "NO"
+        assert abs(pos.entry_price - 0.18) < 1e-6, (
+            f"entry_price must be avg_price=0.18 (not 1-0.18=0.82), got {pos.entry_price}"
+        )
+
+    def test_startup_restore_yes_entry_price_unchanged(self):
+        """YES positions must still use avg_price directly (unchanged behavior)."""
+        mkt = _make_market()
+        markets = {mkt.condition_id: mkt}
+        pos_data = [
+            {
+                "asset": "tok_yes",
+                "outcome": "Yes",
+                "size": 20.0,
+                "avgPrice": 0.82,
+                "closed": False,
+            }
+        ]
+        handler, pm, risk = self._run_restore(pos_data, markets)
+
+        pos = next(iter(risk._positions.values()))
+        assert pos.side == "YES"
+        assert abs(pos.entry_price - 0.82) < 1e-6, (
+            f"YES entry_price must be avg_price=0.82, got {pos.entry_price}"
+        )
+
+    def test_reconcile_no_entry_price_not_derived(self):
+        """reconcile_after_reconnect: avg_price=0.18 for NO must be stored as 0.18."""
+        mkt = _make_market()
+        markets = {mkt.condition_id: mkt}
+        pos_data = [
+            {
+                "asset": "tok_no",
+                "outcome": "No",
+                "size": 15.0,
+                "avgPrice": 0.18,
+                "closed": False,
+            }
+        ]
+        handler, pm, risk = self._run_reconcile(pos_data, markets)
+
+        assert len(risk._positions) > 0, "Position should have been imported by reconcile"
+        pos = next(iter(risk._positions.values()))
+        assert pos.side == "NO"
+        assert abs(pos.entry_price - 0.18) < 1e-6, (
+            f"entry_price must be avg_price=0.18 (not derived 0.82), got {pos.entry_price}"
+        )

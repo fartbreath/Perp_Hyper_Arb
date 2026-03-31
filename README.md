@@ -10,7 +10,7 @@ A semi-automated crypto trading bot that runs three complementary strategies: ma
 
 **Strategy 2 — Mispricing Scanner:** Scans Polymarket milestone markets against matching Kalshi markets. When both venues list the same crypto event (e.g. "Will BTC close above $90k on March 31?"), any price divergence above the fee hurdle is a candidate trade. Deribit N(d₂) can optionally be used as a second-layer confirmation signal.
 
-**Strategy 3 — Momentum Scanner:** Runs a price-confirmation taker strategy that enters high-probability contracts when Polymarket token prices and spot movement jointly confirm momentum. It supports volatility-aware thresholds, per-market cooldowns, and stop-loss / take-profit exits.
+**Strategy 3 — Momentum Scanner:** Runs a price-confirmation taker strategy that enters high-probability contracts when Polymarket token prices and spot movement jointly confirm momentum. It supports volatility-aware thresholds, per-market cooldowns, stop-loss / take-profit exits, and a near-expiry protective exit.
 
 All strategies start in **paper trading mode** (no real funds). Switching to live is a single config change.
 
@@ -44,7 +44,7 @@ Perp_Hyper_Arb/
 │   ├── mispricing/           # Strategy 2: signal generation, Kalshi + N(d₂) filters
 │   └── Momentum/             # Strategy 3: momentum scanner + taker execution
 │
-├── tests/                    # Pytest suite (672 passed, 7 skipped)
+├── tests/                    # Pytest suite (741 passed, 7 skipped)
 ├── data/                     # CSV trade logs, paper trade records
 │
 └── webapp/                   # Vite + React monitoring dashboard (port 5173)

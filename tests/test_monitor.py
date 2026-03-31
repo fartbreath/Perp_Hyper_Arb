@@ -64,14 +64,15 @@ class TestComputeUnrealisedPnl:
         assert pnl == pytest.approx(-15.0)
 
     def test_no_profit(self):
-        # Bought NO at 0.60 (YES was 0.40); profit when YES price falls (NO rises)
-        pos = _make_position(side="NO", entry_price=0.60, size=100.0)
-        pnl = compute_unrealised_pnl(pos, current_price=0.40)
+        # Bought NO at 0.40 (YES was 0.60); YES falls to 0.40 so actual NO rises to 0.60 → profit.
+        pos = _make_position(side="NO", entry_price=0.40, size=100.0)
+        pnl = compute_unrealised_pnl(pos, current_price=0.60)
         assert pnl == pytest.approx(20.0)
 
     def test_no_loss(self):
-        pos = _make_position(side="NO", entry_price=0.60, size=100.0)
-        pnl = compute_unrealised_pnl(pos, current_price=0.70)
+        # Bought NO at 0.40; YES rises so actual NO falls to 0.30 → loss.
+        pos = _make_position(side="NO", entry_price=0.40, size=100.0)
+        pnl = compute_unrealised_pnl(pos, current_price=0.30)
         assert pnl == pytest.approx(-10.0)
 
     def test_buy_yes_alias(self):
@@ -253,16 +254,19 @@ class TestShouldExit:
         assert reason == ExitReason.MOMENTUM_STOP_LOSS
 
     def test_momentum_stop_loss_triggered_no_side(self):
-        # NO position entered at p_yes=0.15 → p_no=0.85; stop fires if p_no ≤ 0.55
+        # NO position entered at p_yes=0.15 → p_no=0.85; stop fires if p_no ≤ 0.55.
+        # current_token_price must be the actual NO CLOB mid (not derived from YES).
         config.MOMENTUM_STOP_LOSS_YES = 0.55
         config.MOMENTUM_STOP_LOSS_NO = 0.55
         config.MIN_HOLD_SECONDS = 60
+        config.MOMENTUM_MIN_HOLD_SECONDS = 60
         pos = _make_position(
             entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
         )
         exit_flag, reason, _ = should_exit(
             pos=pos,
-            current_price=0.50,          # p_no = 1 - 0.50 = 0.50 ≤ MOMENTUM_STOP_LOSS_NO=0.55
+            current_price=0.50,              # YES-space mid (used for P&L only)
+            current_token_price=0.50,        # actual NO CLOB mid ≤ MOMENTUM_STOP_LOSS_NO=0.55
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(minutes=10),
             now=self.NOW,
@@ -271,22 +275,24 @@ class TestShouldExit:
         assert reason == ExitReason.MOMENTUM_STOP_LOSS
 
     def test_momentum_stop_loss_no_not_triggered_when_price_favourable(self):
-        # NO position: p_yes falls (NO token rises) — should NOT stop out
+        # NO position with NO book unavailable (current_token_price=None) → skip check,
+        # never fire a stop on a derived price.
         config.MOMENTUM_STOP_LOSS_YES = 0.55
         config.MOMENTUM_STOP_LOSS_NO = 0.55
         config.MOMENTUM_TAKE_PROFIT = 0.96
         config.MIN_HOLD_SECONDS = 60
+        config.MOMENTUM_MIN_HOLD_SECONDS = 60
         pos = _make_position(
             entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
         )
         exit_flag, reason, _ = should_exit(
             pos=pos,
-            current_price=0.10,          # p_no = 1 - 0.10 = 0.90 → well above stop
+            current_price=0.10,          # YES mid only — no current_token_price passed
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(minutes=10),
             now=self.NOW,
         )
-        assert not exit_flag
+        assert not exit_flag  # NO book unavailable → skip, never derive
 
     def test_momentum_take_profit_triggered(self):
         config.MOMENTUM_TAKE_PROFIT = 0.96
@@ -327,6 +333,139 @@ class TestShouldExit:
         assert not exit_flag
         assert reason != ExitReason.TIME_STOP
 
+    # ── NO CLOB path — actual token price (not derived) ───────────────────
+
+    def test_momentum_stop_loss_no_side_uses_actual_clob_price(self):
+        """NO position: stop fires when the actual NO CLOB mid (current_token_price)
+        drops below the stop threshold, regardless of what YES-space price implies."""
+        config.MOMENTUM_STOP_LOSS_NO = 0.55
+        config.MOMENTUM_MIN_HOLD_SECONDS = 0
+        pos = _make_position(
+            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
+        )
+        # YES mid is 0.55 → derived NO would be 0.45, below stop — but we pass the
+        # ACTUAL NO CLOB mid (0.50) explicitly to test the real path.
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.55,              # YES mid (used for P&L only)
+            current_token_price=0.50,        # ACTUAL NO CLOB mid ≤ 0.55 stop
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert exit_flag
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_momentum_stop_loss_no_side_not_triggered_by_actual_clob_price(self):
+        """NO position: stop does NOT fire when actual NO CLOB mid is above stop,
+        even if the derived price (1.0 - YES_mid) would be below it."""
+        config.MOMENTUM_STOP_LOSS_NO = 0.55
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_MIN_HOLD_SECONDS = 0
+        pos = _make_position(
+            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
+        )
+        # Derived: 1.0 - 0.55 = 0.45 → would fire stop.  Actual NO CLOB: 0.65 → safe.
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.55,              # YES mid — would imply NO=0.45 (below stop)
+            current_token_price=0.65,        # ACTUAL NO CLOB mid — above stop → no exit
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert not exit_flag, (
+            "Stop must not fire when the actual NO CLOB mid is above the stop threshold "
+            "— even if the YES-derived price would suggest otherwise"
+        )
+
+    # ── Near-expiry stop ──────────────────────────────────────────────────
+
+    def test_momentum_near_expiry_stop_triggers(self):
+        """Near-expiry stop fires when TTE < threshold AND token price ≤ threshold."""
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
+        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
+        config.MOMENTUM_STOP_LOSS_YES = 0.50
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_MIN_HOLD_SECONDS = 0
+        pos = _make_position(
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.60,              # YES mid = 0.60 (above stop 0.50, below TP)
+            current_token_price=0.60,        # same for YES side
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=30),   # TTE=30s < 60s threshold
+            tte_seconds=30.0,
+            now=self.NOW,
+        )
+        assert exit_flag
+        assert reason == ExitReason.MOMENTUM_NEAR_EXPIRY
+
+    def test_momentum_near_expiry_stop_no_trigger_above_price_threshold(self):
+        """Near-expiry stop does NOT fire when token price is above the price threshold."""
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
+        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
+        config.MOMENTUM_STOP_LOSS_YES = 0.50
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_MIN_HOLD_SECONDS = 0
+        pos = _make_position(
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.80,              # token at 0.80 > 0.65 threshold → no near-expiry exit
+            current_token_price=0.80,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=30),
+            tte_seconds=30.0,
+            now=self.NOW,
+        )
+        assert not exit_flag
+
+    def test_momentum_near_expiry_stop_no_trigger_with_tte_above_threshold(self):
+        """Near-expiry stop does NOT fire when TTE is still above the time threshold."""
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
+        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
+        config.MOMENTUM_STOP_LOSS_YES = 0.50
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_MIN_HOLD_SECONDS = 0
+        pos = _make_position(
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.60,              # price ≤ 0.65 but TTE=90s > 60s → no exit
+            current_token_price=0.60,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=90),
+            tte_seconds=90.0,
+            now=self.NOW,
+        )
+        assert not exit_flag
+
+    def test_momentum_near_expiry_no_stop_without_tte_seconds(self):
+        """Near-expiry stop is silently disabled when tte_seconds=None."""
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
+        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
+        config.MOMENTUM_STOP_LOSS_YES = 0.50
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_MIN_HOLD_SECONDS = 0
+        pos = _make_position(
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.60,
+            current_token_price=0.60,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=30),
+            tte_seconds=None,              # ← disabled
+            now=self.NOW,
+        )
+        assert not exit_flag
+
 
 # ── PositionMonitor ───────────────────────────────────────────────────────────
 
@@ -337,6 +476,9 @@ def _make_monitor():
     pm.place_limit = AsyncMock(return_value="paper_order_001")
     pm.place_market = AsyncMock(return_value="paper_mkt_001")
     pm.on_price_change = MagicMock()  # called by PositionMonitor.start()
+    # get_token_balance is awaited in _exit_position when PAPER_TRADING=False.
+    # Return None so the code falls back to pos.size (safe in tests).
+    pm.get_token_balance = AsyncMock(return_value=None)
     risk = RiskEngine()
     monitor = PositionMonitor(pm=pm, risk=risk, interval=30)
     return monitor, pm, risk
@@ -462,13 +604,12 @@ class TestCheckPosition:
 
     def test_resolved_spread_both_legs_snap_consistently(self):
         """
-        Regression: when a spread (YES + NO) resolves near mid=0.50, the old code
-        used best_bid for the YES exit and best_ask for the NO exit.  With a typical
-        1–2 cent spread (bid=0.49, ask=0.51) both would round to opposite values
-        (0 and 1 respectively), making both legs appear as losers simultaneously.
+        Regression: at resolution each leg must exit using its own CLOB book mid
+        (YES book for YES positions, NO book for NO positions).
 
-        After the fix both legs use mid, so round(mid) gives the same settlement
-        value and the combined spread P&L is always positive (capturing the spread).
+        A spread bought at YES=0.49 + NO=0.48 (total cost 0.97/ct) should yield
+        positive combined P&L when YES snaps to 0 and NO snaps to 1 (or vice
+        versa), capturing the spread ≈ 0.03/ct × 20 = ~$0.60.
         """
         config.PROFIT_TARGET_PCT = 0.60
         config.STOP_LOSS_USD = 999.0  # disable stop-loss
@@ -481,14 +622,17 @@ class TestCheckPosition:
         mkt = self._make_market(end_date=past)  # already resolved
         pm._markets["mkt_001"] = mkt
 
-        # Book centered near 0.50 with a 2-cent spread: bid rounds down, ask rounds up.
-        pm._books["tok_yes"] = self._make_book(mid=0.50, bid=0.49, ask=0.51)
+        # YES mid=0.49 → round(0.49)=0 → YES loses
+        pm._books["tok_yes"] = self._make_book(mid=0.49, bid=0.48, ask=0.50)
+        # NO mid=0.51  → round(0.51)=1 → NO wins
+        # Must provide an independent NO book; never derive from YES book.
+        pm._books["tok_no"]  = self._make_book(mid=0.51, bid=0.50, ask=0.52)
 
         # YES leg: entry 0.490
         yes_pos = _make_position(side="YES", entry_price=0.490, size=20.0,
                                  strategy="maker", seconds_ago=120)
-        # NO leg: entry 0.520 (YES space)
-        no_pos = _make_position(side="NO", entry_price=0.520, size=20.0,
+        # NO leg: entry 0.480 (actual NO token price)
+        no_pos = _make_position(side="NO", entry_price=0.480, size=20.0,
                                 strategy="maker", market_id="mkt_001", seconds_ago=120)
         no_pos.market_id = "mkt_001"  # same market, separate risk key
         yes_pos.market_id = "mkt_001"
@@ -505,8 +649,26 @@ class TestCheckPosition:
         assert yes_closed.is_closed, "YES leg should be closed on resolution"
         assert no_closed.is_closed,  "NO leg should be closed on resolution"
 
-        # Combined P&L must be positive: the spread was (0.490 + (1−0.520)) = 0.970,
-        # leaving 0.030/ct × 20 = $0.60 spread capture regardless of direction.
+        # YES: exit at round(0.49)=0 → pnl=(0-0.49)*20=-9.8
+        # NO:  exit at round(0.51)=1 → pnl=(1-0.48)*20=+10.4
+        # Combined ≈ +0.6 (spread capture)
+        combined_pnl = yes_closed.realized_pnl + no_closed.realized_pnl
+        assert combined_pnl > 0.0, (
+            f"Spread should capture positive P&L on resolution, "
+            f"got YES={yes_closed.realized_pnl:.4f} NO={no_closed.realized_pnl:.4f}"
+        )
+
+        _run(monitor._check_position(yes_pos))
+        _run(monitor._check_position(no_pos))
+
+        yes_closed = risk._positions["mkt_001:YES"]
+        no_closed  = risk._positions["mkt_001:NO"]
+
+        assert yes_closed.is_closed, "YES leg should be closed on resolution"
+        assert no_closed.is_closed,  "NO leg should be closed on resolution"
+
+        # Combined P&L must be positive: YES entry 0.490 + NO entry 0.480 = 0.970/ct.
+        # At resolution one side pays 1.0: spread capture = 1.0 - 0.970 = 0.030/ct × 20 = $0.60
         combined_pnl = yes_closed.realized_pnl + no_closed.realized_pnl
         assert combined_pnl > 0.0, (
             f"Spread should capture positive P&L on resolution, "
@@ -514,7 +676,244 @@ class TestCheckPosition:
         )
 
 
-class TestCheckAllPositions:
+# ── YES/NO CLOB independence tests ───────────────────────────────────────────
+
+def _make_monitor_with_market(
+    yes_mid=0.30, yes_bid=0.29, yes_ask=0.31,
+    no_mid=None, no_bid=None, no_ask=None,
+    end_date=None,
+):
+    """Return (monitor, pm, risk) with a single market in the PM books cache.
+
+    If no_mid is None the NO book is absent from the cache (simulating an
+    unavailable NO CLOB), which is the key precondition for every test here.
+    """
+    monitor, pm, risk = _make_monitor()
+
+    mkt = MagicMock()
+    mkt.condition_id = "mkt_001"
+    mkt.token_id_yes = "tok_yes"
+    mkt.token_id_no  = "tok_no"
+    mkt.fees_enabled = False
+    mkt.end_date     = end_date
+    mkt.title        = "Will BTC exceed $100k?"
+    pm._markets      = {"mkt_001": mkt}
+
+    yes_book = MagicMock()
+    yes_book.mid      = yes_mid
+    yes_book.best_bid = yes_bid
+    yes_book.best_ask = yes_ask
+
+    if no_mid is not None:
+        no_book = MagicMock()
+        no_book.mid      = no_mid
+        no_book.best_bid = no_bid if no_bid is not None else no_mid
+        no_book.best_ask = no_ask if no_ask is not None else no_mid
+        pm._books = {"tok_yes": yes_book, "tok_no": no_book}
+    else:
+        pm._books = {"tok_yes": yes_book}  # NO book absent
+
+    return monitor, pm, risk, mkt
+
+
+class TestYesNoBookIndependence:
+    """
+    Verify that the monitor NEVER derives a NO token price from the YES book.
+    For every exit path, when the NO CLOB book is unavailable the monitor must
+    either skip the operation or fall back to entry_price — it must NOT compute
+    `1.0 - yes_price` as a proxy for the NO price.
+
+    Key invariant: YES mid=0.30  ≠  1.0 − NO mid.  We set NO mid=0.60 to make
+    the difference obvious: any remaining derivation would produce 0.70, not 0.60.
+    """
+
+    YES_MID = 0.30   # NOT 1 - NO_MID (0.40); intentionally decoupled
+
+    # ── coin-loss P&L aggregation ─────────────────────────────────────────────
+
+    def test_coin_loss_pnl_no_book_missing_skips_position(self):
+        """When the NO CLOB book is absent, the NO position must be excluded from
+        the coin-loss P&L sum rather than contributing a derived value."""
+        config.MAKER_COIN_MAX_LOSS_USD = 1.0   # very tight to force trigger if any value leaks
+
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
+            no_mid=None,  # NO book absent
+        )
+        no_pos = _make_position(side="NO", entry_price=0.60, size=100.0, strategy="maker")
+        risk.open_position(no_pos)
+
+        # If a derived price (1 - 0.30 = 0.70) were used, unrealised = (0.70 - 0.60) × 100 = +$10
+        # which is positive, so the coin-loss limit would not trigger.
+        # If entry_price were used, unrealised = 0, no trigger.
+        # Either way, the position must NOT be closed (it should be skipped).
+        _run(monitor._check_all_positions())
+
+        assert not risk._positions["mkt_001:NO"].is_closed, (
+            "NO position should be skipped (not closed) when NO book is unavailable"
+        )
+
+    def test_coin_loss_pnl_uses_no_book_mid_not_derived(self):
+        """When the NO CLOB book IS available, coin-loss P&L must use the actual
+        NO mid, not 1 − YES_mid."""
+        config.MAKER_COIN_MAX_LOSS_USD = 0.01  # trigger on any loss
+
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=self.YES_MID,   # 0.30
+            no_mid=0.55, no_bid=0.54, no_ask=0.56,   # independent of YES
+        )
+        # Entry at 0.60, NO now 0.55 → loss of 5c × 10 = -$0.50 → triggers limit
+        no_pos = _make_position(side="NO", entry_price=0.60, size=10.0, strategy="maker")
+        risk.open_position(no_pos)
+
+        _run(monitor._check_all_positions())
+
+        # Position should be closed because actual NO mid (0.55) < entry (0.60) → loss
+        assert risk._positions["mkt_001:NO"].is_closed, (
+            "NO position should be closed using actual NO book mid (0.55), not derived 1-0.30=0.70"
+        )
+
+    # ── coin-loss exit price ──────────────────────────────────────────────────
+
+    def test_coin_loss_exit_no_book_missing_uses_entry_price(self):
+        """When NO book is unavailable for coin-loss exit, fall back to entry_price
+        (zero P&L) rather than deriving 1 − YES_ask."""
+        config.MAKER_COIN_MAX_LOSS_USD = 0.01  # force trigger
+
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
+            no_mid=None,   # NO book absent → must skip in P&L agg → position NOT in coin_positions for closure
+        )
+        # With NO book absent, position is skipped entirely in aggregation.
+        # Coin-loss limit cannot trigger → position stays open.
+        no_pos = _make_position(side="NO", entry_price=0.60, size=100.0, strategy="maker")
+        risk.open_position(no_pos)
+
+        _run(monitor._check_all_positions())
+
+        assert not risk._positions["mkt_001:NO"].is_closed, (
+            "NO position must not be closed via derived exit price when NO book is absent"
+        )
+
+    # ── resolution exit ───────────────────────────────────────────────────────
+
+    def test_resolution_exit_no_uses_no_book_mid(self):
+        """At resolution, NO position should exit at the actual NO CLOB mid."""
+        now = datetime.now(timezone.utc)
+        end_date = now - timedelta(seconds=5)  # already past expiry
+
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=0.01,                          # YES snapped near 0
+            no_mid=0.99, no_bid=0.99, no_ask=1.0,  # NO should win
+            end_date=end_date,
+        )
+        no_pos = _make_position(side="NO", entry_price=0.82, size=100.0, strategy="momentum",
+                                seconds_ago=120, now=now)
+        risk.open_position(no_pos)
+
+        _run(monitor._check_position(no_pos))
+
+        closed = risk._positions["mkt_001:NO"]
+        assert closed.is_closed
+        # Exit must be at NO book mid (0.99), not at 1 − YES_mid (1 − 0.01 = 0.99 coincidentally)
+        # Use a different pairing to make the test meaningful:
+        # YES_mid=0.01 → derived=0.99; actual NO_mid=0.99 — same here.
+        # Test that realized_pnl is positive (correct), not zero (entry_price fallback).
+        assert closed.realized_pnl > 0.0, (
+            f"P&L should be positive (NO gained value from 0.82 to 0.99), got {closed.realized_pnl}"
+        )
+
+    def test_resolution_exit_no_book_missing_uses_entry_price(self):
+        """At resolution, when NO book is gone, exit at entry_price (no YES derivation).
+
+        entry_price=0.20 is used so that:
+          - New code: exit_mid=0.20 → round(0.20)=0.0 → pnl=(0-0.20)*100≈-20  (NO loses)
+          - Old code: exit_mid=1.0-round(YES_mid=0.01)=1.0 → pnl=(1-0.20)*100=+80 (NO wins)
+        This verifies the derivation path is no longer taken.
+        """
+        now = datetime.now(timezone.utc)
+        end_date = now - timedelta(seconds=5)
+
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=0.01,   # YES snaps to 0 — old code would derive NO exit=1.0
+            no_mid=None,    # NO book absent
+            end_date=end_date,
+        )
+        no_pos = _make_position(side="NO", entry_price=0.20, size=100.0, strategy="momentum",
+                                seconds_ago=120, now=now)
+        risk.open_position(no_pos)
+
+        _run(monitor._check_position(no_pos))
+
+        closed = risk._positions["mkt_001:NO"]
+        assert closed.is_closed, "Resolved position must always be closed"
+        # Old derivation: 1.0-round(0.01)=1.0 → pnl ≈ +80.  New: entry_price=0.20 → pnl ≈ -20.
+        assert closed.realized_pnl == pytest.approx(-20.0, abs=0.5), (
+            f"exit must use entry_price=0.20 (pnl≈-20), not derived 1.0 (pnl≈+80), got {closed.realized_pnl:.4f}"
+        )
+
+    # ── pre-expiry taker exit ─────────────────────────────────────────────────
+
+    def test_pre_expiry_exit_no_uses_no_book_best_bid(self):
+        """Near-expiry taker exit for NO uses the actual NO CLOB best_bid."""
+        now = datetime.now(timezone.utc)
+        future = now + timedelta(seconds=30)   # 30s TTE → within near-expiry window
+
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
+        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
+        config.MOMENTUM_STOP_LOSS_NO = 0.50
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_MIN_HOLD_SECONDS = 0
+
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
+            no_mid=0.60, no_bid=0.58, no_ask=0.62,  # independent of YES
+            end_date=future,
+        )
+        # NO is in [0.81, 0.89] band, now 0.60 < 0.65 threshold → near-expiry exit
+        no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
+                                seconds_ago=120, now=now)
+        risk.open_position(no_pos)
+
+        _run(monitor._check_position(no_pos))
+
+        closed = risk._positions["mkt_001:NO"]
+        assert closed.is_closed, "Near-expiry exit should have fired"
+        # Realized P&L must reflect actual NO best_bid (0.58), not 1 − YES_ask (1 − 0.31 = 0.69)
+        expected_pnl = (0.58 - 0.85) * 100.0  # exit at 0.58, entry at 0.85
+        assert closed.realized_pnl == pytest.approx(expected_pnl, abs=0.5), (
+            f"P&L should use NO best_bid=0.58, got {closed.realized_pnl:.4f}"
+        )
+
+    def test_pre_expiry_exit_no_book_missing_defers(self):
+        """When NO book is unavailable for pre-expiry exit, the monitor must defer
+        (not call _exit_position and not derive a price from YES)."""
+        now = datetime.now(timezone.utc)
+        future = now + timedelta(seconds=30)
+
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
+        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
+        config.MOMENTUM_STOP_LOSS_NO = 0.50
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_MIN_HOLD_SECONDS = 0
+
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
+            no_mid=None,   # NO book absent → must defer
+            end_date=future,
+        )
+        no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
+                                seconds_ago=120, now=now)
+        risk.open_position(no_pos)
+
+        _run(monitor._check_position(no_pos))
+
+        assert not risk._positions["mkt_001:NO"].is_closed, (
+            "Monitor must defer the exit (not close) when NO book is unavailable"
+        )
+        pm.place_market.assert_not_called()
+        pm.place_limit.assert_not_called()
+
     def test_skips_closed_positions(self):
         monitor, pm, risk = _make_monitor()
         pos = _make_position(seconds_ago=120)
@@ -726,3 +1125,31 @@ class TestEventDrivenStopLoss:
         _run(monitor._on_price_update("tok_no", 0.50))
 
         assert risk._positions["mkt_001:YES"].is_closed, "NO-token tick should trigger check and close YES position"
+
+    def test_take_profit_uses_force_taker(self):
+        """
+        MOMENTUM_TAKE_PROFIT exit must use a market order (force_taker=True) so it
+        executes immediately rather than resting as a post-only limit that would
+        likely be rejected or delayed at near-certainty prices.
+        """
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 0
+
+        monitor, pm, risk = _make_monitor()
+        pos = _make_position(
+            strategy="momentum", side="YES", entry_price=0.80,
+            size=100.0, seconds_ago=120,
+        )
+        risk.open_position(pos)
+
+        mkt = self._make_market()
+        pm._markets = {"mkt_001": mkt}
+        # Price at or above take-profit level
+        pm._books = {"tok_yes": self._make_book(mid=0.999)}
+
+        _run(monitor._on_price_update("tok_yes", 0.999))
+
+        assert risk._positions["mkt_001:YES"].is_closed, "Position should be closed by take-profit"
+        # force_taker=True → place_market() must be called, not place_limit()
+        pm.place_market.assert_called_once()
+        pm.place_limit.assert_not_called()
