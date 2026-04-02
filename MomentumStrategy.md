@@ -64,8 +64,7 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_MAX_ENTRY_USD` | `50.0` | Maximum USDC deployed per position |
 | `MOMENTUM_MIN_CLOB_DEPTH` | `200.0` | Minimum USDC depth on the ask side within 1c of best ask (thin-book guard) |
 | `MOMENTUM_ORDER_TYPE` | `"limit"` | `"limit"` = taker limit at ask+0.5c; `"market"` = market order |
-| `MOMENTUM_STOP_LOSS_YES` | `0.50` | Exit YES position if YES token price drops below this |
-| `MOMENTUM_STOP_LOSS_NO` | `0.50` | Exit NO position if NO token price drops below this |
+| `MOMENTUM_DELTA_STOP_LOSS_PCT` | `0.05` | Exit when \|(spot − strike) / strike\| reverses past this % against the position. Applied to HL spot vs strike — not the token CLOB price. Fires even when the token book is empty near expiry. |
 | `MOMENTUM_TAKE_PROFIT` | `0.999` | Exit if held token rises above this |
 | `MOMENTUM_MIN_TTE_SECONDS` | see below | Per-bucket-type dict of entry-window ceilings (seconds to expiry); markets with more TTE are outside the entry window and skipped |
 | `MOMENTUM_MIN_TTE_SECONDS_DEFAULT` | `120` | Fallback TTE ceiling for any market type not listed in the dict |
@@ -78,6 +77,7 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_VOL_Z_SCORE` | `1.6449` | Global z-score for the probability threshold (1.6449 ≈ 95th percentile) |
 | `MOMENTUM_VOL_Z_SCORE_BY_TYPE` | `{}` | Per-bucket-type z-score overrides; unlisted types use the global default. Example: `{"bucket_daily": 1.0, "bucket_15m": 1.3}` |
 | `MOMENTUM_MIN_DELTA_PCT` | `0.0` | Absolute minimum spot-to-strike gap (%) required to enter, independent of time bucket or vol regime. See [Absolute Floor Principle](#absolute-floor-principle). |
+| `MOMENTUM_MIN_GAP_PCT` | `0.0` | Minimum *additional* gap required above the effective vol-scaled threshold. Blocks marginal signals where delta barely clears the bar. `0.0` = disabled. Recommended live value: `0.02`. |
 | `MOMENTUM_MAX_CONCURRENT` | `3` | Maximum simultaneous momentum positions |
 | `MOMENTUM_MARKET_COOLDOWN_SECONDS` | `300` | Seconds to suppress re-entry after any open/close/failed attempt in a market (deduplication guard) |
 | `MOMENTUM_MAX_TTE_DAYS` | `7` | Days of bucket markets subscribed for WS book data (independent of maker window) |
@@ -114,8 +114,8 @@ via `config_overrides.json` without restarting the bot.
 
 | Priority | Source | Coins | TTL |
 |----------|--------|-------|-----|
-| 1 | **Deribit ATM IV** (nearest ~7-day call option, ATM strike ± spot) | BTC, ETH, SOL | `MOMENTUM_VOL_CACHE_TTL` (5 min) |
-| 2 | **HL rolling realized vol** (log-return std from last 24h of HL BBO feed) | Any coin in `HL_PERP_COINS` | 60 s |
+| 1 | **Deribit ATM IV** (nearest ~7-day call option, ATM strike ± spot) | BTC, ETH, SOL, XRP | `MOMENTUM_VOL_CACHE_TTL` (5 min) |
+| 2 | **HL rolling realized vol** (log-return std from last 24h of HL BBO feed, min 10 samples) | Any coin in `HL_PERP_COINS` | 60 s |
 | 3 | **Skip signal** | Coins with no data | — |
 
 **Why Deribit ATM IV as primary?**
@@ -324,7 +324,12 @@ For each open bucket market M:
     if _blocked_by_tte: continue
 
     # ── Gate: delta must exceed dynamic threshold ─────────────────────────
-    if delta_pct < y: continue
+    _effective_threshold = max(y, MOMENTUM_MIN_DELTA_PCT)
+    if delta_pct < _effective_threshold: continue
+
+    # ── Gate: minimum gap above threshold ────────────────────────────────
+    # Blocks marginal signals that barely clear the threshold.
+    if MOMENTUM_MIN_GAP_PCT > 0 and (delta_pct - _effective_threshold) < MOMENTUM_MIN_GAP_PCT: continue
 
     # ── Gate: no existing position in this market ─────────────────────────
     if any(p.market_id == M.condition_id for p in risk.get_open_positions()): continue
@@ -388,25 +393,30 @@ For each open bucket market M:
 
 ## Exit Rules
 
-Three exit conditions, whichever triggers first. Exits are based on the **held token's price**,
-not USD P&L (unlike the mispricing strategy):
+Four exit conditions evaluated in priority order. **Delta SL is checked first and does not require the CLOB book to be available** — this is critical because near expiry the NO book often drains completely before the market resolves.
 
-| Condition | Config Key | Default | Action | Rationale |
-|-----------|-----------|---------|--------|-----------|
-| YES position: YES token drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_YES` | 0.50 | Taker-sell YES token | Cap downside if the held YES token fails |
-| NO position: NO token drops ≤ stop-loss | `MOMENTUM_STOP_LOSS_NO` | 0.50 | Taker-sell NO token | Symmetric stop on NO token price |
-| Token price >= take-profit | `MOMENTUM_TAKE_PROFIT` | 0.999 | Taker-sell held token | Capture near-certainty gains |
-| Near expiry + weak token | `MOMENTUM_NEAR_EXPIRY_*` | 60s / 0.60 | Taker-sell held token | Avoid binary snap when close to resolution and in loss zone |
-| Expiry | — | — | Hold to resolution | If no other trigger fires, let the market resolve |
+| Priority | Condition | Config Key | Default | Action | Rationale |
+|----------|-----------|-----------|---------|--------|-----------|
+| 1 | Spot crosses strike against position by > stop-loss % | `MOMENTUM_DELTA_STOP_LOSS_PCT` | `0.05` | Taker-sell held token | Underlying moved against us — genuine adverse signal. Fires even if token CLOB book is drained/empty. |
+| 2 | Near expiry and spot has crossed strike (delta < 0) | `MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS` | 60 s | Taker-sell held token | Avoid binary snap to zero close to resolution when already losing |
+| 3 | Token price >= take-profit | `MOMENTUM_TAKE_PROFIT` | `0.999` | Taker-sell held token | Capture near-certainty gains |
+| 4 | Expiry | — | — | Hold to resolution | If no other trigger fires, let the market resolve naturally |
+
+**Why delta SL (not CLOB-price SL)?**
+
+Previous versions used a CLOB-price stop (`MOMENTUM_STOP_LOSS_YES/NO = 0.5`). This was replaced because:
+- Near expiry, MMs withdraw from the book. The NO token mid becomes `None`, making a CLOB-price stop impossible to evaluate.
+- CLOB price collapses (book thinning) are not the same as genuine adverse spot moves. A thin-book bounce from 0.80 to 0.60 can reverse to 0.85 within a single second.
+- Delta SL fires on **underlying price vs strike** — a harder, less-gameable signal that works whether or not the token book is live.
 
 **Token price mapping (monitor):**
 
-- YES position: token_price = current YES mid
-- NO position: token_price = current NO mid
+- YES position: `token_price` = current YES CLOB mid (falls back to `current_price` if not available)
+- NO position: `token_price` = current NO CLOB mid; **delta SL fires even if NO book is empty**
 
 > Exits are handled by `monitor.py` in `should_exit()` under `pos.strategy == "momentum"`.
-> Momentum has no generic time-stop, but does include a dedicated near-expiry protective
-> stop (`MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS` + `MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD`).
+> The delta SL block runs first in the function, before any token-price fetch, so NO-book drainage
+> near expiry no longer silences the stop-loss.
 
 ---
 
@@ -425,14 +435,16 @@ Before entering, check all open positions across ALL strategies:
 
 | Scenario | Guard | Resolution |
 |----------|-------|------------|
-| Spot reverses immediately after entry | Side-specific stop-loss (`MOMENTUM_STOP_LOSS_YES` / `_NO`) | Max loss ~30c on ~85c entry |
+| Spot reverses immediately after entry | Delta SL (`MOMENTUM_DELTA_STOP_LOSS_PCT`): exit when spot moves > 0.05% past strike against position | Fires on HL spot ticks; does not require the token CLOB book to be live |
+| NO token book drains near expiry (MMs withdraw) | Delta SL evaluated before any NO-book fetch; book drain no longer silences the stop | Delta SL fires regardless of CLOB state |
 | Market already at 94c when scanner runs | Upper band check (< 0.90 strictly) | Signal filtered out |
 | Signal fires outside entry window | Per-bucket TTE gate (`MOMENTUM_MIN_TTE_SECONDS`) | Signal filtered out |
 | HL spot data is stale (> 30s old) | Stale spot guard | Signal skipped |
 | PM book data is stale (> 60s old) | Stale book guard | Signal skipped |
 | PM book has no levels (MMs withdrawn) | Empty book guard | Signal skipped |
 | Deribit IV fails to fetch | Fallback to HL rolling vol; if also absent, skip | Signal skipped; logs at DEBUG |
-| HL rolling vol has < 20 samples | Vol fetcher returns None | Signal skipped |
+| HL rolling vol has < 10 samples | Vol fetcher returns None | Signal skipped (threshold lowered from 20 to reduce cold-start drops) |
+| Marginal signal: delta barely clears threshold | `MOMENTUM_MIN_GAP_PCT` minimum gap above threshold | Blocks signals where a single adverse tick reverses the position |
 | Thin liquidity at ask | CLOB depth gate (> 200 USDC) | Signal skipped |
 | Price moved out of band before execution | Price re-check at execution time (band + 2c tolerance) | Order not placed |
 | Same market already held by any strategy | Duplicate guard + cooldown | Skip entry |
@@ -465,15 +477,27 @@ data/market_open_spots.json   # window-open spot cache for Up/Down markets (surv
 
 ```
 HLClient (BBO feed) ──→ VolFetcher._on_bbo() ──→ rolling mid buffer
-                                                    ↓ (fallback)
-DeribitFetcher ──────────────────────────────→ VolFetcher.get_sigma_ann()
-                                                    ↓
-VolFetcher.start_prefetch() ──────────────→ background warm-up task
+         │                                          ↓ (fallback)
+         │             DeribitFetcher ──────→ VolFetcher.get_sigma_ann()
+         │                                          ↓
+         │             VolFetcher.start_prefetch() → background warm-up task
+         │
+         ├──→ MomentumScanner._on_hl_spot_update_entry(coin, bbo)
+         │         ↓ (coin matches a tracked underlying? wake immediately)
+         │    asyncio.Event.set()
+         │
+         └──→ PositionMonitor._on_hl_spot_update(coin, bbo)
+                   ↓ (for each open momentum position with matching underlying)
+                   should_exit() — delta SL runs first (no CLOB book required)
 
 PMClient (WS price ticks) ──→ MomentumScanner._on_price_update_entry()
                                             ↓ (band hit? wake immediately)
                                      asyncio.Event.set()
                                             ↓
+PMClient (WS price ticks) ──→ PositionMonitor._on_price_update()
+                                     ↓ (for open momentum positions)
+                                 should_exit() — delta SL + take profit
+
 PMClient (books) ─────────────→ MomentumScanner._scan_once()
                                         ↓ (signal passes all gates)
                                  _execute_signal()
@@ -484,9 +508,10 @@ PMClient (books) ─────────────→ MomentumScanner._sca
                                         ↓
                                  risk.open_position()
                                         ↓
-                                 PositionMonitor (exit checks every 30s)
+                          PositionMonitor (poll fallback every 5s; event-driven
+                          on PM WS ticks + HL BBO ticks)
                                         ↓
-                                 should_exit() — MOMENTUM_STOP_LOSS_YES/_NO / TAKE_PROFIT
+                          should_exit() — delta SL / near-expiry / take-profit
 
 MomentumScanner._last_scan_diags ──→ GET /momentum/diagnostics
 MomentumScanner._on_signal cb ────→ GET /momentum/signals
@@ -495,9 +520,11 @@ MomentumScanner._on_signal cb ────→ GET /momentum/signals
 ### Key design decisions
 
 1. **No agent loop** — momentum is time-critical; scanner executes directly without Ollama evaluation.
-2. **Event-driven entry** — PMClient price-change callbacks wake the scan loop immediately when a market enters the band, instead of waiting the full `MOMENTUM_SCAN_INTERVAL`. The lightweight callback does only a band + cooldown pre-filter; the full gate evaluation runs in the normal scan path.
-3. **No queue** — direct execution prevents stale signals accumulating.
-4. **Re-check at execution** — price is re-validated right before order placement to guard against fast moves between detection and execution.
+2. **Fully event-driven entry** — both PM CLOB ticks (`_on_price_update_entry`) and HL BBO ticks (`_on_hl_spot_update_entry`) wake the scan loop immediately. The scan loop uses `asyncio.Event.wait()` with a timeout so it fires on either signal type, whichever arrives first.
+3. **Fully event-driven exit** — both PM CLOB ticks (`_on_price_update`) and HL BBO ticks (`_on_hl_spot_update`) trigger `_check_position` for open momentum positions. The 5-second poll loop (`MONITOR_INTERVAL`) is a safety-net fallback only. This eliminates the latency gap where a spot move through the strike goes undetected while the PM book is quiet.
+4. **Delta SL before CLOB check** — `should_exit()` evaluates the delta stop-loss against HL spot vs strike **before** reading the token CLOB price. This ensures the stop fires even when the NO book is fully drained near expiry (MMs withdraw first, markets drain after).
+5. **No queue** — direct execution prevents stale signals accumulating.
+6. **Re-check at execution** — price is re-validated right before order placement to guard against fast moves between detection and execution.
 5. **WS fill detection** — a one-shot `asyncio.Future` is registered before awaiting anything; the MATCHED WS event resolves it (~0 ms, zero REST calls). REST fallback fires only on timeout (5 s).
 6. **Token-native entry price** — both YES and NO entries are stored as the held token's actual fill price (no YES-space conversion).
 7. **Shared risk engine** — `risk.open_position()` and `risk.get_positions()` are shared with maker/mispricing, ensuring cap enforcement is global.

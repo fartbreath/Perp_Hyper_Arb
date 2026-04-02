@@ -167,8 +167,10 @@ else:
         total_rebate = sum(float(r["rebate_usd"]) for r in rows)
         avg_px    = total_cost / total_ct if total_ct else 0.0
         fills_n   = len(rows)
-        # Cost basis: YES→ avg_px*ct; NO (SELL YES)→ (1-avg_px)*ct as YES-equivalent exposure
-        exposure  = avg_px * total_ct if side == "YES" else (1.0 - avg_px) * total_ct
+        # Cost basis: actual token fill price × contracts for both YES and NO.
+        # fills.csv stores actual NO token fill prices (not YES-space), so the
+        # same formula applies to both sides.
+        exposure  = avg_px * total_ct
         total_open_exposure += exposure
         print(
             f"  {side:3s} | {total_ct:7.3f}ct @ {avg_px:.4f} avg | "

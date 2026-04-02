@@ -58,12 +58,17 @@ Perp_Hyper_Arb/
 pm_client.run()           ← Polymarket WS + heartbeat
 hl_client.run()           ← Hyperliquid WS + dead-man's switch
 maker_strategy.start()    ← quoting sweep + hedge debounce
-momentum_scanner.start()  ← scan every 10 s + direct taker execution
+momentum_scanner.start()  ← scan every 5-10 s + event-driven entry (PM ticks + HL BBO ticks)
 mispricing_scanner.start()← scan every 60 s
 agent_loop()              ← consumes signal queue from scanner
 api_server                ← FastAPI REST for webapp
 state_sync_loop()         ← pushes bot state to API layer
 ```
+
+The momentum scanner wakes immediately on **either** a PM CLOB price tick or an HL BBO tick.
+The position monitor evaluates exit conditions on **both** tick types, so a spot move through
+the stop-loss strike is detected within one WebSocket round-trip (~100-500 ms) rather than
+waiting for the next poll cycle.
 
 ---
 
@@ -253,7 +258,7 @@ pytest tests/test_maker.py -v
 pytest --cov=. --cov-report=term-missing
 ```
 
-**741 tests passed, 7 skipped, 0 failing** as of the current release.
+**746 tests passed, 1 skipped (live-book snapshot), 0 failing** as of the current release.
 
 Test files:
 - `tests/test_maker.py` — strategy quoting, repricing, inventory skew, edge filters
@@ -273,6 +278,10 @@ Test files:
 **Why Hyperliquid for the hedge?** Zero-fee maker quotes on HL perps, sub-second execution, and reliable REST + WebSocket APIs. The hedge fires once per fill burst (debounced), reducing HL order frequency.
 
 **Why Kalshi for mispricing confirmation?** N(d₂) from Deribit gives a terminal price probability, but Polymarket markets resolve on a barrier-hit (one-touch) condition — a structural mismatch that can be 20–40 percentage points. Kalshi lists the same events on the same terms, making PM↔Kalshi comparison a true apples-to-apples mispricing signal. Full analysis in [MISPRICING_STRATEGY.md](MISPRICING_STRATEGY.md).
+
+**Why HL BBO drives momentum exits (not a poll timer)?** Near expiry, Polymarket MMs withdraw from the NO/YES CLOB before the market resolves — the book drains to empty. A poll-based monitor with a 30s interval may only fire once during a 57-second hold, and a drained CLOB book silences token-price stops. Wiring `hl.on_bbo_update` to both the scanner and monitor means every HL spot tick evaluates the delta stop-loss independently of PM book state.
+
+**Why delta SL (not CLOB-price SL)?** The previous `MOMENTUM_STOP_LOSS_YES/NO` config stopped out positions when the *token price* dropped below a threshold. Near expiry, token prices collapse as MMs leave — a 0.85 token can momentarily show a mid of 0.50 from a single thin-book trade, triggering an unnecessary exit. Delta SL compares HL spot to the strike: if spot has genuinely moved past the strike against us by >0.05%, we exit. Spot is harder to game and doesn't depend on PM order book liquidity.
 
 **Config architecture:** `config.py` holds all defaults as module-level constants. `config_overrides.json` holds any runtime changes. At startup, overrides are applied via `setattr`. The `GET /config/effective` endpoint returns the merged live view, making the running state fully inspectable without reading files.
 

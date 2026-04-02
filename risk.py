@@ -26,7 +26,7 @@ DATA_DIR.mkdir(exist_ok=True)
 TRADES_CSV = DATA_DIR / "trades.csv"
 OPEN_POSITIONS_JSON = DATA_DIR / "open_positions.json"
 TRADES_HEADER = [
-    "timestamp", "market_id", "market_title", "market_type", "underlying", "side", "size", "price",
+    "timestamp", "entry_timestamp", "market_id", "market_title", "market_type", "underlying", "side", "size", "price",
     "fees_paid", "rebates_earned", "hl_hedge_size", "hl_entry_price",
     "strategy", "pnl",
     # Signal context — populated for mispricing strategy; 0.0 for maker
@@ -39,6 +39,7 @@ TRADES_HEADER = [
     "kalshi_price",     # matched Kalshi YES price at signal time (0.0 = no match)
     "signal_source",    # "kalshi_confirmed" | "kalshi_only" | "nd2_only"
     "signal_score",     # quality score 0–100 at signal time
+    "resolved_outcome", # WIN | LOSS | "" (empty = early exit / paper / unknown)
 ]
 
 
@@ -89,7 +90,7 @@ class Position:
     pm_rebates_earned: float = 0.0
 
     # Capital deployed to open this position (actual USDC cost, not face value).
-    # BUY YES: entry_price × size.  SELL YES (NO side): (1 − entry_price) × size.
+    # Both YES and NO: entry_price × size.
     entry_cost_usd: float = 0.0
 
     # P&L
@@ -399,13 +400,9 @@ class RiskEngine:
                 existing.entry_cost_usd += position.entry_cost_usd
                 # Update weighted-average entry price so close_position P&L uses the
                 # blended cost across all fills (not just the first batch's price).
-                # YES:  avg_price = total_cost / total_size
-                # NO:   entry_cost = (1 − price) × size  →  avg_price = 1 − cost/size
+                # Both YES and NO: avg_price = total_cost / total_size
                 if existing.size > 0:
-                    if existing.side == "YES":
-                        existing.entry_price = existing.entry_cost_usd / existing.size
-                    else:
-                        existing.entry_price = 1.0 - existing.entry_cost_usd / existing.size
+                    existing.entry_price = existing.entry_cost_usd / existing.size
                 # Update order_id when a reprice fires a new order.
                 if position.order_id and position.order_id != existing.order_id:
                     existing.order_id = position.order_id
@@ -504,6 +501,7 @@ class RiskEngine:
         side: str = "YES",
         fees_paid: float = 0.0,
         rebates_earned: float = 0.0,
+        resolved_outcome: str = "",
     ) -> Optional[Position]:
         _csv_row: Optional[dict] = None
         _closed_pos: Optional[Position] = None
@@ -513,8 +511,6 @@ class RiskEngine:
                 return None
 
             pnl = (exit_price - pos.entry_price) * pos.size
-            if pos.side == "NO":
-                pnl = -pnl
             pnl -= fees_paid
             # Total rebates = entry rebate (already on pos) + exit rebate passed in
             total_rebates_earned = pos.pm_rebates_earned + rebates_earned
@@ -545,13 +541,14 @@ class RiskEngine:
 
             _csv_row = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "entry_timestamp": pos.opened_at.isoformat() if pos.opened_at else "",
                 "market_id": market_id,
                 "market_title": pos.market_title,
                 "market_type": pos.market_type,
                 "underlying": pos.underlying,
                 "side": pos.side,
                 "size": pos.size,
-                "price": pos.entry_price,
+                "price": pos.entry_price,  # actual token fill price for both YES and NO
                 "fees_paid": fees_paid,
                 "rebates_earned": total_rebates_earned,
                 "hl_hedge_size": pos.hl_hedge_size,
@@ -567,6 +564,7 @@ class RiskEngine:
                 "kalshi_price": pos.kalshi_price,
                 "signal_source": pos.signal_source,
                 "signal_score": pos.signal_score,
+                "resolved_outcome": resolved_outcome,
             }
             _closed_pos = pos
             log.info(
@@ -611,6 +609,7 @@ class RiskEngine:
             self._realized_pnl += pnl
             _csv_row = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "entry_timestamp": "",
                 "market_id": f"hl_{coin}",
                 "market_title": f"HL {coin} perp hedge",
                 "market_type": "hl_perp",
@@ -633,6 +632,7 @@ class RiskEngine:
                 "kalshi_price": 0.0,
                 "signal_source": "hl_hedge",
                 "signal_score": 0.0,
+                "resolved_outcome": "",
             }
             log.info(
                 "HL hedge trade recorded",

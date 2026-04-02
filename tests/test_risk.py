@@ -190,12 +190,12 @@ class TestRiskEnginePnL:
         assert math.isclose(closed.realized_pnl, 50.0, rel_tol=1e-6)
 
     def test_winning_trade_no(self):
-        """Long NO at 0.50, close at 0.0 → profit = size * 0.50."""
+        """Long NO at 0.50, close at 1.0 (actual NO when YES fails) → profit = size × 0.50."""
         pos = _make_position(size=100.0)
         pos.entry_price = 0.50
         pos.side = "NO"
         self.engine.open_position(pos)
-        closed = self.engine.close_position("mkt_001", exit_price=0.0, side="NO")
+        closed = self.engine.close_position("mkt_001", exit_price=1.0, side="NO")
         assert closed is not None
         assert math.isclose(closed.realized_pnl, 50.0, rel_tol=1e-6)
 
@@ -389,29 +389,29 @@ def test_merge_updates_weighted_avg_entry_price_no_side():
     engine = RiskEngine()
     now = datetime.now(timezone.utc)
 
-    # NO side: entry_cost_usd = (1 - entry_price) × size
-    # Batch 1: 20 contracts @ YES price 0.70 → cost (0.30) × 20 = $6.00
+    # NO side: entry_cost_usd = entry_price × size  (actual NO token price)
+    # Batch 1: 20 contracts @ actual NO price 0.30 → cost 0.30 × 20 = $6.00
     p1 = Position(
         market_id="mkt_avg_no",
         market_type="bucket_daily",
         underlying="ETH",
         side="NO",
         size=20.0,
-        entry_price=0.70,
+        entry_price=0.30,
         strategy="maker",
         opened_at=now,
         entry_cost_usd=6.0,
     )
     engine.open_position(p1)
 
-    # Batch 2: 20 contracts @ YES price 0.60 → cost (0.40) × 20 = $8.00
+    # Batch 2: 20 contracts @ actual NO price 0.40 → cost 0.40 × 20 = $8.00
     p2 = Position(
         market_id="mkt_avg_no",
         market_type="bucket_daily",
         underlying="ETH",
         side="NO",
         size=20.0,
-        entry_price=0.60,
+        entry_price=0.40,
         strategy="maker",
         opened_at=now,
         entry_cost_usd=8.0,
@@ -421,8 +421,8 @@ def test_merge_updates_weighted_avg_entry_price_no_side():
     merged = engine.get_open_positions()[0]
     assert merged.size == 40.0
     assert merged.entry_cost_usd == 14.0
-    # avg NO price: 1 - (14/40) = 1 - 0.35 = 0.65
-    assert abs(merged.entry_price - 0.65) < 1e-9
+    # avg actual NO price: 14/40 = 0.35
+    assert abs(merged.entry_price - 0.35) < 1e-9
 
 def test_max_concurrent_positions_cap():
     from risk import RiskEngine, Position

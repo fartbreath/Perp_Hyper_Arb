@@ -249,14 +249,14 @@ _MUTABLE_CONFIG = {
     "momentum_max_entry_usd":         ("MOMENTUM_MAX_ENTRY_USD",           float),
     "momentum_min_clob_depth":        ("MOMENTUM_MIN_CLOB_DEPTH",          float),
     "momentum_order_type":            ("MOMENTUM_ORDER_TYPE",              str),
-    "momentum_stop_loss_yes":          ("MOMENTUM_STOP_LOSS_YES",           float),
-    "momentum_stop_loss_no":           ("MOMENTUM_STOP_LOSS_NO",            float),
+    "momentum_delta_stop_loss_pct":    ("MOMENTUM_DELTA_STOP_LOSS_PCT",     float),
     "momentum_take_profit":            ("MOMENTUM_TAKE_PROFIT",             float),
     "momentum_min_tte_default":        ("MOMENTUM_MIN_TTE_SECONDS_DEFAULT",         int),
     "momentum_spot_max_age_secs":     ("MOMENTUM_SPOT_MAX_AGE_SECS",       float),
     "momentum_book_max_age_secs":     ("MOMENTUM_BOOK_MAX_AGE_SECS",       float),
     "momentum_vol_cache_ttl":         ("MOMENTUM_VOL_CACHE_TTL",           float),
     "momentum_vol_z_score":           ("MOMENTUM_VOL_Z_SCORE",             float),
+    "momentum_min_delta_pct":         ("MOMENTUM_MIN_DELTA_PCT",           float),
     "momentum_scan_interval":         ("MOMENTUM_SCAN_INTERVAL",           int),
     "momentum_max_concurrent":        ("MOMENTUM_MAX_CONCURRENT",          int),
 }
@@ -373,8 +373,7 @@ class ConfigPatch(BaseModel):
     momentum_max_entry_usd: float | None = None
     momentum_min_clob_depth: float | None = None
     momentum_order_type: str | None = None
-    momentum_stop_loss_yes: float | None = None
-    momentum_stop_loss_no: float | None = None
+    momentum_delta_stop_loss_pct: float | None = None
     momentum_take_profit: float | None = None
     momentum_min_tte_5m: int | None = None
     momentum_min_tte_15m: int | None = None
@@ -388,6 +387,7 @@ class ConfigPatch(BaseModel):
     momentum_book_max_age_secs: float | None = None
     momentum_vol_cache_ttl: float | None = None
     momentum_vol_z_score: float | None = None
+    momentum_min_delta_pct: float | None = None
     momentum_vol_z_score_5m: float | None = None
     momentum_vol_z_score_15m: float | None = None
     momentum_vol_z_score_1h: float | None = None
@@ -511,8 +511,7 @@ def get_config() -> dict:
         "momentum_max_entry_usd":         config.MOMENTUM_MAX_ENTRY_USD,
         "momentum_min_clob_depth":        config.MOMENTUM_MIN_CLOB_DEPTH,
         "momentum_order_type":            config.MOMENTUM_ORDER_TYPE,
-        "momentum_stop_loss_yes":          config.MOMENTUM_STOP_LOSS_YES,
-        "momentum_stop_loss_no":           config.MOMENTUM_STOP_LOSS_NO,
+        "momentum_delta_stop_loss_pct":    config.MOMENTUM_DELTA_STOP_LOSS_PCT,
         "momentum_take_profit":            config.MOMENTUM_TAKE_PROFIT,
         "momentum_min_tte_5m":             config.MOMENTUM_MIN_TTE_SECONDS.get("bucket_5m",      config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT),
         "momentum_min_tte_15m":            config.MOMENTUM_MIN_TTE_SECONDS.get("bucket_15m",     config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT),
@@ -526,6 +525,7 @@ def get_config() -> dict:
         "momentum_book_max_age_secs":     config.MOMENTUM_BOOK_MAX_AGE_SECS,
         "momentum_vol_cache_ttl":         config.MOMENTUM_VOL_CACHE_TTL,
         "momentum_vol_z_score":           config.MOMENTUM_VOL_Z_SCORE,
+        "momentum_min_delta_pct":         config.MOMENTUM_MIN_DELTA_PCT,
         "momentum_vol_z_score_5m":         config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_5m",    config.MOMENTUM_VOL_Z_SCORE),
         "momentum_vol_z_score_15m":        config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_15m",   config.MOMENTUM_VOL_Z_SCORE),
         "momentum_vol_z_score_1h":         config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_1h",    config.MOMENTUM_VOL_Z_SCORE),

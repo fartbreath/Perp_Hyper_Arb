@@ -1561,28 +1561,17 @@ export default function Settings() {
           <div className="card">
             <h3>Momentum — Exit Thresholds</h3>
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
-              Positions are held until the held-token price crosses one of these thresholds
+              Positions are held until the underlying spot crosses one of these thresholds
               (no time-based exit — holds to resolution or exit trigger).
             </p>
 
             <FloatInput
-              label="Stop Loss — YES"
-              description="Exit a YES position if p_yes falls below this (e.g. 0.60 = exit if YES token drops to 60¢)."
-              value={data.momentum_stop_loss_yes ?? 0.55}
+              label="Delta Stop-Loss"
+              description="Exit when the underlying spot has moved this % past the strike against the position (e.g. 0.05 = exit when spot is 0.05% below strike for YES, or 0.05% above strike for NO). Uses live HL spot price, not binary CLOB."
+              value={data.momentum_delta_stop_loss_pct ?? 0.05}
               step={0.01}
-              unit=""
-              onSubmit={(v) => apply({ momentum_stop_loss_yes: v })}
-            />
-
-            {GAP}
-
-            <FloatInput
-              label="Stop Loss — NO"
-              description="Exit a NO position if p_no falls below this (e.g. 0.60 = exit if NO token drops to 60¢, i.e. p_yes rises above 40¢)."
-              value={data.momentum_stop_loss_no ?? 0.55}
-              step={0.01}
-              unit=""
-              onSubmit={(v) => apply({ momentum_stop_loss_no: v })}
+              unit="%"
+              onSubmit={(v) => apply({ momentum_delta_stop_loss_pct: v })}
             />
 
             {GAP}

@@ -65,6 +65,10 @@ def _reset_production_limits():
         "MAKER_SPREAD_SIZE_MAX",
         "MAKER_SPREAD_SIZE_MIN",
         "MAKER_SPREAD_SIZE_NEW_MARKET",
+        # Prevents test-order config leaks: config_overrides.json sets this to
+        # False for live trading, which causes tests relying on paper mode to
+        # break when run in isolation (get_token_balance is awaited in live mode).
+        "PAPER_TRADING",
     )
     saved = {k: getattr(config, k) for k in _keys}
 
@@ -80,6 +84,7 @@ def _reset_production_limits():
     config.MAKER_SPREAD_SIZE_MAX          = 500.0   # must equal MAX_PM_EXPOSURE_PER_MARKET
     config.MAKER_SPREAD_SIZE_MIN          = 125.0
     config.MAKER_SPREAD_SIZE_NEW_MARKET   = 100.0
+    config.PAPER_TRADING                  = True  # tests operate in paper mode by default
 
     yield
 

@@ -85,10 +85,10 @@ def open_position_from_fill(
         )
         return None
 
-    # entry_price convention: always stored in YES-probability space for P&L calcs.
-    #   BUY YES: entry_price = fill_price       (YES price, already in YES-space)
-    #   BUY NO:  entry_price = 1.0 - fill_price (convert NO price to YES-equivalent)
-    entry_price_stored = fill_price if position_side == "YES" else (1.0 - fill_price)
+    # entry_price is the actual fill price of the held token for both sides.
+    #   BUY YES: entry_price = fill_price  (actual YES token price)
+    #   BUY NO:  entry_price = fill_price  (actual NO token price)
+    entry_price_stored = fill_price
 
     pos = Position(
         market_id=consumed.market_id,
@@ -120,7 +120,7 @@ def open_position_from_fill(
 
     rebate_usd = 0.0
     if market.fees_enabled and market.rebate_pct > 0.0:
-        token_price = fill_price if position_side == "YES" else (1.0 - fill_price)
+        token_price = fill_price  # actual token price for both YES and NO
         rebate_usd = round(
             actual_filled * config.PM_FEE_COEFF
             * token_price * (1.0 - token_price)
@@ -132,7 +132,7 @@ def open_position_from_fill(
     return FillResult(
         pos=pos,
         consumed=consumed,
-        fill_price=entry_price_stored,   # always YES-space so callers can use directly
+        fill_price=entry_price_stored,   # actual token fill price
         actual_filled=actual_filled,
         position_side=position_side,
         fill_cost_usd=fill_cost_usd,

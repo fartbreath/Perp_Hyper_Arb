@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ── Polymarket ──────────────────────────────────────────────────────────────
 POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
@@ -15,6 +15,8 @@ POLY_FUNDER: str = os.getenv("POLY_FUNDER", "") or os.getenv("POLY_ADDRESS", "")
 POLY_HOST: str = "https://clob.polymarket.com"
 GAMMA_HOST: str = "https://gamma-api.polymarket.com"
 POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+RELAYER_API_KEY: str = os.getenv("RELAYER_API_KEY", "")
+RELAYER_API_KEY_ADDRESS: str = os.getenv("RELAYER_API_KEY_ADDRESS", "")
 
 # Token IDs of underlying assets tracked. Used to label markets.
 TRACKED_UNDERLYINGS: list[str] = [
@@ -266,6 +268,11 @@ MOMENTUM_PRICE_BAND_HIGH: float = 0.90
 
 # Maximum USDC deployed per momentum position.
 MOMENTUM_MAX_ENTRY_USD: float = 50.0
+# Edge-proportional sizing: scale entry size based on signal edge strength.
+# When edge_pct >= MOMENTUM_EDGE_SIZE_ANCHOR the full MAX_ENTRY is deployed.
+# Below the anchor: size = (edge_pct / anchor) * MAX_ENTRY, floored at MIN_ENTRY_USD.
+MOMENTUM_EDGE_SIZE_ANCHOR: float = 0.10  # edge_pct at which full MAX_ENTRY is used
+MOMENTUM_MIN_ENTRY_USD: float = 1.0      # floor to avoid dust orders
 
 # Minimum USDC depth on the ask side within 1c of best ask (thin-book guard).
 # Prevents entering markets where our order would exhaust available liquidity.
@@ -274,12 +281,16 @@ MOMENTUM_MIN_CLOB_DEPTH: float = 200.0
 # Order type: "limit" = taker limit at ask+0.5c (ensures fill); "market" = immediate cross.
 MOMENTUM_ORDER_TYPE: str = "limit"
 
-# Exit thresholds — based on the HELD TOKEN'S price (not USD P&L).
-# YES stop: exit if p_yes falls below this (entered YES at band lo ~0.81).
-# NO stop:  exit if p_no  falls below this (entered NO  at band lo ~0.81).
-MOMENTUM_STOP_LOSS_YES: float = 0.55   # Exit YES position if p_yes drops below this
-MOMENTUM_STOP_LOSS_NO:  float = 0.55   # Exit NO  position if p_no  drops below this
-MOMENTUM_TAKE_PROFIT: float = 0.96     # Exit if held token rises above this
+# Exit thresholds — based on the underlying spot (not CLOB binary price).
+# Delta-based stop-loss: exit when live HL spot has moved this % past the
+# strike against the position (e.g. 0.05 → exit when spot is 0.05% below
+# strike for YES, or 0.05% above strike for NO).
+MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.05  # % beyond strike before stop fires
+MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
+
+# Near-expiry time-stop: when TTE is very short and spot has already crossed
+# the strike (delta < 0), exit via taker to avoid a binary snap to zero.
+MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS: int = 90        # TTE threshold (seconds)
 
 # Minimum seconds to hold a momentum position before allowing any stop-loss/TP exit.
 # Kept short (momentum positions are near expiry; 60s is designed for mispricing).
@@ -319,6 +330,20 @@ MOMENTUM_VOL_Z_SCORE: float = 1.6449
 # MOMENTUM_VOL_Z_SCORE for that bucket; unlisted buckets use the global default.
 # Example: {"bucket_daily": 1.0, "bucket_15m": 1.3}
 MOMENTUM_VOL_Z_SCORE_BY_TYPE: dict[str, float] = {}
+
+# Minimum absolute spot displacement required regardless of how small the
+# vol-based threshold has collapsed near expiry.  0.0 = disabled (default).
+# Example: 0.05 means the spot price must have moved at least 0.05% above (YES)
+# or below (NO) the strike; signals smaller than this are ignored even if they
+# technically exceed the vol-scaled z-threshold.
+MOMENTUM_MIN_DELTA_PCT: float = 0.0
+
+# Minimum additional gap required above the vol-scaled threshold (percentage
+# points of |(spot - strike) / strike|).  Prevents marginal signals where the
+# spot-to-strike gap barely clears the threshold and a single adverse tick is
+# enough to flip the position from winning to losing before expiry.
+# 0.0 = disabled (default).  Recommended live value: 0.02 (see config_overrides).
+MOMENTUM_MIN_GAP_PCT: float = 0.0
 
 # How often to run a full scan pass over all bucket markets (seconds).
 MOMENTUM_SCAN_INTERVAL: int = 10
@@ -368,7 +393,7 @@ MIN_STRIKE_DISTANCE_PCT: float = 0.08  # fraction of spot, e.g. 0.08 = 8%
 # MAX_BUY_NO_YES_PRICE. Retro analysis showed 30 min was over-filtering:
 # price filter alone blocks the bad signals; short cooldown just deduplicates.
 MISPRICING_MARKET_COOLDOWN_SECONDS: int = 300   # 5 minutes — mispricing strategy
-MOMENTUM_MARKET_COOLDOWN_SECONDS: int = 5     # 5 seconds — momentum strategy
+MOMENTUM_MARKET_COOLDOWN_SECONDS: int = 60  # 30 minutes — momentum strategy
 
 # ── Kalshi signal confirmation layer ──────────────────────────────────────
 # When KALSHI_ENABLED=True, the scanner fetches matching Kalshi market prices

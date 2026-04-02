@@ -35,6 +35,7 @@ def _make_position(
     market_id="mkt_001",
     seconds_ago=120,
     now: Optional[datetime] = None,
+    strike: float = 0.0,
 ) -> Position:
     ref = now if now is not None else datetime.now(timezone.utc)
     opened = ref - timedelta(seconds=seconds_ago)
@@ -47,6 +48,7 @@ def _make_position(
         entry_price=entry_price,
         strategy=strategy,
         opened_at=opened,
+        strike=strike,
     )
 
 
@@ -237,15 +239,18 @@ class TestShouldExit:
         assert not exit_flag
 
     def test_momentum_stop_loss_triggered(self):
-        config.MOMENTUM_STOP_LOSS_YES = 0.55
-        config.MOMENTUM_STOP_LOSS_NO = 0.55
+        # YES position: spot 0.101% below strike — exceeds 0.05% threshold.
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+        config.MOMENTUM_MIN_HOLD_SECONDS = 60
         config.MIN_HOLD_SECONDS = 60
         pos = _make_position(
-            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
+            strike=100_000.0,
         )
         exit_flag, reason, _ = should_exit(
             pos=pos,
-            current_price=0.50,          # p_yes = 0.50 ≤ MOMENTUM_STOP_LOSS_YES=0.55
+            current_price=0.50,
+            current_spot=99_899.0,   # (99899−100000)/100000×100 = −0.101% < −0.05%
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(minutes=10),
             now=self.NOW,
@@ -254,19 +259,19 @@ class TestShouldExit:
         assert reason == ExitReason.MOMENTUM_STOP_LOSS
 
     def test_momentum_stop_loss_triggered_no_side(self):
-        # NO position entered at p_yes=0.15 → p_no=0.85; stop fires if p_no ≤ 0.55.
-        # current_token_price must be the actual NO CLOB mid (not derived from YES).
-        config.MOMENTUM_STOP_LOSS_YES = 0.55
-        config.MOMENTUM_STOP_LOSS_NO = 0.55
+        # NO position: spot 0.101% above strike — delta_no = −0.101% < −0.05%.
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 60
         config.MOMENTUM_MIN_HOLD_SECONDS = 60
         pos = _make_position(
-            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
+            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO",
+            strike=100_000.0,
         )
         exit_flag, reason, _ = should_exit(
             pos=pos,
             current_price=0.50,              # YES-space mid (used for P&L only)
-            current_token_price=0.50,        # actual NO CLOB mid ≤ MOMENTUM_STOP_LOSS_NO=0.55
+            current_token_price=0.50,        # actual NO CLOB mid
+            current_spot=100_101.0,          # (100000−100101)/100000×100 = −0.101% < −0.05%
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(minutes=10),
             now=self.NOW,
@@ -274,11 +279,9 @@ class TestShouldExit:
         assert exit_flag
         assert reason == ExitReason.MOMENTUM_STOP_LOSS
 
-    def test_momentum_stop_loss_no_not_triggered_when_price_favourable(self):
-        # NO position with NO book unavailable (current_token_price=None) → skip check,
-        # never fire a stop on a derived price.
-        config.MOMENTUM_STOP_LOSS_YES = 0.55
-        config.MOMENTUM_STOP_LOSS_NO = 0.55
+    def test_momentum_no_exit_when_no_book_unavailable(self):
+        # NO position with NO book unavailable (current_token_price=None) →
+        # function returns early before any SL/NE check.
         config.MOMENTUM_TAKE_PROFIT = 0.96
         config.MIN_HOLD_SECONDS = 60
         config.MOMENTUM_MIN_HOLD_SECONDS = 60
@@ -296,7 +299,6 @@ class TestShouldExit:
 
     def test_momentum_take_profit_triggered(self):
         config.MOMENTUM_TAKE_PROFIT = 0.96
-        config.MOMENTUM_STOP_LOSS_YES = 0.55
         config.MIN_HOLD_SECONDS = 60
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
@@ -316,8 +318,6 @@ class TestShouldExit:
         # Prior to the fix, the else-branch would TIME_STOP any non-maker position.
         # The fix guards with `pos.strategy != "momentum"` so this must NOT exit.
         config.EXIT_DAYS_BEFORE_RESOLUTION = 3
-        config.MOMENTUM_STOP_LOSS_YES = 0.55
-        config.MOMENTUM_STOP_LOSS_NO = 0.55
         config.MOMENTUM_TAKE_PROFIT = 0.96
         config.MIN_HOLD_SECONDS = 60
         pos = _make_position(
@@ -333,22 +333,23 @@ class TestShouldExit:
         assert not exit_flag
         assert reason != ExitReason.TIME_STOP
 
-    # ── NO CLOB path — actual token price (not derived) ───────────────────
+    # ── Delta-based SL — NO side ──────────────────────────────────────────
 
-    def test_momentum_stop_loss_no_side_uses_actual_clob_price(self):
-        """NO position: stop fires when the actual NO CLOB mid (current_token_price)
-        drops below the stop threshold, regardless of what YES-space price implies."""
-        config.MOMENTUM_STOP_LOSS_NO = 0.55
+    def test_momentum_stop_loss_no_side_fires_when_delta_exceeded(self):
+        """NO position: delta SL fires when spot exceeds strike by threshold.
+        Verifies the correct delta formula is used (spot vs strike), NOT CLOB price."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
-            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
+            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO",
+            strike=100_000.0,
         )
-        # YES mid is 0.55 → derived NO would be 0.45, below stop — but we pass the
-        # ACTUAL NO CLOB mid (0.50) explicitly to test the real path.
+        # spot 0.101% above strike → delta_no = (100000−100101)/100000×100 = −0.101% < −0.05%
         exit_flag, reason, _ = should_exit(
             pos=pos,
-            current_price=0.55,              # YES mid (used for P&L only)
-            current_token_price=0.50,        # ACTUAL NO CLOB mid ≤ 0.55 stop
+            current_price=0.55,              # YES mid (P&L only)
+            current_token_price=0.65,        # NO CLOB mid (not used for SL)
+            current_spot=100_101.0,
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(minutes=10),
             now=self.NOW,
@@ -356,45 +357,44 @@ class TestShouldExit:
         assert exit_flag
         assert reason == ExitReason.MOMENTUM_STOP_LOSS
 
-    def test_momentum_stop_loss_no_side_not_triggered_by_actual_clob_price(self):
-        """NO position: stop does NOT fire when actual NO CLOB mid is above stop,
-        even if the derived price (1.0 - YES_mid) would be below it."""
-        config.MOMENTUM_STOP_LOSS_NO = 0.55
+    def test_momentum_stop_loss_no_side_no_fire_below_delta_threshold(self):
+        """NO position: delta SL does NOT fire when spot hasn't moved past threshold."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
-            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
+            entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO",
+            strike=100_000.0,
         )
-        # Derived: 1.0 - 0.55 = 0.45 → would fire stop.  Actual NO CLOB: 0.65 → safe.
-        exit_flag, reason, _ = should_exit(
+        # spot only 0.01% above strike → delta_no = −0.01% > −0.05% → no fire
+        exit_flag, _, _ = should_exit(
             pos=pos,
-            current_price=0.55,              # YES mid — would imply NO=0.45 (below stop)
-            current_token_price=0.65,        # ACTUAL NO CLOB mid — above stop → no exit
+            current_price=0.55,
+            current_token_price=0.65,
+            current_spot=100_010.0,   # (100000−100010)/100000×100 = −0.01% > −0.05%
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(minutes=10),
             now=self.NOW,
         )
-        assert not exit_flag, (
-            "Stop must not fire when the actual NO CLOB mid is above the stop threshold "
-            "— even if the YES-derived price would suggest otherwise"
-        )
+        assert not exit_flag
 
     # ── Near-expiry stop ──────────────────────────────────────────────────
 
     def test_momentum_near_expiry_stop_triggers(self):
-        """Near-expiry stop fires when TTE < threshold AND token price ≤ threshold."""
+        """Near-expiry stop fires when TTE < threshold AND spot has crossed the strike."""
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
-        config.MOMENTUM_STOP_LOSS_YES = 0.50
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0  # large — so SL doesn't fire first
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
-            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
+            strike=100_000.0,
         )
         exit_flag, reason, _ = should_exit(
             pos=pos,
-            current_price=0.60,              # YES mid = 0.60 (above stop 0.50, below TP)
-            current_token_price=0.60,        # same for YES side
+            current_price=0.60,
+            current_token_price=0.60,
+            current_spot=99_990.0,   # 0.01% below strike → delta = −0.01% < 0 → NE fires
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(seconds=30),   # TTE=30s < 60s threshold
             tte_seconds=30.0,
@@ -403,20 +403,22 @@ class TestShouldExit:
         assert exit_flag
         assert reason == ExitReason.MOMENTUM_NEAR_EXPIRY
 
-    def test_momentum_near_expiry_stop_no_trigger_above_price_threshold(self):
-        """Near-expiry stop does NOT fire when token price is above the price threshold."""
+    def test_momentum_near_expiry_stop_no_trigger_when_spot_above_strike(self):
+        """Near-expiry stop does NOT fire when spot is above the strike (delta > 0)."""
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
-        config.MOMENTUM_STOP_LOSS_YES = 0.50
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
-            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
+            strike=100_000.0,
         )
-        exit_flag, reason, _ = should_exit(
+        # spot above strike → delta > 0 → no NE exit
+        exit_flag, _, _ = should_exit(
             pos=pos,
-            current_price=0.80,              # token at 0.80 > 0.65 threshold → no near-expiry exit
+            current_price=0.80,
             current_token_price=0.80,
+            current_spot=100_100.0,   # +0.1% above strike → delta = +0.1%
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(seconds=30),
             tte_seconds=30.0,
@@ -427,17 +429,19 @@ class TestShouldExit:
     def test_momentum_near_expiry_stop_no_trigger_with_tte_above_threshold(self):
         """Near-expiry stop does NOT fire when TTE is still above the time threshold."""
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
-        config.MOMENTUM_STOP_LOSS_YES = 0.50
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
-            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
+            strike=100_000.0,
         )
-        exit_flag, reason, _ = should_exit(
+        # spot below strike (would trigger NE) — but TTE=90s > 60s → no exit
+        exit_flag, _, _ = should_exit(
             pos=pos,
-            current_price=0.60,              # price ≤ 0.65 but TTE=90s > 60s → no exit
+            current_price=0.60,
             current_token_price=0.60,
+            current_spot=99_990.0,
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(seconds=90),
             tte_seconds=90.0,
@@ -448,17 +452,18 @@ class TestShouldExit:
     def test_momentum_near_expiry_no_stop_without_tte_seconds(self):
         """Near-expiry stop is silently disabled when tte_seconds=None."""
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
-        config.MOMENTUM_STOP_LOSS_YES = 0.50
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
-            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES"
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
+            strike=100_000.0,
         )
-        exit_flag, reason, _ = should_exit(
+        exit_flag, _, _ = should_exit(
             pos=pos,
             current_price=0.60,
             current_token_price=0.60,
+            current_spot=99_990.0,
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(seconds=30),
             tte_seconds=None,              # ← disabled
@@ -469,7 +474,14 @@ class TestShouldExit:
 
 # ── PositionMonitor ───────────────────────────────────────────────────────────
 
-def _make_monitor():
+def _make_mock_hl(spot: float, coin: str = "BTC") -> MagicMock:
+    """Return a mock HLClient whose get_mid(coin) returns the given spot price."""
+    hl = MagicMock()
+    hl.get_mid = MagicMock(side_effect=lambda c: spot if c == coin else None)
+    return hl
+
+
+def _make_monitor(hl_client=None):
     pm = MagicMock()
     pm._markets = {}
     pm._books = {}
@@ -480,7 +492,7 @@ def _make_monitor():
     # Return None so the code falls back to pos.size (safe in tests).
     pm.get_token_balance = AsyncMock(return_value=None)
     risk = RiskEngine()
-    monitor = PositionMonitor(pm=pm, risk=risk, interval=30)
+    monitor = PositionMonitor(pm=pm, risk=risk, interval=30, hl_client=hl_client)
     return monitor, pm, risk
 
 
@@ -682,13 +694,14 @@ def _make_monitor_with_market(
     yes_mid=0.30, yes_bid=0.29, yes_ask=0.31,
     no_mid=None, no_bid=None, no_ask=None,
     end_date=None,
+    hl_client=None,
 ):
     """Return (monitor, pm, risk) with a single market in the PM books cache.
 
     If no_mid is None the NO book is absent from the cache (simulating an
     unavailable NO CLOB), which is the key precondition for every test here.
     """
-    monitor, pm, risk = _make_monitor()
+    monitor, pm, risk = _make_monitor(hl_client=hl_client)
 
     mkt = MagicMock()
     mkt.condition_id = "mkt_001"
@@ -860,19 +873,21 @@ class TestYesNoBookIndependence:
         future = now + timedelta(seconds=30)   # 30s TTE → within near-expiry window
 
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
-        config.MOMENTUM_STOP_LOSS_NO = 0.50
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0  # prevent SL from firing first
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MOMENTUM_MIN_HOLD_SECONDS = 0
 
+        # For NO: NE fires when spot > strike (delta_no < 0).
+        # strike=100, spot=101 → delta_no = (100-101)/100×100 = −1% < 0
+        hl = _make_mock_hl(spot=101.0)
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
             no_mid=0.60, no_bid=0.58, no_ask=0.62,  # independent of YES
             end_date=future,
+            hl_client=hl,
         )
-        # NO is in [0.81, 0.89] band, now 0.60 < 0.65 threshold → near-expiry exit
         no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
-                                seconds_ago=120, now=now)
+                                seconds_ago=120, now=now, strike=100.0)
         risk.open_position(no_pos)
 
         _run(monitor._check_position(no_pos))
@@ -886,24 +901,25 @@ class TestYesNoBookIndependence:
         )
 
     def test_pre_expiry_exit_no_book_missing_defers(self):
-        """When NO book is unavailable for pre-expiry exit, the monitor must defer
-        (not call _exit_position and not derive a price from YES)."""
+        """When NO book is unavailable the monitor must defer (current_token_price=None
+        causes early return before the NE delta check)."""
         now = datetime.now(timezone.utc)
         future = now + timedelta(seconds=30)
 
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD = 0.65
-        config.MOMENTUM_STOP_LOSS_NO = 0.50
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MOMENTUM_MIN_HOLD_SECONDS = 0
 
+        hl = _make_mock_hl(spot=101.0)
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
             no_mid=None,   # NO book absent → must defer
             end_date=future,
+            hl_client=hl,
         )
         no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
-                                seconds_ago=120, now=now)
+                                seconds_ago=120, now=now, strike=100.0)
         risk.open_position(no_pos)
 
         _run(monitor._check_position(no_pos))
@@ -1030,20 +1046,21 @@ class TestEventDrivenStopLoss:
         return book
 
     def test_stop_loss_triggered_via_price_event(self):
-        """YES momentum position exits when price drops below stop via WS tick."""
-        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        """YES momentum position exits when spot crosses below strike threshold via WS tick."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        monitor, pm, risk = _make_monitor()
+        hl = _make_mock_hl(spot=99_899.0)  # 0.101% below strike → exceeds 0.05% threshold
+        monitor, pm, risk = _make_monitor(hl_client=hl)
         pos = _make_position(
             strategy="momentum", side="YES", entry_price=0.80,
-            size=100.0, seconds_ago=120,
+            size=100.0, seconds_ago=120, strike=100_000.0,
         )
         risk.open_position(pos)
 
         mkt = self._make_market()
         pm._markets = {"mkt_001": mkt}
-        pm._books = {"tok_yes": self._make_book(mid=0.50)}  # below stop
+        pm._books = {"tok_yes": self._make_book(mid=0.50)}
 
         # Simulate a WS tick on the YES token
         _run(monitor._on_price_update("tok_yes", 0.50))
@@ -1071,11 +1088,13 @@ class TestEventDrivenStopLoss:
 
     def test_no_exit_for_unrelated_token(self):
         """Tick on an unrelated token_id does not affect open positions."""
-        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        monitor, pm, risk = _make_monitor()
-        pos = _make_position(strategy="momentum", side="YES", entry_price=0.80, seconds_ago=120)
+        hl = _make_mock_hl(spot=99_899.0)  # would trigger SL if correct token fires
+        monitor, pm, risk = _make_monitor(hl_client=hl)
+        pos = _make_position(strategy="momentum", side="YES", entry_price=0.80,
+                             seconds_ago=120, strike=100_000.0)
         risk.open_position(pos)
 
         mkt = self._make_market()
@@ -1089,11 +1108,13 @@ class TestEventDrivenStopLoss:
 
     def test_double_exit_prevented_by_exiting_guard(self):
         """Second _on_price_update call while first exit is in-flight is silently skipped."""
-        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        monitor, pm, risk = _make_monitor()
-        pos = _make_position(strategy="momentum", side="YES", entry_price=0.80, seconds_ago=120)
+        hl = _make_mock_hl(spot=99_899.0)  # would trigger SL but guard fires first
+        monitor, pm, risk = _make_monitor(hl_client=hl)
+        pos = _make_position(strategy="momentum", side="YES", entry_price=0.80,
+                             seconds_ago=120, strike=100_000.0)
         risk.open_position(pos)
 
         mkt = self._make_market()
@@ -1110,16 +1131,17 @@ class TestEventDrivenStopLoss:
 
     def test_no_trigger_fires_on_no_token_too(self):
         """A WS tick on the NO token also triggers the check for that market's position."""
-        config.MOMENTUM_STOP_LOSS_YES = 0.55
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        monitor, pm, risk = _make_monitor()
-        pos = _make_position(strategy="momentum", side="YES", entry_price=0.80, seconds_ago=120)
+        hl = _make_mock_hl(spot=99_899.0)  # 0.101% below strike → delta SL fires
+        monitor, pm, risk = _make_monitor(hl_client=hl)
+        pos = _make_position(strategy="momentum", side="YES", entry_price=0.80,
+                             seconds_ago=120, strike=100_000.0)
         risk.open_position(pos)
 
         mkt = self._make_market(token_yes="tok_yes", token_no="tok_no")
         pm._markets = {"mkt_001": mkt}
-        # YES book shows mid=0.50 — below stop even though we fired via NO token
         pm._books = {"tok_yes": self._make_book(mid=0.50)}
 
         _run(monitor._on_price_update("tok_no", 0.50))

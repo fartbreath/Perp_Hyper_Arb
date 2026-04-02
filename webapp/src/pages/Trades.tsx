@@ -33,38 +33,40 @@ function gross(t: Trade): number {
 }
 
 /**
- * Reverse-engineer the implied YES-space exit price from the recorded P&L.
- *   YES:  exitYes = entry + gross/size
- *   NO:   exitYes = entry - gross/size
+ * Reverse-engineer the exit price from the recorded P&L.
+ * P&L = (exit - entry) * size for both YES and NO tokens.
+ * entry_price is the actual token fill price in both cases.
+ *   exit = entry + gross / size
  */
-function impliedExitYes(t: Trade): number | null {
+function impliedExitToken(t: Trade): number | null {
   const size = Number(t.size);
   if (size === 0) return null;
   const entry = Number(t.price);
   const g = gross(t);
-  return t.side === "YES" ? entry + g / size : entry - g / size;
+  return entry + g / size;
 }
 
 /**
- * Classify close type from the implied exit price.
+ * Classify close type from the implied exit token price.
  * Near 0 or 1 → resolution snap. Otherwise taker or pre-expiry.
+ * exit token price is the same space as entry for both YES and NO.
  */
 function closeType(legs: Trade[]): string {
   // Check each leg — all legs of a spread share the same close type
   for (const t of legs) {
     if (isHl(t)) return "HL CLOSE";
-    const exitYes = impliedExitYes(t);
-    if (exitYes === null) continue;
-    const dist0 = Math.abs(exitYes - 0);
-    const dist1 = Math.abs(exitYes - 1);
+    const exitToken = impliedExitToken(t);
+    if (exitToken === null) continue;
+    const dist0 = Math.abs(exitToken - 0);
+    const dist1 = Math.abs(exitToken - 1);
     const snapDist = Math.min(dist0, dist1);
     if (snapDist < 0.015) {
       const settled = dist1 < dist0 ? 1 : 0;
       return `RESOLVED → ${settled}`;
     }
     // exit near 0 but not truly 0 → pre-expiry taker
-    if (exitYes < 0.05 || exitYes > 0.95) return "PRE-EXPIRY";
-    return `TAKER @ ${exitYes.toFixed(3)}`;
+    if (exitToken < 0.05 || exitToken > 0.95) return "PRE-EXPIRY";
+    return `TAKER @ ${exitToken.toFixed(3)}`;
   }
   return "—";
 }
@@ -101,10 +103,9 @@ function aggregateToMarkets(trades: Trade[], typeFilter: string): MarketGroup[] 
     const mtype = first.market_type ?? "";
     if (typeFilter && mtype !== typeFilter) continue;
 
-    // USDC cost basis per leg: YES → priceÃ—size; NO → (1−price)Ã—size
+    // USDC cost basis per leg: price × size (entry_price is the actual token price for both YES and NO)
     const totalSize = legs.reduce((acc, t) => {
-      const tp = t.side === "NO" ? 1 - Number(t.price) : Number(t.price);
-      return acc + (isHl(t) ? Number(t.size) * Number(t.price) : tp * Number(t.size));
+      return acc + (isHl(t) ? Number(t.size) * Number(t.price) : Number(t.price) * Number(t.size));
     }, 0);
 
     const totalGross    = legs.reduce((a, t) => a + gross(t), 0);
@@ -191,6 +192,7 @@ function LegsBadges({ legs }: { legs: Trade[] }) {
     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
       {legs.map((t, i) => {
         const ct   = Number(t.size).toFixed(1);
+        // entry_price is the actual token fill price for both YES and NO.
         const px   = Number(t.price).toFixed(3);
         const bg   = t.side === "YES" ? "#0c4a6e" : "#4a1d0c";
         const col  = t.side === "YES" ? "#38bdf8" : "#fb923c";
@@ -267,9 +269,9 @@ function LegDetail({ legs }: { legs: Trade[] }) {
               const pnl    = Number(t.pnl);
               const fee    = Number(t.fees_paid);
               const reb    = Number(t.rebates_earned);
-              const exitYes = impliedExitYes(t);
-              const exitToken = exitYes === null ? null : (t.side === "NO" ? 1 - exitYes : exitYes);
-              const entryToken = t.side === "NO" ? 1 - Number(t.price) : Number(t.price);
+              // entry_price is the actual token fill price for both YES and NO.
+              const exitToken  = impliedExitToken(t);
+              const entryToken = Number(t.price);
               return (
                 <tr key={i} style={{ borderBottom: "1px solid #1e293b" }}>
                   <td style={{ padding: "3px 8px", color: "#64748b" }}>{fmtTs(t.timestamp)}</td>

@@ -36,6 +36,7 @@ class MomentumSignal:
     # ── Volatility ────────────────────────────────────────────────────────
     sigma_ann: float        # annualized vol used for threshold computation
     vol_source: str         # "deribit_atm" | "hl_realized" | "unknown"
+    vol_z_score: float = 1.6449  # z-score used for this entry; anchors edge_pct computation
 
     # ── Metadata ──────────────────────────────────────────────────────────
     timestamp: float = field(default_factory=time.time)
@@ -54,7 +55,7 @@ class MomentumSignal:
         # Edge ≈ fair_prob - token_price.  Clip to [0, 1].
         import math
         excess_z = (self.delta_pct - self.threshold_pct) / (self.sigma_ann * 100 + 1e-9)
-        fair_prob = min(0.9999, 0.5 * (1.0 + math.erf((1.6449 + excess_z) / 2 ** 0.5)))
+        fair_prob = min(0.9999, 0.5 * (1.0 + math.erf((self.vol_z_score + excess_z) / 2 ** 0.5)))
         return max(0.0, fair_prob - self.token_price)
 
     def summary(self) -> str:

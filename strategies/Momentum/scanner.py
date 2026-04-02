@@ -17,24 +17,72 @@ See MomentumStrategy.md for full specification.
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import math
 import os
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import config
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket, _MARKET_TYPE_DURATION_SECS
-from market_data.hl_client import HLClient
+from market_data.hl_client import HLClient, BBO
 from risk import RiskEngine, Position
 from strategies.base import BaseStrategy
 from strategies.Momentum.signal import MomentumSignal
 from strategies.Momentum.vol_fetcher import VolFetcher
 
 log = get_bot_logger(__name__)
+
+# ── Momentum fill log ─────────────────────────────────────────────────────────
+_DATA_DIR = Path(__file__).parent.parent.parent / "data"
+_DATA_DIR.mkdir(exist_ok=True)
+MOMENTUM_FILLS_CSV = _DATA_DIR / "momentum_fills.csv"
+MOMENTUM_FILLS_HEADER = [
+    "timestamp",          # ISO UTC when fill was confirmed
+    "market_id",
+    "market_title",
+    "underlying",
+    "market_type",
+    "side",               # YES | NO
+    "signal_price",       # mid price when signal was detected (token_price from signal)
+    "order_price",        # price sent to CLOB
+    "fill_price",         # actual fill price (from WS/REST confirmation)
+    "fill_size",          # contracts filled
+    "slippage_pct",       # (fill_price - signal_price) / signal_price * 100
+    "signal_delta_pct",   # delta_pct at signal time
+    "signal_obs_z",       # observed z at signal time
+    "signal_sigma_ann",   # annualised vol used
+    "tte_seconds",        # TTE at entry
+    "ask_depth_usd",      # CLOB depth at signal time
+    "fill_from_ws",       # True = confirmed via WS event, False = REST fallback
+]
+
+
+def _ensure_momentum_fills_csv() -> None:
+    """Create momentum_fills.csv with header; back up on schema change."""
+    if not MOMENTUM_FILLS_CSV.exists():
+        with MOMENTUM_FILLS_CSV.open("w", newline="") as f:
+            csv.writer(f).writerow(MOMENTUM_FILLS_HEADER)
+        return
+    with MOMENTUM_FILLS_CSV.open("r", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            existing = next(reader)
+        except StopIteration:
+            existing = []
+    if existing != MOMENTUM_FILLS_HEADER:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup = MOMENTUM_FILLS_CSV.with_name(f"momentum_fills_{ts}.csv.bak")
+        MOMENTUM_FILLS_CSV.rename(backup)
+        log.info("momentum_fills.csv schema changed — backed up", backup=str(backup))
+        with MOMENTUM_FILLS_CSV.open("w", newline="") as f:
+            csv.writer(f).writerow(MOMENTUM_FILLS_HEADER)
+
 
 # Bucket market types that the scanner targets.
 _TARGET_MARKET_TYPES = frozenset(_MARKET_TYPE_DURATION_SECS.keys())
@@ -68,6 +116,10 @@ class MomentumScanner(BaseStrategy):
             os.path.dirname(__file__), "..", "..", "data", "momentum_cooldowns.json"
         )
         self._market_cooldown: dict[str, float] = _load_cooldowns(self._cooldown_path)
+        # Stop-loss block: after a stop-loss exit, re-entry into the same market is
+        # blocked until the market's remaining TTE expires to prevent compounding losses.
+        # key: condition_id  value: unix timestamp at which the block lifts
+        self._stop_loss_blocked: dict[str, float] = {}
         # Open-spot cache for "Up or Down" directional markets.
         # key: condition_id  value: HL spot price at the moment the window opened.
         # Persisted to disk so restarts don't lose recorded opens mid-window.
@@ -110,6 +162,9 @@ class MomentumScanner(BaseStrategy):
         # Event-driven entry: wake the scan loop immediately when a YES/NO token
         # price enters the signal band rather than waiting up to SCAN_INTERVAL.
         self._pm.on_price_change(self._on_price_update_entry)
+        # Also wake on HL spot ticks — underlying price moves are just as
+        # likely to create or dissolve a signal as PM CLOB ticks.
+        self._hl.on_bbo_update(self._on_hl_spot_update_entry)
         asyncio.create_task(self._scan_loop())
 
     async def stop(self) -> None:
@@ -130,6 +185,24 @@ class MomentumScanner(BaseStrategy):
         self._market_cooldown[f"{market_id}:NO"] = now
         _save_cooldowns(self._cooldown_path, self._market_cooldown)
         log.info("Momentum cooldown reset on close", market_id=market_id[:22])
+
+    def record_stop_loss_close(self, market_id: str, tte_remaining: float) -> None:
+        """Block re-entry into this market until its TTE expires after a stop-loss.
+
+        After a stop-loss exit the same market often re-signals within seconds
+        (price still in band, delta still above threshold).  Re-entering into a
+        market that just stopped us out compounds the loss.  This method records
+        an absolute block-until timestamp so no new position is opened in this
+        market for the remainder of its window.
+        """
+        block_until = time.time() + max(0.0, tte_remaining)
+        self._stop_loss_blocked[market_id] = block_until
+        self.record_trade_close(market_id)
+        log.info(
+            "Momentum stop-loss block set",
+            market_id=market_id[:22],
+            block_secs=round(tte_remaining),
+        )
 
     def get_signals(self) -> list[dict]:
         """Return an empty list — momentum signals execute immediately (no queue)."""
@@ -414,6 +487,17 @@ class MomentumScanner(BaseStrategy):
             _d["side"] = high_side
             _d["token_price"] = round(token_price, 4)
 
+            # ── Stop-loss block ──────────────────────────────────────────────
+            # If this market had a stop-loss exit, re-entry is blocked until the
+            # market's TTE expires to avoid compounding losses into the same window.
+            _sl_block_until = self._stop_loss_blocked.get(market.condition_id, 0.0)
+            if now_ts < _sl_block_until:
+                skipped_cooldown += 1
+                _d["skip_reason"] = "stop_loss_block"
+                _d["cooldown_remaining_s"] = round(_sl_block_until - now_ts, 1)
+                scan_diags.append(_d)
+                continue
+
             # ── Per-side cooldown check ──────────────────────────────────────
             # The early pre-filter above skips only when BOTH sides are cooling.
             # Now that we know which side is in-band, gate on that side's clock.
@@ -557,6 +641,16 @@ class MomentumScanner(BaseStrategy):
                 scan_diags.append(_d)
                 continue
 
+            # ── Gate: minimum gap above threshold ────────────────────────────
+            # Prevents marginal signals where a single adverse tick can flip
+            # the position from winning to losing before expiry.  0.0 = off.
+            _min_gap = config.MOMENTUM_MIN_GAP_PCT
+            if _min_gap > 0 and (delta_pct - _effective_threshold) < _min_gap:
+                skipped_delta += 1
+                _d["skip_reason"] = "gap_below_minimum"
+                scan_diags.append(_d)
+                continue
+
             # ── Duplicate guard ──────────────────────────────────────────────
             if any(p.market_id == market.condition_id
                    for p in self._risk.get_open_positions()):
@@ -589,14 +683,24 @@ class MomentumScanner(BaseStrategy):
                 continue
 
             best_ask = book_target.best_ask
-            # Sum USDC depth at asks within 1c of best ask
-            ask_depth_usd = sum(
-                s * p
-                for (p, s) in book_target.asks
-                if p <= best_ask + 0.01
-            )
+            # Sum USDC depth at asks within 1c of best ask. Be defensive:
+            # - treat missing/empty ask lists as zero depth
+            # - treat zero or missing depth as insufficient
+            try:
+                ask_depth_usd = sum(
+                    s * p
+                    for (p, s) in getattr(book_target, "asks", [])
+                    if p <= (best_ask or 0) + 0.01
+                )
+            except Exception:
+                ask_depth_usd = 0.0
+
+            # Normalize and record in diagnostics
+            ask_depth_usd = 0.0 if ask_depth_usd is None else float(ask_depth_usd)
             _d["ask_depth_usd"] = round(ask_depth_usd, 2)
-            if ask_depth_usd < config.MOMENTUM_MIN_CLOB_DEPTH:
+
+            # Enforce: missing/zero depth or depth <= required is thin
+            if not ask_depth_usd or ask_depth_usd <= config.MOMENTUM_MIN_CLOB_DEPTH:
                 skipped_depth += 1
                 log.debug(
                     "Momentum: thin CLOB depth",
@@ -638,14 +742,14 @@ class MomentumScanner(BaseStrategy):
             # Push to API state for webapp display
             if self._on_signal is not None:
                 self._on_signal(_signal_log_dict(signal) | {"timestamp": time.time()})
-            executed = await self._execute_signal(signal, market)
-            # Always mark cooldown after evaluating any signal — whether the order
-            # was placed or was rejected (ask moved out of band, duplicate race, etc).
-            # Without this, a mid that stays in-band but with a spiked ask causes
-            # the event-driven path to re-trigger _scan_once every few milliseconds
-            # in a tight loop, spamming identical "price moved out of band" log lines.
+            # Mark cooldown BEFORE awaiting execution so that concurrent event-driven
+            # scan-once calls (triggered by the same price tick while _execute_signal
+            # is in-flight) see the cooldown and skip this market immediately.
+            # Without this, the event-driven path can fire the same signal 30+ times
+            # per second while the async order-placement coroutine is awaited.
             self._market_cooldown[f"{market.condition_id}:{high_side}"] = now_ts
             _save_cooldowns(self._cooldown_path, self._market_cooldown)
+            executed = await self._execute_signal(signal, market)
             if executed:
                 signals_fired += 1
                 # NB: open_momentum counter is NOT incremented here.
@@ -755,6 +859,20 @@ class MomentumScanner(BaseStrategy):
         # Signal the scan loop to wake up and run a full evaluation now.
         self._scan_event.set()
 
+    async def _on_hl_spot_update_entry(self, coin: str, bbo: BBO) -> None:
+        """Wake the scan loop when the HL spot price for `coin` changes.
+
+        Mirrors _on_price_update_entry but fires on HL BBO changes rather
+        than PM CLOB ticks.  A spot move through the strike changes the
+        delta signal even if no PM order-book update has arrived yet.
+        """
+        if not config.STRATEGY_MOMENTUM_ENABLED or not config.BOT_ACTIVE:
+            return
+        for mkt in self._token_to_market.values():
+            if mkt.underlying == coin:
+                self._scan_event.set()
+                return
+
     async def diagnostics(self) -> dict:
         """Return per-market diagnostics from the last completed _scan_once pass.
 
@@ -810,8 +928,8 @@ class MomentumScanner(BaseStrategy):
         band_lo = config.MOMENTUM_PRICE_BAND_LOW
         band_hi = config.MOMENTUM_PRICE_BAND_HIGH
 
-        # Allow 2c tolerance above band top (in case of minor repricing)
-        if not (band_lo <= current_ask <= band_hi + 0.02):
+        # Allow 0.5c tolerance above band top (tight guard against slippage).
+        if not (band_lo <= current_ask <= band_hi + 0.005):
             log.info(
                 "Momentum: price moved out of band before execution — skipping",
                 token_id=signal.token_id[:16],
@@ -959,6 +1077,45 @@ class MomentumScanner(BaseStrategy):
             signal_score=round(_excess_z, 4),
         )
         self._risk.open_position(pos)
+
+        # ── Write momentum fills CSV for execution-quality analysis ──────────
+        try:
+            _ensure_momentum_fills_csv()
+            _obs_z = signal.delta_pct / (
+                signal.sigma_ann * math.sqrt(max(signal.tte_seconds, 1.0) / 31_536_000) * 100
+                + 1e-9
+            )
+            _slippage_pct = (
+                round((entry_price - signal.token_price) / signal.token_price * 100, 4)
+                if signal.token_price > 0 else 0.0
+            )
+            # ask depth in USD at execution-time book (within price band)
+            _ask_depth_usd = round(
+                sum(p * s for p, s in book.asks if p <= band_hi + 0.02), 2
+            )
+            _fill_row: dict = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market_id": signal.market_id,
+                "market_title": signal.market_title[:80],
+                "underlying": signal.underlying,
+                "market_type": signal.market_type,
+                "side": signal.side,
+                "signal_price": signal.token_price,
+                "order_price": order_price,
+                "fill_price": round(entry_price, 6),
+                "fill_size": round(entry_size, 6),
+                "slippage_pct": _slippage_pct,
+                "signal_delta_pct": round(signal.delta_pct, 6),
+                "signal_obs_z": round(_obs_z, 4),
+                "signal_sigma_ann": round(signal.sigma_ann, 6),
+                "tte_seconds": round(signal.tte_seconds, 1),
+                "ask_depth_usd": _ask_depth_usd,
+                "fill_from_ws": actual_fill is not None and not self._pm._paper_mode,
+            }
+            with MOMENTUM_FILLS_CSV.open("a", newline="") as _f:
+                csv.DictWriter(_f, fieldnames=MOMENTUM_FILLS_HEADER).writerow(_fill_row)
+        except Exception as _ex:
+            log.debug("momentum_fills.csv write error", exc=str(_ex))
 
         log.info(
             "Momentum position opened ✓",

@@ -300,11 +300,14 @@ async def state_sync_loop(
                     if _age > _CLOSED_GRACE_SECONDS:
                         continue
                 _mkt = markets_snap.get(pos.market_id)  # cid is now a composite key; use pos.market_id
-                # Get current order book mid from live WebSocket feed
+                # Get current order book mid for the HELD token from live WebSocket feed.
+                # YES positions use the YES book; NO positions use the NO book.
                 _book = pm.get_book(_mkt.token_id_yes) if _mkt else None
+                _book_no = pm.get_book(_mkt.token_id_no) if _mkt else None
+                _held_book = _book if pos.side in ("YES", "BUY_YES") else _book_no
                 _cur_mid: float | None = None
-                if _book:
-                    _b, _a = _book.best_bid, _book.best_ask
+                if _held_book:
+                    _b, _a = _held_book.best_bid, _held_book.best_ask
                     if _b is not None and _a is not None:
                         _cur_mid = (_b + _a) / 2
                     elif _b is not None:
@@ -344,14 +347,9 @@ async def state_sync_loop(
                 _token_current_price: float | None = None
                 _unrealised_pnl: float | None = None
                 if _cur_mid is not None:
-                    # entry_price is always the YES-token price.
-                    # token_entry_price adjusts for NO positions (we hold NO = 1 - YES).
-                    _token_entry_price = (
-                        1.0 - pos.entry_price if pos.side == "NO" else pos.entry_price
-                    )
-                    _token_current_price = (
-                        1.0 - _cur_mid if pos.side == "NO" else _cur_mid
-                    )
+                    # entry_price and current price are both actual token prices.
+                    _token_entry_price = pos.entry_price
+                    _token_current_price = _cur_mid
                     _unrealised_pnl = round(
                         compute_unrealised_pnl(pos, _cur_mid), 4
                     )
@@ -373,14 +371,12 @@ async def state_sync_loop(
                 # Estimated close P&L at book (taker exit) including already-earned
                 # entry rebates + projected exit-leg rebate, minus taker exit fee.
                 _est_close_pnl: float | None = None
-                if _book:
-                    _exit_p_book = (
-                        _book.best_bid if pos.side in ("YES", "BUY_YES") else _book.best_ask
-                    )
+                if _held_book:
+                    _exit_p_book = _held_book.best_bid
                     if _exit_p_book is not None:
                         _pnl_price = compute_unrealised_pnl(pos, _exit_p_book)
-                        # token price for the exit side (NO exits at 1 - YES_ask)
-                        _tok_ep = _exit_p_book if pos.side in ("YES", "BUY_YES") else (1.0 - _exit_p_book)
+                        # actual token price for fee formula
+                        _tok_ep = _exit_p_book
                         _fees_on = (_mkt.fees_enabled if _mkt else True)
                         _rebate_pct = (_mkt.rebate_pct if _mkt else 0.0)
                         _exit_fee = (
@@ -404,7 +400,7 @@ async def state_sync_loop(
                     "size_usd": pos.size,       # contracts (legacy field name kept for compat)
                     "contracts": pos.size,      # explicit contract count
                     "entry_cost_usd": round(pos.entry_cost_usd, 2),
-                    "entry_price": pos.entry_price,         # YES-token price at fill
+                    "entry_price": pos.entry_price,         # actual token fill price
                     "token_entry_price": round(_token_entry_price, 4) if _token_entry_price is not None else pos.entry_price,
                     "token_current_price": round(_token_current_price, 4) if _token_current_price is not None else None,
                     "current_mid": round(_cur_mid, 4) if _cur_mid is not None else None,
@@ -614,7 +610,6 @@ async def main() -> None:
     maker = MakerStrategy(pm, hl, risk_engine)
     scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL)
     agent = AgentDecisionLayer(risk_engine)
-    monitor = PositionMonitor(pm, risk_engine, on_close_callback=scanner.record_trade_close)
     # Strategy 3 — Momentum scanner (direct execution, no agent loop)
     vol_fetcher = VolFetcher()
     vol_fetcher.register(hl)   # registers BBO callback for rolling realized-vol buffer
@@ -626,6 +621,35 @@ async def main() -> None:
             api_state.momentum_signals = api_state.momentum_signals[-200:]
 
     momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, on_signal=_on_momentum_signal)
+
+    def _on_position_close(market_id: str) -> None:
+        """Notify both strategy scanners when any position closes.
+
+        Mispricing scanner: resets its cooldown clock so the same market can
+        be re-evaluated immediately after a round-trip.
+        Momentum scanner: resets the per-market cooldown so the full
+        MOMENTUM_MARKET_COOLDOWN_SECONDS window restarts from close, not from
+        the original signal fire (which expires in 5 s and was the root cause
+        of systematic re-entry churn).
+        """
+        scanner.record_trade_close(market_id)
+        momentum_scanner.record_trade_close(market_id)
+
+    def _on_momentum_stop_loss(market_id: str, tte_remaining: float) -> None:
+        """Block re-entry into a market for the rest of its window after a stop-loss.
+
+        Prevents the scanner from immediately re-entering the same expiry bucket
+        after being stopped out, which compounds losses when the market continues
+        moving against the original signal.
+        """
+        momentum_scanner.record_stop_loss_close(market_id, tte_remaining)
+
+    monitor = PositionMonitor(
+        pm, risk_engine,
+        hl_client=hl,
+        on_close_callback=_on_position_close,
+        on_stop_loss_callback=_on_momentum_stop_loss,
+    )
     fill_sim = FillSimulator(pm, maker, risk_engine, monitor)
     live_fill_handler = LiveFillHandler(pm, maker, risk_engine, monitor)
 

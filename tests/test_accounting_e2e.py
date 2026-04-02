@@ -75,13 +75,14 @@ def _yes(
 
 def _no(
     market_id: str = "mkt",
-    entry_price: float = 0.50,  # YES token price at fill (SELL YES → BUY NO)
+    entry_price: float = 0.50,  # actual NO token price at fill
     size: float = 100.0,
     underlying: str = "BTC",
     strategy: str = "maker",
     seconds_ago: int = 120,
 ) -> Position:
-    """NO position helper.  entry_cost_usd = (1 − entry_price) × size."""
+    """NO position helper.  entry_price = actual NO token price.
+    entry_cost_usd = entry_price × size."""
     opened = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
     return Position(
         market_id=market_id,
@@ -92,7 +93,7 @@ def _no(
         entry_price=entry_price,
         strategy=strategy,
         opened_at=opened,
-        entry_cost_usd=round((1.0 - entry_price) * size, 6),
+        entry_cost_usd=round(entry_price * size, 6),
     )
 
 
@@ -139,7 +140,7 @@ class TestEntryCost:
 
     def test_no_when_yes_is_10_cents(self):
         # YES at $0.10 → NO at $0.90 → 100 NO contracts costs $90.
-        pos = _no(entry_price=0.10, size=100.0)
+        pos = _no(entry_price=0.90, size=100.0)
         assert pos.entry_cost_usd == pytest.approx(90.0)
 
     def test_no_when_yes_is_50_cents(self):
@@ -148,7 +149,7 @@ class TestEntryCost:
 
     def test_no_when_yes_is_90_cents(self):
         # YES at $0.90 → NO at $0.10 → 100 NO contracts costs $10.
-        pos = _no(entry_price=0.90, size=100.0)
+        pos = _no(entry_price=0.10, size=100.0)
         assert pos.entry_cost_usd == pytest.approx(10.0)
 
     def test_yes_no_cost_complement_at_midpoint(self):
@@ -161,7 +162,7 @@ class TestEntryCost:
         # YES cost + NO cost = size (a complete binary market exhausts the notional).
         p, s = 0.30, 200.0
         assert _yes(entry_price=p, size=s).entry_cost_usd + \
-               _no(entry_price=p, size=s).entry_cost_usd == pytest.approx(s)
+               _no(entry_price=1.0 - p, size=s).entry_cost_usd == pytest.approx(s)
 
     def test_leverage_ratio_deep_otm_yes(self):
         # Deep OTM YES at 5¢: $5 deployed on 100 contracts → 19× payout if YES wins.
@@ -172,7 +173,7 @@ class TestEntryCost:
 
     def test_leverage_ratio_deep_itm_no(self):
         # Deep OTM NO (YES=0.95) at 5¢: $5 deployed, 20× payout if NO wins.
-        pos = _no(entry_price=0.95, size=100.0)
+        pos = _no(entry_price=0.05, size=100.0)
         max_proceeds = 1.0 * pos.size   # NO token resolves to $1 if YES fails
         leverage = max_proceeds / pos.entry_cost_usd
         assert leverage == pytest.approx(20.0)
@@ -198,18 +199,18 @@ class TestUnrealisedPnl:
         assert compute_unrealised_pnl(pos, 0.40) == pytest.approx(0.0)
 
     def test_no_price_falls_profit(self):
-        # Sold YES at 0.70 (bought NO at 0.30). YES falls to 0.50 → profit.
-        pos = _no(entry_price=0.70, size=100.0)
+        # Bought NO at 0.30 (YES was 0.70). YES falls to 0.50 → actual NO rises to 0.50 → profit.
+        pos = _no(entry_price=0.30, size=100.0)
         assert compute_unrealised_pnl(pos, 0.50) == pytest.approx(20.0)
 
     def test_no_price_rises_loss(self):
-        # Sold YES at 0.30 (bought NO at 0.70). YES rises to 0.45 → loss.
-        pos = _no(entry_price=0.30, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.45) == pytest.approx(-15.0)
+        # Bought NO at 0.70 (YES was 0.30). YES rises to 0.45 → actual NO falls to 0.55 → loss.
+        pos = _no(entry_price=0.70, size=100.0)
+        assert compute_unrealised_pnl(pos, 0.55) == pytest.approx(-15.0)
 
     def test_no_unchanged_zero_pnl(self):
-        pos = _no(entry_price=0.60, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.60) == pytest.approx(0.0)
+        pos = _no(entry_price=0.40, size=100.0)
+        assert compute_unrealised_pnl(pos, 0.40) == pytest.approx(0.0)
 
     def test_pnl_scales_linearly_with_size(self):
         # Same price move on 10× the contracts → 10× the P&L.
@@ -230,14 +231,14 @@ class TestUnrealisedPnl:
         assert compute_unrealised_pnl(pos, 0.00) == pytest.approx(-40.0)
 
     def test_no_maximum_gain_at_yes_resolution_to_zero(self):
-        # Sold YES at 0.40 (NO entry). YES→0: full NO notional.
-        pos = _no(entry_price=0.40, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.00) == pytest.approx(40.0)
+        # Bought NO at 0.60 (YES was 0.40). YES→0: actual NO→1.0, full gain.
+        pos = _no(entry_price=0.60, size=100.0)
+        assert compute_unrealised_pnl(pos, 1.00) == pytest.approx(40.0)
 
     def test_no_maximum_loss_at_yes_resolution_to_one(self):
-        # Sold YES at 0.40 (NO entry). YES→1: lose full entry cost.
-        pos = _no(entry_price=0.40, size=100.0)
-        assert compute_unrealised_pnl(pos, 1.00) == pytest.approx(-60.0)
+        # Bought NO at 0.60 (YES was 0.40). YES→1: actual NO→0.0, full loss.
+        pos = _no(entry_price=0.60, size=100.0)
+        assert compute_unrealised_pnl(pos, 0.00) == pytest.approx(-60.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -266,15 +267,15 @@ class TestRealisedPnl:
         assert closed.realized_pnl == pytest.approx(0.0)
 
     def test_no_win(self):
-        # Sold YES at 0.70 (NO). YES falls to 0.50 → profit.
-        self.engine.open_position(_no("m", entry_price=0.70, size=100.0))
+        # Bought NO at 0.30 (YES was 0.70). YES falls to 0.50 → actual NO rises to 0.50 → profit.
+        self.engine.open_position(_no("m", entry_price=0.30, size=100.0))
         closed = self.engine.close_position("m", exit_price=0.50, side="NO")
         assert closed.realized_pnl == pytest.approx(20.0)
 
     def test_no_loss(self):
-        # Sold YES at 0.30 (NO). YES rises to 0.55 → loss.
-        self.engine.open_position(_no("m", entry_price=0.30, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.55, side="NO")
+        # Bought NO at 0.70 (YES was 0.30). YES rises to 0.55 → actual NO falls to 0.45 → loss.
+        self.engine.open_position(_no("m", entry_price=0.70, size=100.0))
+        closed = self.engine.close_position("m", exit_price=0.45, side="NO")
         assert closed.realized_pnl == pytest.approx(-25.0)
 
     def test_yes_full_resolution_win(self):
@@ -290,16 +291,16 @@ class TestRealisedPnl:
         assert closed.realized_pnl == pytest.approx(-200.0)  # (0-0.40)×500
 
     def test_no_resolution_yes_wins(self):
-        # Sold YES at 0.30 (NO). YES resolves to 1 → maximum NO loss.
-        self.engine.open_position(_no("m", entry_price=0.30, size=200.0))
-        closed = self.engine.close_position("m", exit_price=1.00, side="NO")
-        assert closed.realized_pnl == pytest.approx(-140.0)  # (0.30-1.0)×200
+        # Bought NO at 0.70 (YES was 0.30). YES resolves to 1 → actual NO=0.0 → maximum NO loss.
+        self.engine.open_position(_no("m", entry_price=0.70, size=200.0))
+        closed = self.engine.close_position("m", exit_price=0.00, side="NO")
+        assert closed.realized_pnl == pytest.approx(-140.0)  # (0.0-0.70)×200
 
     def test_no_resolution_no_wins(self):
-        # Sold YES at 0.30 (NO). YES resolves to 0 → maximum NO gain.
-        self.engine.open_position(_no("m", entry_price=0.30, size=200.0))
-        closed = self.engine.close_position("m", exit_price=0.00, side="NO")
-        assert closed.realized_pnl == pytest.approx(60.0)  # (0.30-0.0)×200
+        # Bought NO at 0.70 (YES was 0.30). YES resolves to 0 → actual NO=1.0 → maximum NO gain.
+        self.engine.open_position(_no("m", entry_price=0.70, size=200.0))
+        closed = self.engine.close_position("m", exit_price=1.00, side="NO")
+        assert closed.realized_pnl == pytest.approx(60.0)  # (1.0-0.70)×200
 
     def test_pnl_is_set_on_position_object(self):
         self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
@@ -504,11 +505,11 @@ class TestTwoSidedMaking:
 
     def test_yes_and_no_are_separate_positions(self):
         self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_no("m",  entry_price=0.60, size=100.0))
+        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
         assert len(self.engine.get_open_positions()) == 2
 
     def test_yes_fill_does_not_corrupt_no_position(self):
-        self.engine.open_position(_no("m",  entry_price=0.60, size=100.0))
+        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
         self.engine.open_position(_yes("m", entry_price=0.40, size=200.0))  # different size
         yes_pos = next(p for p in self.engine.get_open_positions() if p.side == "YES")
         no_pos  = next(p for p in self.engine.get_open_positions() if p.side == "NO")
@@ -516,14 +517,14 @@ class TestTwoSidedMaking:
         assert no_pos.size  == pytest.approx(100.0)
 
     def test_spread_capture_both_sides_profitable(self):
-        # The market maker quotes BID=0.40, ASK=0.60 (20¢ spread).
+        # The market maker quotes BID=0.40 on YES, and fills NO at 0.40 (complement of ASK=0.60).
         # Both sides fill.  At any final price between 0.40 and 0.60, both
         # positions are profitable.  Here we close at mid = 0.50:
         #   YES pnl = (0.50 − 0.40) × 100 = +$10
-        #   NO  pnl = (0.60 − 0.50) × 100 = +$10
+        #   NO  pnl = (0.50 − 0.40) × 100 = +$10
         #   Total   = +$20 = spread × size = 0.20 × 100
         self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_no("m",  entry_price=0.60, size=100.0))
+        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
 
         yes_closed = self.engine.close_position("m", exit_price=0.50, side="YES")
         no_closed  = self.engine.close_position("m", exit_price=0.50, side="NO")
@@ -536,32 +537,32 @@ class TestTwoSidedMaking:
         # The 20¢ spread is locked in regardless of which way the market resolves.
         # YES resolves to 1.0:
         # YES pnl = (1.0 − 0.40) × 100 = +$60
-        # NO  pnl = (0.60 − 1.0) × 100 = −$40
+        # NO  pnl = (0.0 − 0.40) × 100 = −$40  (actual NO=0.0 when YES=1.0)
         # Net     = +$20 = spread capture ✓
         self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_no("m",  entry_price=0.60, size=100.0))
+        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
 
         yes_r1 = self.engine.close_position("m", exit_price=1.00, side="YES")
-        no_r1  = self.engine.close_position("m", exit_price=1.00, side="NO")
+        no_r1  = self.engine.close_position("m", exit_price=0.00, side="NO")
         assert yes_r1.realized_pnl + no_r1.realized_pnl == pytest.approx(20.0)
 
     def test_spread_capture_yes_resolves_to_zero(self):
         # YES resolves to 0.0:
         # YES pnl = (0.0 − 0.40) × 100 = −$40
-        # NO  pnl = (0.60 − 0.0) × 100 = +$60
+        # NO  pnl = (1.0 − 0.40) × 100 = +$60  (actual NO=1.0 when YES=0.0)
         # Net     = +$20 ✓
         engine2 = RiskEngine()
         engine2.open_position(_yes("m", entry_price=0.40, size=100.0))
-        engine2.open_position(_no("m",  entry_price=0.60, size=100.0))
+        engine2.open_position(_no("m",  entry_price=0.40, size=100.0))
 
         yes_r0 = engine2.close_position("m", exit_price=0.00, side="YES")
-        no_r0  = engine2.close_position("m", exit_price=0.00, side="NO")
+        no_r0  = engine2.close_position("m", exit_price=1.00, side="NO")
         assert yes_r0.realized_pnl + no_r0.realized_pnl == pytest.approx(20.0)
 
     def test_independent_close_yes_only(self):
         # Closing YES side does not close NO side.
         self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_no("m",  entry_price=0.60, size=100.0))
+        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
         self.engine.close_position("m", exit_price=0.50, side="YES")
         assert len(self.engine.get_open_positions()) == 1
         assert self.engine.get_open_positions()[0].side == "NO"
@@ -569,7 +570,7 @@ class TestTwoSidedMaking:
     def test_different_sizes_tracked_independently(self):
         # YES: 300 contracts.  NO: 150 contracts.  Separate positions, no bleed.
         self.engine.open_position(_yes("m", entry_price=0.45, size=300.0))
-        self.engine.open_position(_no("m",  entry_price=0.55, size=150.0))
+        self.engine.open_position(_no("m",  entry_price=0.45, size=150.0))
         yes_pos = next(p for p in self.engine.get_open_positions() if p.side == "YES")
         no_pos  = next(p for p in self.engine.get_open_positions() if p.side == "NO")
         assert yes_pos.entry_cost_usd == pytest.approx(0.45 * 300)   # $135
@@ -611,30 +612,31 @@ class TestResolutionPayoffs:
 
     @pytest.mark.parametrize("entry_price", ENTRY_PRICES)
     def test_no_wins_all_entry_prices(self, entry_price: float):
-        # NO (= sold YES at entry_price); YES resolves to 0.0 → NO wins.
+        # NO at actual token price entry_price; YES resolves to 0 → actual NO goes to 1.0.
         self.engine = RiskEngine()
         self.engine.open_position(_no("m", entry_price=entry_price, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.0, side="NO")
-        expected = entry_price * 100.0    # (entry - 0.0) × size
+        closed = self.engine.close_position("m", exit_price=1.0, side="NO")
+        expected = (1.0 - entry_price) * 100.0
         assert closed.realized_pnl == pytest.approx(expected, rel=1e-6)
 
     @pytest.mark.parametrize("entry_price", ENTRY_PRICES)
     def test_no_loses_all_entry_prices(self, entry_price: float):
-        # NO; YES resolves to 1.0 → NO loses.
+        # NO at actual token price entry_price; YES resolves to 1 → actual NO goes to 0.0.
         self.engine = RiskEngine()
         self.engine.open_position(_no("m", entry_price=entry_price, size=100.0))
-        closed = self.engine.close_position("m", exit_price=1.0, side="NO")
-        expected = (entry_price - 1.0) * 100.0   # negative
+        closed = self.engine.close_position("m", exit_price=0.0, side="NO")
+        expected = -entry_price * 100.0
         assert closed.realized_pnl == pytest.approx(expected, rel=1e-6)
 
     def test_yes_and_no_at_same_entry_are_complements(self):
-        # YES + NO at same price → one exactly cancels the other at resolution.
+        # YES at p and NO at (1-p) are economic complements: at any resolution
+        # the combined P&L is always zero (they exactly cancel).
         eng_yes = RiskEngine()
         eng_no  = RiskEngine()
         p, s = 0.40, 100.0
 
         eng_yes.open_position(_yes("m", entry_price=p, size=s))
-        eng_no.open_position(_no("m",   entry_price=p, size=s))
+        eng_no.open_position(_no("m",   entry_price=1.0 - p, size=s))
 
         for exit_price in [0.0, 1.0]:
             pnl_yes = (exit_price - p) * s
@@ -1093,13 +1095,14 @@ class TestExitFeeModel:
         assert closed.realized_pnl      == pytest.approx((1.0 - 0.37) * 25.0)
 
     def test_resolved_no_side_wins_no_fee(self):
-        # NO position: market resolved NO (YES→0) → NO pays $1.
-        # P&L for NO: (entry_price - exit_price) × size = (0.42 - 0.0) × 20 = $8.40
-        self.engine.open_position(_no("m", entry_price=0.42, size=20.0))
-        closed = self.engine.close_position("m", exit_price=0.0, side="NO",
+        # NO position: market resolved NO (YES→0) → actual NO token goes to 1.0.
+        # NO was bought at actual token price 0.58 (YES was 0.42 at buy time).
+        # P&L = (1.0 - 0.58) × 20 = $8.40
+        self.engine.open_position(_no("m", entry_price=0.58, size=20.0))
+        closed = self.engine.close_position("m", exit_price=1.0, side="NO",
                                             fees_paid=0.0, rebates_earned=0.0)
         assert closed.pm_fees_paid  == pytest.approx(0.0)
-        assert closed.realized_pnl  == pytest.approx((0.42 - 0.0) * 20.0)
+        assert closed.realized_pnl  == pytest.approx((1.0 - 0.58) * 20.0)
 
     # ── Post-only exit (maker on exit): zero fee, earn rebate ─────────────────
 

@@ -39,7 +39,7 @@ _DERIBIT_SUPPORTED = frozenset({"BTC", "ETH", "SOL", "XRP"})
 # Rolling-vol buffer: max samples per coin and max age in seconds.
 _MAX_SAMPLES = 2000
 _MAX_AGE_SECS = 86_400          # 24 hours
-_MIN_SAMPLES_FOR_VOL = 20       # require at least 20 log-returns
+_MIN_SAMPLES_FOR_VOL = 10       # require at least 10 log-returns
 
 
 class VolFetcher:

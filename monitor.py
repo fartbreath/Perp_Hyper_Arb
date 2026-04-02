@@ -41,6 +41,7 @@ import config
 from logger import get_bot_logger
 from risk import RiskEngine, Position
 from market_data.pm_client import PMClient, _MARKET_TYPE_DURATION_SECS
+from market_data.hl_client import BBO
 from ctf_utils import _redeem_ctf_via_safe
 
 log = get_bot_logger(__name__)
@@ -80,6 +81,7 @@ def should_exit(
     now: Optional[datetime] = None,
     current_token_price: Optional[float] = None,
     tte_seconds: Optional[float] = None,
+    current_spot: Optional[float] = None,
 ) -> tuple[bool, str, float]:
     """
     Decide whether a position should be exited.
@@ -175,34 +177,47 @@ def should_exit(
                 return True, ExitReason.TIME_STOP, unrealised
         return False, "", unrealised
 
-    # ── Momentum exits — token-price based, evaluated on each side's own CLOB ──
+    # ── Momentum exits — delta-based (live HL spot vs strike) ─────────────────
     if pos.strategy == "momentum":
+        # Delta SL runs FIRST — requires only spot+strike, NOT token_price.
+        # This must evaluate even when the NO CLOB book is drained near expiry
+        # (book drain sets current_token_price=None for NO positions, which
+        # previously blocked this block entirely — causing missed stop-losses).
+        if current_spot is not None and pos.strike > 0:
+            if pos.side in ("YES", "BUY_YES"):
+                # Long YES: profit when spot > strike.  Delta negative when spot < strike.
+                current_delta_pct = (current_spot - pos.strike) / pos.strike * 100
+            else:
+                # Long NO: profit when spot < strike.  Delta negative when spot > strike.
+                current_delta_pct = (pos.strike - current_spot) / pos.strike * 100
+            if current_delta_pct < -config.MOMENTUM_DELTA_STOP_LOSS_PCT:
+                return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
+            # Near-expiry: only exit if spot has already crossed the strike
+            # (delta < 0).  Avoids premature exits from CLOB price collapse.
+            if (
+                tte_seconds is not None
+                and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
+                and current_delta_pct < 0
+            ):
+                return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
+
+        # Token-price exits (take-profit) require the held token's CLOB mid.
         if pos.side in ("YES", "BUY_YES"):
             # Use actual YES CLOB mid; fall back to YES-space current_price.
             token_price = current_token_price if current_token_price is not None else current_price
-            stop_loss = config.MOMENTUM_STOP_LOSS_YES
         else:
             # Use actual NO CLOB mid.  Do NOT derive from the YES side —
             # YES and NO are independent CLOBs and 1-p_yes ≠ p_no in general.
-            # If the NO book is unavailable, skip exit checks this tick.
+            # If the NO book is unavailable, skip token-price exits this tick.
             if current_token_price is None:
                 return False, "", unrealised
             token_price = current_token_price
-            stop_loss = config.MOMENTUM_STOP_LOSS_NO
         # Recompute unrealised against the actual held-token price.
         unrealised = compute_unrealised_pnl(pos, token_price)
-        if token_price <= stop_loss:
-            return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
+
+        # Take-profit: still CLOB-based (converging to 1.0 at resolution).
         if token_price >= config.MOMENTUM_TAKE_PROFIT:
             return True, ExitReason.MOMENTUM_TAKE_PROFIT, unrealised
-        # Near-expiry stop: if very close to resolution and already in loss
-        # territory, exit via taker to avoid a binary snap to zero.
-        if (
-            tte_seconds is not None
-            and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
-            and token_price <= config.MOMENTUM_NEAR_EXPIRY_EXIT_THRESHOLD
-        ):
-            return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
         return False, "", unrealised
 
     # ── Mispricing exits ──────────────────────────────────────────────────────
@@ -238,14 +253,20 @@ class PositionMonitor:
         pm: PMClient,
         risk: RiskEngine,
         interval: int = config.MONITOR_INTERVAL,
+        hl_client=None,
         on_close_callback: Optional[Callable[[str], None]] = None,
+        on_stop_loss_callback: Optional[Callable[[str, float], None]] = None,
     ) -> None:
         self._pm = pm
         self._risk = risk
+        self._hl = hl_client  # Optional HLClient; used for delta-based spot SL
         self._interval = interval
         # Called with market_id whenever a position is successfully closed.
         # Used by MispricingScanner to reset the per-market cooldown clock.
         self._on_close_callback = on_close_callback
+        # Called with (market_id, tte_remaining) when a momentum stop-loss fires.
+        # Used by MomentumScanner to block re-entry for the remainder of TTE.
+        self._on_stop_loss_callback = on_stop_loss_callback
         # Stores the initial |deviation| for each market_id; used for profit target
         self._initial_deviations: dict[str, float] = {}
         self._running = False
@@ -277,6 +298,12 @@ class PositionMonitor:
         # Non-momentum strategies (maker / mispricing) have hold windows of hours
         # or days so the slower poll loop is adequate for them.
         self._pm.on_price_change(self._on_price_update)
+        # Event-driven delta SL: also check on every HL spot tick so that a
+        # rapid underlying move triggers the delta SL immediately, without
+        # waiting for the next PM WS tick (which may not come if the PM book
+        # goes quiet near expiry — exactly when the SL matters most).
+        if self._hl is not None:
+            self._hl.on_bbo_update(self._on_hl_spot_update)
         log.info("PositionMonitor started", interval=self._interval)
         asyncio.create_task(self._auto_redeem_loop())
         while self._running:
@@ -318,6 +345,23 @@ class PositionMonitor:
             if key in self._exiting_positions:
                 continue  # exit already in progress for this leg
             await self._check_position(pos, triggering_token_id=token_id, triggering_mid=mid)
+
+    async def _on_hl_spot_update(self, coin: str, bbo: BBO) -> None:
+        """Triggered on every HL BBO tick.
+
+        Checks open momentum positions whose underlying matches `coin`.
+        Ensures that a rapid spot move (e.g. BTC flash crash through the
+        strike) triggers the delta SL immediately — without waiting for
+        the PM WS to echo a price change, which may not happen if the PM
+        book is thin or empty near expiry.
+        """
+        for pos in self._risk.get_open_positions():
+            if pos.strategy != "momentum" or pos.underlying != coin:
+                continue
+            key = f"{pos.market_id}:{pos.side}"
+            if key in self._exiting_positions:
+                continue
+            await self._check_position(pos)
 
     # ── Auto-redemption ───────────────────────────────────────────────────────
 
@@ -389,7 +433,8 @@ class PositionMonitor:
                 for rp in list(self._risk.get_positions().values()):
                     if rp.market_id == target_market_id and not rp.is_closed:
                         self._risk.close_position(
-                            target_market_id, exit_price=settlement_price, side=rp.side
+                            target_market_id, exit_price=settlement_price, side=rp.side,
+                            resolved_outcome="WIN" if won else "LOSS",
                         )
 
             if not won:
@@ -655,6 +700,12 @@ class PositionMonitor:
             if market.end_date is not None else None
         )
 
+        # Fetch live underlying spot for delta-based stop-loss.
+        # get_mid() is a synchronous in-memory cache read — no await needed.
+        current_spot: Optional[float] = None
+        if pos.strategy == "momentum" and self._hl is not None and pos.underlying:
+            current_spot = self._hl.get_mid(pos.underlying)
+
         exit_flag, reason, unrealised = should_exit(
             pos=pos,
             current_price=current_price,
@@ -663,6 +714,7 @@ class PositionMonitor:
             now=now,
             current_token_price=current_token_price,
             tte_seconds=tte_seconds,
+            current_spot=current_spot,
         )
 
         log.debug(
@@ -870,12 +922,16 @@ class PositionMonitor:
             exit_fees = 0.0
             total_rebates = fee_base * market.rebate_pct if market.rebate_pct > 0.0 else 0.0
 
+        _resolved_outcome = ""
+        if reason == ExitReason.RESOLVED:
+            _resolved_outcome = "WIN" if exit_price >= 0.5 else "LOSS"
         closed = self._risk.close_position(
             market_id=pos.market_id,
             side=pos.side,
             exit_price=exit_price,
             fees_paid=exit_fees,
             rebates_earned=total_rebates,
+            resolved_outcome=_resolved_outcome,
         )
 
         # Release the exit guard so the slot can be reused if the same market
@@ -901,3 +957,12 @@ class PositionMonitor:
                         asyncio.create_task(result)
                 except Exception as exc:
                     log.warning("on_close_callback raised", exc=str(exc))
+            if reason == ExitReason.MOMENTUM_STOP_LOSS and self._on_stop_loss_callback is not None:
+                try:
+                    _tte_rem = (
+                        (market.end_date - datetime.now(timezone.utc)).total_seconds()
+                        if market.end_date is not None else 0.0
+                    )
+                    self._on_stop_loss_callback(pos.market_id, max(0.0, _tte_rem))
+                except Exception as exc:
+                    log.warning("on_stop_loss_callback raised", exc=str(exc))

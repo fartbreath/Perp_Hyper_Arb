@@ -1218,17 +1218,21 @@ class PMClient:
         self,
         token_id: str,
         side: str,          # "BUY" or "SELL"
-        price: float,       # aggressive crossing price — guarantees fill
+        price: float,       # worst-case price floor (slippage protection); 0 = auto from book
         size: float,
         market: Optional[PMMarket] = None,
     ) -> Optional[str]:
         """
-        Place an immediate (taker) order.  Crosses the spread — fills at the
-        best available price.  No post_only constraint.
+        Place a FAK (Fill-And-Kill) market order — sweeps available liquidity
+        immediately and cancels any unfilled remainder.
 
-        In paper mode: behaves identically to place_limit (instant fake fill).
-        In live mode:  GTC limit without post_only — sweeps the book at `price`.
-        Use for manual closes and any exit that must fill immediately.
+        Docs: https://docs.polymarket.com/trading/orders/create
+          BUY  amount = USD to spend; SELL amount = shares to sell.
+          price = worst-case limit (slippage floor), not an execution target.
+          FAK is preferred over FOK for exits: partial fills are acceptable.
+
+        In paper mode: instant fake fill.
+        In live mode: proper create_market_order SDK path, NOT a GTC limit.
         """
         if self._paper_mode:
             log.info("[PAPER] place_market", token_id=token_id, side=side, price=price, size=size)
@@ -1239,20 +1243,21 @@ class PMClient:
             return None
 
         tick = market.tick_size if market else 0.01
-        rounded_price = self._round_to_tick(price, tick)
+        rounded_price = self._round_to_tick(price, tick) if price > 0 else 0.0
 
         try:
-            order_args = OrderArgs(
+            market_args = MarketOrderArgs(
                 token_id=token_id,
-                price=rounded_price,
-                size=size,
+                amount=size,   # for SELL: number of shares; for BUY: USD amount
                 side=side,
+                price=rounded_price,
+                order_type=OrderType.FAK,
             )
-            # GTC without post_only — will cross the spread and fill immediately
-            signed = self._clob.create_order(order_args)
-            resp = self._clob.post_order(signed, OrderType.GTC)
+            # create_market_order auto-calculates price from the book if price=0
+            signed = self._clob.create_market_order(market_args)
+            resp = self._clob.post_order(signed, OrderType.FAK)
             order_id = resp.get("orderID")
-            log.info("Market order posted", token_id=token_id, side=side,
+            log.info("Market order posted (FAK)", token_id=token_id, side=side,
                      price=rounded_price, size=size, order_id=order_id)
             if order_id:
                 _append_order_event(
@@ -1261,7 +1266,7 @@ class PMClient:
                     side=side,
                     price=rounded_price,
                     size=size,
-                    order_type="market",
+                    order_type="market_fak",
                     action="placed",
                     market_id=market.condition_id if market else "",
                 )

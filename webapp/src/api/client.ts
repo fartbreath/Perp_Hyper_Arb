@@ -408,6 +408,7 @@ export interface ConfigData {
   momentum_max_entry_usd?: number;
   momentum_min_clob_depth?: number;
   momentum_order_type?: string;
+  momentum_delta_stop_loss_pct?: number;
   momentum_stop_loss?: number;
   momentum_take_profit?: number;
   momentum_min_tte_5m?: number;
