@@ -241,7 +241,6 @@ class TestShouldExit:
     def test_momentum_stop_loss_triggered(self):
         # YES position: spot 0.101% below strike — exceeds 0.05% threshold.
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
-        config.MOMENTUM_MIN_HOLD_SECONDS = 60
         config.MIN_HOLD_SECONDS = 60
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
@@ -262,7 +261,6 @@ class TestShouldExit:
         # NO position: spot 0.101% above strike — delta_no = −0.101% < −0.05%.
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 60
-        config.MOMENTUM_MIN_HOLD_SECONDS = 60
         pos = _make_position(
             entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO",
             strike=100_000.0,
@@ -284,7 +282,6 @@ class TestShouldExit:
         # function returns early before any SL/NE check.
         config.MOMENTUM_TAKE_PROFIT = 0.96
         config.MIN_HOLD_SECONDS = 60
-        config.MOMENTUM_MIN_HOLD_SECONDS = 60
         pos = _make_position(
             entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO"
         )
@@ -339,7 +336,6 @@ class TestShouldExit:
         """NO position: delta SL fires when spot exceeds strike by threshold.
         Verifies the correct delta formula is used (spot vs strike), NOT CLOB price."""
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
-        config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
             entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO",
             strike=100_000.0,
@@ -361,7 +357,6 @@ class TestShouldExit:
         """NO position: delta SL does NOT fire when spot hasn't moved past threshold."""
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MOMENTUM_TAKE_PROFIT = 0.999
-        config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
             entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO",
             strike=100_000.0,
@@ -385,7 +380,6 @@ class TestShouldExit:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0  # large — so SL doesn't fire first
         config.MOMENTUM_TAKE_PROFIT = 0.999
-        config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
             strike=100_000.0,
@@ -408,7 +402,6 @@ class TestShouldExit:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
         config.MOMENTUM_TAKE_PROFIT = 0.999
-        config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
             strike=100_000.0,
@@ -431,7 +424,6 @@ class TestShouldExit:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
         config.MOMENTUM_TAKE_PROFIT = 0.999
-        config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
             strike=100_000.0,
@@ -454,7 +446,6 @@ class TestShouldExit:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
         config.MOMENTUM_TAKE_PROFIT = 0.999
-        config.MOMENTUM_MIN_HOLD_SECONDS = 0
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
             strike=100_000.0,
@@ -474,14 +465,14 @@ class TestShouldExit:
 
 # ── PositionMonitor ───────────────────────────────────────────────────────────
 
-def _make_mock_hl(spot: float, coin: str = "BTC") -> MagicMock:
-    """Return a mock HLClient whose get_mid(coin) returns the given spot price."""
-    hl = MagicMock()
-    hl.get_mid = MagicMock(side_effect=lambda c: spot if c == coin else None)
-    return hl
+def _make_mock_pyth(spot: float, coin: str = "BTC") -> MagicMock:
+    """Return a mock PythClient whose get_mid(coin) returns the given spot price."""
+    pyth = MagicMock()
+    pyth.get_mid = MagicMock(side_effect=lambda c: spot if c == coin else None)
+    return pyth
 
 
-def _make_monitor(hl_client=None):
+def _make_monitor(pyth_client=None):
     pm = MagicMock()
     pm._markets = {}
     pm._books = {}
@@ -492,7 +483,7 @@ def _make_monitor(hl_client=None):
     # Return None so the code falls back to pos.size (safe in tests).
     pm.get_token_balance = AsyncMock(return_value=None)
     risk = RiskEngine()
-    monitor = PositionMonitor(pm=pm, risk=risk, interval=30, hl_client=hl_client)
+    monitor = PositionMonitor(pm=pm, risk=risk, interval=30, pyth_client=pyth_client)
     return monitor, pm, risk
 
 
@@ -694,14 +685,16 @@ def _make_monitor_with_market(
     yes_mid=0.30, yes_bid=0.29, yes_ask=0.31,
     no_mid=None, no_bid=None, no_ask=None,
     end_date=None,
-    hl_client=None,
+    pyth_client=None,
 ):
-    """Return (monitor, pm, risk) with a single market in the PM books cache.
+    """Return (monitor, pm, risk, mkt) with a single market in the PM books cache.
 
     If no_mid is None the NO book is absent from the cache (simulating an
-    unavailable NO CLOB), which is the key precondition for every test here.
+    unavailable NO CLOB).  If yes_mid is None the YES book is also absent
+    (simulating a fully drained CLOB near expiry — the key precondition for
+    the delta-SL-when-book-empty tests).
     """
-    monitor, pm, risk = _make_monitor(hl_client=hl_client)
+    monitor, pm, risk = _make_monitor(pyth_client=pyth_client)
 
     mkt = MagicMock()
     mkt.condition_id = "mkt_001"
@@ -712,20 +705,23 @@ def _make_monitor_with_market(
     mkt.title        = "Will BTC exceed $100k?"
     pm._markets      = {"mkt_001": mkt}
 
-    yes_book = MagicMock()
-    yes_book.mid      = yes_mid
-    yes_book.best_bid = yes_bid
-    yes_book.best_ask = yes_ask
+    books: dict = {}
+
+    if yes_mid is not None:
+        yes_book = MagicMock()
+        yes_book.mid      = yes_mid
+        yes_book.best_bid = yes_bid
+        yes_book.best_ask = yes_ask
+        books["tok_yes"] = yes_book
 
     if no_mid is not None:
         no_book = MagicMock()
         no_book.mid      = no_mid
         no_book.best_bid = no_bid if no_bid is not None else no_mid
         no_book.best_ask = no_ask if no_ask is not None else no_mid
-        pm._books = {"tok_yes": yes_book, "tok_no": no_book}
-    else:
-        pm._books = {"tok_yes": yes_book}  # NO book absent
+        books["tok_no"] = no_book
 
+    pm._books = books
     return monitor, pm, risk, mkt
 
 
@@ -875,16 +871,15 @@ class TestYesNoBookIndependence:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0  # prevent SL from firing first
         config.MOMENTUM_TAKE_PROFIT = 0.999
-        config.MOMENTUM_MIN_HOLD_SECONDS = 0
 
         # For NO: NE fires when spot > strike (delta_no < 0).
         # strike=100, spot=101 → delta_no = (100-101)/100×100 = −1% < 0
-        hl = _make_mock_hl(spot=101.0)
+        pyth = _make_mock_pyth(spot=101.0)
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
             no_mid=0.60, no_bid=0.58, no_ask=0.62,  # independent of YES
             end_date=future,
-            hl_client=hl,
+            pyth_client=pyth,
         )
         no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
                                 seconds_ago=120, now=now, strike=100.0)
@@ -900,23 +895,28 @@ class TestYesNoBookIndependence:
             f"P&L should use NO best_bid=0.58, got {closed.realized_pnl:.4f}"
         )
 
-    def test_pre_expiry_exit_no_book_missing_defers(self):
-        """When NO book is unavailable the monitor must defer (current_token_price=None
-        causes early return before the NE delta check)."""
+    def test_pre_expiry_exit_no_book_missing_exits_at_entry_price(self):
+        """When the near-expiry delta stop fires but NO book is drained, the monitor
+        must still close the position — using entry_price as the order target rather
+        than deferring indefinitely.  This prevents wipeouts where the NO book stays
+        empty all the way to RESOLVED.
+
+        Key invariant: the exit price must NOT be derived from the YES book (1 - yes_mid).
+        spot=101, strike=100 → delta_no = −1% (YES side would give 1 − 0.30 = 0.70 ≠ entry_price).
+        """
         now = datetime.now(timezone.utc)
         future = now + timedelta(seconds=30)
 
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0  # prevent delta SL; NE fires
         config.MOMENTUM_TAKE_PROFIT = 0.999
-        config.MOMENTUM_MIN_HOLD_SECONDS = 0
 
-        hl = _make_mock_hl(spot=101.0)
+        pyth = _make_mock_pyth(spot=101.0)
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
-            no_mid=None,   # NO book absent → must defer
+            no_mid=None,   # NO book absent
             end_date=future,
-            hl_client=hl,
+            pyth_client=pyth,
         )
         no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
                                 seconds_ago=120, now=now, strike=100.0)
@@ -924,11 +924,106 @@ class TestYesNoBookIndependence:
 
         _run(monitor._check_position(no_pos))
 
+        assert risk._positions["mkt_001:NO"].is_closed, (
+            "Near-expiry delta stop must still exit even when NO book is drained"
+        )
+        # Exit must use entry_price (zero P&L), NOT a YES-derived price
+        assert risk._positions["mkt_001:NO"].realized_pnl == pytest.approx(0.0, abs=0.01), (
+            "P&L must be ~0 (entry_price fallback), not a YES-derived value"
+        )
+        pm.place_market.assert_called_once()
+
+    def test_take_profit_defers_when_no_book_missing(self):
+        """Take-profit (CLOB-price-based) still defers when NO book is unavailable — it
+        requires a valid NO mid to fire.  Only delta-based stops bypass the NO book guard."""
+        now = datetime.now(timezone.utc)
+        future = now + timedelta(seconds=120)  # TTE > NE threshold → NE won't fire
+
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 30  # below 120s → NE not active
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+        config.MOMENTUM_TAKE_PROFIT = 0.01   # extremely low — would trigger if price checked
+
+        # spot within threshold (no delta SL), NE not active
+        pyth = _make_mock_pyth(spot=100_001.0)  # only 0.001% above strike
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
+            no_mid=None,   # NO book absent
+            end_date=future,
+            pyth_client=pyth,
+        )
+        no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
+                                seconds_ago=120, now=now, strike=100_000.0)
+        risk.open_position(no_pos)
+
+        _run(monitor._check_position(no_pos))
+
         assert not risk._positions["mkt_001:NO"].is_closed, (
-            "Monitor must defer the exit (not close) when NO book is unavailable"
+            "Take-profit must not fire when NO book is absent (no valid token price)"
         )
         pm.place_market.assert_not_called()
-        pm.place_limit.assert_not_called()
+
+    # ── Delta SL fires even when YES CLOB book is drained ─────────────────────
+
+    def test_delta_sl_fires_when_yes_book_empty(self):
+        """Root-cause regression: YES CLOB book drains near expiry but delta SL
+        must still fire via the HL spot path.
+
+        Before the fix: book guard returned early → should_exit never called → SL missed.
+        After the fix: momentum bypasses the book guard → delta SL fires correctly.
+        """
+        now = datetime.now(timezone.utc)
+        future = now + timedelta(seconds=120)  # 2 min TTE
+
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 30  # below 120s TTE — NE won't fire
+
+        # spot 0.1% below strike (100_000) → delta = −0.1% < −0.05% → SL fires
+        pyth = _make_mock_pyth(spot=99_900.0)
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=None,  # YES CLOB book drained — only Pyth spot is available
+            end_date=future,
+            pyth_client=pyth,
+        )
+        yes_pos = _make_position(
+            side="YES", entry_price=0.85, size=100.0,
+            strategy="momentum", seconds_ago=60, now=now, strike=100_000.0,
+        )
+        risk.open_position(yes_pos)
+
+        _run(monitor._check_position(yes_pos))
+
+        assert risk._positions["mkt_001:YES"].is_closed, (
+            "Delta SL must fire even when YES CLOB book is empty"
+        )
+
+    def test_delta_sl_does_not_fire_when_spot_within_threshold(self):
+        """Confirm delta SL is NOT over-eager when YES book is empty but spot is close."""
+        now = datetime.now(timezone.utc)
+        future = now + timedelta(seconds=120)
+
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 30
+
+        # spot only 0.01% below strike → delta = −0.01% > −0.05% → no SL
+        pyth = _make_mock_pyth(spot=99_990.0)
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=None,  # YES CLOB book drained
+            end_date=future,
+            pyth_client=pyth,
+        )
+        yes_pos = _make_position(
+            side="YES", entry_price=0.85, size=100.0,
+            strategy="momentum", seconds_ago=60, now=now, strike=100_000.0,
+        )
+        risk.open_position(yes_pos)
+
+        _run(monitor._check_position(yes_pos))
+
+        assert not risk._positions["mkt_001:YES"].is_closed, (
+            "Delta SL must NOT fire when spot is within the threshold"
+        )
 
     def test_skips_closed_positions(self):
         monitor, pm, risk = _make_monitor()
@@ -1050,8 +1145,8 @@ class TestEventDrivenStopLoss:
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        hl = _make_mock_hl(spot=99_899.0)  # 0.101% below strike → exceeds 0.05% threshold
-        monitor, pm, risk = _make_monitor(hl_client=hl)
+        pyth = _make_mock_pyth(spot=99_899.0)  # 0.101% below strike → exceeds 0.05% threshold
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
         pos = _make_position(
             strategy="momentum", side="YES", entry_price=0.80,
             size=100.0, seconds_ago=120, strike=100_000.0,
@@ -1068,8 +1163,18 @@ class TestEventDrivenStopLoss:
         assert risk._positions["mkt_001:YES"].is_closed, "Position should be closed by event-driven stop-loss"
         pm.place_market.assert_called_once()  # exit used market (force_taker) order
 
-    def test_no_exit_for_non_momentum_strategy(self):
-        """Event-driven path ignores maker/mispricing positions."""
+    def test_non_momentum_strategy_exits_on_pm_tick_when_stop_triggers(self):
+        """PM price ticks now check ALL strategies — mispricing exits on stop-loss.
+
+        After removing the momentum-only filter from _on_price_update, all open
+        positions are evaluated on every relevant PM WS tick. This test verifies
+        that a mispricing position with a qualifying stop-loss DOES exit.
+        """
+        config.STOP_LOSS_USD = 50.0
+        config.PROFIT_TARGET_PCT = 999.0  # disable profit target
+        config.EXIT_DAYS_BEFORE_RESOLUTION = 0
+        config.MIN_HOLD_SECONDS = 0
+
         monitor, pm, risk = _make_monitor()
         pos = _make_position(
             strategy="mispricing", side="YES", entry_price=0.80,
@@ -1081,18 +1186,46 @@ class TestEventDrivenStopLoss:
         pm._markets = {"mkt_001": mkt}
         pm._books = {"tok_yes": self._make_book(mid=0.10)}
 
-        # Even with price at 0.10 (far below any stop), mispricing is not checked here
+        # unrealised = (0.10 - 0.80) * 100 = -$70 ≤ -$50 → stop-loss fires
         _run(monitor._on_price_update("tok_yes", 0.10))
 
-        assert not risk._positions["mkt_001:YES"].is_closed, "Mispricing position should NOT be closed by event-driven path"
+        assert risk._positions["mkt_001:YES"].is_closed, (
+            "Mispricing position must exit on PM tick when stop-loss is triggered"
+        )
+
+    def test_no_exit_for_non_momentum_with_no_stop_trigger(self):
+        """When a mispricing position's price is still above the stop level,
+        it should NOT be exited even though it is now checked on every PM tick.
+        All strategies are event-driven; this verifies the exit logic correctly
+        applies per-strategy conditions (not that mispricing is skipped)."""
+        config.STOP_LOSS_USD = 9999.0   # disable stop-loss for this test
+        config.PROFIT_TARGET_PCT = 0.999  # disable profit target
+        config.EXIT_DAYS_BEFORE_RESOLUTION = 0
+        config.MIN_HOLD_SECONDS = 0
+
+        monitor, pm, risk = _make_monitor()
+        pos = _make_position(
+            strategy="mispricing", side="YES", entry_price=0.80,
+            size=100.0, seconds_ago=120,
+        )
+        risk.open_position(pos)
+
+        mkt = self._make_market()
+        pm._markets = {"mkt_001": mkt}
+        pm._books = {"tok_yes": self._make_book(mid=0.10)}
+
+        # Price is well below entry but stop-loss is disabled — no exit should fire
+        _run(monitor._on_price_update("tok_yes", 0.10))
+
+        assert not risk._positions["mkt_001:YES"].is_closed, "No exit: stop-loss disabled for this test"
 
     def test_no_exit_for_unrelated_token(self):
         """Tick on an unrelated token_id does not affect open positions."""
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        hl = _make_mock_hl(spot=99_899.0)  # would trigger SL if correct token fires
-        monitor, pm, risk = _make_monitor(hl_client=hl)
+        pyth = _make_mock_pyth(spot=99_899.0)  # would trigger SL if correct token fires
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
         pos = _make_position(strategy="momentum", side="YES", entry_price=0.80,
                              seconds_ago=120, strike=100_000.0)
         risk.open_position(pos)
@@ -1111,8 +1244,8 @@ class TestEventDrivenStopLoss:
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        hl = _make_mock_hl(spot=99_899.0)  # would trigger SL but guard fires first
-        monitor, pm, risk = _make_monitor(hl_client=hl)
+        pyth = _make_mock_pyth(spot=99_899.0)  # would trigger SL but guard fires first
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
         pos = _make_position(strategy="momentum", side="YES", entry_price=0.80,
                              seconds_ago=120, strike=100_000.0)
         risk.open_position(pos)
@@ -1134,8 +1267,8 @@ class TestEventDrivenStopLoss:
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        hl = _make_mock_hl(spot=99_899.0)  # 0.101% below strike → delta SL fires
-        monitor, pm, risk = _make_monitor(hl_client=hl)
+        pyth = _make_mock_pyth(spot=99_899.0)  # 0.101% below strike → delta SL fires
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
         pos = _make_position(strategy="momentum", side="YES", entry_price=0.80,
                              seconds_ago=120, strike=100_000.0)
         risk.open_position(pos)
@@ -1175,3 +1308,300 @@ class TestEventDrivenStopLoss:
         # force_taker=True → place_market() must be called, not place_limit()
         pm.place_market.assert_called_once()
         pm.place_limit.assert_not_called()
+
+
+# ── Hold-floor removal: momentum exits immediately, non-momentum still guarded ─
+
+class TestMomentumHoldFloorRemoval:
+    """Verify that MOMENTUM_MIN_HOLD_SECONDS removal has the intended effect:
+    - Momentum positions can SL/TP the instant they are opened (0 s hold).
+    - Non-momentum positions still respect MIN_HOLD_SECONDS.
+    """
+
+    NOW = datetime(2099, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_momentum_exits_at_time_zero(self):
+        """Delta SL fires for a momentum position held for 0 seconds.
+        This is the key regression test for the hold-floor removal — previously
+        MOMENTUM_MIN_HOLD_SECONDS=10 meant a freshly opened position was
+        immune to the SL for 10 seconds, which is a long time near expiry."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+
+        pos = _make_position(
+            strategy="momentum", side="YES", entry_price=0.85,
+            size=100.0, seconds_ago=0,   # opened RIGHT NOW
+            strike=100_000.0,
+        )
+        # spot 0.1% below strike → delta = −0.1% < −0.05% → SL should fire instantly
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.70,
+            current_spot=99_900.0,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=5),
+            now=self.NOW,
+        )
+        assert exit_flag, "Delta SL must fire even at seconds_held=0 (no hold floor for momentum)"
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_non_momentum_hold_floor_still_applies(self):
+        """MIN_HOLD_SECONDS still blocks exits for mispricing positions held < floor.
+        Ensures the floor removal was scoped to momentum only."""
+        config.MIN_HOLD_SECONDS = 60
+        config.PROFIT_TARGET_PCT = 0.60
+        config.STOP_LOSS_USD = 5.0  # hair-trigger stop
+
+        pos = _make_position(
+            strategy="mispricing", side="YES", entry_price=0.50,
+            size=100.0, seconds_ago=5, now=self.NOW,  # only 5s old — within the 60s floor
+        )
+        # P&L = (0.20 - 0.50) × 100 = −$30, well past the $5 stop — but hold floor blocks it
+        exit_flag, _, _ = should_exit(
+            pos=pos,
+            current_price=0.20,
+            initial_deviation=0.10,
+            market_end_date=self.NOW + timedelta(days=30),
+            now=self.NOW,
+        )
+        assert not exit_flag, "Mispricing position must NOT exit before MIN_HOLD_SECONDS"
+
+    def test_non_momentum_exits_after_hold_floor(self):
+        """Same mispricing position exits once hold floor has passed."""
+        config.MIN_HOLD_SECONDS = 60
+        config.STOP_LOSS_USD = 5.0
+
+        pos = _make_position(
+            strategy="mispricing", side="YES", entry_price=0.50,
+            size=100.0, seconds_ago=120, now=self.NOW,  # 120s > 60s floor → allowed
+        )
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.20,
+            initial_deviation=0.10,
+            market_end_date=self.NOW + timedelta(days=30),
+            now=self.NOW,
+        )
+        assert exit_flag
+        assert reason == ExitReason.STOP_LOSS
+
+
+# ── Pyth oracle event path (_on_pyth_spot_update) ─────────────────────────────
+
+class TestPythOracleEventPath:
+    """Tests for PositionMonitor._on_pyth_spot_update — the Pyth oracle event path.
+
+    This is the critical path that must fire the delta SL when the PM CLOB book
+    drains near expiry (the root-cause scenario for the missed stop-losses).
+    Unlike _on_price_update (PM book ticks), this fires purely on Pyth spot price
+    updates and does NOT require the PM book to have a valid mid.
+    """
+
+    def _make_market_and_books(self, pm, yes_mid=None, no_mid=None,
+                                end_date=None, market_id="mkt_001"):
+        mkt = MagicMock()
+        mkt.condition_id = market_id
+        mkt.token_id_yes = "tok_yes"
+        mkt.token_id_no  = "tok_no"
+        mkt.fees_enabled = False
+        mkt.end_date     = end_date
+        mkt.title        = "Will BTC exceed $100k?"
+        pm._markets = {market_id: mkt}
+
+        books = {}
+        if yes_mid is not None:
+            b = MagicMock(); b.mid = yes_mid; b.best_bid = yes_mid; b.best_ask = yes_mid
+            books["tok_yes"] = b
+        if no_mid is not None:
+            b = MagicMock(); b.mid = no_mid; b.best_bid = no_mid; b.best_ask = no_mid
+            books["tok_no"] = b
+        pm._books = books
+        return mkt
+
+    # ── Root-cause scenario ───────────────────────────────────────────────────
+
+    def test_pyth_tick_fires_delta_sl_when_yes_book_empty(self):
+        """THE ROOT-CAUSE SCENARIO.
+
+        Spot moves past the strike while the YES CLOB book is completely drained
+        (near expiry).  The PM tick path (_on_price_update) is silent because
+        pm_client only fires _fire_price_change when book.mid is not None.
+        The Pyth oracle path must still trigger the delta SL.
+
+        Before the fix: YES book guard returned early → SL missed → RESOLVED wipeout.
+        After the fix:  momentum bypasses the guard → delta SL fires.
+        """
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 10  # only fire NE if <10s TTE
+
+        # spot 0.1% below strike → delta = −0.1% < −0.05% → SL fires
+        pyth = _make_mock_pyth(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+
+        now = datetime.now(timezone.utc)
+        # YES CLOB book completely empty (simulates market near expiry)
+        self._make_market_and_books(pm, yes_mid=None,
+                                     end_date=now + timedelta(seconds=120))
+
+        pos = _make_position(
+            strategy="momentum", side="YES", entry_price=0.85,
+            size=100.0, seconds_ago=60, now=now, strike=100_000.0,
+        )
+        risk.open_position(pos)
+
+        # Fire the Pyth oracle path — as if Pyth WS received a price tick for BTC
+        _run(monitor._on_pyth_spot_update("BTC", 99_900.0))
+
+        assert risk._positions["mkt_001:YES"].is_closed, (
+            "Delta SL must fire via Pyth oracle path even when YES CLOB book is empty"
+        )
+        pm.place_market.assert_called_once()  # force_taker=True for stop-loss
+
+    def test_pyth_tick_no_fire_when_spot_within_threshold(self):
+        """Delta SL does NOT fire when spot is only slightly below strike."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 10
+
+        # spot only 0.01% below strike → delta = −0.01% > −0.05% → no fire
+        pyth = _make_mock_pyth(spot=99_990.0)
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+
+        now = datetime.now(timezone.utc)
+        self._make_market_and_books(pm, yes_mid=None,
+                                     end_date=now + timedelta(seconds=120))
+
+        pos = _make_position(
+            strategy="momentum", side="YES", entry_price=0.85,
+            size=100.0, seconds_ago=60, now=now, strike=100_000.0,
+        )
+        risk.open_position(pos)
+
+        _run(monitor._on_pyth_spot_update("BTC", 99_990.0))
+
+        assert not risk._positions["mkt_001:YES"].is_closed, (
+            "Delta SL must NOT fire when spot is within the threshold"
+        )
+
+    def test_pyth_tick_ignores_wrong_coin(self):
+        """ETH tick does not affect a BTC position."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+
+        pyth = _make_mock_pyth(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+
+        now = datetime.now(timezone.utc)
+        self._make_market_and_books(pm, yes_mid=None,
+                                     end_date=now + timedelta(seconds=120))
+
+        pos = _make_position(
+            strategy="momentum", side="YES", entry_price=0.85,
+            size=100.0, seconds_ago=60, now=now, strike=100_000.0,
+        )
+        risk.open_position(pos)
+
+        # ETH tick — underlying is BTC, so this should be filtered out
+        _run(monitor._on_pyth_spot_update("ETH", 2_905.0))
+
+        assert not risk._positions["mkt_001:YES"].is_closed, (
+            "ETH tick must not trigger a check on a BTC momentum position"
+        )
+
+    def test_pyth_tick_skips_non_momentum_positions(self):
+        """Pyth oracle path only checks momentum positions, not maker/mispricing."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+
+        pyth = _make_mock_pyth(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+
+        now = datetime.now(timezone.utc)
+        self._make_market_and_books(pm, yes_mid=0.50,
+                                     end_date=now + timedelta(seconds=120))
+
+        pos = _make_position(
+            strategy="mispricing", side="YES", entry_price=0.50,
+            size=100.0, seconds_ago=120, now=now,
+        )
+        risk.open_position(pos)
+
+        _run(monitor._on_pyth_spot_update("BTC", 99_900.0))
+
+        assert not risk._positions["mkt_001:YES"].is_closed, (
+            "Pyth oracle path must skip non-momentum positions"
+        )
+
+    def test_pyth_tick_double_exit_guard(self):
+        """Exit already in-flight is not re-triggered by a second Pyth oracle tick."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+
+        pyth = _make_mock_pyth(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+
+        now = datetime.now(timezone.utc)
+        self._make_market_and_books(pm, yes_mid=None,
+                                     end_date=now + timedelta(seconds=120))
+
+        pos = _make_position(
+            strategy="momentum", side="YES", entry_price=0.85,
+            size=100.0, seconds_ago=60, now=now, strike=100_000.0,
+        )
+        risk.open_position(pos)
+
+        # Pre-mark as exiting (simulates first exit in-flight)
+        monitor._exiting_positions.add("mkt_001:YES")
+
+        _run(monitor._on_pyth_spot_update("BTC", 99_900.0))
+
+        pm.place_market.assert_not_called()
+
+    def test_pyth_no_client_does_not_crash(self):
+        """Monitor without pyth_client wired does not register price callback — no crash."""
+        monitor, pm, risk = _make_monitor(pyth_client=None)
+        # _on_pyth_spot_update is never called when pyth_client is None (not registered),
+        # but if somehow called manually it should be a no-op (no positions match).
+        now = datetime.now(timezone.utc)
+        self._make_market_and_books(pm, yes_mid=0.50,
+                                     end_date=now + timedelta(seconds=120))
+        pos = _make_position(strategy="momentum", side="YES", seconds_ago=60, now=now)
+        risk.open_position(pos)
+
+        # Should not raise even without pyth_client
+        _run(monitor._on_pyth_spot_update("BTC", 99_050.0))
+
+    def test_pyth_tick_no_position_does_not_crash(self):
+        """Pyth oracle tick with no open positions is a no-op."""
+        pyth = _make_mock_pyth(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        self._make_market_and_books(pm)
+        # No positions registered
+        _run(monitor._on_pyth_spot_update("BTC", 99_900.0))
+
+    def test_pyth_tick_fires_delta_sl_no_position_both_books_empty(self):
+        """NO position: spot crosses above strike, both YES and NO books are empty.
+        Delta SL fires and exits at entry_price (worst-case fallback)."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 10
+
+        # spot 0.1% above strike → delta_no = −0.1% < −0.05% → SL fires for NO position
+        pyth = _make_mock_pyth(spot=100_100.0)
+        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+
+        now = datetime.now(timezone.utc)
+        # Both books empty
+        self._make_market_and_books(pm, yes_mid=None, no_mid=None,
+                                     end_date=now + timedelta(seconds=120))
+
+        pos = _make_position(
+            strategy="momentum", side="NO", entry_price=0.15,
+            size=100.0, seconds_ago=60, now=now, strike=100_000.0,
+        )
+        risk.open_position(pos)
+
+        _run(monitor._on_pyth_spot_update("BTC", 100_100.0))
+
+        assert risk._positions["mkt_001:NO"].is_closed, (
+            "Delta SL must fire for NO position even when both YES and NO books are empty"
+        )
+        pm.place_market.assert_called_once()

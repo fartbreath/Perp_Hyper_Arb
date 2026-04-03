@@ -70,7 +70,7 @@ Stale quotes get picked off. Four mechanisms reprice continuously:
 1. **Polymarket price move.** The moment the market mid drifts far enough from our
    posted quotes, we cancel and repost at the new price. This is nearly instant.
 
-2. **Bitcoin or Ethereum price move.** If the underlying crypto on Hyperliquid moves
+2. **Bitcoin or Ethereum price move.** If the underlying crypto price on the Pyth oracle moves
    by more than 0.2%, we reprice all related Polymarket quotes and re-check the hedge.
 
 3. **30-second backstop.** Every 30 seconds, any quote older than 30 seconds is
@@ -138,7 +138,7 @@ only one HL order fires after the burst settles. A minimum interval between exec
 If the rolling 20-trade average slippage exceeds 0.30%, a warning is logged suggesting
 spread widening or reduced hedge frequency.
 
-The hedge is re-evaluated on every HL price move and every new fill. If inventory
+The hedge is re-evaluated on every Pyth oracle price tick and every new fill. If inventory
 drops back below the configured threshold, the hedge is removed.
 
 ---
@@ -240,7 +240,7 @@ restarts via `config_overrides.json`.
 | `MAKER_MIN_EDGE_PCT` | `0.001` | Minimum fee-adjusted edge to post (0.1%); overridden to 0.005 |
 | `MAKER_MIN_SPREAD_PROFIT_MARGIN` | `0.010` | Minimum locked-in spread edge for one-sided close logic |
 | `PM_FEE_COEFF` | `0.0175` | Polymarket taker fee coefficient (~1.75% peak) |
-| `REPRICE_TRIGGER_PCT` | `0.002` | HL BBO move that triggers full reprice (0.2%) |
+| `REPRICE_TRIGGER_PCT` | `0.002` | Pyth oracle move that triggers full reprice (0.2%) |
 | `MAX_QUOTE_AGE_SECONDS` | `30` | Backstop reprice interval (seconds) |
 | `MAKER_ADVERSE_DRIFT_REPRICE` | `0.015` | Force-reprice partial fill if mid drifts > 1.5% from quote price |
 | `MAKER_VOL_FILTER_PCT` | `0.015` | Pause quoting when 5-min HL move exceeds 1.5% |
@@ -283,7 +283,7 @@ failing check returns `None` (no quote posted):
 1. Market has a valid `end_date`
 2. TTE within `[MAKER_EXIT_HOURS, MAKER_MAX_TTE_DAYS × 24h]`
 3. Fee-adjusted edge passes `MAKER_MIN_EDGE_PCT` (see formula below)
-4. Underlying HL move over the **adaptive vol window** ≤ `MAKER_VOL_FILTER_PCT` (1.5%)
+4. Underlying Pyth oracle move over the **adaptive vol window** ≤ `MAKER_VOL_FILTER_PCT` (1.5%)
 5. Risk capacity check — `can_open()` (skipped for markets with an already-open one-sided position to avoid false-blocking the missing leg)
 6. Mid within `[MAKER_MIN_QUOTE_PRICE, 1 − MAKER_MIN_QUOTE_PRICE]`
 7. Lifetime-scaled volume gate (see below)
@@ -360,8 +360,8 @@ post_ask   = imbalance > -MAKER_MAX_IMBALANCE_CONTRACTS  # skip SELL YES if too 
 if abs(new_mid - quote.price) > market.max_incentive_spread / 2:
     await self._reprice_market(market)
 
-# HL BBO callback
-move_pct = abs(bbo.mid - last_mid) / last_mid
+# Pyth oracle callback
+move_pct = abs(pyth_price.mid - last_mid) / last_mid
 if move_pct >= REPRICE_TRIGGER_PCT:
     await _reprice_underlying(coin)
     _schedule_hedge_rebalance(coin)   # debounced; see hedge section
@@ -419,7 +419,7 @@ sigma          = u / sqrt(T)
 delta          = n(d2) / (S * sigma * sqrt(T))   # n = standard normal PDF
 coins_to_hedge = |entry_cost_usd| * delta
 
-where S = HL spot, K = strike, T = TTE in years
+where S = Pyth oracle spot, K = strike, T = TTE in years
 ```
 
 If `sigma` is invalid (negative, zero, non-finite — common near expiry or deep
@@ -428,18 +428,18 @@ ITM/OTM), the result is discarded and the fallback is used.
 ### Fallback (naive linear delta)
 
 ```python
-coins_to_hedge = abs(net_inventory_usd) / hl_mid
+coins_to_hedge = abs(net_inventory_usd) / pyth_mid
 ```
 
 ### Hedge direction and sizing
 
 ```python
 direction       = "SHORT" if net_inventory_usd > 0 else "LONG"  # short perp when long PM
-coins_to_hedge  = abs(_position_delta_coins(coin, hl_mid))
-target_notional = coins_to_hedge * hl_mid
+coins_to_hedge  = abs(_position_delta_coins(coin, pyth_mid))
+target_notional = coins_to_hedge * pyth_mid
 
 # Hard cap: never hedge more than MAX_HL_NOTIONAL USD notional
-coins_to_hedge  = min(coins_to_hedge, MAX_HL_NOTIONAL / hl_mid)
+coins_to_hedge  = min(coins_to_hedge, MAX_HL_NOTIONAL / pyth_mid)
 ```
 
 ### Hedge fire/adjust conditions

@@ -34,7 +34,7 @@ CACHE_TTL = 300  # 5 minutes — refresh market list on first use then every 5 m
 
 _TRACKED_UNDERLYINGS = {
     "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX",
-    "LINK", "DOT", "TON", "SUI", "APT", "NEAR", "OP", "ARB",
+    "LINK", "DOT", "TON", "SUI", "APT", "NEAR", "OP", "HYPE",
 }
 
 

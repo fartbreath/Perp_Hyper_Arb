@@ -25,6 +25,7 @@ import config
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket
 from market_data.hl_client import HLClient
+from market_data.pyth_client import PythClient
 from market_data.deribit import DeribitFetcher
 from market_data.kalshi_client import KalshiClient
 from risk import min_edge_after_fees
@@ -48,9 +49,11 @@ class MispricingScanner(BaseStrategy):
         hl: HLClient,
         signal_callback,   # async callable(signal: MispricingSignal)
         scan_interval: int = 300,
+        pyth: Optional[PythClient] = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
+        self._pyth = pyth  # Pyth oracle — authoritative spot, same as Polymarket resolution source
         self._on_signal = signal_callback
         self._default_scan_interval = scan_interval
         self._deribit = DeribitFetcher()
@@ -143,9 +146,14 @@ class MispricingScanner(BaseStrategy):
                 skipped_no_price += 1
                 continue
 
-            spot = self._hl.get_mid(market.underlying)
+            # Use Pyth oracle if wired (authoritative resolution price); fall back to HL perp.
+            spot = (
+                self._pyth.get_mid(market.underlying)
+                if self._pyth is not None
+                else self._hl.get_mid(market.underlying)
+            )
             if spot is None:
-                log.debug("Scan skip: no HL spot", market=market.title[:60],
+                log.debug("Scan skip: no oracle spot", market=market.title[:60],
                           underlying=market.underlying)
                 skipped_no_spot += 1
                 continue

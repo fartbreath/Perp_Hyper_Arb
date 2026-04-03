@@ -29,6 +29,7 @@ import config
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket, _MARKET_TYPE_DURATION_SECS
 from market_data.hl_client import HLClient, BBO
+from market_data.pyth_client import PythClient
 from risk import RiskEngine, Position
 import risk as risk_module
 from strategies.base import BaseStrategy
@@ -77,17 +78,19 @@ class MakerStrategy(BaseStrategy):
         hl: HLClient,
         risk: RiskEngine,
         quote_size_usd: Optional[float] = None,
+        pyth: Optional[PythClient] = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
+        self._pyth = pyth  # Pyth oracle — authoritative spot for all pricing decisions
         self._risk = risk
         self._quote_size_override = quote_size_usd
         self._active_quotes: dict[str, ActiveQuote] = {}  # token_id → quote
         self._inventory: dict[str, float] = {}            # underlying → net USD
-        self._last_hl_mids: dict[str, float] = {}         # coin → last mid when quoted
+        self._last_spot_mids: dict[str, float] = {}       # coin → last Pyth mid at reprice
         self._coin_hedges: dict[str, dict] = {}
         self._signals: dict[str, MakerSignal] = {}
-        self._hl_mid_history: dict[str, deque] = {}  # coin → rate-limited (ts, mid) history
+        self._spot_price_history: dict[str, deque] = {}  # coin → rate-limited (ts, mid) from Pyth
         # ── Hedge cooldown / debounce ──────────────────────────────────────────
         self._last_hedge_ts: dict[str, float] = {}          # coin → unix ts of last executed hedge
         self._pending_hedge_tasks: dict[str, asyncio.Task] = {}  # coin → in-flight debounce task
@@ -120,7 +123,11 @@ class MakerStrategy(BaseStrategy):
                 await asyncio.sleep(5)
             log.info("MakerStrategy enabled via config — starting now")
         self._pm.on_price_change(self._on_pm_price_change)
-        self._hl.on_bbo_update(self._on_hl_bbo_update)
+        # Reprice on Pyth oracle ticks — authoritative spot price, not HL perp.
+        # HL perp carries funding-rate basis and diverges from the settlement oracle;
+        # using Pyth ensures reprice triggers match what Polymarket actually resolves on.
+        if self._pyth is not None:
+            self._pyth.on_price_update(self._on_pyth_price_update)
         log.info("MakerStrategy started", quote_size_override=self._quote_size_override)
         asyncio.create_task(self._quote_age_watchdog())
         await self._refresh_all_quotes()
@@ -155,23 +162,28 @@ class MakerStrategy(BaseStrategy):
                 log.warning("PM price-change reprice failed",
                             market=market.condition_id, exc=str(exc))
 
-    async def _on_hl_bbo_update(self, coin: str, bbo: BBO) -> None:
-        if bbo.mid is None:
-            return
+    async def _on_pyth_price_update(self, coin: str, price: float) -> None:
+        """Triggered on every Pyth oracle tick.
+
+        Maintains a rate-limited price history for the volatility filter and fires
+        a reprice when the Pyth oracle spot has moved more than REPRICE_TRIGGER_PCT
+        since the last reprice.  Pyth is used here — not HL perp BBO — because
+        Polymarket resolves against the oracle price; HL perp can diverge at expiry.
+        """
         # Rate-limited history (≤1 sample/s) for the vol filter in _evaluate_signal.
-        hist = self._hl_mid_history.setdefault(coin, deque(maxlen=360))
+        hist = self._spot_price_history.setdefault(coin, deque(maxlen=360))
         _now = time.time()
         if not hist or _now - hist[-1][0] >= 1.0:
-            hist.append((_now, bbo.mid))
-        last = self._last_hl_mids.get(coin, bbo.mid)
-        move_pct = abs(bbo.mid - last) / last if last > 0 else 0.0
+            hist.append((_now, price))
+        last = self._last_spot_mids.get(coin, price)
+        move_pct = abs(price - last) / last if last > 0 else 0.0
         if move_pct >= config.REPRICE_TRIGGER_PCT:
-            self._last_hl_mids[coin] = bbo.mid
+            self._last_spot_mids[coin] = price
             try:
                 await self._reprice_underlying(coin)
                 self._schedule_hedge_rebalance(coin)
             except Exception as exc:
-                log.warning("HL BBO reprice/hedge failed", coin=coin, exc=str(exc))
+                log.warning("Pyth price reprice/hedge failed", coin=coin, exc=str(exc))
 
     # ── Quote age watchdog ─────────────────────────────────────────────────────
 
@@ -450,7 +462,7 @@ class MakerStrategy(BaseStrategy):
         move = self._get_recent_move_pct(market.underlying, window_s=_vol_window)
         if move is not None and move > config.MAKER_VOL_FILTER_PCT:
             log.debug(
-                "Skipping quote — HL moving hard",
+                "Skipping quote — underlying moving hard (Pyth oracle)",
                 underlying=market.underlying,
                 move_5m_pct=round(move * 100, 2),
             )
@@ -924,7 +936,7 @@ class MakerStrategy(BaseStrategy):
                         score=signal.score,
                     )
 
-        self._last_hl_mids.setdefault(signal.underlying, 0.0)
+        self._last_spot_mids.setdefault(signal.underlying, 0.0)
 
     async def _reprice_market(self, market: PMMarket) -> None:
         lock = self._reprice_locks.setdefault(market.condition_id, asyncio.Lock())
@@ -1190,7 +1202,12 @@ class MakerStrategy(BaseStrategy):
         if abs(net_delta) < config.HEDGE_THRESHOLD_USD:
             if coin in self._coin_hedges:
                 existing = self._coin_hedges[coin]
-                close_mid = self._hl.get_mid(coin) or existing["price"]
+                # Use Pyth oracle for reference close price; fall back to recorded open price.
+                close_mid = (
+                    (self._pyth.get_mid(coin) if self._pyth is not None else None)
+                    or self._hl.get_mid(coin)
+                    or existing["price"]
+                )
                 await self._hl.close_hedge(coin, existing["direction"], existing["size"])
                 self._risk.record_hl_hedge_trade(
                     coin=coin,
@@ -1204,9 +1221,12 @@ class MakerStrategy(BaseStrategy):
                 log.info("Hedge closed — delta below threshold", coin=coin)
             return
 
-        hl_mid = self._hl.get_mid(coin)
+        hl_mid = (
+            (self._pyth.get_mid(coin) if self._pyth is not None else None)
+            or self._hl.get_mid(coin)
+        )
         if hl_mid is None:
-            log.warning("No HL mid — cannot hedge", coin=coin)
+            log.warning("No Pyth oracle mid — cannot size hedge", coin=coin)
             return
 
         direction = "SHORT" if net_delta > 0 else "LONG"
@@ -1477,11 +1497,18 @@ class MakerStrategy(BaseStrategy):
         return list(self._hedge_quality)[:limit]
 
     def get_hl_mid(self, coin: str) -> Optional[float]:
+        """Spot mid price for `coin` (Pyth oracle; HL perp fallback).
+
+        Used by FillSimulator for paper-mode hedge simulation.  Method name
+        kept for backward compat with tests that mock this attribute.
+        """
+        if self._pyth is not None:
+            return self._pyth.get_mid(coin)
         return self._hl.get_mid(coin)
 
     def _get_recent_move_pct(self, coin: str, window_s: float = 300.0) -> Optional[float]:
-        """Abs % price change over the last *window_s* seconds, or None if no history."""
-        hist = self._hl_mid_history.get(coin)
+        """Abs % price change over the last *window_s* seconds from Pyth oracle history."""
+        hist = self._spot_price_history.get(coin)
         if not hist or len(hist) < 2:
             return None
         cutoff = time.time() - window_s

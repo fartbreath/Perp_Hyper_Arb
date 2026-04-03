@@ -144,7 +144,7 @@ $$
 Where:
 | Symbol | Meaning |
 |--------|---------|
-| $S$ | Current spot price (from Hyperliquid mid) |
+| $S$ | Current spot price (from Pyth oracle mid) |
 | $K$ | Strike parsed from PM market title |
 | $r$ | Risk-free rate (5%) |
 | $\sigma$ | Deribit mark IV (annualised) |
@@ -192,8 +192,8 @@ deviation → $250 (capped).
 
 ## Exit Conditions
 
-Once a position is open, `monitor.py` checks every 30 seconds (with a minimum hold of
-`MIN_HOLD_SECONDS = 60 s`):
+Once a position is open, `monitor.py` checks on every relevant PM price tick (fully
+event-driven; 300 s poll backstop; minimum hold of `MIN_HOLD_SECONDS = 60 s`):
 
 | Exit | Condition | Rationale |
 |------|-----------|-----------|
@@ -215,7 +215,7 @@ unrealised_pnl = (current_reference_price - entry_price) * size
 ## Data Flow
 
 ```
-KalshiClient            DeribitFetcher          PMClient                 HLClient
+KalshiClient            DeribitFetcher          PMClient                 PythClient
     │ YES mid price         │ mark_iv               │ YES mid price          │ spot price
     │                       └──────────┬────────────┘                        │
     │                                  ▼                                     │
@@ -241,7 +241,7 @@ KalshiClient            DeribitFetcher          PMClient                 HLClien
  risk.open_position()
     │
     ▼
- PositionMonitor (every 30 s)
+ PositionMonitor (event-driven on PM ticks; 300 s backstop)
     │
   exit condition met?
     │
@@ -354,8 +354,9 @@ arbitrary patch that does not fix the root miscalibration.
 - For barrier-hit events the error is compounded — closed-form barrier formulas already
   diverge from European formulas under Black-Scholes; real-world jumps make the
   divergence larger still.
-- The constant `r = 5%` risk-free rate and spot price sourced from a perp exchange
-  (Hyperliquid) add small but unnecessary additional noise.
+  The constant `r = 5%` risk-free rate adds small but unnecessary additional noise.
+  Spot price is now sourced from Pyth oracle (not HL perp mid), removing the
+  funding-rate basis previously introduced by sourcing S from Hyperliquid.
 
 ---
 
@@ -370,7 +371,7 @@ arbitrary patch that does not fix the root miscalibration.
   open positions are all long/short BTC milestone markets. The portfolio has concentrated
   directional BTC exposure regardless of position count.
 - No handling of limit vs. market order choice, queue position, or API latency across
-  PM, Deribit, and Hyperliquid.
+  PM, Deribit, Pyth, and Kalshi.
 
 ---
 

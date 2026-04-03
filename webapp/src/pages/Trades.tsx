@@ -194,6 +194,8 @@ function LegsBadges({ legs }: { legs: Trade[] }) {
         const ct   = Number(t.size).toFixed(1);
         // entry_price is the actual token fill price for both YES and NO.
         const px   = Number(t.price).toFixed(3);
+        const exitTok = impliedExitToken(t);
+        const exitStr = exitTok !== null ? ` → ${exitTok.toFixed(3)}` : "";
         const bg   = t.side === "YES" ? "#0c4a6e" : "#4a1d0c";
         const col  = t.side === "YES" ? "#38bdf8" : "#fb923c";
         const score = t.signal_score ? ` ·${Number(t.signal_score).toFixed(0)}` : "";
@@ -203,7 +205,7 @@ function LegsBadges({ legs }: { legs: Trade[] }) {
             fontWeight: 600, padding: "2px 6px", borderRadius: 4,
             whiteSpace: "nowrap",
           }}>
-            {t.side} {ct}ct @ {px}{score}
+            {t.side} {ct}ct @ {px}{exitStr}{score}
           </span>
         );
       })}
@@ -247,7 +249,7 @@ function SummaryBar({ groups }: { groups: MarketGroup[] }) {
 function LegDetail({ legs }: { legs: Trade[] }) {
   return (
     <tr>
-      <td colSpan={11} style={{ padding: "6px 16px 10px 32px", background: "rgba(0,0,0,0.25)" }}>
+      <td colSpan={13} style={{ padding: "6px 16px 10px 32px", background: "rgba(0,0,0,0.25)" }}>
         <table style={{ width: "100%", fontSize: "0.8em", borderCollapse: "collapse" }}>
           <thead>
             <tr style={{ color: "#94a3b8", borderBottom: "1px solid #334155" }}>
@@ -256,6 +258,8 @@ function LegDetail({ legs }: { legs: Trade[] }) {
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Contracts</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Entry</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Exit (calc)</th>
+              <th style={{ textAlign: "right", padding: "3px 8px" }}>Spot Entry</th>
+              <th style={{ textAlign: "right", padding: "3px 8px" }}>Spot Exit</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Gross</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Fee</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Rebate</th>
@@ -272,6 +276,12 @@ function LegDetail({ legs }: { legs: Trade[] }) {
               // entry_price is the actual token fill price for both YES and NO.
               const exitToken  = impliedExitToken(t);
               const entryToken = Number(t.price);
+              const entrySpot  = Number(t.spot_price);
+              const exitSpot   = t.exit_spot_price ? Number(t.exit_spot_price) : null;
+              // Resolved trades: exit_spot_price IS the resolved spot (same oracle).
+              // Stop-loss/taker trades: exit_spot_price = spot at time of SL fire.
+              const isResolved = (exitToken !== null) && (Math.abs(exitToken) < 0.015 || Math.abs(exitToken - 1) < 0.015);
+              const exitSpotLabel = isResolved ? "Resolved" : "Exit";
               return (
                 <tr key={i} style={{ borderBottom: "1px solid #1e293b" }}>
                   <td style={{ padding: "3px 8px", color: "#64748b" }}>{fmtTs(t.timestamp)}</td>
@@ -289,6 +299,20 @@ function LegDetail({ legs }: { legs: Trade[] }) {
                   </td>
                   <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#94a3b8" }}>
                     {exitToken !== null ? exitToken.toFixed(4) : "—"}
+                  </td>
+                  {/* Underlying spot at entry */}
+                  <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#cbd5e1" }}>
+                    {entrySpot > 0 ? `$${entrySpot.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—"}
+                  </td>
+                  {/* Underlying spot at exit (stop-loss) or resolution */}
+                  <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace" }}
+                      title={exitSpotLabel}>
+                    {exitSpot && exitSpot > 0
+                      ? <span style={{ color: isResolved ? "#94a3b8" : "#fbbf24" }}>
+                          ${exitSpot.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                        </span>
+                      : <span style={{ color: "#475569" }}>—</span>
+                    }
                   </td>
                   <td style={{ padding: "3px 8px", textAlign: "right", color: pnlColor(g), fontFamily: "monospace" }}>
                     {fmtSigned(g, 4)}

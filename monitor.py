@@ -41,7 +41,7 @@ import config
 from logger import get_bot_logger
 from risk import RiskEngine, Position
 from market_data.pm_client import PMClient, _MARKET_TYPE_DURATION_SECS
-from market_data.hl_client import BBO
+from market_data.pyth_client import PythClient
 from ctf_utils import _redeem_ctf_via_safe
 
 log = get_bot_logger(__name__)
@@ -130,17 +130,12 @@ def should_exit(
     if now is None:
         now = datetime.now(timezone.utc)
 
-    # Respect minimum hold time — avoids noise-triggered exits.
-    # Momentum uses a much shorter hold floor (positions are near expiry;
-    # MIN_HOLD_SECONDS=60 is calibrated for mispricing positions that last days).
-    _min_hold = (
-        config.MOMENTUM_MIN_HOLD_SECONDS
-        if pos.strategy == "momentum"
-        else config.MIN_HOLD_SECONDS
-    )
-    hold_seconds = (now - pos.opened_at).total_seconds()
-    if hold_seconds < _min_hold:
-        return False, "", 0.0
+    # Minimum hold time: applies to maker and mispricing only.
+    # Momentum is event-driven — exits fire immediately on WS ticks; no hold
+    # floor is applied so the delta SL can fire the instant spot crosses the strike.
+    if pos.strategy != "momentum":
+        if (now - pos.opened_at).total_seconds() < config.MIN_HOLD_SECONDS:
+            return False, "", 0.0
 
     unrealised = compute_unrealised_pnl(pos, current_price)
 
@@ -253,13 +248,13 @@ class PositionMonitor:
         pm: PMClient,
         risk: RiskEngine,
         interval: int = config.MONITOR_INTERVAL,
-        hl_client=None,
+        pyth_client: Optional[PythClient] = None,
         on_close_callback: Optional[Callable[[str], None]] = None,
         on_stop_loss_callback: Optional[Callable[[str, float], None]] = None,
     ) -> None:
         self._pm = pm
         self._risk = risk
-        self._hl = hl_client  # Optional HLClient; used for delta-based spot SL
+        self._pyth = pyth_client  # PythClient; authoritative spot price for momentum SL
         self._interval = interval
         # Called with market_id whenever a position is successfully closed.
         # Used by MispricingScanner to reset the per-market cooldown clock.
@@ -295,23 +290,27 @@ class PositionMonitor:
         self._running = True
         # Event-driven stop-loss: check open momentum positions on every WS tick.
         # This eliminates the 30 s polling lag for stop-loss and take-profit exits.
-        # Non-momentum strategies (maker / mispricing) have hold windows of hours
-        # or days so the slower poll loop is adequate for them.
+        # All open positions are checked on every relevant PM price tick — regardless
+        # of strategy.  No polling delay: the only latency is the PM WS round-trip.
         self._pm.on_price_change(self._on_price_update)
-        # Event-driven delta SL: also check on every HL spot tick so that a
+        # Event-driven delta SL: also check on every Pyth price tick so that a
         # rapid underlying move triggers the delta SL immediately, without
         # waiting for the next PM WS tick (which may not come if the PM book
         # goes quiet near expiry — exactly when the SL matters most).
-        if self._hl is not None:
-            self._hl.on_bbo_update(self._on_hl_spot_update)
-        log.info("PositionMonitor started", interval=self._interval)
+        if self._pyth is not None:
+            self._pyth.on_price_update(self._on_pyth_spot_update)
+        log.info("PositionMonitor started (event-driven)")
         asyncio.create_task(self._auto_redeem_loop())
+        # Rare backstop sweep: catches resolved markets that PM WS never echoes
+        # (e.g. resolution during a transient disconnect) and any other edge-case
+        # positions that slipped through.  300 s is acceptable for non-real-time
+        # cleanup; all live position checks are driven by PM / Pyth events above.
         while self._running:
-            await asyncio.sleep(self._interval)
+            await asyncio.sleep(300)
             try:
                 await self._check_all_positions()
             except Exception as exc:
-                log.error("PositionMonitor iteration failed", exc=str(exc))
+                log.error("PositionMonitor backstop sweep failed", exc=str(exc))
 
     async def stop(self) -> None:
         self._running = False
@@ -319,22 +318,14 @@ class PositionMonitor:
     # ── Event-driven price callback ───────────────────────────────────────────
 
     async def _on_price_update(self, token_id: str, mid: float) -> None:
-        """Triggered on every WS book/price_change tick.
+        """Triggered on every PM WS book/price_change tick.
 
-        Checks open momentum positions whose market's YES *or* NO token just
-        updated.  Fires ``_check_position`` immediately so stop-loss and take-
-        profit exits are detected within one WS round-trip (~100-500 ms) rather
-        than waiting for the 30-second poll cycle.
-
-        Only momentum positions are evaluated here because:
-          * maker / mispricing positions have hold windows of hours/days, where
-            30 s polling lag is negligible.
-          * checking every strategy on every tick would add unnecessary latency
-            to the WS message-processing path.
+        Checks ALL open positions whose market's YES or NO token just updated.
+        This makes every strategy event-driven — no configured delays, only
+        WS round-trip latency (≈100–500 ms).  Momentum, maker, and mispricing
+        positions are all checked immediately on every relevant price tick.
         """
         for pos in self._risk.get_open_positions():
-            if pos.strategy != "momentum":
-                continue
             market = self._pm._markets.get(pos.market_id)
             if market is None:
                 continue
@@ -346,14 +337,18 @@ class PositionMonitor:
                 continue  # exit already in progress for this leg
             await self._check_position(pos, triggering_token_id=token_id, triggering_mid=mid)
 
-    async def _on_hl_spot_update(self, coin: str, bbo: BBO) -> None:
-        """Triggered on every HL BBO tick.
+    async def _on_pyth_spot_update(self, coin: str, price: float) -> None:
+        """Triggered on every Pyth price tick.
 
         Checks open momentum positions whose underlying matches `coin`.
         Ensures that a rapid spot move (e.g. BTC flash crash through the
         strike) triggers the delta SL immediately — without waiting for
         the PM WS to echo a price change, which may not happen if the PM
         book is thin or empty near expiry.
+
+        Uses the Pyth oracle price, which is the same data source that
+        Polymarket's resolution bots read at market end_date, eliminating
+        the HL perp funding-rate basis that caused missed stop-losses.
         """
         for pos in self._risk.get_open_positions():
             if pos.strategy != "momentum" or pos.underlying != coin:
@@ -649,17 +644,28 @@ class PositionMonitor:
             await self._exit_position(pos, market, exit_mid, ExitReason.RESOLVED, unrealised)
             return
 
-        # ── Standard check (live book required for all other exits) ───────────
+        # ── Standard check ─────────────────────────────────────────────────────
         # current_price is always the YES-token mid — used for the P&L formula
         # and non-momentum exit conditions (both store entry_price in YES-space).
         # For momentum exits on NO positions we additionally fetch the actual
         # NO CLOB book so stop-loss / take-profit trigger on the correct price.
         book = self._pm._books.get(market.token_id_yes)
         if book is None or book.mid is None:
-            log.debug("Monitor: no book data yet", market_id=pos.market_id, token_id=market.token_id_yes)
-            return
-
-        current_price = book.mid  # YES-space mid; used for P&L formula
+            if pos.strategy != "momentum":
+                # Non-momentum positions need book data for all exit types.
+                log.debug("Monitor: no book data yet", market_id=pos.market_id, token_id=market.token_id_yes)
+                return
+            # Momentum: YES book drained (common near expiry), but the HL-spot-based
+            # delta SL must still fire — it requires only HL spot + pos.strike, NOT
+            # the CLOB book.  Use entry_price as a stub for the P&L calculation;
+            # the actual fill price is determined by place_market in _exit_position.
+            log.debug(
+                "Monitor: YES book empty for momentum position — delta SL still active",
+                market_id=pos.market_id,
+            )
+            current_price = pos.entry_price
+        else:
+            current_price = book.mid  # YES-space mid; used for P&L formula
         initial_deviation = self._initial_deviations.get(
             pos.market_id, config.MISPRICING_THRESHOLD
         )
@@ -670,7 +676,8 @@ class PositionMonitor:
         book_no = None
         if pos.strategy == "momentum":
             if pos.side in ("YES", "BUY_YES"):
-                current_token_price = book.mid  # YES CLOB mid
+                # YES CLOB mid; None when book is drained (delta SL still active via HL spot).
+                current_token_price = book.mid if book is not None else None
             else:
                 book_no = self._pm._books.get(market.token_id_no)
                 if book_no is not None and book_no.mid is not None:
@@ -700,11 +707,13 @@ class PositionMonitor:
             if market.end_date is not None else None
         )
 
-        # Fetch live underlying spot for delta-based stop-loss.
+        # Fetch live Pyth oracle spot for delta-based stop-loss.
         # get_mid() is a synchronous in-memory cache read — no await needed.
+        # Pyth reflects the same price Polymarket resolves on; HL perp would
+        # carry funding-rate basis that can mask a genuine oracle crossing.
         current_spot: Optional[float] = None
-        if pos.strategy == "momentum" and self._hl is not None and pos.underlying:
-            current_spot = self._hl.get_mid(pos.underlying)
+        if pos.strategy == "momentum" and self._pyth is not None and pos.underlying:
+            current_spot = self._pyth.get_mid(pos.underlying)
 
         exit_flag, reason, unrealised = should_exit(
             pos=pos,
@@ -722,8 +731,8 @@ class PositionMonitor:
             market_id=pos.market_id,
             entry=round(pos.entry_price, 4),
             mid=round(current_price, 4),
-            bid=round(book.best_bid, 4) if book.best_bid is not None else None,
-            ask=round(book.best_ask, 4) if book.best_ask is not None else None,
+            bid=round(book.best_bid, 4) if book is not None and book.best_bid is not None else None,
+            ask=round(book.best_ask, 4) if book is not None and book.best_ask is not None else None,
             unrealised_usd=round(unrealised, 4),
             exit=exit_flag,
             reason=reason or "—",
@@ -750,15 +759,31 @@ class PositionMonitor:
                 taker_exit_price = current_price
             elif pos.side in ("YES", "BUY_YES"):
                 # Pre-expiry taker exit: YES sell crosses the spread at best_bid.
-                taker_exit_price = book.best_bid if book.best_bid is not None else current_price
+                # Guard book being None (YES book drained when delta SL fired).
+                taker_exit_price = (
+                    book.best_bid
+                    if book is not None and book.best_bid is not None
+                    else current_price
+                )
             else:
                 # NO close: sell NO tokens at the actual NO CLOB best_bid.
                 # YES and NO are independent CLOBs — never derive NO price from YES.
                 if book_no is not None and book_no.best_bid is not None:
                     taker_exit_price = book_no.best_bid
+                elif reason in (ExitReason.MOMENTUM_STOP_LOSS, ExitReason.MOMENTUM_NEAR_EXPIRY):
+                    # Delta-based stop fired but NO CLOB book is also drained.
+                    # Attempt a market order targeted at entry_price — place_market
+                    # will cross whatever resting bids exist; worst case retries 3×.
+                    # Do NOT defer: a drained book near expiry means we may never
+                    # get another tick with NO book data before RESOLVED.
+                    log.warning(
+                        "Monitor: NO book empty on delta stop-loss — attempting market exit at entry_price",
+                        market_id=pos.market_id, reason=reason,
+                    )
+                    taker_exit_price = pos.entry_price
                 else:
-                    # NO book unavailable — defer to the next monitor tick rather
-                    # than deriving a price from the YES book.
+                    # Price-based exits (take-profit) require a meaningful NO price.
+                    # Defer to next tick — NO book will likely repopulate.
                     log.warning(
                         "Monitor: NO book unavailable for pre-expiry exit — deferring to next tick",
                         market_id=pos.market_id, reason=reason,
@@ -925,6 +950,12 @@ class PositionMonitor:
         _resolved_outcome = ""
         if reason == ExitReason.RESOLVED:
             _resolved_outcome = "WIN" if exit_price >= 0.5 else "LOSS"
+        # Capture the underlying spot price at exit time (Pyth oracle).
+        _exit_spot = (
+            self._pyth.get_mid(pos.underlying)
+            if self._pyth is not None and pos.underlying
+            else 0.0
+        ) or 0.0
         closed = self._risk.close_position(
             market_id=pos.market_id,
             side=pos.side,
@@ -932,6 +963,7 @@ class PositionMonitor:
             fees_paid=exit_fees,
             rebates_earned=total_rebates,
             resolved_outcome=_resolved_outcome,
+            exit_spot_price=_exit_spot,
         )
 
         # Release the exit guard so the slot can be reused if the same market

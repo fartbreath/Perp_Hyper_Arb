@@ -259,6 +259,9 @@ _MUTABLE_CONFIG = {
     "momentum_min_delta_pct":         ("MOMENTUM_MIN_DELTA_PCT",           float),
     "momentum_scan_interval":         ("MOMENTUM_SCAN_INTERVAL",           int),
     "momentum_max_concurrent":        ("MOMENTUM_MAX_CONCURRENT",          int),
+    "momentum_min_gap_pct":           ("MOMENTUM_MIN_GAP_PCT",             float),
+    "momentum_near_expiry_time_stop_secs": ("MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS", int),
+    "monitor_interval":               ("MONITOR_INTERVAL",                 int),
 }
 
 
@@ -395,6 +398,9 @@ class ConfigPatch(BaseModel):
     momentum_vol_z_score_daily: float | None = None
     momentum_scan_interval: int | None = None
     momentum_max_concurrent: int | None = None
+    momentum_min_gap_pct: float | None = None
+    momentum_near_expiry_time_stop_secs: int | None = None
+    monitor_interval: int | None = None
 
 
 @app.get("/config")
@@ -533,6 +539,9 @@ def get_config() -> dict:
         "momentum_vol_z_score_daily":      config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_daily",  config.MOMENTUM_VOL_Z_SCORE),
         "momentum_scan_interval":         config.MOMENTUM_SCAN_INTERVAL,
         "momentum_max_concurrent":        config.MOMENTUM_MAX_CONCURRENT,
+        "momentum_min_gap_pct":           config.MOMENTUM_MIN_GAP_PCT,
+        "momentum_near_expiry_time_stop_secs": config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS,
+        "monitor_interval":               config.MONITOR_INTERVAL,
         "timestamp":            time.time(),
     }
 

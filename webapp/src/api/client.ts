@@ -101,7 +101,8 @@ export interface Trade {
   rebates_earned: string;
   hl_hedge_size: string;
   hl_entry_price: string;
-  spot_price: string;   // close price for HL hedges; spot at entry for PM
+  spot_price: string;       // underlying spot (BTC/ETH/…) at entry
+  exit_spot_price?: string; // underlying spot at exit (0 if resolved or not yet recorded)
   pnl: string;
   timestamp: string;
   signal_score?: string;  // 0–100 signal quality score at fill time
@@ -430,6 +431,10 @@ export interface ConfigData {
   momentum_vol_z_score_daily?: number;
   momentum_scan_interval?: number;
   momentum_max_concurrent?: number;
+  momentum_min_gap_pct?: number;
+  momentum_near_expiry_time_stop_secs?: number;
+  momentum_min_delta_pct?: number;
+  monitor_interval?: number;
 }
 
 export interface InventoryData {

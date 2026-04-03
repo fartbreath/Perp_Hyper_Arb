@@ -1584,6 +1584,28 @@ export default function Settings() {
               unit=""
               onSubmit={(v) => apply({ momentum_take_profit: v })}
             />
+
+            {GAP}
+
+            <FloatInput
+              label="Min Gap Above Threshold (%)"
+              description="Spot must exceed the vol-scaled entry threshold by at least this extra margin before a signal is taken. Blocks marginal entries where a single adverse tick can flip the position to a loser before expiry. 0 = disabled."
+              value={data.momentum_min_gap_pct ?? 0}
+              step={0.01}
+              unit="%"
+              onSubmit={(v) => apply({ momentum_min_gap_pct: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="Near-Expiry Stop Window (s)"
+              description="When fewer than this many seconds remain AND spot has already crossed the strike against the position (delta < 0), exit via taker immediately. Prevents a snap to zero at resolution. Only fires on losing positions — winning positions are unaffected."
+              value={data.momentum_near_expiry_time_stop_secs ?? 90}
+              step={10}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_near_expiry_time_stop_secs: v })}
+            />
           </div>
 
           <div className="card">
@@ -1717,6 +1739,26 @@ export default function Settings() {
           </>
         )}
       </StrategySection>
+
+      {/* ── Position Monitor ─────────────────────────────────── */}
+      <div className="card" style={{ margin: "1.5rem 0" }}>
+        <h3>Position Monitor</h3>
+        <p className="settings-desc">
+          Fallback poll interval for <strong>maker and mispricing</strong> positions only.
+          Momentum exits are event-driven (HL BBO + PM book ticks) and are not affected by this setting.
+        </p>
+
+        {GAP}
+
+        <NumberInput
+          label="Poll Interval"
+          description="How often the background monitor checks open maker and mispricing positions for exit conditions. Lower = faster exit response for those strategies. Has no effect on momentum positions."
+          value={data.monitor_interval ?? 30}
+          step={5}
+          unit="s"
+          onSubmit={(v) => apply({ monitor_interval: v })}
+        />
+      </div>
     </div>
   );
 }

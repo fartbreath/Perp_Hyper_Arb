@@ -103,7 +103,10 @@ def _make_scanner(tmp_path=None) -> MomentumScanner:
     vol.get_sigma_ann = AsyncMock(return_value=(0.80, "hl_realized"))
     vol.start_prefetch = MagicMock()
 
-    scanner = MomentumScanner(pm=pm, hl=hl, risk=risk, vol_fetcher=vol)
+    pyth = MagicMock()
+    pyth.get_mid = MagicMock(side_effect=lambda c: 99_900.0)
+
+    scanner = MomentumScanner(pm=pm, hl=hl, risk=risk, vol_fetcher=vol, pyth=pyth)
     if tmp_path is not None:
         scanner._cooldown_path = str(tmp_path / "cooldowns.json")
         scanner._open_spot_path = str(tmp_path / "open_spots.json")

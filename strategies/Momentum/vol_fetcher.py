@@ -28,7 +28,7 @@ from typing import Optional
 import config
 from logger import get_bot_logger
 from market_data.deribit import DeribitFetcher
-from market_data.hl_client import HLClient, BBO
+from market_data.pyth_client import PythClient
 
 log = get_bot_logger(__name__)
 
@@ -46,8 +46,10 @@ class VolFetcher:
     """
     Provides annualized volatility estimates for momentum threshold computation.
 
-    Must call `register(hl_client)` before the first `get_sigma_ann()` call so
-    that the rolling realized-vol buffer is populated by live BBO callbacks.
+    Must call `register(pyth_client)` before the first `get_sigma_ann()` call so
+    that the rolling realized-vol buffer is populated by live Pyth oracle ticks.
+    Rolling vol uses Pyth prices (same oracle Polymarket resolves against) rather
+    than HL perp to avoid funding-rate basis distorting the vol estimate.
     """
 
     def __init__(self) -> None:
@@ -63,13 +65,13 @@ class VolFetcher:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def register(self, hl: HLClient) -> None:
+    def register(self, pyth: PythClient) -> None:
         """
-        Register the BBO callback so `_mid_history` stays populated.
+        Register the Pyth price callback so `_mid_history` stays populated.
         Call once during bot startup, before the first scan.
         """
-        hl.on_bbo_update(self._on_bbo)
-        log.info("VolFetcher registered with HLClient BBO feed")
+        pyth.on_price_update(self._on_pyth)
+        log.info("VolFetcher registered with Pyth oracle feed")
 
     def start_prefetch(self, underlyings: list[str]) -> "asyncio.Task[None]":
         """Start a background task that keeps the vol cache warm for all
@@ -130,17 +132,17 @@ class VolFetcher:
                 )
                 return iv, "deribit_atm"
 
-        # Fallback: HL rolling realized vol
+        # Fallback: Pyth rolling realized vol
         rv = self._compute_rolling_vol(underlying)
         if rv is not None:
             # Shorter TTL for realized vol — less stable than options IV
-            self._cache[underlying] = (rv, now + 60.0, "hl_realized")
+            self._cache[underlying] = (rv, now + 60.0, "pyth_realized")
             log.debug(
-                "VolFetcher: HL rolling vol",
+                "VolFetcher: Pyth rolling vol",
                 underlying=underlying,
                 sigma_ann=round(rv, 4),
             )
-            return rv, "hl_realized"
+            return rv, "pyth_realized"
 
         log.debug(
             "VolFetcher: no vol available",
@@ -149,17 +151,16 @@ class VolFetcher:
         )
         return None
 
-    # ── BBO callback ─────────────────────────────────────────────────────────
+    # ── Pyth price callback ───────────────────────────────────────────────────
 
-    async def _on_bbo(self, coin: str, bbo: BBO) -> None:
-        """Append (timestamp, mid) to the rolling buffer for `coin`."""
-        if bbo.mid is None:
-            return
+    async def _on_pyth(self, coin: str, price: float) -> None:
+        """Append (timestamp, price) to the rolling buffer for `coin`."""
+        now_ts = time.time()
         buf = self._mid_history[coin]
-        buf.append((bbo.timestamp, bbo.mid))
+        buf.append((now_ts, price))
 
         # Prune entries older than _MAX_AGE_SECS
-        cutoff = bbo.timestamp - _MAX_AGE_SECS
+        cutoff = now_ts - _MAX_AGE_SECS
         while buf and buf[0][0] < cutoff:
             buf.popleft()
 
@@ -180,7 +181,7 @@ class VolFetcher:
             spot = history[-1][1]
         else:
             log.debug(
-                "VolFetcher: no HL history for Deribit lookup",
+                "VolFetcher: no Pyth price history for Deribit lookup",
                 underlying=underlying,
             )
             return None

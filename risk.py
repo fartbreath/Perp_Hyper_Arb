@@ -34,7 +34,8 @@ TRADES_HEADER = [
     "implied_prob",     # Deribit N(d2) value
     "deribit_iv",       # annualised IV used in model
     "tte_years",        # time-to-expiry at entry (years)
-    "spot_price",       # underlying spot price at entry
+    "spot_price",       # underlying spot price at entry (Pyth oracle)
+    "exit_spot_price",  # underlying spot price at exit (Pyth oracle; 0.0 if unrecorded)
     "strike",           # parsed target price from market title
     "kalshi_price",     # matched Kalshi YES price at signal time (0.0 = no match)
     "signal_source",    # "kalshi_confirmed" | "kalshi_only" | "nd2_only"
@@ -502,6 +503,7 @@ class RiskEngine:
         fees_paid: float = 0.0,
         rebates_earned: float = 0.0,
         resolved_outcome: str = "",
+        exit_spot_price: float = 0.0,   # underlying spot (BTC/ETH/…) at exit time
     ) -> Optional[Position]:
         _csv_row: Optional[dict] = None
         _closed_pos: Optional[Position] = None
@@ -560,6 +562,7 @@ class RiskEngine:
                 "deribit_iv": pos.deribit_iv,
                 "tte_years": round(pos.tte_years, 6),
                 "spot_price": pos.spot_price,
+                "exit_spot_price": exit_spot_price,
                 "strike": pos.strike,
                 "kalshi_price": pos.kalshi_price,
                 "signal_source": pos.signal_source,

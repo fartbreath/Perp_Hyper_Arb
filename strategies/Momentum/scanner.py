@@ -30,7 +30,8 @@ from typing import Any, Optional
 import config
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket, _MARKET_TYPE_DURATION_SECS
-from market_data.hl_client import HLClient, BBO
+from market_data.hl_client import HLClient
+from market_data.pyth_client import PythClient, SpotPrice
 from risk import RiskEngine, Position
 from strategies.base import BaseStrategy
 from strategies.Momentum.signal import MomentumSignal
@@ -101,10 +102,12 @@ class MomentumScanner(BaseStrategy):
         hl: HLClient,
         risk: RiskEngine,
         vol_fetcher: VolFetcher,
+        pyth: PythClient,
         on_signal: Any = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
+        self._pyth = pyth
         self._risk = risk
         self._vol = vol_fetcher
         self._running = False
@@ -121,7 +124,7 @@ class MomentumScanner(BaseStrategy):
         # key: condition_id  value: unix timestamp at which the block lifts
         self._stop_loss_blocked: dict[str, float] = {}
         # Open-spot cache for "Up or Down" directional markets.
-        # key: condition_id  value: HL spot price at the moment the window opened.
+        # key: condition_id  value: Pyth oracle spot price at the moment the window opened.
         # Persisted to disk so restarts don't lose recorded opens mid-window.
         self._open_spot_path = os.path.join(
             os.path.dirname(__file__), "..", "..", "data", "market_open_spots.json"
@@ -142,6 +145,8 @@ class MomentumScanner(BaseStrategy):
         # refresh.  Used by _on_price_update_entry for O(1) market lookup per WS tick.
         self._token_to_market: dict[str, PMMarket] = {}
         self._vol_prefetch_task: Optional[asyncio.Task] = None
+        # Throttle: last unix timestamp we emitted a log.info for started markets.
+        self._last_live_log_ts: float = 0.0
 
     # ── BaseStrategy interface ────────────────────────────────────────────────
 
@@ -162,9 +167,9 @@ class MomentumScanner(BaseStrategy):
         # Event-driven entry: wake the scan loop immediately when a YES/NO token
         # price enters the signal band rather than waiting up to SCAN_INTERVAL.
         self._pm.on_price_change(self._on_price_update_entry)
-        # Also wake on HL spot ticks — underlying price moves are just as
+        # Also wake on Pyth price ticks — oracle spot moves are just as
         # likely to create or dissolve a signal as PM CLOB ticks.
-        self._hl.on_bbo_update(self._on_hl_spot_update_entry)
+        self._pyth.on_price_update(self._on_pyth_spot_update_entry)
         asyncio.create_task(self._scan_loop())
 
     async def stop(self) -> None:
@@ -262,10 +267,14 @@ class MomentumScanner(BaseStrategy):
 
     # ── Scan loop ─────────────────────────────────────────────────────────────
 
-    _SUBSCRIPTION_REFRESH_INTERVAL = 300  # seconds between _refresh_subscriptions calls
+    _SUBSCRIPTION_REFRESH_INTERVAL = 60   # seconds between _refresh_subscriptions calls (short: 5m buckets need fast pickup)
 
     async def _scan_loop(self) -> None:
-        _last_sub_refresh = time.time() - (self._SUBSCRIPTION_REFRESH_INTERVAL - 90)
+        # start() already called _refresh_subscriptions() — wait the full interval
+        # before the next one.  The old formula (time.time() - (INTERVAL - 90))
+        # was written for INTERVAL=300; with INTERVAL=60 it produces a negative
+        # subtraction and pushes _last_sub_refresh 30 s into the future.
+        _last_sub_refresh = time.time()
         while self._running:
             if not config.STRATEGY_MOMENTUM_ENABLED or not config.BOT_ACTIVE:
                 self._scan_event.clear()
@@ -510,15 +519,15 @@ class MomentumScanner(BaseStrategy):
                 scan_diags.append(_d)
                 continue
 
-            # ── HL spot ──────────────────────────────────────────────────────
-            bbo = self._hl.get_bbo(market.underlying)
-            if bbo is None or bbo.mid is None:
+            # ── Pyth oracle spot ──────────────────────────────────────────────
+            snap = self._pyth.get_spot(market.underlying)
+            if snap is None or snap.mid is None:
                 skipped_stale_spot += 1
                 _d["skip_reason"] = "no_spot"
                 scan_diags.append(_d)
                 continue
 
-            _spot_age = round(now_ts - bbo.timestamp, 1)
+            _spot_age = round(now_ts - snap.timestamp, 1)
             _d["spot_age_s"] = _spot_age
 
             # ── Stale spot guard ─────────────────────────────────────────────
@@ -528,7 +537,7 @@ class MomentumScanner(BaseStrategy):
                 scan_diags.append(_d)
                 continue
 
-            spot = bbo.mid
+            spot = snap.mid
             _d["spot"] = round(spot, 4)
 
             # ── Parse strike from market title ───────────────────────────────
@@ -566,16 +575,6 @@ class MomentumScanner(BaseStrategy):
             _d["tte_seconds"] = round(tte_seconds)
             _min_tte = _min_tte_by_type.get(market.market_type, _min_tte_default)
             _d["min_tte_s"] = _min_tte
-
-            # ── TTE floor: reject entries where the market will resolve before
-            # the minimum-hold guard even expires, making any stop-loss impossible.
-            # Floor = MOMENTUM_MIN_HOLD_SECONDS + a 10-second execution buffer.
-            _tte_floor = config.MOMENTUM_MIN_HOLD_SECONDS + 10
-            if tte_seconds <= _tte_floor:
-                skipped_tte += 1
-                _d["skip_reason"] = "tte_floor"
-                scan_diags.append(_d)
-                continue
 
             # Entry window ceiling: flag markets with too much time left.
             # We do NOT continue here — vol/delta are computed regardless so that
@@ -806,6 +805,27 @@ class MomentumScanner(BaseStrategy):
             "skipped_cap":             skipped_cap,
         }
         self._last_scan_ts = now_ts
+
+        # ── Scanner log: started markets (throttled to once per minute) ──────
+        # "Started" = passed the horizon + not_started gates (i.e. market is
+        # currently live).  Emit at INFO so entries appear in the webapp log
+        # ring-buffer (debug is suppressed for the scanner module).
+        _started_diags = [
+            d for d in scan_diags
+            if d.get("skip_reason") not in ("beyond_horizon", "not_started")
+        ]
+        if _started_diags and now_ts - self._last_live_log_ts >= 60:
+            self._last_live_log_ts = now_ts
+            from collections import Counter as _Counter
+            _status_counts = dict(_Counter(
+                d.get("skip_reason", "?") for d in _started_diags
+            ))
+            log.info(
+                "Momentum: live markets",
+                started=len(_started_diags),
+                **_status_counts,
+            )
+
         # ── PM feed health ────────────────────────────────────────────────────
         # If >50% of subscribed (non-horizon-filtered) markets have a stale PM
         # book, it is more likely a WS shard outage than normal market activity.
@@ -859,12 +879,15 @@ class MomentumScanner(BaseStrategy):
         # Signal the scan loop to wake up and run a full evaluation now.
         self._scan_event.set()
 
-    async def _on_hl_spot_update_entry(self, coin: str, bbo: BBO) -> None:
-        """Wake the scan loop when the HL spot price for `coin` changes.
+    async def _on_pyth_spot_update_entry(self, coin: str, price: float) -> None:
+        """Wake the scan loop when the Pyth oracle price for `coin` changes.
 
-        Mirrors _on_price_update_entry but fires on HL BBO changes rather
-        than PM CLOB ticks.  A spot move through the strike changes the
-        delta signal even if no PM order-book update has arrived yet.
+        Mirrors _on_price_update_entry but fires on Pyth price ticks rather
+        than PM CLOB ticks.  A spot move through the strike changes the delta
+        signal even if no PM order-book update has arrived yet.
+
+        Uses the Pyth oracle price — the same source Polymarket resolves on —
+        so that signal detection and stop-loss are consistent with settlement.
         """
         if not config.STRATEGY_MOMENTUM_ENABLED or not config.BOT_ACTIVE:
             return

@@ -43,6 +43,22 @@ HL_BASE_URL: str = "https://api.hyperliquid.xyz"
 
 HL_PERP_COINS: list[str] = ["BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP", "LINK"]
 HL_DEFAULT_SLIPPAGE: float = 0.003   # 0.3% max slippage for hedge market orders
+
+# ── Pyth Oracle — spot price feed (used for momentum delta SL / entry delta) ─
+# Polymarket "Up or Down" bucket markets resolve against the Pyth spot price at
+# their end_date (directly or via Chainlink/Binance feeds which track the same
+# underlying).  Using Pyth instead of HL perp eliminates funding-rate basis and
+# ensures the bot's stop-loss triggers on the same price that Polymarket settles.
+# Feed IDs from https://pyth.network/developers/price-feed-ids (no "0x" prefix).
+PYTH_PRICE_FEED_IDS: dict[str, str] = {
+    "BTC":  "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+    "ETH":  "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+    "SOL":  "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+    "XRP":  "ec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8",
+    "BNB":  "2f95862b045670cd22bee3114c39763a4a08beeb663b145d283c31d7d1101c4f",
+    "DOGE": "dcef50dd0a4cd2dcc17e45df1676dcb336a11a61c69df7a0299b0150c672d25c",
+    "HYPE": "4279e31cc369bbcc2faf022b382b080e32a8e689ff20fbc530d2a603eb6cd98b",
+}
 HL_DEAD_MAN_INTERVAL: int = 300      # seconds — refresh dead man's switch every 5 min
 HL_FUNDING_POLL_INTERVAL: int = 300  # seconds
 
@@ -285,18 +301,12 @@ MOMENTUM_ORDER_TYPE: str = "limit"
 # Delta-based stop-loss: exit when live HL spot has moved this % past the
 # strike against the position (e.g. 0.05 → exit when spot is 0.05% below
 # strike for YES, or 0.05% above strike for NO).
-MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.05  # % beyond strike before stop fires
+MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.01  # % beyond strike before stop fires
 MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
 
 # Near-expiry time-stop: when TTE is very short and spot has already crossed
 # the strike (delta < 0), exit via taker to avoid a binary snap to zero.
 MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS: int = 90        # TTE threshold (seconds)
-
-# Minimum seconds to hold a momentum position before allowing any stop-loss/TP exit.
-# Kept short (momentum positions are near expiry; 60s is designed for mispricing).
-# Also used to derive the TTE entry floor:  entries with TTE < MOMENTUM_MIN_HOLD_SECONDS
-# are blocked because the stop-loss guard would expire AFTER the market resolves.
-MOMENTUM_MIN_HOLD_SECONDS: int = 10
 
 # Entry window per bucket market type — only enter when TTE ≤ this value.
 # Markets with MORE time remaining than this are outside the entry window and
@@ -515,7 +525,8 @@ STOP_LOSS_USD: float = 25.0
 # Time stop: close positions this many days before market resolution (mispricing only)
 EXIT_DAYS_BEFORE_RESOLUTION: int = 3
 # Minimum hold time before any exit is considered (prevents flip on noise).
-# Applies to maker and mispricing positions.  Momentum uses MOMENTUM_MIN_HOLD_SECONDS.
+# Applies to maker and mispricing positions only.  Momentum is event-driven — exits
+# fire immediately on WS ticks; no hold floor is applied.
 MIN_HOLD_SECONDS: int = 60
 
 # ── Runtime overrides (persisted across restarts) ───────────────────────────

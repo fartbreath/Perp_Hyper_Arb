@@ -50,6 +50,7 @@ import api_server
 from api_server import state as api_state
 from market_data.pm_client import PMClient
 from market_data.hl_client import HLClient
+from market_data.pyth_client import PythClient
 from risk import RiskEngine, Position
 from strategies.maker.strategy import MakerStrategy
 from strategies.mispricing.strategy import MispricingScanner
@@ -264,6 +265,7 @@ async def state_sync_loop(
     maker: MakerStrategy,
     agent: AgentDecisionLayer,
     risk: RiskEngine,
+    pyth: "PythClient",
 ) -> None:
     """
     Periodically push live bot state into api_state so the webapp
@@ -482,8 +484,8 @@ async def state_sync_loop(
                     "yes_book_bid": book_yes.best_bid if book_yes else None,
                     "yes_book_ask": book_yes.best_ask if book_yes else None,
                     "yes_book_ts":  book_yes.timestamp  if book_yes else None,
-                    # HL mid price — last-resort fallback when no PM book exists
-                    "hl_mid": hl.get_mid(mkt.underlying),
+                    # Pyth oracle spot — authoritative resolution price (same source as Polymarket)
+                    "spot_mid": pyth.get_mid(mkt.underlying),
                 }
             api_state.markets = markets_raw
 
@@ -607,12 +609,13 @@ async def main() -> None:
     risk_engine = RiskEngine()
     pm = PMClient()
     hl = HLClient()
-    maker = MakerStrategy(pm, hl, risk_engine)
-    scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL)
+    pyth = PythClient()
+    maker = MakerStrategy(pm, hl, risk_engine, pyth=pyth)
+    scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL, pyth=pyth)
     agent = AgentDecisionLayer(risk_engine)
     # Strategy 3 — Momentum scanner (direct execution, no agent loop)
     vol_fetcher = VolFetcher()
-    vol_fetcher.register(hl)   # registers BBO callback for rolling realized-vol buffer
+    vol_fetcher.register(pyth)   # registers Pyth price callback for rolling realized-vol buffer
 
     def _on_momentum_signal(sig_dict: dict) -> None:
         api_state.momentum_signals.append(sig_dict)
@@ -620,7 +623,7 @@ async def main() -> None:
         if len(api_state.momentum_signals) > 200:
             api_state.momentum_signals = api_state.momentum_signals[-200:]
 
-    momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, on_signal=_on_momentum_signal)
+    momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, pyth=pyth, on_signal=_on_momentum_signal)
 
     def _on_position_close(market_id: str) -> None:
         """Notify both strategy scanners when any position closes.
@@ -646,7 +649,7 @@ async def main() -> None:
 
     monitor = PositionMonitor(
         pm, risk_engine,
-        hl_client=hl,
+        pyth_client=pyth,
         on_close_callback=_on_position_close,
         on_stop_loss_callback=_on_momentum_stop_loss,
     )
@@ -666,6 +669,9 @@ async def main() -> None:
     log.info("Connecting HL client…")
     await hl.start()
 
+    log.info("Connecting Pyth oracle client…")
+    await pyth.start()
+
     # In live mode: cancel any stale open orders and restore existing positions
     # before the maker strategy begins quoting.  No-op in paper mode.
     if not config.PAPER_TRADING:
@@ -683,7 +689,7 @@ async def main() -> None:
         ),
         asyncio.create_task(monitor.start(), name="monitor"),
         asyncio.create_task(
-            state_sync_loop(pm, hl, maker, agent, risk_engine),
+            state_sync_loop(pm, hl, maker, agent, risk_engine, pyth),
             name="state_sync",
         ),
         asyncio.create_task(

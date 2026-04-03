@@ -71,7 +71,7 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_PRICE_BAND_LOW` | `0.80` | Lower bound of the signal price band |
 | `MOMENTUM_PRICE_BAND_HIGH` | `0.90` | Upper bound of the signal price band |
 | `MOMENTUM_SCAN_INTERVAL` | `10` | Seconds between full scan passes (also max wake latency; event-driven entry can wake sooner) |
-| `MOMENTUM_SPOT_MAX_AGE_SECS` | `30` | Discard if HL BBO is older than this (stale spot guard) |
+| `MOMENTUM_SPOT_MAX_AGE_SECS` | `30` | Discard if Pyth price update is older than this (stale spot guard) |
 | `MOMENTUM_BOOK_MAX_AGE_SECS` | `60` | Discard if PM order book is older than this (stale book guard) |
 | `MOMENTUM_VOL_CACHE_TTL` | `300` | Seconds to cache Deribit ATM IV before re-fetching |
 | `MOMENTUM_VOL_Z_SCORE` | `1.6449` | Global z-score for the probability threshold (1.6449 ≈ 95th percentile) |
@@ -115,7 +115,7 @@ via `config_overrides.json` without restarting the bot.
 | Priority | Source | Coins | TTL |
 |----------|--------|-------|-----|
 | 1 | **Deribit ATM IV** (nearest ~7-day call option, ATM strike ± spot) | BTC, ETH, SOL, XRP | `MOMENTUM_VOL_CACHE_TTL` (5 min) |
-| 2 | **HL rolling realized vol** (log-return std from last 24h of HL BBO feed, min 10 samples) | Any coin in `HL_PERP_COINS` | 60 s |
+| 2 | **Pyth rolling realized vol** (log-return std from last 24h of Pyth price feed, min 10 samples) | Any coin in `PYTH_PRICE_FEED_IDS` | 60 s |
 | 3 | **Skip signal** | Coins with no data | — |
 
 **Why Deribit ATM IV as primary?**
@@ -125,12 +125,12 @@ nearest weekly option already reflects the regime (low vol = small threshold, hi
 threshold). This automatically widens the entry gate during volatile conditions and tightens it 
 in quiet markets — exactly the adaptive behavior we need.
 
-**Why HL rolling vol as fallback?**
+**Why Pyth rolling vol as fallback?**
 
-For assets without Deribit options (HYPE, DOGE), the HL BBO feed provides tick-level price 
-history. Rolling 24h log-return standard deviation scaled to the relevant time horizon gives a 
-reasonable realized-vol estimate. The `VolFetcher` maintains a circular buffer (max 2,000 
-samples) per coin and recomputes on demand.
+For assets without Deribit options (HYPE, DOGE, HYPE), the Pyth oracle (~400 ms ticks) provides
+tick-level price history free from HL funding-rate basis. Rolling 24h log-return standard deviation
+scaled to the relevant time horizon gives a reasonable realized-vol estimate. The `VolFetcher`
+maintains a circular buffer (max 2,000 samples) per coin from the Pyth feed and recomputes on demand.
 
 ### Threshold Computation
 
@@ -224,9 +224,9 @@ Eight independent checks must all pass before a signal is acted upon.
 | **Cooldown** | `now - last_touch < MOMENTUM_MARKET_COOLDOWN_SECONDS` | 300 s | Suppress re-entry after any recent open/close/failed attempt |
 | **Stale PM book** | `time.time() - book.timestamp > MOMENTUM_BOOK_MAX_AGE_SECS` | 60 s | Book may not reflect current market state |
 | **Empty book** | `not book.bids and not book.asks` | — | No levels at all — MMs have withdrawn; no meaningful price |
-| **Stale HL spot** | `time.time() - bbo.timestamp > MOMENTUM_SPOT_MAX_AGE_SECS` | 30 s | Delta computation relies on fresh spot |
+| **Stale Pyth price** | `time.time() - pyth_price.timestamp > MOMENTUM_SPOT_MAX_AGE_SECS` | 30 s | Delta computation relies on fresh spot |
 | **Stale vol** | `MOMENTUM_VOL_CACHE_TTL` exceeded and no fresh Deribit response | 300 s | Threshold computation unreliable with old IV |
-| **Missing spot** | `bbo is None or bbo.mid is None` | — | No spot = no delta computation |
+| **Missing spot** | `pyth_price is None or pyth_price.mid is None` | — | No spot = no delta computation |
 | **Missing book** | `book is None or book.best_ask is None` | — | No ask = cannot determine token price or depth |
 | **Price re-check at execution** | Re-fetch book right before placing order; skip if price moved out of band | band + 2c | Market may reprice between signal detection and execution |
 
@@ -275,10 +275,10 @@ For each open bucket market M:
         continue  # no side in band
 
     # ── Stale spot gate ───────────────────────────────────────────────────
-    bbo = hl.get_bbo(M.underlying)
-    if bbo is None or bbo.mid is None: continue
-    if now_ts - bbo.timestamp > MOMENTUM_SPOT_MAX_AGE_SECS: continue
-    spot = bbo.mid
+    pyth_price = pyth.get_mid(M.underlying)  # Pyth oracle spot
+    if pyth_price is None: continue
+    if now_ts - pyth_price.timestamp > MOMENTUM_SPOT_MAX_AGE_SECS: continue
+    spot = pyth_price.mid
 
     # ── Parse strike from market title ────────────────────────────────────
     # Standard price-level markets: extract "$68,300", "$68k", etc.
@@ -397,7 +397,7 @@ Four exit conditions evaluated in priority order. **Delta SL is checked first an
 
 | Priority | Condition | Config Key | Default | Action | Rationale |
 |----------|-----------|-----------|---------|--------|-----------|
-| 1 | Spot crosses strike against position by > stop-loss % | `MOMENTUM_DELTA_STOP_LOSS_PCT` | `0.05` | Taker-sell held token | Underlying moved against us — genuine adverse signal. Fires even if token CLOB book is drained/empty. |
+| 1 | Spot crosses strike against position by > stop-loss % | `MOMENTUM_DELTA_STOP_LOSS_PCT` | `0.05` | Taker-sell held token | Underlying moved against us — genuine adverse signal. Fires on Pyth oracle ticks even if token CLOB book is drained/empty. |
 | 2 | Near expiry and spot has crossed strike (delta < 0) | `MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS` | 60 s | Taker-sell held token | Avoid binary snap to zero close to resolution when already losing |
 | 3 | Token price >= take-profit | `MOMENTUM_TAKE_PROFIT` | `0.999` | Taker-sell held token | Capture near-certainty gains |
 | 4 | Expiry | — | — | Hold to resolution | If no other trigger fires, let the market resolve naturally |
@@ -435,21 +435,21 @@ Before entering, check all open positions across ALL strategies:
 
 | Scenario | Guard | Resolution |
 |----------|-------|------------|
-| Spot reverses immediately after entry | Delta SL (`MOMENTUM_DELTA_STOP_LOSS_PCT`): exit when spot moves > 0.05% past strike against position | Fires on HL spot ticks; does not require the token CLOB book to be live |
+| Spot reverses immediately after entry | Delta SL (`MOMENTUM_DELTA_STOP_LOSS_PCT`): exit when spot moves > 0.05% past strike against position | Fires on Pyth oracle ticks (~400 ms); does not require the token CLOB book to be live |
 | NO token book drains near expiry (MMs withdraw) | Delta SL evaluated before any NO-book fetch; book drain no longer silences the stop | Delta SL fires regardless of CLOB state |
 | Market already at 94c when scanner runs | Upper band check (< 0.90 strictly) | Signal filtered out |
 | Signal fires outside entry window | Per-bucket TTE gate (`MOMENTUM_MIN_TTE_SECONDS`) | Signal filtered out |
-| HL spot data is stale (> 30s old) | Stale spot guard | Signal skipped |
+| Pyth price data is stale (> 30s old) | Stale Pyth price guard | Signal skipped |
 | PM book data is stale (> 60s old) | Stale book guard | Signal skipped |
 | PM book has no levels (MMs withdrawn) | Empty book guard | Signal skipped |
-| Deribit IV fails to fetch | Fallback to HL rolling vol; if also absent, skip | Signal skipped; logs at DEBUG |
-| HL rolling vol has < 10 samples | Vol fetcher returns None | Signal skipped (threshold lowered from 20 to reduce cold-start drops) |
+| Deribit IV fails to fetch | Fallback to Pyth rolling vol; if also absent, skip | Signal skipped; logs at DEBUG |
+| Pyth rolling vol has < 10 samples | Vol fetcher returns None | Signal skipped (threshold lowered from 20 to reduce cold-start drops) |
 | Marginal signal: delta barely clears threshold | `MOMENTUM_MIN_GAP_PCT` minimum gap above threshold | Blocks signals where a single adverse tick reverses the position |
 | Thin liquidity at ask | CLOB depth gate (> 200 USDC) | Signal skipped |
 | Price moved out of band before execution | Price re-check at execution time (band + 2c tolerance) | Order not placed |
 | Same market already held by any strategy | Duplicate guard + cooldown | Skip entry |
 | Bot restarted mid-window for Up/Down market | `data/market_open_spots.json` persists open-spot cache | Correct strike restored from disk |
-| HL WS feed silently stops delivering | HL outage detection: log warning if >50% markets skipped for stale spot | Operator alerted to investigate |
+| Pyth WS feed silently stops delivering | Pyth outage detection: log warning if >50% markets skipped for stale spot | Operator alerted to investigate |
 | Deribit IV cached from high-vol period | Cache TTL 5 min; stale vol widens threshold | Conservative; may miss some trades |
 | Vol regime spikes 3x (black swan) | z-score scales threshold with vol | Naturally filters out noisy markets |
 | Low-vol coin passes z-gate with tiny gap | `MOMENTUM_MIN_DELTA_PCT` absolute floor (independent of bucket) | Blocks trades where a single tick would cross strike; see [Absolute Floor Principle](#absolute-floor-principle) |
@@ -464,7 +464,7 @@ Before entering, check all open positions across ALL strategies:
 strategies/Momentum/
 ├── __init__.py          # module init
 ├── signal.py            # MomentumSignal dataclass + edge_pct property
-├── vol_fetcher.py       # VolFetcher: Deribit ATM IV + HL rolling realized vol + prefetch task
+├── vol_fetcher.py       # VolFetcher: Deribit ATM IV + Pyth rolling realized vol + prefetch task
 └── scanner.py           # MomentumScanner: event-driven scan + direct execution + diagnostics
 ```
 
@@ -476,17 +476,17 @@ data/market_open_spots.json   # window-open spot cache for Up/Down markets (surv
 ### Data flow
 
 ```
-HLClient (BBO feed) ──→ VolFetcher._on_bbo() ──→ rolling mid buffer
-         │                                          ↓ (fallback)
+PythClient (~400 ms ticks) ──→ VolFetcher._on_pyth() ──→ rolling mid buffer
+         │                                               ↓ (fallback)
          │             DeribitFetcher ──────→ VolFetcher.get_sigma_ann()
-         │                                          ↓
+         │                                               ↓
          │             VolFetcher.start_prefetch() → background warm-up task
          │
-         ├──→ MomentumScanner._on_hl_spot_update_entry(coin, bbo)
+         ├──→ MomentumScanner._on_pyth_spot_update_entry(coin, price)
          │         ↓ (coin matches a tracked underlying? wake immediately)
          │    asyncio.Event.set()
          │
-         └──→ PositionMonitor._on_hl_spot_update(coin, bbo)
+         └──→ PositionMonitor._on_pyth_spot_update(coin, price)
                    ↓ (for each open momentum position with matching underlying)
                    should_exit() — delta SL runs first (no CLOB book required)
 
@@ -509,7 +509,7 @@ PMClient (books) ─────────────→ MomentumScanner._sca
                                  risk.open_position()
                                         ↓
                           PositionMonitor (poll fallback every 5s; event-driven
-                          on PM WS ticks + HL BBO ticks)
+                          on PM WS ticks + Pyth oracle ticks)
                                         ↓
                           should_exit() — delta SL / near-expiry / take-profit
 
@@ -520,9 +520,9 @@ MomentumScanner._on_signal cb ────→ GET /momentum/signals
 ### Key design decisions
 
 1. **No agent loop** — momentum is time-critical; scanner executes directly without Ollama evaluation.
-2. **Fully event-driven entry** — both PM CLOB ticks (`_on_price_update_entry`) and HL BBO ticks (`_on_hl_spot_update_entry`) wake the scan loop immediately. The scan loop uses `asyncio.Event.wait()` with a timeout so it fires on either signal type, whichever arrives first.
-3. **Fully event-driven exit** — both PM CLOB ticks (`_on_price_update`) and HL BBO ticks (`_on_hl_spot_update`) trigger `_check_position` for open momentum positions. The 5-second poll loop (`MONITOR_INTERVAL`) is a safety-net fallback only. This eliminates the latency gap where a spot move through the strike goes undetected while the PM book is quiet.
-4. **Delta SL before CLOB check** — `should_exit()` evaluates the delta stop-loss against HL spot vs strike **before** reading the token CLOB price. This ensures the stop fires even when the NO book is fully drained near expiry (MMs withdraw first, markets drain after).
+2. **Fully event-driven entry** — both PM CLOB ticks (`_on_price_update_entry`) and Pyth oracle ticks (`_on_pyth_spot_update_entry`) wake the scan loop immediately. The scan loop uses `asyncio.Event.wait()` with a timeout so it fires on either signal type, whichever arrives first.
+3. **Fully event-driven exit** — both PM CLOB ticks (`_on_price_update`) and Pyth oracle ticks (`_on_pyth_spot_update`) trigger `_check_position` for open momentum positions. The 5-second poll loop (`MONITOR_INTERVAL`) is a safety-net fallback only. This eliminates the latency gap where a spot move through the strike goes undetected while the PM book is quiet.
+4. **Delta SL before CLOB check** — `should_exit()` evaluates the delta stop-loss against Pyth oracle spot vs strike **before** reading the token CLOB price. This ensures the stop fires even when the NO book is fully drained near expiry (MMs withdraw first, markets drain after).
 5. **No queue** — direct execution prevents stale signals accumulating.
 6. **Re-check at execution** — price is re-validated right before order placement to guard against fast moves between detection and execution.
 5. **WS fill detection** — a one-shot `asyncio.Future` is registered before awaiting anything; the MATCHED WS event resolves it (~0 ms, zero REST calls). REST fallback fires only on timeout (5 s).
@@ -543,11 +543,11 @@ MomentumScanner._on_signal cb ────→ GET /momentum/signals
 - [x] Config keys: all `MOMENTUM_*` in `config.py` (including per-bucket TTE dict, z-score overrides, cooldown, horizon)
 - [x] `monitor.py` — `ExitReason.MOMENTUM_STOP_LOSS/TAKE_PROFIT` + side-specific stops in `should_exit()`
 - [x] `main.py` — init `MomentumScanner`, start as asyncio task
-- [x] Event-driven entry via `pm.on_price_change()` callback
+- [x] Event-driven entry via `pm.on_price_change()` callback and `pyth.on_price_update()` callback
 - [x] Per-bucket `MOMENTUM_MIN_TTE_SECONDS` dict with per-type entry windows
 - [x] Per-bucket `MOMENTUM_VOL_Z_SCORE_BY_TYPE` overrides
 - [x] "Up or Down" directional market support (implicit strike persisted to disk)
-- [x] HL outage detection (>50% stale-spot warning)
+- [x] Pyth outage detection (>50% stale-price warning)
 - [x] `/momentum/diagnostics` API endpoint backed by `_last_scan_diags`
 - [x] WS subscription refresh every 5 minutes (new bucket markets picked up automatically)
 - [ ] Unit tests for `vol_fetcher.py` (mock Deribit + HL)
@@ -628,11 +628,11 @@ skip-reason counts is included for quick scan-health inspection.
 The `gap_pct` field (`delta_pct - threshold_pct`) and `observed_z` field are particularly useful
 for calibrating `MOMENTUM_VOL_Z_SCORE` and `MOMENTUM_MIN_TTE_SECONDS` from real market data.
 
-### HL Outage Detection
+### Pyth Outage Detection
 
-If more than 50% of all bucket markets are skipped for stale spot in a single scan pass, the
-scanner logs a `WARNING: possible HL WS outage`. This distinguishes a genuine feed outage from
-isolated stale-spot misses and alerts operators to investigate quickly.
+If more than 50% of all bucket markets are skipped for stale Pyth price in a single scan pass,
+the scanner logs a `WARNING: possible Pyth WS outage`. This distinguishes a genuine feed outage
+from isolated stale-price misses and alerts operators to investigate quickly.
 
 ---
 

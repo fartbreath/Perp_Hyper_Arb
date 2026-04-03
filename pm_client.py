@@ -187,17 +187,13 @@ _UNDERLYING_TAG_SLUGS: dict[str, list[str]] = {
     "XRP":  ["ripple", "xrp"],
     "BNB":  ["bnb", "binance"],
     "DOGE": ["dogecoin"],
-    "ADA":  ["cardano"],
-    "AVAX": ["avalanche"],
-    "LINK": ["chainlink"],
-    "DOT":  ["polkadot"],
-    "SUI":  ["sui"],
-    "APT":  ["aptos"],
-    "NEAR": ["near-protocol"],
-    "ARB":  ["arbitrum"],
-    "OP":   ["optimism"],
-    "TON":  ["toncoin"],
-    "HYPE": ["hyperliquid"],
+    "HYPE": ["hyperliquid", "hype", "up-or-down"],
+    # HYPE 5m / 15m / 1h bucket markets are tagged "crypto" + "up-or-down" + "hype"
+    # but NOT "hyperliquid" on Polymarket's Gamma API.  "hyperliquid" only returns
+    # milestone/monthly events.  "hype" is the direct coin-specific tag and is the
+    # primary route to bucket events.  "up-or-down" is kept as a fallback in case
+    # Polymarket re-tags events, but "hype" avoids relying on pagination order
+    # through the high-volume up-or-down feed.
 }
 # Flat deduplicated list of all tag slugs to query
 _ALL_TAG_SLUGS: list[str] = list(dict.fromkeys(
@@ -1514,8 +1510,11 @@ class PMClient:
         """Register additional tokens for WS book subscriptions, bypassing the maker
         TTE/volume filters.  Used by non-maker strategies (e.g. momentum) to subscribe
         to a broader set of bucket markets.  Replaces the previous set on each call;
-        the next ``_update_shards`` cycle will add/remove shards as needed."""
+        triggers an immediate _update_shards pass so new tokens are subscribed within
+        one event-loop tick rather than waiting up to 60s for the market-refresh cycle."""
         self._extra_tokens = token_ids
+        if self._running:
+            asyncio.ensure_future(self._update_shards())
 
     def fee_free_markets(self) -> list[PMMarket]:
         return [m for m in self._markets.values() if m.is_fee_free]

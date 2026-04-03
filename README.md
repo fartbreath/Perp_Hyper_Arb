@@ -6,9 +6,9 @@ A semi-automated crypto trading bot that runs three complementary strategies: ma
 
 ## What It Does
 
-**Strategy 1 — Market Making:** Posts two-sided YES/NO quotes on Polymarket crypto bucket markets, earning the spread plus maker rebates. Every significant inventory build is automatically hedged via a Hyperliquid perp trade in the opposite direction, keeping the book close to market-neutral.
+**Strategy 1 — Market Making:** Posts two-sided YES/NO quotes on Polymarket crypto bucket markets, earning the spread plus maker rebates. Every significant inventory build is automatically hedged via a Hyperliquid perp trade in the opposite direction, keeping the book close to market-neutral. All pricing decisions (reprice triggers, hedge sizing, vol estimation) use **Pyth oracle** prices — Hyperliquid is used only for order execution.
 
-**Strategy 2 — Mispricing Scanner:** Scans Polymarket milestone markets against matching Kalshi markets. When both venues list the same crypto event (e.g. "Will BTC close above $90k on March 31?"), any price divergence above the fee hurdle is a candidate trade. Deribit N(d₂) can optionally be used as a second-layer confirmation signal.
+**Strategy 2 — Mispricing Scanner:** Scans Polymarket milestone markets against matching Kalshi markets. When both venues list the same crypto event (e.g. "Will BTC close above $90k on March 31?"), any price divergence above the fee hurdle is a candidate trade. Deribit N(d₂) can optionally be used as a second-layer confirmation signal. Spot price for Black-Scholes is sourced from **Pyth oracle**.
 
 **Strategy 3 — Momentum Scanner:** Runs a price-confirmation taker strategy that enters high-probability contracts when Polymarket token prices and spot movement jointly confirm momentum. It supports volatility-aware thresholds, per-market cooldowns, stop-loss / take-profit exits, and a near-expiry protective exit.
 
@@ -35,7 +35,8 @@ Perp_Hyper_Arb/
 │
 ├── market_data/
 │   ├── pm_client.py          # Polymarket CLOB REST + WS + Gamma API
-│   ├── hl_client.py          # Hyperliquid REST + WS
+│   ├── hl_client.py          # Hyperliquid REST + WS (execution only)
+│   ├── pyth_client.py        # Pyth Network oracle (authoritative spot prices)
 │   ├── kalshi_client.py      # Kalshi REST (read-only, no auth required)
 │   └── deribit.py            # Deribit implied vol / N(d₂) data
 │
@@ -56,19 +57,33 @@ Perp_Hyper_Arb/
 
 ```
 pm_client.run()           ← Polymarket WS + heartbeat
-hl_client.run()           ← Hyperliquid WS + dead-man's switch
-maker_strategy.start()    ← quoting sweep + hedge debounce
-momentum_scanner.start()  ← scan every 5-10 s + event-driven entry (PM ticks + HL BBO ticks)
-mispricing_scanner.start()← scan every 60 s
+hl_client.run()           ← Hyperliquid WS + dead-man's switch (execution only)
+pyth_client.run()         ← Pyth oracle WS (~400 ms ticks for BTC/ETH/SOL/XRP/BNB/DOGE/HYPE)
+maker_strategy.start()    ← quoting sweep + hedge debounce (reprice trigger = Pyth tick)
+momentum_scanner.start()  ← scan every 5-10 s + event-driven entry (PM ticks + Pyth ticks)
+mispricing_scanner.start()← scan every 60 s (spot price from Pyth)
 agent_loop()              ← consumes signal queue from scanner
 api_server                ← FastAPI REST for webapp
-state_sync_loop()         ← pushes bot state to API layer
+state_sync_loop()         ← pushes bot state to API layer (spot_mid from Pyth)
 ```
 
-The momentum scanner wakes immediately on **either** a PM CLOB price tick or an HL BBO tick.
-The position monitor evaluates exit conditions on **both** tick types, so a spot move through
-the stop-loss strike is detected within one WebSocket round-trip (~100-500 ms) rather than
-waiting for the next poll cycle.
+The momentum scanner wakes immediately on **either** a PM CLOB price tick or a Pyth price tick.
+The position monitor evaluates exit conditions for **all open positions** on every PM WS tick
+and for momentum positions on every Pyth tick, so a spot move through the stop-loss strike is
+detected within one WebSocket round-trip (~100–500 ms) rather than any configured poll delay.
+
+**Price oracle split:**
+
+| Component | Pyth oracle | Hyperliquid |
+|-----------|------------|-------------|
+| Reprice trigger (maker) | ✓ spot ticks | ✗ |
+| Hedge sizing (maker) | ✓ `get_mid()` | ✗ |
+| Rolling realized vol (vol_fetcher) | ✓ price feed | ✗ |
+| Black-Scholes spot S (mispricing) | ✓ `get_mid()` | ✗ |
+| Momentum delta SL / scanner entry | ✓ `get_mid()` | ✗ |
+| Exit spot recorded in trades.csv | ✓ at exit time | ✗ |
+| Hedge order placement | ✗ | ✓ |
+| `get_bbo()` for slippage measurement | ✗ | ✓ |
 
 ---
 
@@ -233,7 +248,7 @@ The React dashboard at `http://localhost:5173` gives real-time visibility into e
 | Page | What you see |
 |------|-------------|
 | **Dashboard** | Bot status, P&L summary, open positions, system health |
-| **Trades** | Full trade history with search / filter |
+| **Trades** | Full trade history with search / filter; each leg shows entry & exit spot prices (Pyth oracle) |
 | **Positions** | Open positions, momentum positions, recently closed spreads, and settlement/redemption state |
 | **Performance** | Analytics breakdowns by market type, underlying, and strategy leg |
 | **Signals** | Strategy 1/2/3 panel: maker opportunities, mispricing queue, and live momentum scan diagnostics |
@@ -258,7 +273,7 @@ pytest tests/test_maker.py -v
 pytest --cov=. --cov-report=term-missing
 ```
 
-**746 tests passed, 1 skipped (live-book snapshot), 0 failing** as of the current release.
+**223 tests passed, 1 skipped (live-book snapshot), 0 failing** as of the current release.
 
 Test files:
 - `tests/test_maker.py` — strategy quoting, repricing, inventory skew, edge filters
@@ -279,9 +294,9 @@ Test files:
 
 **Why Kalshi for mispricing confirmation?** N(d₂) from Deribit gives a terminal price probability, but Polymarket markets resolve on a barrier-hit (one-touch) condition — a structural mismatch that can be 20–40 percentage points. Kalshi lists the same events on the same terms, making PM↔Kalshi comparison a true apples-to-apples mispricing signal. Full analysis in [MISPRICING_STRATEGY.md](MISPRICING_STRATEGY.md).
 
-**Why HL BBO drives momentum exits (not a poll timer)?** Near expiry, Polymarket MMs withdraw from the NO/YES CLOB before the market resolves — the book drains to empty. A poll-based monitor with a 30s interval may only fire once during a 57-second hold, and a drained CLOB book silences token-price stops. Wiring `hl.on_bbo_update` to both the scanner and monitor means every HL spot tick evaluates the delta stop-loss independently of PM book state.
+**Why Pyth oracle drives momentum exits (not a poll timer)?** Near expiry, Polymarket MMs withdraw from the NO/YES CLOB before the market resolves — the book drains to empty. A poll-based monitor with a 30 s interval may only fire once during a 57-second hold, and a drained CLOB book silences token-price stops. Wiring `pyth.on_price_update` to both the scanner and monitor means every Pyth ~400 ms tick evaluates the delta stop-loss independently of PM book state. Pyth is used for all spot decisions (entry gate, delta SL, Black-Scholes S, hedge sizing); Hyperliquid is execution-only.
 
-**Why delta SL (not CLOB-price SL)?** The previous `MOMENTUM_STOP_LOSS_YES/NO` config stopped out positions when the *token price* dropped below a threshold. Near expiry, token prices collapse as MMs leave — a 0.85 token can momentarily show a mid of 0.50 from a single thin-book trade, triggering an unnecessary exit. Delta SL compares HL spot to the strike: if spot has genuinely moved past the strike against us by >0.05%, we exit. Spot is harder to game and doesn't depend on PM order book liquidity.
+**Why delta SL (not CLOB-price SL)?** The previous `MOMENTUM_STOP_LOSS_YES/NO` config stopped out positions when the *token price* dropped below a threshold. Near expiry, token prices collapse as MMs leave — a 0.85 token can momentarily show a mid of 0.50 from a single thin-book trade, triggering an unnecessary exit. Delta SL compares the **Pyth oracle spot** to the strike: if spot has genuinely moved past the strike against us by >0.05%, we exit. Pyth spot is harder to game, doesn't depend on PM order book liquidity, and is free from the HL funding-rate basis that would otherwise distort the comparison.
 
 **Config architecture:** `config.py` holds all defaults as module-level constants. `config_overrides.json` holds any runtime changes. At startup, overrides are applied via `setattr`. The `GET /config/effective` endpoint returns the merged live view, making the running state fully inspectable without reading files.
 
