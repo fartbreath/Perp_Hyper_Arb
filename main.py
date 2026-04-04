@@ -523,6 +523,11 @@ async def state_sync_loop(
                 "fresh_book_count":   _fresh,
                 "stale_book_count":   _stale,
                 "no_book_count":      _no_book,
+                "spot_mids":   pyth.all_mids(),
+                "spot_ages_s": {
+                    coin: round(pyth.get_spot_age(coin), 1)
+                    for coin in sorted(pyth.tracked_coins)
+                },
             }
             quotes_raw = {}
             for tid, q in active_quotes_snap.items():

@@ -76,7 +76,7 @@ detected within one WebSocket round-trip (~100–500 ms) rather than any confi
 
 | Topic | Coins | Format |
 |-------|-------|--------|
-| `crypto_prices` | BTC, ETH, SOL, XRP, BNB, DOGE | Binance pairs (`btcusdt`, …) |
+| `crypto_prices` | BTC, ETH, SOL, XRP, BNB, DOGE, LINK | RTDS usdt-pair format (`btcusdt`, …) |
 | `crypto_prices_chainlink` | HYPE | Chainlink slash-format (`hype/usd`) |
 
 **Price source split:**

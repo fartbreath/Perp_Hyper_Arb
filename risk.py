@@ -74,7 +74,7 @@ class Position:
     market_id: str
     market_type: str          # bucket_15m | bucket_1h | bucket_daily | milestone
     underlying: str           # BTC | ETH | SOL
-    side: str                 # YES | NO
+    side: str                 # YES | NO  (standard markets)  or  UP | DOWN  (Up-or-Down bucket markets)
     size: float               # USDC notional
     entry_price: float        # PM limit price
     strategy: str             # maker | mispricing
@@ -118,8 +118,8 @@ class Position:
 
     @property
     def pm_delta_notional(self) -> float:
-        """Signed notional exposure: positive = net long YES."""
-        return self.size if self.side == "YES" else -self.size
+        """Signed notional exposure: positive = net long YES/UP (first token)."""
+        return self.size if self.side in ("YES", "UP") else -self.size
 
 
 # ── Risk Engine ───────────────────────────────────────────────────────────────

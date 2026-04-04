@@ -2,8 +2,8 @@
 tests/test_rtds_live.py — Live end-to-end tests for RTDSClient.
 
 Connects to the real Polymarket RTDS WebSocket and verifies that:
-  1. The crypto_prices topic delivers prices for all 6 Binance coins
-     (BTC, ETH, SOL, XRP, BNB, DOGE).
+  1. The crypto_prices topic delivers prices for all RTDS coins
+     (BTC, ETH, SOL, XRP, BNB, DOGE, LINK).
   2. The crypto_prices_chainlink topic delivers prices for HYPE.
   3. The RTDSClient correctly merges both topics into a single price cache.
   4. SpotPrice dataclass is populated correctly (coin, price > 0, timestamp, .mid).
@@ -93,11 +93,11 @@ class TestRTDSConnectivity:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# crypto_prices topic — Binance coins
+# crypto_prices topic — RTDS coins
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestRTDSBinanceCoins:
-    """Verify all six crypto_prices coins are populated."""
+class TestRTDSCoins:
+    """Verify all crypto_prices (RTDS) topic coins are populated."""
 
     @pytest.mark.parametrize("coin", ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"])
     def test_coin_price_received(self, coin, live_rtds_prices):
@@ -250,7 +250,7 @@ class TestRTDSPublicAPI:
 
 class TestRTDSCallback:
 
-    def test_callback_fires_for_binance_and_chainlink(self):
+    def test_callback_fires_for_rtds_and_chainlink(self):
         """on_price_update callback receives coins from both RTDS topics."""
         received: dict[str, float] = {}
 
@@ -264,22 +264,22 @@ class TestRTDSCallback:
             await client.start()
 
             deadline = time.monotonic() + _TIMEOUT_S
-            # Wait until we have at least one Binance coin AND HYPE (Chainlink)
+            # Wait until we have at least one RTDS coin AND HYPE (Chainlink)
             while time.monotonic() < deadline:
                 await asyncio.sleep(0.5)
-                has_binance = any(c in received for c in ["BTC", "ETH", "SOL"])
+                has_rtds = any(c in received for c in ["BTC", "ETH", "SOL"])
                 has_hype = "HYPE" in received
-                if has_binance and has_hype:
+                if has_rtds and has_hype:
                     break
 
             await client.stop()
 
         _run(_collect())
 
-        binance_coins = {"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"}
-        received_binance = binance_coins & set(received.keys())
-        assert received_binance, (
-            "No Binance-topic coins received via callback — "
+        rtds_coins = {"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "LINK"}
+        received_rtds = rtds_coins & set(received.keys())
+        assert received_rtds, (
+            "No RTDS crypto_prices coins received via callback — "
             f"crypto_prices subscription may be broken. Received: {list(received.keys())}"
         )
         assert "HYPE" in received, (

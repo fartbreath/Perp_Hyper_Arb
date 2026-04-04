@@ -78,6 +78,8 @@ export interface DataQuality {
   fresh_book_count: number;
   stale_book_count: number;
   no_book_count: number;
+  spot_mids?: Record<string, number>;    // coin → latest price
+  spot_ages_s?: Record<string, number | null>;  // coin → seconds since last RTDS update; null if never received (inf)
 }
 
 export interface HealthData {
@@ -164,7 +166,8 @@ export interface Trade {
   exit_spot_price?: string; // underlying spot at exit (0 if resolved or not yet recorded)
   pnl: string;
   timestamp: string;
-  signal_score?: string;  // 0–100 signal quality score at fill time
+  signal_score?: string;    // 0–100 signal quality score at fill time
+  resolved_outcome?: string; // "WIN" | "LOSS" | "" — set on RESOLVED exits; empty for taker/stop
 }
 
 export interface PnlData {
@@ -286,7 +289,7 @@ export interface FillEntry {
   market_title: string;
   underlying: string;
   order_side: string;       // BUY | SELL
-  position_side: string;    // YES | NO
+  position_side: string;    // YES | NO | UP | DOWN
   fill_price: string;
   contracts_filled: string;
   fill_cost_usd: string;
@@ -343,9 +346,9 @@ export interface MomentumSignal {
   market_title: string;
   underlying: string;
   market_type: string;
-  side: string;          // "YES" | "NO"
+  side: string;          // "YES" | "NO"  or  "UP" | "DOWN" for Up-or-Down markets
   token_id: string;
-  token_price: number;   // 0-1 YES-token price for the high side
+  token_price: number;   // 0-1 token price for the high side
   p_yes: number;         // raw YES mid
   delta_pct: number;     // % spot move toward winning direction
   threshold_pct: number; // dynamic vol threshold that was crossed
@@ -720,6 +723,13 @@ export const useTrades = (limit = 100, offset = 0, strategy?: string, underlying
   if (underlying) params.set("underlying", underlying);
   return usePolling<{ trades: Trade[]; total: number }>(`/trades?${params}`, 30_000);
 };
+
+/** Resolved YES-token prices keyed by condition_id.
+ *  { [condition_id: string]: { resolved_yes_price: number } }
+ *  Populated by monitor.py from RESOLVED exits and retroactively for taker/stop exits. */
+export const useMarketOutcomes = () =>
+  usePolling<Record<string, { resolved_yes_price: number }>>("/market_outcomes", 60_000);
+
 export const usePerformance = (period: "7d" | "30d" | "all" = "all") =>
   usePolling<PerformanceData>(`/performance?period=${period}`, 30_000);
 export const useInventory = () => usePolling<InventoryData>("/maker/inventory");

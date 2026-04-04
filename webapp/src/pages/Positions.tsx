@@ -38,8 +38,8 @@ function timeUntilEnd(iso: string | null | undefined): { label: string; color: s
 }
 
 const sideBg = (side: string) => {
-  if (side === "YES" || side === "LONG") return "#166534";
-  if (side === "NO" || side === "SHORT") return "#7f1d1d";
+  if (side === "YES" || side === "LONG" || side === "UP") return "#166534";
+  if (side === "NO" || side === "SHORT" || side === "DOWN") return "#7f1d1d";
   return "#374151";
 };
 

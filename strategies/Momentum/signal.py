@@ -19,7 +19,7 @@ class MomentumSignal:
     market_type: str        # "bucket_5m", "bucket_15m", "bucket_1h", "bucket_4h"
 
     # ── Signal core ────────────────────────────────────────────────────────
-    side: str               # "YES" or "NO" — the high-probability side to buy
+    side: str               # "YES"/"NO" for standard Yes/No markets; "UP"/"DOWN" for Up-or-Down bucket markets
     token_id: str           # CLOB token_id of the token to buy
     token_price: float      # current price of the token to buy (0.80–0.90)
     p_yes: float            # YES-token price at signal time

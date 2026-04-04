@@ -429,7 +429,7 @@ export default function Signals() {
                       <tbody>
                         {sortedMarkets.map((m, i) => {
                           const { label: badgeLabel, color: badgeColor } = momentumSkipBadge(m);
-                          const sideColor = m.side === "YES" ? "#22c55e" : "#ef4444";
+                          const sideColor = (m.side === "YES" || m.side === "UP") ? "#22c55e" : "#ef4444";
                           const tteSecs = m.tte_seconds ?? 0;
                           const tteMins = Math.round(tteSecs / 60);
                           const bucketLabel = m.market_type?.replace("bucket_", "") ?? "—";

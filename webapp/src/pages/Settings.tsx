@@ -1528,9 +1528,9 @@ export default function Settings() {
 
             <NumberInput
               label="Scan Interval"
-              description="How often the momentum scanner sweeps all eligible markets."
+              description="Fallback poll timeout — the scanner is primarily event-driven and wakes on every RTDS price tick and PM book update. This is the maximum time between scans when no events arrive."
               value={data.momentum_scan_interval ?? 10}
-              step={5}
+              step={1}
               unit="s"
               onSubmit={(v) => apply({ momentum_scan_interval: v })}
             />
@@ -1567,7 +1567,7 @@ export default function Settings() {
 
             <FloatInput
               label="Delta Stop-Loss"
-              description="Exit when the underlying spot has moved this % past the strike against the position (e.g. 0.05 = exit when spot is 0.05% below strike for YES, or 0.05% above strike for NO). Uses live HL spot price, not binary CLOB."
+              description="Exit when the underlying spot has moved this % past the strike against the position (e.g. 0.05 = exit when spot is 0.05% below strike for YES, or 0.05% above strike for NO). Uses live RTDS spot price (Polymarket's oracle feed), not binary CLOB."
               value={data.momentum_delta_stop_loss_pct ?? 0.05}
               step={0.01}
               unit="%"
@@ -1709,7 +1709,7 @@ export default function Settings() {
 
             <FloatInput
               label="Max Spot Age"
-              description="Maximum age of the HL spot BBO before the scan skips the market."
+              description="Maximum age of the RTDS spot price before the scan skips the market."
               value={data.momentum_spot_max_age_secs ?? 30}
               step={5}
               unit="s"

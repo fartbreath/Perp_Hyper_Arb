@@ -347,6 +347,8 @@ TRADES_CSV = Path(__file__).parent / "data" / "trades.csv"
 FILLS_CSV = Path(__file__).parent / "data" / "fills.csv"
 # Path to order event log written by pm_client.py
 ORDERS_CSV = Path(__file__).parent / "data" / "orders.csv"
+# Path to market outcomes file written by monitor.py
+MARKET_OUTCOMES_JSON = Path(__file__).parent / "data" / "market_outcomes.json"
 # Path to persisted config overrides — survives bot restarts
 _OVERRIDES_FILE = Path(__file__).parent / "config_overrides.json"
 
@@ -1738,6 +1740,26 @@ def trades(
         "offset": offset,
         "timestamp": time.time(),
     }
+
+
+@app.get("/market_outcomes")
+def market_outcomes_endpoint() -> dict:
+    """Return resolved YES-token prices keyed by condition_id.
+
+    Written by monitor.py whenever a position closes — either at settlement
+    (RESOLVED exit) or retroactively after a taker/stop-loss exit once the
+    market's end_date passes and the Gamma API confirms resolution.
+
+    Response shape:
+        { condition_id: { resolved_yes_price: 0.0 | 1.0 } }
+    """
+    if not MARKET_OUTCOMES_JSON.exists():
+        return {}
+    try:
+        return json.loads(MARKET_OUTCOMES_JSON.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.error("Failed to read market_outcomes.json", exc=str(exc))
+        return {}
 
 
 # ── Order event log ───────────────────────────────────────────────────────────

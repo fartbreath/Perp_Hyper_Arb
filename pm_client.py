@@ -972,6 +972,11 @@ class PMClient:
 
             if mkt.end_date is not None:
                 _tte = mkt.end_date.timestamp() - _now
+                # Filter 0: market already expired — Gamma API may still return it
+                # as active=true due to settlement lag, causing a prune-then-re-add
+                # cycle every 15 s that forces constant shard reconnects.
+                if _tte <= 0:
+                    continue
                 # Filter 1: beyond quoting horizon
                 if _tte > _max_tte:
                     continue
@@ -1473,6 +1478,46 @@ class PMClient:
         except Exception as exc:
             log.error("get_live_positions failed", exc=str(exc))
             return []
+
+    async def fetch_market_resolution(self, condition_id: str) -> Optional[float]:
+        """Query the CLOB API for the resolved YES-token price.
+
+        Uses GET https://clob.polymarket.com/markets/{condition_id} which returns
+        each outcome token with a ``winner`` flag and the final settlement price.
+
+        Returns 1.0 if YES/Up won, 0.0 if NO/Down won, or None if not yet resolved.
+        Callers convert to WIN/LOSS based on position side:
+            YES / UP  wins when resolved_yes_price == 1.0
+            NO  / DOWN wins when resolved_yes_price == 0.0
+        """
+        url = f"{config.POLY_HOST}/markets/{condition_id}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not isinstance(data, dict):
+                        return None
+                    if not data.get("closed"):
+                        return None
+                    tokens = data.get("tokens") or []
+                    if not tokens:
+                        return None
+                    # tokens[0] is the YES/Up token; price is 0 or 1 after settlement.
+                    yes_price = tokens[0].get("price")
+                    if yes_price is not None:
+                        return float(yes_price)
+        except Exception as exc:
+            log.debug(
+                "fetch_market_resolution failed",
+                condition_id=condition_id[:16],
+                exc=str(exc),
+            )
+        return None
 
     # ── Accessors ──────────────────────────────────────────────────────────────
 

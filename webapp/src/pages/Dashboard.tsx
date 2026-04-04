@@ -351,6 +351,37 @@ function HealthCard() {
                   )}
                 </td>
               </tr>
+              {dq.spot_ages_s && Object.keys(dq.spot_ages_s).length > 0 && (
+                <tr>
+                  <td>Spot Oracle</td>
+                  <td>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      {Object.entries(dq.spot_ages_s).sort().map(([coin, age]) => {
+                        const price = dq.spot_mids?.[coin];
+                        const noData = age == null || (age as number) >= 1e6;
+                        const stale = !noData && (age as number) > 30;
+                        const color = noData ? "#ef4444" : stale ? "#f97316" : "#22c55e";
+                        const ageLabel = noData
+                          ? " (no data)"
+                          : stale
+                          ? ` ⚠${(age as number).toFixed(0)}s`
+                          : price
+                          ? ` $${price < 10 ? price.toFixed(4) : price.toFixed(2)}`
+                          : " ✓";
+                        return (
+                          <span
+                            key={coin}
+                            title={noData ? `${coin}: never received` : `${coin}: ${(age as number).toFixed(1)}s ago`}
+                            style={{ color, fontFamily: "monospace", fontSize: "0.85em" }}
+                          >
+                            {coin}{ageLabel}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </td>
+                </tr>
+              )}
             </>
           )}
           {/* P3-C: Hedge status */}

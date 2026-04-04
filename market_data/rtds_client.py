@@ -51,20 +51,21 @@ class SpotPrice:
 
 # ── Symbol maps ───────────────────────────────────────────────────────────────
 
-# crypto_prices topic: symbol → bot coin label.
-# Symbols use Binance's lowercase usdt-pair format as delivered by RTDS.
-_BINANCE_SYM_TO_COIN: dict[str, str] = {
+# crypto_prices topic: RTDS symbol → bot coin label.
+# Symbols are lowercase usdt-pair identifiers as delivered by the RTDS feed.
+_RTDS_SYM_TO_COIN: dict[str, str] = {
     "btcusdt":  "BTC",
     "ethusdt":  "ETH",
     "solusdt":  "SOL",
     "xrpusdt":  "XRP",
     "bnbusdt":  "BNB",
     "dogeusdt": "DOGE",
+    "linkusdt": "LINK",
 }
 
-# crypto_prices_chainlink topic: symbol → bot coin label.
+# crypto_prices_chainlink topic: Chainlink symbol → bot coin label.
 # Symbols use Chainlink's slash-format (e.g. "hype/usd").
-# Only coins not yet integrated into the ``crypto_prices`` topic belong here.
+# Coins delivered via this topic (e.g. HYPE) are not available on crypto_prices.
 _CHAINLINK_SYM_TO_COIN: dict[str, str] = {
     "hype/usd": "HYPE",
 }
@@ -116,6 +117,11 @@ class RTDSClient:
         """Return a copy of the current coin → price dict."""
         return {coin: snap.price for coin, snap in self._prices.items()}
 
+    @property
+    def tracked_coins(self) -> set[str]:
+        """Coins this client expects to receive from RTDS."""
+        return set(self._tracked_coins)
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -123,11 +129,12 @@ class RTDSClient:
         loop and heartbeat run as background asyncio tasks."""
         self._running = True
         # Track any coin that is configured AND covered by either feed.
-        all_rtds_coins = set(_BINANCE_SYM_TO_COIN.values()) | set(_CHAINLINK_SYM_TO_COIN.values())
+        all_rtds_coins = set(_RTDS_SYM_TO_COIN.values()) | set(_CHAINLINK_SYM_TO_COIN.values())
         self._tracked_coins = {
             coin for coin in config.TRACKED_UNDERLYINGS if coin in all_rtds_coins
         }
         asyncio.create_task(self._ws_loop())
+        asyncio.create_task(self._health_log_loop())
         log.info("RTDSClient started", tracked=sorted(self._tracked_coins))
 
     async def stop(self) -> None:
@@ -136,6 +143,31 @@ class RTDSClient:
             await self._ws.close()
 
     # ── WebSocket loop ────────────────────────────────────────────────────────
+
+    async def _health_log_loop(self) -> None:
+        """Every 60 s log the age of each tracked coin's spot price.
+
+        Logs INFO when all coins are fresh (age < 30 s).
+        Logs WARNING when any coin is stale, naming which coins and their ages.
+        This makes oracle outages visible in the log without needing DEBUG level.
+        """
+        STALE_THRESH = 30.0   # seconds — matches MOMENTUM_SPOT_MAX_AGE_SECS
+        await asyncio.sleep(60)   # first check after 60 s so startup noise settles
+        while self._running:
+            ages = {
+                coin: round(self.get_spot_age(coin), 1)
+                for coin in sorted(self._tracked_coins)
+            }
+            stale = {c: a for c, a in ages.items() if a > STALE_THRESH}
+            if stale:
+                log.warning(
+                    "RTDSClient: stale spot prices",
+                    stale_coins=stale,
+                    fresh_coins={c: a for c, a in ages.items() if c not in stale},
+                )
+            else:
+                log.info("RTDSClient: spot prices OK", ages_s=ages)
+            await asyncio.sleep(60)
 
     async def _ws_loop(self) -> None:
         backoff = 1.0
@@ -176,10 +208,10 @@ class RTDSClient:
     async def _subscribe(self, ws) -> None:
         """Subscribe to both RTDS topics in a single message.
 
-        crypto_prices (Binance): no filter needed — receive all symbols and
+        crypto_prices (RTDS): no filter needed — receive all symbols and
         filter client-side.  The per-symbol filter format caused 400 errors.
 
-        crypto_prices_chainlink: empty string filter delivers all symbols;
+        crypto_prices_chainlink (Chainlink): empty string filter delivers all symbols;
         per-symbol JSON filter only returns a historical backfill snapshot,
         then stops sending live ticks — so we subscribe to all and filter
         client-side for HYPE.
@@ -226,7 +258,7 @@ class RTDSClient:
 
         if topic == "crypto_prices":
             symbol: str = payload.get("symbol", "").lower()
-            coin = _BINANCE_SYM_TO_COIN.get(symbol)
+            coin = _RTDS_SYM_TO_COIN.get(symbol)
         elif topic == "crypto_prices_chainlink":
             symbol = payload.get("symbol", "").lower()
             coin = _CHAINLINK_SYM_TO_COIN.get(symbol)

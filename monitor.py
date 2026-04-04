@@ -34,7 +34,9 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Callable, Optional
 
 import config
@@ -58,6 +60,68 @@ class ExitReason:
     MOMENTUM_STOP_LOSS     = "momentum_stop_loss"    # momentum: held token fell below MOMENTUM_STOP_LOSS
     MOMENTUM_TAKE_PROFIT   = "momentum_take_profit"  # momentum: held token rose above MOMENTUM_TAKE_PROFIT
     MOMENTUM_NEAR_EXPIRY   = "momentum_near_expiry"  # momentum: near expiry and in loss territory
+
+
+# ── Market outcome persistence ─────────────────────────────────────────────────
+# market_outcomes.json:    { condition_id: { resolved_yes_price: float } }
+# pending_resolutions.json: [ { condition_id, end_date_iso, checked } ]
+
+_DATA_DIR               = Path(__file__).parent / "data"
+_MARKET_OUTCOMES_PATH   = _DATA_DIR / "market_outcomes.json"
+_PENDING_RESOLUTIONS_PATH = _DATA_DIR / "pending_resolutions.json"
+
+
+def _load_market_outcomes() -> dict:
+    """Return { condition_id: { resolved_yes_price: float } }."""
+    try:
+        if _MARKET_OUTCOMES_PATH.exists():
+            return json.loads(_MARKET_OUTCOMES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_market_outcomes(outcomes: dict) -> None:
+    _DATA_DIR.mkdir(exist_ok=True)
+    _MARKET_OUTCOMES_PATH.write_text(
+        json.dumps(outcomes, indent=2), encoding="utf-8"
+    )
+
+
+def _record_market_outcome(condition_id: str, resolved_yes_price: float) -> None:
+    """Write a resolved market price to market_outcomes.json."""
+    outcomes = _load_market_outcomes()
+    outcomes[condition_id] = {"resolved_yes_price": resolved_yes_price}
+    _save_market_outcomes(outcomes)
+
+
+def _load_pending_resolutions() -> list:
+    """Return list of { condition_id, end_date_iso, checked }."""
+    try:
+        if _PENDING_RESOLUTIONS_PATH.exists():
+            return json.loads(_PENDING_RESOLUTIONS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
+def _save_pending_resolutions(pending: list) -> None:
+    _DATA_DIR.mkdir(exist_ok=True)
+    _PENDING_RESOLUTIONS_PATH.write_text(
+        json.dumps(pending, indent=2), encoding="utf-8"
+    )
+
+
+def _add_pending_resolution(condition_id: str, end_date: Optional[datetime]) -> None:
+    """Track a market whose resolution we haven't seen yet (taker/stop exit)."""
+    if not condition_id:
+        return
+    pending = _load_pending_resolutions()
+    if any(e["condition_id"] == condition_id for e in pending):
+        return  # already tracked
+    end_date_iso = end_date.isoformat() if end_date else ""
+    pending.append({"condition_id": condition_id, "end_date_iso": end_date_iso, "checked": False})
+    _save_pending_resolutions(pending)
 
 
 # ── Pure helpers (easily unit-tested) ────────────────────────────────────────
@@ -179,11 +243,11 @@ def should_exit(
         # (book drain sets current_token_price=None for NO positions, which
         # previously blocked this block entirely — causing missed stop-losses).
         if current_spot is not None and pos.strike > 0:
-            if pos.side in ("YES", "BUY_YES"):
-                # Long YES: profit when spot > strike.  Delta positive when in-the-money.
+            if pos.side in ("YES", "BUY_YES", "UP"):
+                # Long YES/UP: profit when spot > strike.  Delta positive when in-the-money.
                 current_delta_pct = (current_spot - pos.strike) / pos.strike * 100
             else:
-                # Long NO: profit when spot < strike.  Delta positive when in-the-money.
+                # Long NO/DOWN: profit when spot < strike.  Delta positive when in-the-money.
                 current_delta_pct = (pos.strike - current_spot) / pos.strike * 100
             # PROTECTIVE BUFFER: fire when delta drops below +SL_PCT, i.e. while
             # still in-the-money but within SL_PCT% of the strike.  With
@@ -201,13 +265,13 @@ def should_exit(
                 return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
 
         # Token-price exits (take-profit) require the held token's CLOB mid.
-        if pos.side in ("YES", "BUY_YES"):
-            # Use actual YES CLOB mid; fall back to YES-space current_price.
+        if pos.side in ("YES", "BUY_YES", "UP"):
+            # Use actual YES/UP CLOB mid; fall back to current_price.
             token_price = current_token_price if current_token_price is not None else current_price
         else:
-            # Use actual NO CLOB mid.  Do NOT derive from the YES side —
-            # YES and NO are independent CLOBs and 1-p_yes ≠ p_no in general.
-            # If the NO book is unavailable, skip token-price exits this tick.
+            # Use actual NO/DOWN CLOB mid.  Do NOT derive from the YES/UP side —
+            # both token CLOBs are independent and 1-p_yes ≠ p_no in general.
+            # If the NO/DOWN book is unavailable, skip token-price exits this tick.
             if current_token_price is None:
                 return False, "", unrealised
             token_price = current_token_price
@@ -316,6 +380,10 @@ class PositionMonitor:
                 await self._check_all_positions()
             except Exception as exc:
                 log.error("PositionMonitor backstop sweep failed", exc=str(exc))
+            try:
+                await self._check_pending_resolutions()
+            except Exception as exc:
+                log.error("PositionMonitor pending-resolution check failed", exc=str(exc))
 
     async def stop(self) -> None:
         self._running = False
@@ -358,6 +426,63 @@ class PositionMonitor:
             if key in self._exiting_positions:
                 continue
             await self._check_position(pos)
+
+    # ── Pending market-outcome resolution ─────────────────────────────────────
+
+    async def _check_pending_resolutions(self) -> None:
+        """For taker/stop exits, look up what the market eventually resolved to.
+
+        Runs during the backstop sweep.  Checks pending_resolutions.json for
+        markets whose end_date has passed, queries the Gamma API, and writes
+        the settled YES-price to market_outcomes.json so the webapp can show
+        WIN/LOSS for every trade — including early exits.
+        """
+        pending = _load_pending_resolutions()
+        if not pending:
+            return
+        now = datetime.now(timezone.utc)
+        changed = False
+        for entry in pending:
+            if entry.get("checked"):
+                continue
+            end_date_iso = entry.get("end_date_iso", "")
+            if end_date_iso:
+                try:
+                    end_dt = datetime.fromisoformat(end_date_iso)
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    # Wait at least 5 minutes after end_date before querying.
+                    if now < end_dt + timedelta(minutes=5):
+                        continue
+                except ValueError:
+                    pass
+            cid = entry.get("condition_id", "")
+            if not cid:
+                entry["checked"] = True
+                changed = True
+                continue
+            # Skip if already recorded from a RESOLVED exit.
+            existing = _load_market_outcomes().get(cid)
+            if existing is not None:
+                entry["checked"] = True
+                changed = True
+                continue
+            try:
+                resolved_yes_price = await self._pm.fetch_market_resolution(cid)
+            except Exception as exc:
+                log.debug("_check_pending_resolutions: lookup failed", cid=cid[:16], exc=str(exc))
+                continue
+            if resolved_yes_price is not None:
+                _record_market_outcome(cid, resolved_yes_price)
+                entry["checked"] = True
+                changed = True
+                log.info(
+                    "Retroactive resolution recorded",
+                    condition_id=cid[:16],
+                    resolved_yes_price=resolved_yes_price,
+                )
+        if changed:
+            _save_pending_resolutions(pending)
 
     # ── Auto-redemption ───────────────────────────────────────────────────────
 
@@ -506,13 +631,13 @@ class PositionMonitor:
                     market_id=pos.market_id, coin=coin,
                 )
                 continue
-            if pos.side in ("YES", "BUY_YES"):
+            if pos.side in ("YES", "BUY_YES", "UP"):
                 cur_price = book.mid
             else:
                 book_no = self._pm._books.get(market.token_id_no)
                 if book_no is None or book_no.mid is None:
                     log.debug(
-                        "Monitor: no NO book for coin-loss aggregation — treating as 0 unrealised",
+                        "Monitor: no NO/DOWN book for coin-loss aggregation — treating as 0 unrealised",
                         market_id=pos.market_id, coin=coin,
                     )
                     continue
@@ -544,8 +669,8 @@ class PositionMonitor:
                         )
                         exit_mid = pos.entry_price
                     else:
-                        # Taker exit: YES sells at best_bid; NO sells at NO CLOB best_bid.
-                        if pos.side in ("YES", "BUY_YES"):
+                        # Taker exit: YES/UP sells at best_bid; NO/DOWN sells at NO CLOB best_bid.
+                        if pos.side in ("YES", "BUY_YES", "UP"):
                             exit_mid = book.best_bid if book.best_bid is not None else book.mid
                         else:
                             book_no_cl = self._pm._books.get(market.token_id_no)
@@ -615,7 +740,7 @@ class PositionMonitor:
         ):
             book = self._pm._books.get(market.token_id_yes)
             # Use last known mid for the held token; fall back to entry_price.
-            if pos.side in ("YES", "BUY_YES"):
+            if pos.side in ("YES", "BUY_YES", "UP"):
                 exit_mid = (
                     book.mid
                     if book is not None and book.mid is not None
@@ -626,12 +751,12 @@ class PositionMonitor:
                 if book_no_res is not None and book_no_res.mid is not None:
                     exit_mid = book_no_res.mid
                 else:
-                    # NO book gone at resolution — cannot derive the outcome from
-                    # the YES book (YES and NO are independent CLOBs).  Fall back
+                    # NO/DOWN book gone at resolution — cannot derive the outcome from
+                    # the YES/UP book (both CLOBs are independent).  Fall back
                     # to entry_price (zero P&L); the risk engine still closes the
                     # position and records the trade.
                     log.warning(
-                        "Monitor: NO book gone at resolution — using entry_price (zero P&L)",
+                        "Monitor: NO/DOWN book gone at resolution — using entry_price (zero P&L)",
                         market_id=pos.market_id,
                     )
                     exit_mid = pos.entry_price
@@ -676,19 +801,19 @@ class PositionMonitor:
         current_token_price: Optional[float] = None
         book_no = None
         if pos.strategy == "momentum":
-            if pos.side in ("YES", "BUY_YES"):
-                # YES CLOB mid; None when book is drained (delta SL still active via HL spot).
+            if pos.side in ("YES", "BUY_YES", "UP"):
+                # YES/UP CLOB mid; None when book is drained (delta SL still active via HL spot).
                 current_token_price = book.mid if book is not None else None
             else:
                 book_no = self._pm._books.get(market.token_id_no)
                 if book_no is not None and book_no.mid is not None:
                     current_token_price = book_no.mid
                 else:
-                    # NO book unavailable — leave current_token_price as None.
+                    # NO/DOWN book unavailable — leave current_token_price as None.
                     # should_exit will skip momentum exit checks this tick rather
-                    # than firing on a price derived from the independent YES side.
+                    # than firing on a price derived from the independent first-token book.
                     log.debug(
-                        "Monitor: NO book unavailable — skipping exit check this tick",
+                        "Monitor: NO/DOWN book unavailable — skipping exit check this tick",
                         market_id=pos.market_id,
                     )
 
@@ -710,7 +835,7 @@ class PositionMonitor:
 
         # Fetch live spot price for delta-based stop-loss.
         # get_mid() is a synchronous in-memory cache read — no await needed.
-        # RTDSClient (Polymarket's own Binance feed) is the primary source;
+        # RTDSClient (Polymarket's own RTDS feed) is the primary source;
         # PythClient is no longer used — RTDSClient is the only supported implementation.
         current_spot: Optional[float] = None
         if pos.strategy == "momentum" and self._pyth is not None and pos.underlying:
@@ -758,9 +883,9 @@ class PositionMonitor:
                 # In live trading PM distributes at the true settlement directly;
                 # paper trading uses mid as the best available proxy.
                 taker_exit_price = current_price
-            elif pos.side in ("YES", "BUY_YES"):
-                # Pre-expiry taker exit: YES sell crosses the spread at best_bid.
-                # Guard book being None (YES book drained when delta SL fired).
+            elif pos.side in ("YES", "BUY_YES", "UP"):
+                # Pre-expiry taker exit: YES/UP sell crosses the spread at best_bid.
+                # Guard book being None (YES/UP book drained when delta SL fired).
                 taker_exit_price = (
                     book.best_bid
                     if book is not None and book.best_bid is not None
@@ -841,7 +966,7 @@ class PositionMonitor:
             # Place exit SELL order (opposite side to entry).
             # exit_price is in YES-price space; convert to token price for the order.
             sell_token = (
-                market.token_id_yes if pos.side in ("YES", "BUY_YES")
+                market.token_id_yes if pos.side in ("YES", "BUY_YES", "UP")
                 else market.token_id_no
             )
             sell_order_price = exit_price  # actual token price for both YES and NO
@@ -951,6 +1076,15 @@ class PositionMonitor:
         _resolved_outcome = ""
         if reason == ExitReason.RESOLVED:
             _resolved_outcome = "WIN" if exit_price >= 0.5 else "LOSS"
+            # Persist the exact YES-price settlement so the webapp can show the
+            # true resolution for any position in this market (including those that
+            # exited early via taker/stop-loss before resolution).
+            _record_market_outcome(pos.market_id, float(round(exit_price)))
+        else:
+            # The market may still resolve after our early exit.  Track it so the
+            # background resolution-check task can fill in the outcome later.
+            _market_end_date = getattr(market, "end_date", None)
+            _add_pending_resolution(pos.market_id, _market_end_date)
         # Capture the underlying spot price at exit time (Pyth oracle).
         _exit_spot = (
             self._pyth.get_mid(pos.underlying)

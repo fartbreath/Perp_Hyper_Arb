@@ -16,7 +16,7 @@
  *   Net P&L     — realised PnL (sum) with colour
  */
 import { useState, useMemo, Fragment } from "react";
-import { useTrades } from "../api/client";
+import { useTrades, useMarketOutcomes } from "../api/client";
 import type { Trade } from "../api/client";
 
 const UNDERLYINGS = ["", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"];
@@ -174,8 +174,10 @@ function TypeBadge({ t }: { t: string }) {
 
 function CloseBadge({ label }: { label: string }) {
   let bg = "#475569";
-  if (label.startsWith("RESOLVED → 1")) bg = "#15803d";
-  else if (label.startsWith("RESOLVED → 0")) bg = "#b91c1c";
+  if (label.startsWith("RESOLVED \u2192 WIN") || label.startsWith("RESOLVED \u2192 1")) bg = "#15803d";
+  else if (label.startsWith("RESOLVED \u2192 LOSS") || label.startsWith("RESOLVED \u2192 0")) bg = "#b91c1c";
+  else if (label.includes("\u2192 WIN")) bg = "#166534";  // taker/pre-expiry + known WIN
+  else if (label.includes("\u2192 LOSS")) bg = "#7f1d1d"; // taker/pre-expiry + known LOSS
   else if (label.startsWith("TAKER")) bg = "#ca8a04";
   else if (label.startsWith("PRE-EXPIRY")) bg = "#0284c7";
   return (
@@ -186,8 +188,22 @@ function CloseBadge({ label }: { label: string }) {
   );
 }
 
+/** Derive WIN/LOSS for a leg, checking CSV field first then market_outcomes lookup. */
+function effectiveOutcome(
+  t: Trade,
+  outcomes: Record<string, { resolved_yes_price: number }> | null,
+): "WIN" | "LOSS" | "" {
+  if (t.resolved_outcome === "WIN" || t.resolved_outcome === "LOSS") return t.resolved_outcome;
+  const entry = outcomes?.[t.market_id];
+  if (!entry) return "";
+  const rp = entry.resolved_yes_price;
+  if (rp !== 0 && rp !== 1) return "";
+  const isYesSide = t.side === "YES" || t.side === "UP";
+  return rp === 1 ? (isYesSide ? "WIN" : "LOSS") : (isYesSide ? "LOSS" : "WIN");
+}
+
 /** One badge per leg: "YES 19.0ct@0.54" */
-function LegsBadges({ legs }: { legs: Trade[] }) {
+function LegsBadges({ legs, outcomes }: { legs: Trade[]; outcomes: Record<string, { resolved_yes_price: number }> | null }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
       {legs.map((t, i) => {
@@ -196,16 +212,19 @@ function LegsBadges({ legs }: { legs: Trade[] }) {
         const px   = Number(t.price).toFixed(3);
         const exitTok = impliedExitToken(t);
         const exitStr = exitTok !== null ? ` → ${exitTok.toFixed(3)}` : "";
-        const bg   = t.side === "YES" ? "#0c4a6e" : "#4a1d0c";
-        const col  = t.side === "YES" ? "#38bdf8" : "#fb923c";
+        const bg   = (t.side === "YES" || t.side === "UP") ? "#0c4a6e" : "#4a1d0c";
+        const col  = (t.side === "YES" || t.side === "UP") ? "#38bdf8" : "#fb923c";
         const score = t.signal_score ? ` ·${Number(t.signal_score).toFixed(0)}` : "";
+        // Append WIN/LOSS badge when the market resolved
+        const eff = effectiveOutcome(t, outcomes);
+        const resolvedStr = eff === "WIN" ? " \u2714WIN" : eff === "LOSS" ? " \u2718LOSS" : "";
         return (
           <span key={i} style={{
             background: bg, color: col, fontSize: "0.75em",
             fontWeight: 600, padding: "2px 6px", borderRadius: 4,
             whiteSpace: "nowrap",
           }}>
-            {t.side} {ct}ct @ {px}{exitStr}{score}
+            {t.side} {ct}ct @ {px}{exitStr}{score}{resolvedStr}
           </span>
         );
       })}
@@ -246,7 +265,7 @@ function SummaryBar({ groups }: { groups: MarketGroup[] }) {
 
 // ── Expanded leg detail ───────────────────────────────────────────────────────
 
-function LegDetail({ legs }: { legs: Trade[] }) {
+function LegDetail({ legs, outcomes }: { legs: Trade[]; outcomes: Record<string, { resolved_yes_price: number }> | null }) {
   return (
     <tr>
       <td colSpan={13} style={{ padding: "6px 16px 10px 32px", background: "rgba(0,0,0,0.25)" }}>
@@ -258,6 +277,7 @@ function LegDetail({ legs }: { legs: Trade[] }) {
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Contracts</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Entry</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Exit (calc)</th>
+              <th style={{ textAlign: "right", padding: "3px 8px" }}>Resolved</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Spot Entry</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Spot Exit</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Gross</th>
@@ -279,15 +299,17 @@ function LegDetail({ legs }: { legs: Trade[] }) {
               const entrySpot  = Number(t.spot_price);
               const exitSpot   = t.exit_spot_price ? Number(t.exit_spot_price) : null;
               // Resolved trades: exit_spot_price IS the resolved spot (same oracle).
+              const eff = effectiveOutcome(t, outcomes);
               // Stop-loss/taker trades: exit_spot_price = spot at time of SL fire.
-              const isResolved = (exitToken !== null) && (Math.abs(exitToken) < 0.015 || Math.abs(exitToken - 1) < 0.015);
+              const isResolved = (eff === "WIN" || eff === "LOSS")
+                || ((exitToken !== null) && (Math.abs(exitToken) < 0.015 || Math.abs(exitToken - 1) < 0.015));
               const exitSpotLabel = isResolved ? "Resolved" : "Exit";
               return (
                 <tr key={i} style={{ borderBottom: "1px solid #1e293b" }}>
                   <td style={{ padding: "3px 8px", color: "#64748b" }}>{fmtTs(t.timestamp)}</td>
                   <td style={{ padding: "3px 8px" }}>
                     <span style={{
-                      color: t.side === "YES" ? "#38bdf8" : "#fb923c",
+                      color: (t.side === "YES" || t.side === "UP") ? "#38bdf8" : "#fb923c",
                       fontWeight: 600,
                     }}>{t.side}</span>
                   </td>
@@ -299,6 +321,15 @@ function LegDetail({ legs }: { legs: Trade[] }) {
                   </td>
                   <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#94a3b8" }}>
                     {exitToken !== null ? exitToken.toFixed(4) : "—"}
+                  </td>
+                  {/* Resolved outcome — WIN/LOSS regardless of whether bot held to resolution */}
+                  <td style={{ padding: "3px 8px", textAlign: "right" }}>
+                    {eff === "WIN"
+                      ? <span style={{ color: "#22c55e", fontWeight: 700 }}>✔ WIN</span>
+                      : eff === "LOSS"
+                        ? <span style={{ color: "#ef4444", fontWeight: 700 }}>✘ LOSS</span>
+                        : <span style={{ color: "#475569" }}>—</span>
+                    }
                   </td>
                   {/* Underlying spot at entry */}
                   <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#cbd5e1" }}>
@@ -347,6 +378,7 @@ export default function Trades() {
   const [expanded,   setExpanded]   = useState<Set<string>>(new Set());
 
   const { data, loading, error } = useTrades(ALL_LIMIT, 0, undefined, underlying || undefined);
+  const { data: outcomes } = useMarketOutcomes();
 
   const groups = useMemo(() => {
     if (!data?.trades) return [];
@@ -429,10 +461,17 @@ export default function Trades() {
                       <td style={{ fontWeight: 600 }}>{g.underlying}</td>
 
                       {/* legs */}
-                      <td><LegsBadges legs={g.legs} /></td>
+                      <td><LegsBadges legs={g.legs} outcomes={outcomes} /></td>
 
-                      {/* close type */}
-                      <td><CloseBadge label={g.closeTypeLabel} /></td>
+                      {/* close type — augment taker labels with resolved outcome when known */}
+                      <td><CloseBadge label={(() => {
+                        const lbl = g.closeTypeLabel;
+                        if (!lbl.startsWith("TAKER") && !lbl.startsWith("PRE-EXPIRY")) return lbl;
+                        const eff = g.legs
+                          .map(t => effectiveOutcome(t, outcomes))
+                          .find(o => o === "WIN" || o === "LOSS");
+                        return eff ? `${lbl} → ${eff}` : lbl;
+                      })()} /></td>
 
                       {/* size */}
                       <td style={{ textAlign: "right", fontFamily: "monospace" }}>
@@ -471,7 +510,7 @@ export default function Trades() {
                     </tr>
 
                     {/* expandable leg detail */}
-                    {isOpen && <LegDetail legs={g.legs} />}
+                    {isOpen && <LegDetail legs={g.legs} outcomes={outcomes} />}
                   </Fragment>
                 );
               })}

@@ -186,8 +186,10 @@ class MomentumScanner(BaseStrategy):
         MOMENTUM_MARKET_COOLDOWN_SECONDS window expires.
         """
         now = time.time()
-        self._market_cooldown[f"{market_id}:YES"] = now
-        self._market_cooldown[f"{market_id}:NO"] = now
+        # Clear all four possible side-key formats so both Yes/No markets (using
+        # "YES"/"NO" keys) and Up/Down markets (using "UP"/"DOWN" keys) are covered.
+        for _s in ("YES", "NO", "UP", "DOWN"):
+            self._market_cooldown[f"{market_id}:{_s}"] = now
         _save_cooldowns(self._cooldown_path, self._market_cooldown)
         log.info("Momentum cooldown reset on close", market_id=market_id[:22])
 
@@ -395,11 +397,21 @@ class MomentumScanner(BaseStrategy):
                     continue
 
             # ── Cooldown pre-filter ──────────────────────────────────────────
-            # YES and NO each have independent cooldown clocks (keyed by
-            # condition_id:side).  Skip the market early only when BOTH sides
-            # are still cooling — saves fetching two books for no reason.
-            _cd_yes = now_ts - self._market_cooldown.get(f"{market.condition_id}:YES", 0.0)
-            _cd_no  = now_ts - self._market_cooldown.get(f"{market.condition_id}:NO",  0.0)
+            # Each side has an independent cooldown clock keyed by condition_id:side.
+            # Up/Down markets use "UP"/"DOWN" keys; standard markets use "YES"/"NO".
+            # Check both conventions so the pre-filter works regardless of which
+            # label was written (e.g. markets scanned before this rename keep their
+            # old ":YES"/":NO" cooldown entries and are still respected here).
+            # max() picks the most-recently-set entry (largest timestamp → smallest
+            # elapsed time) so a cooldown in EITHER format is honoured.
+            _cd_yes = now_ts - max(
+                self._market_cooldown.get(f"{market.condition_id}:YES", 0.0),
+                self._market_cooldown.get(f"{market.condition_id}:UP",  0.0),
+            )
+            _cd_no  = now_ts - max(
+                self._market_cooldown.get(f"{market.condition_id}:NO",   0.0),
+                self._market_cooldown.get(f"{market.condition_id}:DOWN", 0.0),
+            )
             if _cd_yes < config.MOMENTUM_MARKET_COOLDOWN_SECONDS and \
                _cd_no  < config.MOMENTUM_MARKET_COOLDOWN_SECONDS:
                 skipped_cooldown += 1
@@ -471,13 +483,18 @@ class MomentumScanner(BaseStrategy):
             _d["p_no"] = round(p_no, 4)
 
             # ── Find which side is in the signal band ────────────────────────
+            # For "Up or Down" bucket markets the outcomes are named "Up" / "Down"
+            # (not "Yes" / "No").  Use descriptive labels so signals and positions
+            # clearly reflect the correct direction; monitor.py and risk.py accept
+            # both "YES"/"UP" (long the first token) and "NO"/"DOWN" (long the second).
+            _is_updown = _is_updown_market(market.title)
             if band_lo <= p_yes <= band_hi:
-                high_side = "YES"
+                high_side = "UP" if _is_updown else "YES"
                 token_id = market.token_id_yes
                 token_price = p_yes
                 required_direction = "spot_above_strike"
             elif band_lo <= p_no <= band_hi:
-                high_side = "NO"
+                high_side = "DOWN" if _is_updown else "NO"
                 token_id = market.token_id_no
                 token_price = p_no
                 required_direction = "spot_below_strike"
@@ -762,7 +779,7 @@ class MomentumScanner(BaseStrategy):
         # Log a warning so the operator can investigate quickly.
         if len(bucket_markets) > 0 and skipped_stale_spot / len(bucket_markets) > 0.5:
             log.warning(
-                "MomentumScanner: possible HL WS outage — >50% markets skipped for stale spot",
+                "MomentumScanner: possible RTDS outage — >50% markets skipped for stale spot",
                 skipped_stale_spot=skipped_stale_spot,
                 total_bucket_markets=len(bucket_markets),
             )
@@ -849,30 +866,33 @@ class MomentumScanner(BaseStrategy):
         on the hot path; the full multi-gate evaluation is left to _scan_once()
         which runs when the loop wakes up.
 
-        Both YES and NO token IDs are in _token_to_market so either token firing
-        triggers an early wakeup — important when only the NO side is in-band.
+        Both YES/UP and NO/DOWN token IDs are in _token_to_market so either token firing
+        triggers an early wakeup — important when only the DOWN/NO side is in-band.
         """
         if not config.STRATEGY_MOMENTUM_ENABLED or not config.BOT_ACTIVE:
             return
         market = self._token_to_market.get(token_id)
         if market is None:
             return
-        # Each side (YES / NO) is evaluated against its own CLOB book mid.
+        # Each side (YES/UP or NO/DOWN) is evaluated against its own CLOB book mid.
         # The token_id that fired tells us which side updated; use that book's
         # mid directly — do not derive the opposite side's price from 1.0 - mid.
         band_lo = config.MOMENTUM_PRICE_BAND_LOW
         band_hi = config.MOMENTUM_PRICE_BAND_HIGH
         now = time.time()
+        # Use "UP"/"DOWN" keys for Up-or-Down markets, "YES"/"NO" for others —
+        # consistent with the labels written by _scan_once and record_trade_close.
+        _updown = _is_updown_market(market.title)
         if token_id == market.token_id_yes:
-            # YES token fired — mid is the YES CLOB mid.
+            # First token (Up / Yes) fired.
             if not (band_lo <= mid <= band_hi):
-                return  # YES not in band
-            side_key = f"{market.condition_id}:YES"
+                return  # not in band
+            side_key = f"{market.condition_id}:{'UP' if _updown else 'YES'}"
         else:
-            # NO token fired — mid is the actual NO CLOB mid.
+            # Second token (Down / No) fired.
             if not (band_lo <= mid <= band_hi):
-                return  # NO not in band
-            side_key = f"{market.condition_id}:NO"
+                return  # not in band
+            side_key = f"{market.condition_id}:{'DOWN' if _updown else 'NO'}"
         # Skip if this side is still in cooldown.
         if now - self._market_cooldown.get(side_key, 0.0) < config.MOMENTUM_MARKET_COOLDOWN_SECONDS:
             return
