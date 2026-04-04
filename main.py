@@ -50,7 +50,7 @@ import api_server
 from api_server import state as api_state
 from market_data.pm_client import PMClient
 from market_data.hl_client import HLClient
-from market_data.pyth_client import PythClient
+from market_data.rtds_client import RTDSClient
 from risk import RiskEngine, Position
 from strategies.maker.strategy import MakerStrategy
 from strategies.mispricing.strategy import MispricingScanner
@@ -70,6 +70,17 @@ _signal_queue: asyncio.Queue[MispricingSignal] = asyncio.Queue(maxsize=50)
 
 # Shutdown event — set any time we want a clean exit
 _shutdown_event = asyncio.Event()
+
+# ── State-change event ─────────────────────────────────────────────────────────
+# Set by position-open/close callbacks and signal arrivals so that state_sync_loop
+# wakes immediately instead of waiting the full 1 s backstop interval.
+
+_state_changed: asyncio.Event = asyncio.Event()
+
+
+def notify_state_changed() -> None:
+    """Signal that bot state has changed; wakes the state_sync_loop early."""
+    _state_changed.set()
 
 
 # ── Signal callback from scanner ──────────────────────────────────────────────
@@ -95,8 +106,13 @@ async def _on_mispricing_signal(signal_obj: MispricingSignal) -> None:
             "timestamp": time.time(),
             "agent_decision": None,   # filled by agent loop
         })
+        # Cap in-memory list to last 200 signals (matches momentum_signals pattern)
+        if len(api_state.signals) > 200:
+            api_state.signals = api_state.signals[-200:]
     except asyncio.QueueFull:
         log.warning("Signal queue full — dropping signal", market=signal_obj.market_title)
+    else:
+        notify_state_changed()
 
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
@@ -265,7 +281,7 @@ async def state_sync_loop(
     maker: MakerStrategy,
     agent: AgentDecisionLayer,
     risk: RiskEngine,
-    pyth: "PythClient",
+    pyth: "RTDSClient",
 ) -> None:
     """
     Periodically push live bot state into api_state so the webapp
@@ -484,7 +500,7 @@ async def state_sync_loop(
                     "yes_book_bid": book_yes.best_bid if book_yes else None,
                     "yes_book_ask": book_yes.best_ask if book_yes else None,
                     "yes_book_ts":  book_yes.timestamp  if book_yes else None,
-                    # Pyth oracle spot — authoritative resolution price (same source as Polymarket)
+                    # RTDS spot — authoritative resolution price (same source as Polymarket)
                     "spot_mid": pyth.get_mid(mkt.underlying),
                 }
             api_state.markets = markets_raw
@@ -542,10 +558,26 @@ async def state_sync_loop(
             # Agent shadow log
             api_state.agent_shadow_log = agent.get_shadow_log()[-100:]
 
+            # ── Broadcast SSE + event-driven sleep ────────────────────────────
+            # Push a state bundle to all connected SSE clients so the frontend
+            # receives live updates without polling individual REST endpoints.
+            try:
+                await api_server.broadcast_sse(api_server.build_live_state())
+            except Exception as _sse_exc:
+                log.debug("SSE broadcast error", exc=str(_sse_exc))
+
         except Exception as exc:
             log.error("State sync error", exc=str(exc))
 
-        await asyncio.sleep(5.0)
+        # Wait for a state-change event (position open/close, signal), or the
+        # 1 s backstop — whichever comes first.  This ensures the webapp stays
+        # fresh within ≤1 s even without explicit events while removing the
+        # hard 5 s delay between state updates.
+        try:
+            await asyncio.wait_for(_state_changed.wait(), timeout=1.0)
+            _state_changed.clear()
+        except asyncio.TimeoutError:
+            pass
 
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
@@ -609,7 +641,9 @@ async def main() -> None:
     risk_engine = RiskEngine()
     pm = PMClient()
     hl = HLClient()
-    pyth = PythClient()
+    # Spot price source: Polymarket RTDS — crypto_prices topic for BTC/ETH/SOL/XRP/BNB/DOGE,
+    # crypto_prices_chainlink topic for HYPE (not yet in crypto_prices).
+    pyth = RTDSClient()
     maker = MakerStrategy(pm, hl, risk_engine, pyth=pyth)
     scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL, pyth=pyth)
     agent = AgentDecisionLayer(risk_engine)
@@ -622,6 +656,7 @@ async def main() -> None:
         # Cap in-memory list to last 200 signals
         if len(api_state.momentum_signals) > 200:
             api_state.momentum_signals = api_state.momentum_signals[-200:]
+        notify_state_changed()
 
     momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, pyth=pyth, on_signal=_on_momentum_signal)
 
@@ -637,6 +672,7 @@ async def main() -> None:
         """
         scanner.record_trade_close(market_id)
         momentum_scanner.record_trade_close(market_id)
+        notify_state_changed()
 
     def _on_momentum_stop_loss(market_id: str, tte_remaining: float) -> None:
         """Block re-entry into a market for the rest of its window after a stop-loss.

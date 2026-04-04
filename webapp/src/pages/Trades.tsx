@@ -302,14 +302,14 @@ function LegDetail({ legs }: { legs: Trade[] }) {
                   </td>
                   {/* Underlying spot at entry */}
                   <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#cbd5e1" }}>
-                    {entrySpot > 0 ? `$${entrySpot.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—"}
+                    {entrySpot > 0 ? `$${entrySpot.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}
                   </td>
                   {/* Underlying spot at exit (stop-loss) or resolution */}
                   <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace" }}
                       title={exitSpotLabel}>
                     {exitSpot && exitSpot > 0
                       ? <span style={{ color: isResolved ? "#94a3b8" : "#fbbf24" }}>
-                          ${exitSpot.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                          ${exitSpot.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         </span>
                       : <span style={{ color: "#475569" }}>—</span>
                     }

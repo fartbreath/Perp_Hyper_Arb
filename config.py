@@ -24,7 +24,7 @@ TRACKED_UNDERLYINGS: list[str] = [
 ]
 
 # How often (seconds) to refresh the market list from Gamma API
-MARKET_REFRESH_INTERVAL: int = 60
+MARKET_REFRESH_INTERVAL: int = 15
 
 # PM WebSocket
 PM_WS_URL: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -44,23 +44,8 @@ HL_BASE_URL: str = "https://api.hyperliquid.xyz"
 HL_PERP_COINS: list[str] = ["BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP", "LINK"]
 HL_DEFAULT_SLIPPAGE: float = 0.003   # 0.3% max slippage for hedge market orders
 
-# ── Pyth Oracle — spot price feed (used for momentum delta SL / entry delta) ─
-# Polymarket "Up or Down" bucket markets resolve against the Pyth spot price at
-# their end_date (directly or via Chainlink/Binance feeds which track the same
-# underlying).  Using Pyth instead of HL perp eliminates funding-rate basis and
-# ensures the bot's stop-loss triggers on the same price that Polymarket settles.
-# Feed IDs from https://pyth.network/developers/price-feed-ids (no "0x" prefix).
-PYTH_PRICE_FEED_IDS: dict[str, str] = {
-    "BTC":  "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-    "ETH":  "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-    "SOL":  "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
-    "XRP":  "ec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8",
-    "BNB":  "2f95862b045670cd22bee3114c39763a4a08beeb663b145d283c31d7d1101c4f",
-    "DOGE": "dcef50dd0a4cd2dcc17e45df1676dcb336a11a61c69df7a0299b0150c672d25c",
-    "HYPE": "4279e31cc369bbcc2faf022b382b080e32a8e689ff20fbc530d2a603eb6cd98b",
-}
 HL_DEAD_MAN_INTERVAL: int = 300      # seconds — refresh dead man's switch every 5 min
-HL_FUNDING_POLL_INTERVAL: int = 300  # seconds
+HL_FUNDING_POLL_INTERVAL: int = 120  # seconds
 
 # ── Strategy 1 — Market Making ───────────────────────────────────────────────
 # Repricing: cancel + repost when HL BBO moves by more than this fraction
@@ -301,7 +286,7 @@ MOMENTUM_ORDER_TYPE: str = "limit"
 # Delta-based stop-loss: exit when live HL spot has moved this % past the
 # strike against the position (e.g. 0.05 → exit when spot is 0.05% below
 # strike for YES, or 0.05% above strike for NO).
-MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.01  # % beyond strike before stop fires
+MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.1  # protective buffer: exit when delta (in-the-money %) drops BELOW this threshold (fires before strike is crossed)
 MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
 
 # Near-expiry time-stop: when TTE is very short and spot has already crossed
@@ -517,7 +502,7 @@ BYPASS_AGENT: bool = True
 # ── Position Monitor ──────────────────────────────────────────────────────────
 MONITOR_INTERVAL: int = 30           # seconds between position checks
 # How often to poll PM wallet for redeemable settled positions (live mode only)
-REDEEM_POLL_INTERVAL: int = 60       # seconds
+REDEEM_POLL_INTERVAL: int = 30       # seconds
 # Profit target: exit when unrealised >= this fraction of (deviation * size)
 PROFIT_TARGET_PCT: float = 0.60      # capture 60% of the initial mispricing
 # Stop-loss: exit when unrealised loss exceeds this in USD

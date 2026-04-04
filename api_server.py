@@ -14,6 +14,7 @@ the bot components (main.py injects references after startup).
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import math
@@ -29,6 +30,7 @@ from typing import Any, Optional
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Header, Query, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -79,6 +81,9 @@ class BotState:
     # Data quality metrics (filled by state-sync loop in main.py)
     data_quality: dict = field(default_factory=dict)
 
+    # P&L summary (cached, recomputed every 30 s in state_sync_loop)
+    pnl_summary: dict = field(default_factory=dict)
+
     # Live component references — set once at startup by main.py
     monitor_ref: Any = None   # PositionMonitor — used by manual-close endpoint
     pm_ref: Any = None        # PMClient — used by manual-close endpoint
@@ -87,6 +92,254 @@ class BotState:
 
 # Module-level singleton — main.py populates this
 state = BotState()
+
+# ── Server-Sent Events (SSE) infrastructure ────────────────────────────────────
+# Each connected frontend client gets its own asyncio.Queue.  broadcast_sse()
+# pushes a serialised JSON message to all active queues; dead/full queues are
+# pruned automatically.  main.py's state_sync_loop calls broadcast_sse() after
+# every state update so clients receive live data without polling.
+
+_sse_clients: list[asyncio.Queue] = []
+
+# P&L summary cache — recomputed at most every 30 s (CSV read is O(n) per call)
+_pnl_cache: dict = {}
+_pnl_cache_ts: float = 0.0
+
+
+async def broadcast_sse(data: dict) -> None:
+    """Push a state-change message to all connected SSE clients."""
+    if not _sse_clients:
+        return
+    payload = f"data: {json.dumps(data)}\n\n"
+    dead: list[asyncio.Queue] = []
+    for q in _sse_clients:
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            dead.append(q)
+    for q in dead:
+        try:
+            _sse_clients.remove(q)
+        except ValueError:
+            pass
+
+
+def build_live_state() -> dict:
+    """Build the SSE state bundle from the current module-level `state`.
+
+    Mirrors the response format of each live REST endpoint so the frontend
+    can use SSE data as a drop-in replacement for individual polling calls.
+    Excludes heavy/expensive data (trades CSV, live wallet query) — those
+    endpoints continue to use REST polling on a slower cadence.
+    """
+    global _pnl_cache, _pnl_cache_ts
+    now_t = time.time()
+
+    # ── Health ────────────────────────────────────────────────────────────────
+    uptime_s = now_t - state.started_at
+    dq = state.data_quality
+    data_issues = (
+        dq.get("sub_rejected_count", 0) > 0
+        or dq.get("no_book_count", 0) > 5
+    )
+    try:
+        from fill_simulator import get_fill_session_stats
+        fill_stats = get_fill_session_stats()
+    except Exception:
+        fill_stats = {"adverse_triggers_session": 0, "hl_max_move_pct_session": 0.0}
+    health = {
+        "status": "running",
+        "uptime_seconds": round(uptime_s, 1),
+        "pm_ws_connected": state.pm_ws_connected,
+        "hl_ws_connected": state.hl_ws_connected,
+        "last_heartbeat_ts": state.last_heartbeat_ts,
+        "last_heartbeat_age_s": round(now_t - state.last_heartbeat_ts, 1)
+            if state.last_heartbeat_ts > 0 else None,
+        "paper_trading": state.paper_trading,
+        "agent_auto": config.AGENT_AUTO,
+        "bot_active": config.BOT_ACTIVE,
+        "data_quality": dq,
+        "data_issues": data_issues,
+        "adverse_triggers_session": fill_stats["adverse_triggers_session"],
+        "adverse_threshold_pct": config.PAPER_ADVERSE_SELECTION_PCT,
+        "hl_max_move_pct_session": fill_stats["hl_max_move_pct_session"],
+        "timestamp": now_t,
+    }
+
+    # ── Positions ─────────────────────────────────────────────────────────────
+    positions_list = list(state.positions.values())
+    positions = {"positions": positions_list, "count": len(positions_list), "timestamp": now_t}
+
+    # ── Risk (computed from positions) ────────────────────────────────────────
+    total_pm = sum(float(p.get("size_usd", 0)) for p in positions_list if p.get("venue") == "PM")
+    total_hl = sum(abs(float(p.get("size_usd", 0))) for p in positions_list if p.get("venue") == "HL")
+    risk = {
+        "pm_exposure_usd": round(total_pm, 2),
+        "pm_exposure_limit": config.MAX_TOTAL_PM_EXPOSURE,
+        "pm_exposure_pct": round(total_pm / config.MAX_TOTAL_PM_EXPOSURE * 100, 1),
+        "hl_notional_usd": round(total_hl, 2),
+        "hl_notional_limit": config.MAX_HL_NOTIONAL,
+        "hl_notional_pct": round(total_hl / config.MAX_HL_NOTIONAL * 100, 1),
+        "open_positions": len(state.positions),
+        "max_concurrent_positions": config.MAX_CONCURRENT_POSITIONS,
+        "hard_stop_threshold": config.HARD_STOP_DRAWDOWN,
+        "max_pm_per_market": config.MAX_PM_EXPOSURE_PER_MARKET,
+        "paper_trading": state.paper_trading,
+        "timestamp": now_t,
+    }
+
+    # ── Markets (with active-quote enrichment) ────────────────────────────────
+    def _valid_prob(v) -> bool:
+        return v is not None and 0.0 <= float(v) <= 1.0
+
+    market_list = []
+    for cid, m in state.markets.items():
+        token_id_yes = m.get("token_id_yes", "")
+        q_bid = state.active_quotes.get(token_id_yes)
+        q_ask = state.active_quotes.get(f"{token_id_yes}_ask")
+
+        if q_bid is not None and _valid_prob(q_bid.get("price")):
+            bid_price, bid_src = q_bid.get("price"), "active_quote"
+        else:
+            bk = m.get("yes_book_bid")
+            bid_price = bk if _valid_prob(bk) else None
+            bid_src = "pm_book" if bid_price is not None else None
+
+        if q_ask is not None and _valid_prob(q_ask.get("price")):
+            ask_price, ask_src = q_ask.get("price"), "active_quote"
+        else:
+            bk = m.get("yes_book_ask")
+            ask_price = bk if _valid_prob(bk) else None
+            ask_src = "pm_book" if ask_price is not None else None
+
+        book_ts = m.get("yes_book_ts")
+        book_age_s = round(now_t - book_ts, 1) if book_ts else None
+        if book_age_s is None:
+            dw: str | None = "no_data"
+        elif book_age_s > 120:
+            dw = "very_stale"
+        elif book_age_s > 30:
+            dw = "stale"
+        else:
+            dw = None
+
+        market_list.append({
+            **m,
+            "bid_price": bid_price, "ask_price": ask_price,
+            "bid_source": bid_src,  "ask_source": ask_src,
+            "book_age_s": book_age_s, "data_warning": dw,
+            "quoted": q_bid is not None,
+        })
+    markets = {"markets": market_list, "count": len(market_list), "timestamp": now_t}
+
+    # ── Signals ───────────────────────────────────────────────────────────────
+    # Use [:200] to match the in-memory cap so the SSE bundle does not silently
+    # truncate below what the Signals page requests (useSignals(100)).
+    signals = {
+        "signals": sorted(state.signals, key=lambda s: s.get("score", 0.0), reverse=True)[:200],
+        "total": len(state.signals),
+        "timestamp": now_t,
+    }
+    momentum_signals = {
+        "signals": list(reversed(state.momentum_signals))[:200],
+        "total": len(state.momentum_signals),
+        "timestamp": now_t,
+    }
+
+    # ── Maker quotes ──────────────────────────────────────────────────────────
+    quotes_list = sorted(
+        state.active_quotes.values(),
+        key=lambda x: x.get("posted_at", 0),
+        reverse=True,
+    )
+    for q in quotes_list:
+        q["age_seconds"] = round(now_t - float(q.get("posted_at", now_t)), 1)
+    maker_quotes = {
+        "quotes": quotes_list,
+        "count": len(quotes_list),
+        "strategy_enabled": config.STRATEGY_MAKER_ENABLED,
+        "timestamp": now_t,
+    }
+
+    # ── Maker signals ─────────────────────────────────────────────────────────
+    deployed_keys = set(state.active_quotes.keys())
+    maker_signals_list = []
+    for tid, s in state.maker_signals.items():
+        mkt = state.markets.get(s.get("market_id", ""), {})
+        maker_signals_list.append({
+            **s,
+            "market_title": mkt.get("title", s.get("market_id", "")),
+            "is_deployed": tid in deployed_keys,
+            "age_seconds": round(now_t - float(s.get("ts", now_t)), 1),
+        })
+    maker_signals_list.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    maker_signals = {
+        "signals": maker_signals_list,
+        "count": len(maker_signals_list),
+        "strategy_enabled": config.STRATEGY_MAKER_ENABLED,
+        "timestamp": now_t,
+    }
+
+    # ── Capital ───────────────────────────────────────────────────────────────
+    if state.maker_ref is not None:
+        _dep = state.maker_ref.deployed_capital
+        _avail = state.maker_ref.available_capital
+        _in_pos = state.maker_ref._risk.get_state().get("total_pm_capital_deployed", 0.0)
+    else:
+        _dep, _avail, _in_pos = 0.0, config.PAPER_CAPITAL_USD, 0.0
+    capital = {
+        "total_budget": config.PAPER_CAPITAL_USD,
+        "deployed": round(_dep, 2),
+        "in_positions": round(_in_pos, 2),
+        "available": round(_avail, 2),
+        "mode": config.MAKER_DEPLOYMENT_MODE,
+        "timestamp": now_t,
+    }
+
+    # ── Funding ───────────────────────────────────────────────────────────────
+    funding_bundle = {"funding": state.funding, "timestamp": now_t}
+
+    # ── P&L (cached — recomputed every 30 s from trades CSV) ─────────────────
+    if now_t - _pnl_cache_ts > 30.0:
+        try:
+            rows = _load_trades_csv()
+            _dt_now = datetime.now(timezone.utc)
+            today_rows = [r for r in rows if _row_age_days(r, _dt_now) < 1]
+            week_rows  = [r for r in rows if _row_age_days(r, _dt_now) < 7]
+
+            def _sp(rs: list[dict]) -> float:
+                return sum(float(r.get("pnl", 0)) for r in rs)
+
+            _pnl_cache = {
+                "today":             round(_sp(today_rows), 4),
+                "week":              round(_sp(week_rows),  4),
+                "all_time":          round(_sp(rows),       4),
+                "trade_count_today": len(today_rows),
+                "trade_count_week":  len(week_rows),
+                "trade_count_all":   len(rows),
+                "timestamp":         now_t,
+            }
+            _pnl_cache_ts = now_t
+        except Exception:
+            pass
+    pnl_bundle = _pnl_cache if _pnl_cache else None
+
+    bundle: dict = {
+        "health": health,
+        "positions": positions,
+        "risk": risk,
+        "markets": markets,
+        "funding": funding_bundle,
+        "signals": signals,
+        "momentum_signals": momentum_signals,
+        "maker_quotes": maker_quotes,
+        "maker_signals": maker_signals,
+        "capital": capital,
+    }
+    if pnl_bundle:
+        bundle["pnl"] = pnl_bundle
+    return bundle
+
 
 # Path to trades CSV — use absolute path like risk.py to avoid CWD issues
 TRADES_CSV = Path(__file__).parent / "data" / "trades.csv"
@@ -806,6 +1059,54 @@ def set_bot_status(patch: BotActivePatch) -> dict:
         "active": config.BOT_ACTIVE,
         "timestamp": time.time(),
     }
+
+
+# ── Server-Sent Events stream ─────────────────────────────────────────────────
+
+@app.get("/events")
+async def events_stream() -> StreamingResponse:
+    """Server-Sent Events stream — pushes live bot state to subscribing frontends.
+
+    Clients connect once; the backend pushes a full state bundle whenever
+    positions, markets, signals, or other live data changes (≤1 push/second,
+    governed by state_sync_loop).  Keepalives are sent every 30 s to prevent
+    proxy or load-balancer timeouts.
+
+    Message format:  ``data: <json>\\n\\n``
+    Each JSON object mirrors the merged response of individual REST endpoints,
+    keyed by endpoint name (health, positions, risk, markets, …).
+    """
+    q: asyncio.Queue = asyncio.Queue(maxsize=32)
+    _sse_clients.append(q)
+
+    async def generate():
+        try:
+            # Immediate keepalive confirms the connection to the client
+            yield ": keepalive\n\n"
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=30.0)
+                    yield msg
+                except asyncio.TimeoutError:
+                    # Periodic keepalive prevents proxy/LB timeouts on idle streams
+                    yield ": keepalive\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+        finally:
+            try:
+                _sse_clients.remove(q)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no",          # disable nginx buffering
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

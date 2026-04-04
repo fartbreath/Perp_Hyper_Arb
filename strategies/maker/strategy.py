@@ -29,7 +29,7 @@ import config
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket, _MARKET_TYPE_DURATION_SECS
 from market_data.hl_client import HLClient, BBO
-from market_data.pyth_client import PythClient
+from market_data.rtds_client import RTDSClient
 from risk import RiskEngine, Position
 import risk as risk_module
 from strategies.base import BaseStrategy
@@ -78,19 +78,19 @@ class MakerStrategy(BaseStrategy):
         hl: HLClient,
         risk: RiskEngine,
         quote_size_usd: Optional[float] = None,
-        pyth: Optional[PythClient] = None,
+        pyth: Optional[RTDSClient] = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
-        self._pyth = pyth  # Pyth oracle — authoritative spot for all pricing decisions
+        self._pyth = pyth  # RTDSClient; authoritative RTDS spot for all pricing decisions
         self._risk = risk
         self._quote_size_override = quote_size_usd
         self._active_quotes: dict[str, ActiveQuote] = {}  # token_id → quote
         self._inventory: dict[str, float] = {}            # underlying → net USD
-        self._last_spot_mids: dict[str, float] = {}       # coin → last Pyth mid at reprice
+        self._last_spot_mids: dict[str, float] = {}       # coin → last RTDS mid at reprice
         self._coin_hedges: dict[str, dict] = {}
         self._signals: dict[str, MakerSignal] = {}
-        self._spot_price_history: dict[str, deque] = {}  # coin → rate-limited (ts, mid) from Pyth
+        self._spot_price_history: dict[str, deque] = {}  # coin → rate-limited (ts, mid) from RTDS
         # ── Hedge cooldown / debounce ──────────────────────────────────────────
         self._last_hedge_ts: dict[str, float] = {}          # coin → unix ts of last executed hedge
         self._pending_hedge_tasks: dict[str, asyncio.Task] = {}  # coin → in-flight debounce task
@@ -123,9 +123,9 @@ class MakerStrategy(BaseStrategy):
                 await asyncio.sleep(5)
             log.info("MakerStrategy enabled via config — starting now")
         self._pm.on_price_change(self._on_pm_price_change)
-        # Reprice on Pyth oracle ticks — authoritative spot price, not HL perp.
+        # Reprice on RTDS spot ticks — authoritative RTDS price, not HL perp.
         # HL perp carries funding-rate basis and diverges from the settlement oracle;
-        # using Pyth ensures reprice triggers match what Polymarket actually resolves on.
+        # using RTDS ensures reprice triggers match what Polymarket actually resolves on.
         if self._pyth is not None:
             self._pyth.on_price_update(self._on_pyth_price_update)
         log.info("MakerStrategy started", quote_size_override=self._quote_size_override)
@@ -163,12 +163,12 @@ class MakerStrategy(BaseStrategy):
                             market=market.condition_id, exc=str(exc))
 
     async def _on_pyth_price_update(self, coin: str, price: float) -> None:
-        """Triggered on every Pyth oracle tick.
+        """Triggered on every RTDS spot tick.
 
         Maintains a rate-limited price history for the volatility filter and fires
-        a reprice when the Pyth oracle spot has moved more than REPRICE_TRIGGER_PCT
-        since the last reprice.  Pyth is used here — not HL perp BBO — because
-        Polymarket resolves against the oracle price; HL perp can diverge at expiry.
+        a reprice when the RTDS spot has moved more than REPRICE_TRIGGER_PCT
+        since the last reprice.  RTDS is used here — not HL perp BBO — because
+        Polymarket resolves against the RTDS price; HL perp can diverge at expiry.
         """
         # Rate-limited history (≤1 sample/s) for the vol filter in _evaluate_signal.
         hist = self._spot_price_history.setdefault(coin, deque(maxlen=360))
@@ -183,7 +183,7 @@ class MakerStrategy(BaseStrategy):
                 await self._reprice_underlying(coin)
                 self._schedule_hedge_rebalance(coin)
             except Exception as exc:
-                log.warning("Pyth price reprice/hedge failed", coin=coin, exc=str(exc))
+                log.warning("RTDS price reprice/hedge failed", coin=coin, exc=str(exc))
 
     # ── Quote age watchdog ─────────────────────────────────────────────────────
 

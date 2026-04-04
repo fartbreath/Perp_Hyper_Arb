@@ -41,7 +41,7 @@ import config
 from logger import get_bot_logger
 from risk import RiskEngine, Position
 from market_data.pm_client import PMClient, _MARKET_TYPE_DURATION_SECS
-from market_data.pyth_client import PythClient
+from market_data.rtds_client import RTDSClient
 from ctf_utils import _redeem_ctf_via_safe
 
 log = get_bot_logger(__name__)
@@ -172,7 +172,7 @@ def should_exit(
                 return True, ExitReason.TIME_STOP, unrealised
         return False, "", unrealised
 
-    # ── Momentum exits — delta-based (live HL spot vs strike) ─────────────────
+    # ── Momentum exits — delta-based (live spot vs strike) ─────────────────────
     if pos.strategy == "momentum":
         # Delta SL runs FIRST — requires only spot+strike, NOT token_price.
         # This must evaluate even when the NO CLOB book is drained near expiry
@@ -180,12 +180,16 @@ def should_exit(
         # previously blocked this block entirely — causing missed stop-losses).
         if current_spot is not None and pos.strike > 0:
             if pos.side in ("YES", "BUY_YES"):
-                # Long YES: profit when spot > strike.  Delta negative when spot < strike.
+                # Long YES: profit when spot > strike.  Delta positive when in-the-money.
                 current_delta_pct = (current_spot - pos.strike) / pos.strike * 100
             else:
-                # Long NO: profit when spot < strike.  Delta negative when spot > strike.
+                # Long NO: profit when spot < strike.  Delta positive when in-the-money.
                 current_delta_pct = (pos.strike - current_spot) / pos.strike * 100
-            if current_delta_pct < -config.MOMENTUM_DELTA_STOP_LOSS_PCT:
+            # PROTECTIVE BUFFER: fire when delta drops below +SL_PCT, i.e. while
+            # still in-the-money but within SL_PCT% of the strike.  With
+            # SL_PCT=0.1 the bot exits when still 0.1% ahead, before the oracle
+            # crosses and Polymarket resolves against the position.
+            if current_delta_pct < config.MOMENTUM_DELTA_STOP_LOSS_PCT:
                 return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
             # Near-expiry: only exit if spot has already crossed the strike
             # (delta < 0).  Avoids premature exits from CLOB price collapse.
@@ -248,13 +252,13 @@ class PositionMonitor:
         pm: PMClient,
         risk: RiskEngine,
         interval: int = config.MONITOR_INTERVAL,
-        pyth_client: Optional[PythClient] = None,
+        pyth_client: Optional[RTDSClient] = None,
         on_close_callback: Optional[Callable[[str], None]] = None,
         on_stop_loss_callback: Optional[Callable[[str, float], None]] = None,
     ) -> None:
         self._pm = pm
         self._risk = risk
-        self._pyth = pyth_client  # PythClient; authoritative spot price for momentum SL
+        self._pyth = pyth_client  # RTDSClient; spot price source for momentum SL
         self._interval = interval
         # Called with market_id whenever a position is successfully closed.
         # Used by MispricingScanner to reset the per-market cooldown clock.
@@ -293,7 +297,7 @@ class PositionMonitor:
         # All open positions are checked on every relevant PM price tick — regardless
         # of strategy.  No polling delay: the only latency is the PM WS round-trip.
         self._pm.on_price_change(self._on_price_update)
-        # Event-driven delta SL: also check on every Pyth price tick so that a
+        # Event-driven delta SL: also check on every RTDS spot tick so that a
         # rapid underlying move triggers the delta SL immediately, without
         # waiting for the next PM WS tick (which may not come if the PM book
         # goes quiet near expiry — exactly when the SL matters most).
@@ -303,10 +307,11 @@ class PositionMonitor:
         asyncio.create_task(self._auto_redeem_loop())
         # Rare backstop sweep: catches resolved markets that PM WS never echoes
         # (e.g. resolution during a transient disconnect) and any other edge-case
-        # positions that slipped through.  300 s is acceptable for non-real-time
-        # cleanup; all live position checks are driven by PM / Pyth events above.
+        # positions that slipped through.  self._interval is acceptable for
+        # non-real-time cleanup; all live position checks are driven by PM / RTDS
+        # events above.
         while self._running:
-            await asyncio.sleep(300)
+            await asyncio.sleep(self._interval)
             try:
                 await self._check_all_positions()
             except Exception as exc:
@@ -338,17 +343,13 @@ class PositionMonitor:
             await self._check_position(pos, triggering_token_id=token_id, triggering_mid=mid)
 
     async def _on_pyth_spot_update(self, coin: str, price: float) -> None:
-        """Triggered on every Pyth price tick.
+        """Triggered on every spot price tick (RTDS or Pyth fallback).
 
         Checks open momentum positions whose underlying matches `coin`.
         Ensures that a rapid spot move (e.g. BTC flash crash through the
         strike) triggers the delta SL immediately — without waiting for
         the PM WS to echo a price change, which may not happen if the PM
         book is thin or empty near expiry.
-
-        Uses the Pyth oracle price, which is the same data source that
-        Polymarket's resolution bots read at market end_date, eliminating
-        the HL perp funding-rate basis that caused missed stop-losses.
         """
         for pos in self._risk.get_open_positions():
             if pos.strategy != "momentum" or pos.underlying != coin:
@@ -363,7 +364,7 @@ class PositionMonitor:
     async def _auto_redeem_loop(self) -> None:
         """Periodically fetch PM wallet positions and redeem any that are ready.
 
-        Runs every REDEEM_POLL_INTERVAL seconds (default 60 s).  Only active in
+        Runs every REDEEM_POLL_INTERVAL seconds (default 30 s).  Only active in
         live mode (PAPER_TRADING=False) and when POLY_PRIVATE_KEY + POLY_FUNDER
         are configured.  Each token is redeemed at most once per session; the
         `_redeemed_tokens` set prevents duplicate on-chain submissions.
@@ -707,10 +708,10 @@ class PositionMonitor:
             if market.end_date is not None else None
         )
 
-        # Fetch live Pyth oracle spot for delta-based stop-loss.
+        # Fetch live spot price for delta-based stop-loss.
         # get_mid() is a synchronous in-memory cache read — no await needed.
-        # Pyth reflects the same price Polymarket resolves on; HL perp would
-        # carry funding-rate basis that can mask a genuine oracle crossing.
+        # RTDSClient (Polymarket's own Binance feed) is the primary source;
+        # PythClient is no longer used — RTDSClient is the only supported implementation.
         current_spot: Optional[float] = None
         if pos.strategy == "momentum" and self._pyth is not None and pos.underlying:
             current_spot = self._pyth.get_mid(pos.underlying)

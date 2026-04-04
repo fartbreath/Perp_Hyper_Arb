@@ -28,7 +28,7 @@ from typing import Optional
 import config
 from logger import get_bot_logger
 from market_data.deribit import DeribitFetcher
-from market_data.pyth_client import PythClient
+from market_data.rtds_client import RTDSClient
 
 log = get_bot_logger(__name__)
 
@@ -46,9 +46,9 @@ class VolFetcher:
     """
     Provides annualized volatility estimates for momentum threshold computation.
 
-    Must call `register(pyth_client)` before the first `get_sigma_ann()` call so
-    that the rolling realized-vol buffer is populated by live Pyth oracle ticks.
-    Rolling vol uses Pyth prices (same oracle Polymarket resolves against) rather
+    Must call `register(spot_client)` before the first `get_sigma_ann()` call so
+    that the rolling realized-vol buffer is populated by live RTDS ticks.
+    Rolling vol uses RTDS spot prices (same source Polymarket resolves against) rather
     than HL perp to avoid funding-rate basis distorting the vol estimate.
     """
 
@@ -65,13 +65,13 @@ class VolFetcher:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def register(self, pyth: PythClient) -> None:
+    def register(self, spot: RTDSClient) -> None:
         """
-        Register the Pyth price callback so `_mid_history` stays populated.
+        Register the RTDS spot price callback so `_mid_history` stays populated.
         Call once during bot startup, before the first scan.
         """
-        pyth.on_price_update(self._on_pyth)
-        log.info("VolFetcher registered with Pyth oracle feed")
+        spot.on_price_update(self._on_pyth)
+        log.info("VolFetcher registered with spot price feed")
 
     def start_prefetch(self, underlyings: list[str]) -> "asyncio.Task[None]":
         """Start a background task that keeps the vol cache warm for all
@@ -88,8 +88,8 @@ class VolFetcher:
         """Background loop: eagerly refresh vol cache ahead of TTL expiry.
 
         Deribit TTL is MOMENTUM_VOL_CACHE_TTL (default 300 s); HL realized is
-        60 s.  We refresh every 240 s to keep Deribit warm without hammering
-        the API, and let HL realized self-refresh on each inner iteration.
+        60 s.  We refresh at 75% of the TTL to keep Deribit warm without
+        hammering the API, and let HL realized self-refresh on each inner iteration.
         """
         while True:
             for underlying in underlyings:
@@ -101,7 +101,7 @@ class VolFetcher:
                         underlying=underlying,
                         exc=str(exc),
                     )
-            await asyncio.sleep(240)
+            await asyncio.sleep(int(config.MOMENTUM_VOL_CACHE_TTL * 0.75))
 
     async def get_sigma_ann(self, underlying: str) -> Optional[tuple[float, str]]:
         """
@@ -132,17 +132,17 @@ class VolFetcher:
                 )
                 return iv, "deribit_atm"
 
-        # Fallback: Pyth rolling realized vol
+        # Fallback: RTDS rolling realized vol
         rv = self._compute_rolling_vol(underlying)
         if rv is not None:
             # Shorter TTL for realized vol — less stable than options IV
-            self._cache[underlying] = (rv, now + 60.0, "pyth_realized")
+            self._cache[underlying] = (rv, now + 60.0, "rtds_realized")
             log.debug(
-                "VolFetcher: Pyth rolling vol",
+                "VolFetcher: RTDS rolling vol",
                 underlying=underlying,
                 sigma_ann=round(rv, 4),
             )
-            return rv, "pyth_realized"
+            return rv, "rtds_realized"
 
         log.debug(
             "VolFetcher: no vol available",
@@ -151,7 +151,7 @@ class VolFetcher:
         )
         return None
 
-    # ── Pyth price callback ───────────────────────────────────────────────────
+    # ── RTDS price callback ─────────────────────────────────────────────────────
 
     async def _on_pyth(self, coin: str, price: float) -> None:
         """Append (timestamp, price) to the rolling buffer for `coin`."""
@@ -181,7 +181,7 @@ class VolFetcher:
             spot = history[-1][1]
         else:
             log.debug(
-                "VolFetcher: no Pyth price history for Deribit lookup",
+                "VolFetcher: no RTDS price history for Deribit lookup",
                 underlying=underlying,
             )
             return None

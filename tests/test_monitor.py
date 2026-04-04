@@ -354,19 +354,24 @@ class TestShouldExit:
         assert reason == ExitReason.MOMENTUM_STOP_LOSS
 
     def test_momentum_stop_loss_no_side_no_fire_below_delta_threshold(self):
-        """NO position: delta SL does NOT fire when spot hasn't moved past threshold."""
+        """NO position: delta SL does NOT fire when spot is still well in-the-money.
+
+        With the protective-buffer semantics, SL fires when delta < +SL_PCT.
+        A spot of 99_900 gives delta_no = (100000−99900)/100000×100 = +0.1% > +0.05%
+        → position is still 0.1% in-the-money → no fire.
+        """
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MOMENTUM_TAKE_PROFIT = 0.999
         pos = _make_position(
             entry_price=0.15, size=50.0, seconds_ago=120, strategy="momentum", side="NO",
             strike=100_000.0,
         )
-        # spot only 0.01% above strike → delta_no = −0.01% > −0.05% → no fire
+        # spot 0.1% BELOW strike → NO is in-the-money, delta_no = +0.1% > +0.05% → no fire
         exit_flag, _, _ = should_exit(
             pos=pos,
             current_price=0.55,
             current_token_price=0.65,
-            current_spot=100_010.0,   # (100000−100010)/100000×100 = −0.01% > −0.05%
+            current_spot=99_900.0,   # (100000−99900)/100000×100 = +0.1% > +0.05%
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(minutes=10),
             now=self.NOW,
@@ -376,9 +381,13 @@ class TestShouldExit:
     # ── Near-expiry stop ──────────────────────────────────────────────────
 
     def test_momentum_near_expiry_stop_triggers(self):
-        """Near-expiry stop fires when TTE < threshold AND spot has crossed the strike."""
+        """Near-expiry stop fires when TTE < threshold AND spot has crossed the strike.
+
+        Uses a large negative SL_PCT to disable the primary delta SL so that the
+        near-expiry check fires as the independent last-resort safety net.
+        """
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0  # large — so SL doesn't fire first
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0  # negative → primary SL disabled
         config.MOMENTUM_TAKE_PROFIT = 0.999
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
@@ -398,15 +407,18 @@ class TestShouldExit:
         assert reason == ExitReason.MOMENTUM_NEAR_EXPIRY
 
     def test_momentum_near_expiry_stop_no_trigger_when_spot_above_strike(self):
-        """Near-expiry stop does NOT fire when spot is above the strike (delta > 0)."""
+        """Near-expiry stop does NOT fire when spot is above the strike (delta > 0).
+
+        Uses large negative SL_PCT to isolate near-expiry logic from the primary delta SL.
+        """
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0  # negative → primary SL disabled
         config.MOMENTUM_TAKE_PROFIT = 0.999
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
             strike=100_000.0,
         )
-        # spot above strike → delta > 0 → no NE exit
+        # spot above strike → delta > 0 → no NE exit; and delta > -999 → no delta SL
         exit_flag, _, _ = should_exit(
             pos=pos,
             current_price=0.80,
@@ -420,9 +432,12 @@ class TestShouldExit:
         assert not exit_flag
 
     def test_momentum_near_expiry_stop_no_trigger_with_tte_above_threshold(self):
-        """Near-expiry stop does NOT fire when TTE is still above the time threshold."""
+        """Near-expiry stop does NOT fire when TTE is still above the time threshold.
+
+        Uses large negative SL_PCT to isolate near-expiry logic from the primary delta SL.
+        """
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0  # negative → primary SL disabled
         config.MOMENTUM_TAKE_PROFIT = 0.999
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
@@ -442,9 +457,12 @@ class TestShouldExit:
         assert not exit_flag
 
     def test_momentum_near_expiry_no_stop_without_tte_seconds(self):
-        """Near-expiry stop is silently disabled when tte_seconds=None."""
+        """Near-expiry stop is silently disabled when tte_seconds=None.
+
+        Uses large negative SL_PCT to isolate near-expiry logic from the primary delta SL.
+        """
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 60
-        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0  # negative → primary SL disabled
         config.MOMENTUM_TAKE_PROFIT = 0.999
         pos = _make_position(
             entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
@@ -943,8 +961,9 @@ class TestYesNoBookIndependence:
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MOMENTUM_TAKE_PROFIT = 0.01   # extremely low — would trigger if price checked
 
-        # spot within threshold (no delta SL), NE not active
-        pyth = _make_mock_pyth(spot=100_001.0)  # only 0.001% above strike
+        # NO position in-the-money (spot < strike) with delta well above SL threshold
+        # spot=99_900 → delta_no = (100000−99900)/100000×100 = +0.1% > +0.05% → no delta SL
+        pyth = _make_mock_pyth(spot=99_900.0)  # 0.1% BELOW strike → NO in-the-money
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
             no_mid=None,   # NO book absent
@@ -998,7 +1017,12 @@ class TestYesNoBookIndependence:
         )
 
     def test_delta_sl_does_not_fire_when_spot_within_threshold(self):
-        """Confirm delta SL is NOT over-eager when YES book is empty but spot is close."""
+        """Confirm delta SL is NOT over-eager when YES book is empty and position is in-the-money.
+
+        With protective-buffer semantics, SL fires when delta < +SL_PCT.
+        spot=100_100 gives delta_yes = (100100−100000)/100000×100 = +0.1% > +0.05%
+        → position is 0.1% in-the-money → delta SL does NOT fire.
+        """
         now = datetime.now(timezone.utc)
         future = now + timedelta(seconds=120)
 
@@ -1006,8 +1030,8 @@ class TestYesNoBookIndependence:
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 30
 
-        # spot only 0.01% below strike → delta = −0.01% > −0.05% → no SL
-        pyth = _make_mock_pyth(spot=99_990.0)
+        # spot 0.1% ABOVE strike → YES is clearly in-the-money, delta = +0.1% > +0.05% → no SL
+        pyth = _make_mock_pyth(spot=100_100.0)
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=None,  # YES CLOB book drained
             end_date=future,
@@ -1022,7 +1046,7 @@ class TestYesNoBookIndependence:
         _run(monitor._check_position(yes_pos))
 
         assert not risk._positions["mkt_001:YES"].is_closed, (
-            "Delta SL must NOT fire when spot is within the threshold"
+            "Delta SL must NOT fire when position is still clearly in-the-money"
         )
 
     def test_skips_closed_positions(self):
@@ -1459,13 +1483,17 @@ class TestPythOracleEventPath:
         pm.place_market.assert_called_once()  # force_taker=True for stop-loss
 
     def test_pyth_tick_no_fire_when_spot_within_threshold(self):
-        """Delta SL does NOT fire when spot is only slightly below strike."""
+        """Delta SL does NOT fire when position is still clearly in-the-money.
+
+        With protective-buffer semantics, SL fires when delta < +SL_PCT.
+        spot=100_100 gives delta_yes = +0.1% > +0.05% → no fire.
+        """
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 10
 
-        # spot only 0.01% below strike → delta = −0.01% > −0.05% → no fire
-        pyth = _make_mock_pyth(spot=99_990.0)
+        # spot 0.1% ABOVE strike → YES is in-the-money, delta = +0.1% > +0.05% → no fire
+        pyth = _make_mock_pyth(spot=100_100.0)
         monitor, pm, risk = _make_monitor(pyth_client=pyth)
 
         now = datetime.now(timezone.utc)
@@ -1478,10 +1506,10 @@ class TestPythOracleEventPath:
         )
         risk.open_position(pos)
 
-        _run(monitor._on_pyth_spot_update("BTC", 99_990.0))
+        _run(monitor._on_pyth_spot_update("BTC", 100_100.0))
 
         assert not risk._positions["mkt_001:YES"].is_closed, (
-            "Delta SL must NOT fire when spot is within the threshold"
+            "Delta SL must NOT fire when position is still clearly in-the-money"
         )
 
     def test_pyth_tick_ignores_wrong_coin(self):

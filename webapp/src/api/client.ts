@@ -1,14 +1,73 @@
 /**
- * api/client.ts — Typed API client that polls the FastAPI backend.
+ * api/client.ts — Typed API client for the FastAPI backend.
  *
- * All hooks auto-refresh every POLL_INTERVAL_MS milliseconds.
- * Set VITE_API_URL in .env (or vercel environment) to point to the backend.
+ * Live data hooks (useHealth, usePositions, useRisk, useMarkets, useFunding,
+ * useSignals, useMomentumSignals, useMakerQuotes, useMakerSignals, useCapital)
+ * subscribe to the SSE stream at /events and receive push updates from the
+ * backend instead of polling.  Each hook still falls back to a REST fetch on
+ * initial mount before the SSE connection delivers its first message.
+ *
+ * Slow-changing or expensive endpoints keep REST polling on longer intervals:
+ *   usePnl         — 30 s (CSV file read, not in SSE stream)
+ *   useConfig      — 30 s (rarely changes)
+ *   useLivePositions — 15 s (live Polymarket API call, expensive)
+ *   useTrades      — 30 s (historical, not time-critical)
+ *   useLogs        — 2 s  (ring buffer, stays as-is)
+ *   useErrorLogs   — 10 s (ring buffer, stays as-is)
+ *
+ * Set VITE_API_URL in .env (or Vercel environment) to point to the backend.
  */
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 
 export const BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
 const LAUNCHER_URL = import.meta.env.VITE_LAUNCHER_URL ?? "http://localhost:8081";
 const POLL_INTERVAL_MS = 5_000;
+
+// ── SSE singleton ─────────────────────────────────────────────────────────────
+// A single EventSource connection shared across all hooks.  When the server
+// pushes a state bundle, each registered callback receives its slice of the data.
+
+type SSECallback<T> = (data: T) => void;
+
+const _sseCallbacks = new Map<string, Set<SSECallback<unknown>>>();
+let _sseSource: EventSource | null = null;
+
+function _ensureSSE() {
+  if (_sseSource) return;
+  _sseSource = new EventSource(`${BASE_URL}/events`);
+
+  _sseSource.onopen = () => { /* connected */ };
+
+  _sseSource.onmessage = (ev: MessageEvent) => {
+    try {
+      const bundle = JSON.parse(ev.data) as Record<string, unknown>;
+      for (const [key, callbacks] of _sseCallbacks.entries()) {
+        if (bundle[key] !== undefined) {
+          callbacks.forEach(cb => (cb as SSECallback<unknown>)(bundle[key]));
+        }
+      }
+    } catch {
+      // malformed message — ignore
+    }
+  };
+
+  _sseSource.onerror = () => {
+    // Browser reconnects automatically on close; tear down our source to force a fresh connection
+    _sseSource?.close();
+    _sseSource = null;
+    // Re-connect after a brief delay so we don't spam during downtime
+    setTimeout(_ensureSSE, 3_000);
+  };
+}
+
+function _registerSSE<T>(key: string, cb: SSECallback<T>): () => void {
+  _ensureSSE();
+  if (!_sseCallbacks.has(key)) _sseCallbacks.set(key, new Set());
+  (_sseCallbacks.get(key) as Set<SSECallback<unknown>>).add(cb as SSECallback<unknown>);
+  return () => {
+    _sseCallbacks.get(key)?.delete(cb as SSECallback<unknown>);
+  };
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -466,7 +525,7 @@ export async function updateConfig(patch: ConfigPatch): Promise<ConfigData> {
   return json.current as ConfigData;
 }
 
-// ── Generic fetch hook ────────────────────────────────────────────────────────
+// ── Generic polling hook (kept for slow/expensive endpoints) ──────────────────
 
 function usePolling<T>(
   path: string,
@@ -499,11 +558,66 @@ function usePolling<T>(
   return { data, error, loading, refresh: fetchData };
 }
 
+// ── SSE hook — event-driven live data ─────────────────────────────────────────
+// Subscribes to the /events SSE stream for live pushes and does a single REST
+// fetch on mount so data is available before the first SSE message arrives.
+
+function useSSE<T>(
+  sseKey: string,
+  restPath: string,
+): { data: T | null; error: string | null; loading: boolean; refresh: () => void } {
+  const [data, setData] = useState<T | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  // Keep a stable ref to setData so the SSE callback closure stays current
+  const setDataRef = useRef<(v: T) => void>(setData);
+  setDataRef.current = setData;
+
+  const fetchData = useCallback(async () => {
+    try {
+      const res = await fetch(`${BASE_URL}${restPath}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      setData(json);
+      setError(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "fetch error");
+    } finally {
+      setLoading(false);
+    }
+  }, [restPath]);
+
+  useEffect(() => {
+    fetchData(); // populate immediately before first SSE push
+
+    const unregister = _registerSSE<T>(sseKey, (pushed) => {
+      setDataRef.current(pushed);
+      setLoading(false);
+    });
+    return unregister;
+  }, [sseKey, fetchData]);
+
+  return { data, error, loading, refresh: fetchData };
+}
+
 // ── Typed hooks ───────────────────────────────────────────────────────────────
 
-export const useHealth = () => usePolling<HealthData>("/health");
-export const useConfig = () => usePolling<ConfigData>("/config");
-export const usePositions = () => usePolling<{ positions: Position[]; count: number }>("/positions");
+// Live hooks — event-driven via SSE stream (no polling timer):
+export const useHealth = () => useSSE<HealthData>("health", "/health");
+export const usePositions = () => useSSE<{ positions: Position[]; count: number }>("positions", "/positions");
+export const useRisk = () => useSSE<RiskData>("risk", "/risk");
+export const useMarkets = () => useSSE<{ markets: Market[]; count: number }>("markets", "/markets");
+export const useFunding = () => useSSE<{ funding: Record<string, FundingEntry> }>("funding", "/funding");
+export const useSignals = (limit = 50) => useSSE<{ signals: Signal[]; total: number }>("signals", `/signals?limit=${limit}`);
+export const useMakerQuotes = () => useSSE<{ quotes: MakerQuote[]; count: number; strategy_enabled: boolean }>("maker_quotes", "/maker/quotes");
+export const useMakerSignals = () => useSSE<{ signals: MakerSignal[]; count: number; strategy_enabled: boolean }>("maker_signals", "/maker/signals");
+export const useCapital = () => useSSE<CapitalData>("capital", "/maker/capital");
+export const useMomentumSignals = (limit = 50) => useSSE<{ signals: MomentumSignal[]; total: number }>("momentum_signals", `/momentum/signals?limit=${limit}`);
+
+// Slow/expensive hooks — keep REST polling at relaxed intervals:
+export const useConfig = () => usePolling<ConfigData>("/config", 30_000);
+export const usePnl = () => useSSE<PnlData>("pnl", "/pnl");   // SSE-updated every 30 s by backend
 
 export interface WalletPosition {
   token_id: string;
@@ -545,20 +659,6 @@ export interface LivePositionsData {
 }
 
 export const useLivePositions = () => usePolling<LivePositionsData>("/positions/live", 15_000);
-export const usePnl = () => usePolling<PnlData>("/pnl");
-export const useRisk = () => usePolling<RiskData>("/risk");
-export const useMarkets = () => usePolling<{ markets: Market[]; count: number }>("/markets");
-export const useFunding = () => usePolling<{ funding: Record<string, FundingEntry> }>("/funding");
-export const useSignals = (limit = 50) =>
-  usePolling<{ signals: Signal[]; total: number }>(`/signals?limit=${limit}`);
-export const useMakerQuotes = () =>
-  usePolling<{ quotes: MakerQuote[]; count: number; strategy_enabled: boolean }>("/maker/quotes");
-export const useMakerSignals = () =>
-  usePolling<{ signals: MakerSignal[]; count: number; strategy_enabled: boolean }>("/maker/signals");
-export const useCapital = () =>
-  usePolling<CapitalData>("/maker/capital");
-export const useMomentumSignals = (limit = 50) =>
-  usePolling<{ signals: MomentumSignal[]; total: number }>(`/momentum/signals?limit=${limit}`);
 
 export interface MomentumDiagnosticMarket {
   market_id: string;
@@ -618,7 +718,7 @@ export const useTrades = (limit = 100, offset = 0, strategy?: string, underlying
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   if (strategy) params.set("strategy", strategy);
   if (underlying) params.set("underlying", underlying);
-  return usePolling<{ trades: Trade[]; total: number }>(`/trades?${params}`);
+  return usePolling<{ trades: Trade[]; total: number }>(`/trades?${params}`, 30_000);
 };
 export const usePerformance = (period: "7d" | "30d" | "all" = "all") =>
   usePolling<PerformanceData>(`/performance?period=${period}`, 30_000);

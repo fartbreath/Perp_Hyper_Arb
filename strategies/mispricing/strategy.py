@@ -25,7 +25,7 @@ import config
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket
 from market_data.hl_client import HLClient
-from market_data.pyth_client import PythClient
+from market_data.rtds_client import RTDSClient
 from market_data.deribit import DeribitFetcher
 from market_data.kalshi_client import KalshiClient
 from risk import min_edge_after_fees
@@ -49,21 +49,30 @@ class MispricingScanner(BaseStrategy):
         hl: HLClient,
         signal_callback,   # async callable(signal: MispricingSignal)
         scan_interval: int = 300,
-        pyth: Optional[PythClient] = None,
+        pyth: Optional[RTDSClient] = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
-        self._pyth = pyth  # Pyth oracle — authoritative spot, same as Polymarket resolution source
+        self._pyth = pyth  # RTDSClient — authoritative spot, same as Polymarket resolution source
         self._on_signal = signal_callback
         self._default_scan_interval = scan_interval
         self._deribit = DeribitFetcher()
         self._kalshi = KalshiClient()
         self._running = False
         self._market_last_traded: dict[str, float] = {}
+        # Set when PM price data changes — wakes the scan loop early
+        self._scan_event: asyncio.Event = asyncio.Event()
+
+    async def _on_price_update_mispricing(self, token_id: str, mid: float) -> None:
+        """PM price-change callback: wake the scan loop immediately."""
+        self._scan_event.set()
 
     async def start(self) -> None:
         self._running = True
         log.info("MispricingScanner started", interval=config.MISPRICING_SCAN_INTERVAL)
+        # Wake scan immediately on every PM price tick so we catch deviations
+        # without waiting the full MISPRICING_SCAN_INTERVAL.
+        self._pm.on_price_change(self._on_price_update_mispricing)
         await self._kalshi.refresh_markets()
         asyncio.create_task(self._scan_loop())
 
@@ -86,13 +95,20 @@ class MispricingScanner(BaseStrategy):
             if not config.STRATEGY_MISPRICING_ENABLED or not config.BOT_ACTIVE:
                 await asyncio.sleep(10)
                 continue
+            # Clear the event BEFORE scanning so any tick that fires DURING
+            # _scan_once is captured and triggers an immediate follow-up pass.
+            self._scan_event.clear()
             try:
                 await self._scan_once()
             except Exception as exc:
                 log.error("Scan loop error", exc=str(exc))
             interval = config.MISPRICING_SCAN_INTERVAL
             log.debug("Scan sleeping", seconds=interval)
-            await asyncio.sleep(interval)
+            # Wait for a PM price-change event (wakes early) OR the full backstop timeout.
+            try:
+                await asyncio.wait_for(self._scan_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
 
     async def _scan_once(self) -> None:
         """Run one full scan pass over all milestone markets."""
@@ -146,7 +162,7 @@ class MispricingScanner(BaseStrategy):
                 skipped_no_price += 1
                 continue
 
-            # Use Pyth oracle if wired (authoritative resolution price); fall back to HL perp.
+            # Use RTDS spot if wired (authoritative resolution price); fall back to HL perp.
             spot = (
                 self._pyth.get_mid(market.underlying)
                 if self._pyth is not None

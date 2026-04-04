@@ -269,7 +269,12 @@ class TestE2E_IsCrossed:
         )
 
     def test_bid_at_maker_quoted_price_is_crossed(self, live_btc_book):
-        """Maker BUY at mid-half_spread is within fill tolerance of best_bid."""
+        """Maker BUY at mid-half_spread is within fill tolerance of best_bid.
+
+        Skipped when the live book is too tight for the 0.02 half-spread assumption:
+        _is_crossed requires price >= best_bid - 0.01 (FILL_QUEUE_TOLERANCE).
+        When mid - best_bid < 0.01 the maker bid (mid-0.02) falls below that floor.
+        """
         token_id, snap = live_btc_book
         if snap.mid is None or snap.best_bid is None:
             pytest.skip("No mid/bid in live book")
@@ -277,6 +282,15 @@ class TestE2E_IsCrossed:
             pytest.skip(
                 "No asks in live book — market is likely near resolution "
                 "(mid ≈ best_bid, 2-cent half-spread falls outside fill tolerance)"
+            )
+        # The assumption mid - 0.02 ≈ best_bid only holds when the bid-side
+        # spread is at least 0.01 wide.  Tight books (e.g. 0.005 spread) make
+        # the maker bid (mid-0.02) exceed the FILL_QUEUE_TOLERANCE gap — skip
+        # rather than assert on a condition that depends on live market conditions.
+        if snap.mid - snap.best_bid < 0.01:
+            pytest.skip(
+                f"Book too tight (mid-best_bid={snap.mid - snap.best_bid:.3f} < 0.01); "
+                "0.02 half-spread bid falls below fill tolerance"
             )
         _pm, _hl, engine, strategy, monitor, simulator = _make_components()
         maker_bid = round(snap.mid - 0.02, 4)  # typical: mid minus half_spread

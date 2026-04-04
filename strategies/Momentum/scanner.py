@@ -31,7 +31,7 @@ import config
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket, _MARKET_TYPE_DURATION_SECS
 from market_data.hl_client import HLClient
-from market_data.pyth_client import PythClient, SpotPrice
+from market_data.rtds_client import RTDSClient, SpotPrice
 from risk import RiskEngine, Position
 from strategies.base import BaseStrategy
 from strategies.Momentum.signal import MomentumSignal
@@ -102,7 +102,7 @@ class MomentumScanner(BaseStrategy):
         hl: HLClient,
         risk: RiskEngine,
         vol_fetcher: VolFetcher,
-        pyth: PythClient,
+        pyth: RTDSClient,
         on_signal: Any = None,
     ) -> None:
         self._pm = pm
@@ -124,7 +124,7 @@ class MomentumScanner(BaseStrategy):
         # key: condition_id  value: unix timestamp at which the block lifts
         self._stop_loss_blocked: dict[str, float] = {}
         # Open-spot cache for "Up or Down" directional markets.
-        # key: condition_id  value: Pyth oracle spot price at the moment the window opened.
+        # key: condition_id  value: RTDS spot price at the moment the window opened.
         # Persisted to disk so restarts don't lose recorded opens mid-window.
         self._open_spot_path = os.path.join(
             os.path.dirname(__file__), "..", "..", "data", "market_open_spots.json"
@@ -167,7 +167,7 @@ class MomentumScanner(BaseStrategy):
         # Event-driven entry: wake the scan loop immediately when a YES/NO token
         # price enters the signal band rather than waiting up to SCAN_INTERVAL.
         self._pm.on_price_change(self._on_price_update_entry)
-        # Also wake on Pyth price ticks — oracle spot moves are just as
+        # Also wake on RTDS spot ticks — spot moves can cross the strike
         # likely to create or dissolve a signal as PM CLOB ticks.
         self._pyth.on_price_update(self._on_pyth_spot_update_entry)
         asyncio.create_task(self._scan_loop())
@@ -267,7 +267,7 @@ class MomentumScanner(BaseStrategy):
 
     # ── Scan loop ─────────────────────────────────────────────────────────────
 
-    _SUBSCRIPTION_REFRESH_INTERVAL = 60   # seconds between _refresh_subscriptions calls (short: 5m buckets need fast pickup)
+    _SUBSCRIPTION_REFRESH_INTERVAL = 30   # seconds between _refresh_subscriptions calls (short: 5m buckets need fast pickup)
 
     async def _scan_loop(self) -> None:
         # start() already called _refresh_subscriptions() — wait the full interval
@@ -880,13 +880,13 @@ class MomentumScanner(BaseStrategy):
         self._scan_event.set()
 
     async def _on_pyth_spot_update_entry(self, coin: str, price: float) -> None:
-        """Wake the scan loop when the Pyth oracle price for `coin` changes.
+        """Wake the scan loop when the RTDS spot price for `coin` changes.
 
-        Mirrors _on_price_update_entry but fires on Pyth price ticks rather
+        Mirrors _on_price_update_entry but fires on RTDS ticks rather
         than PM CLOB ticks.  A spot move through the strike changes the delta
         signal even if no PM order-book update has arrived yet.
 
-        Uses the Pyth oracle price — the same source Polymarket resolves on —
+        Uses the RTDS spot price — the same source Polymarket resolves on —
         so that signal detection and stop-loss are consistent with settlement.
         """
         if not config.STRATEGY_MOMENTUM_ENABLED or not config.BOT_ACTIVE:
