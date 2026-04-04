@@ -188,7 +188,19 @@ class RTDSClient:
                     # Start heartbeat — RTDS requires a PING message every 5 s
                     heartbeat_task = asyncio.create_task(self._heartbeat(ws))
                     try:
-                        async for raw in ws:
+                        # Use an explicit timeout on each recv() so that a zombie
+                        # connection (dead TCP, no close frame) is detected and
+                        # causes a reconnect.  We PING every 5 s so we expect at
+                        # least a PONG back within 15 s in steady state.
+                        while True:
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                            except asyncio.TimeoutError:
+                                log.warning(
+                                    "RTDSClient: no message received in 15 s — "
+                                    "zombie connection, forcing reconnect"
+                                )
+                                break
                             await self._handle_message(raw)
                     finally:
                         heartbeat_task.cancel()
@@ -239,6 +251,7 @@ class RTDSClient:
 
     async def _handle_message(self, raw: str) -> None:
         if raw == "PONG":
+            log.debug("RTDSClient: PONG received")
             return  # heartbeat response; no action needed
 
         try:
