@@ -43,7 +43,7 @@ import config
 from logger import get_bot_logger
 from risk import RiskEngine, Position
 from market_data.pm_client import PMClient, _MARKET_TYPE_DURATION_SECS
-from market_data.rtds_client import RTDSClient
+from market_data.rtds_client import RTDSClient, CHAINLINK_MARKET_TYPES
 from ctf_utils import _redeem_ctf_via_safe
 
 log = get_bot_logger(__name__)
@@ -367,6 +367,9 @@ class PositionMonitor:
         # goes quiet near expiry — exactly when the SL matters most).
         if self._pyth is not None:
             self._pyth.on_price_update(self._on_pyth_spot_update)
+            # Also fire on Chainlink ticks so 5m/15m/4h position SLs are
+            # evaluated the moment a Chainlink oracle price update arrives.
+            self._pyth.on_chainlink_update(self._on_pyth_spot_update)
         log.info("PositionMonitor started (event-driven)")
         asyncio.create_task(self._auto_redeem_loop())
         # Rare backstop sweep: catches resolved markets that PM WS never echoes
@@ -835,11 +838,15 @@ class PositionMonitor:
 
         # Fetch live spot price for delta-based stop-loss.
         # get_mid() is a synchronous in-memory cache read — no await needed.
-        # RTDSClient (Polymarket's own RTDS feed) is the primary source;
-        # PythClient is no longer used — RTDSClient is the only supported implementation.
+        # Route to the correct oracle: Chainlink for 5m/15m/4h markets (these
+        # resolve against the Chainlink oracle), RTDS exchange-aggregated for
+        # 1h/daily/weekly markets.
         current_spot: Optional[float] = None
         if pos.strategy == "momentum" and self._pyth is not None and pos.underlying:
-            current_spot = self._pyth.get_mid(pos.underlying)
+            if pos.market_type in CHAINLINK_MARKET_TYPES:
+                current_spot = self._pyth.get_mid_chainlink(pos.underlying)
+            else:
+                current_spot = self._pyth.get_mid(pos.underlying)
 
         exit_flag, reason, unrealised = should_exit(
             pos=pos,
@@ -1085,12 +1092,16 @@ class PositionMonitor:
             # background resolution-check task can fill in the outcome later.
             _market_end_date = getattr(market, "end_date", None)
             _add_pending_resolution(pos.market_id, _market_end_date)
-        # Capture the underlying spot price at exit time (Pyth oracle).
-        _exit_spot = (
-            self._pyth.get_mid(pos.underlying)
-            if self._pyth is not None and pos.underlying
-            else 0.0
-        ) or 0.0
+        # Capture the underlying spot price at exit time.
+        # Use the same oracle that the market resolves against: Chainlink for
+        # 5m/15m/4h markets, RTDS exchange-aggregated for 1h/daily/weekly.
+        if self._pyth is not None and pos.underlying:
+            if pos.market_type in CHAINLINK_MARKET_TYPES:
+                _exit_spot = self._pyth.get_mid_chainlink(pos.underlying) or 0.0
+            else:
+                _exit_spot = self._pyth.get_mid(pos.underlying) or 0.0
+        else:
+            _exit_spot = 0.0
         closed = self._risk.close_position(
             market_id=pos.market_id,
             side=pos.side,

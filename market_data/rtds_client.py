@@ -3,20 +3,27 @@ rtds_client.py — Polymarket Real-Time Data Socket (RTDS) price feed client.
 
 Connects to the Polymarket RTDS WebSocket (wss://ws-live-data.polymarket.com)
 and subscribes to two topics in a single connection:
-  - ``crypto_prices``           — RTDS default topic (BTC, ETH, SOL, XRP, BNB, DOGE)
-  - ``crypto_prices_chainlink`` — RTDS Chainlink topic (HYPE, and any future coins
-                                  not yet integrated into ``crypto_prices``)
+  - ``crypto_prices``           — RTDS default topic (BTC, ETH, SOL, XRP, BNB, DOGE).
+                                  Exchange-aggregated prices.  Used for 1h / daily /
+                                  weekly Up/Down markets.
+  - ``crypto_prices_chainlink`` — Chainlink oracle prices for ALL tracked coins.
+                                  Polymarket resolves 5m, 15m, and 4h Up/Down markets
+                                  against this feed.  Use ``get_mid_chainlink()`` /
+                                  ``get_spot_chainlink()`` for delta-SL and strike
+                                  calculations on those market types.
 
-This is Polymarket's own live price feed — the same source their resolution
-oracles read — so stop-loss decisions are based on the price Polymarket
-actually settles against.
+Market-type → oracle source mapping (``CHAINLINK_MARKET_TYPES``):
+    bucket_5m, bucket_15m, bucket_4h  → crypto_prices_chainlink (Chainlink)
+    bucket_1h, bucket_daily, etc.     → crypto_prices (RTDS exchange-aggregated)
 
 Usage:
     client = RTDSClient()
     await client.start()
-    price = client.get_mid("ETH")         # Optional[float]; None before first tick
-    age   = client.get_spot_age("ETH")    # seconds since last update; inf if never seen
-    client.on_price_update(async_callback)  # callback(coin: str, price: float)
+    price = client.get_mid("ETH")             # RTDS exchange-aggregated
+    price = client.get_mid_chainlink("BNB")   # Chainlink oracle
+    age   = client.get_spot_age("ETH")        # seconds since last RTDS update
+    client.on_price_update(async_callback)    # callback(coin, price) — RTDS ticks
+    client.on_chainlink_update(async_callback)# callback(coin, price) — Chainlink ticks
 """
 from __future__ import annotations
 
@@ -64,27 +71,52 @@ _RTDS_SYM_TO_COIN: dict[str, str] = {
 }
 
 # crypto_prices_chainlink topic: Chainlink symbol → bot coin label.
-# Symbols use Chainlink's slash-format (e.g. "hype/usd").
-# Coins delivered via this topic (e.g. HYPE) are not available on crypto_prices.
+# All tracked coins are available on this topic; symbols use slash/usd format.
+# These are the oracle prices Polymarket uses for 5m, 15m, and 4h Up/Down markets.
 _CHAINLINK_SYM_TO_COIN: dict[str, str] = {
+    "btc/usd":  "BTC",
+    "eth/usd":  "ETH",
+    "sol/usd":  "SOL",
+    "xrp/usd":  "XRP",
+    "bnb/usd":  "BNB",
+    "doge/usd": "DOGE",
     "hype/usd": "HYPE",
 }
+
+# Market types whose resolution oracle is Chainlink (crypto_prices_chainlink).
+# All other bucket types (bucket_1h, bucket_daily, etc.) use the RTDS
+# exchange-aggregated feed (crypto_prices).
+CHAINLINK_MARKET_TYPES: frozenset[str] = frozenset({
+    "bucket_5m",
+    "bucket_15m",
+    "bucket_4h",
+})
 
 class RTDSClient:
     """
     Streams real-time spot prices from Polymarket's own RTDS WebSocket.
 
-    Subscribes to ``crypto_prices`` (BTC/ETH/SOL/XRP/BNB/DOGE) and
-    ``crypto_prices_chainlink`` (HYPE).  Maintains an in-memory SpotPrice
-    cache keyed by coin symbol.
+    Subscribes to two topics:
+    - ``crypto_prices`` — exchange-aggregated RTDS prices for BTC/ETH/SOL/XRP/BNB/DOGE/LINK.
+      Used as the oracle for 1h, daily, and weekly bucket markets.
+    - ``crypto_prices_chainlink`` — Chainlink oracle prices for BTC/ETH/SOL/XRP/BNB/DOGE/HYPE.
+      Used as the oracle for 5m, 15m, and 4h bucket markets (``CHAINLINK_MARKET_TYPES``).
+
+    Each topic is cached separately.  Callers must use the appropriate method:
+    ``get_mid`` / ``get_spot`` for RTDS markets, and
+    ``get_mid_chainlink`` / ``get_spot_chainlink`` for Chainlink markets.
 
     Reconnection is automatic with exponential back-off (max 30 s).
     A PING frame is sent every 5 seconds to keep the connection alive.
     """
 
     def __init__(self) -> None:
+        # Exchange-aggregated prices (crypto_prices topic).
         self._prices: dict[str, SpotPrice] = {}
         self._callbacks: list[Callable[[str, float], Coroutine]] = []
+        # Chainlink oracle prices (crypto_prices_chainlink topic).
+        self._chainlink_prices: dict[str, SpotPrice] = {}
+        self._chainlink_callbacks: list[Callable[[str, float], Coroutine]] = []
         # Coins requested by the bot (from TRACKED_UNDERLYINGS, filtered to RTDS coverage).
         # Populated in start(); messages for other symbols are silently ignored.
         self._tracked_coins: set[str] = set()
@@ -96,16 +128,24 @@ class RTDSClient:
     def on_price_update(
         self, callback: Callable[[str, float], Coroutine]
     ) -> None:
-        """Register an async callback(coin, price) fired on every RTDS tick."""
+        """Register an async callback(coin, price) fired on every RTDS exchange-aggregated tick."""
         self._callbacks.append(callback)
 
+    def on_chainlink_update(
+        self, callback: Callable[[str, float], Coroutine]
+    ) -> None:
+        """Register an async callback(coin, price) fired on every Chainlink oracle tick."""
+        self._chainlink_callbacks.append(callback)
+
+    # ── Exchange-aggregated (crypto_prices) accessors ─────────────────────────
+
     def get_mid(self, coin: str) -> Optional[float]:
-        """Latest spot mid price for `coin`; None if no data received yet."""
+        """Latest RTDS exchange-aggregated mid for `coin`; None if not received."""
         snap = self._prices.get(coin)
         return snap.price if snap is not None else None
 
     def get_spot(self, coin: str) -> Optional[SpotPrice]:
-        """Latest SpotPrice snapshot for `coin`; None if no data received yet."""
+        """Latest RTDS SpotPrice snapshot for `coin`; None if not received."""
         return self._prices.get(coin)
 
     def get_spot_age(self, coin: str) -> float:
@@ -114,8 +154,24 @@ class RTDSClient:
         return time.time() - snap.timestamp if snap is not None else float("inf")
 
     def all_mids(self) -> dict[str, float]:
-        """Return a copy of the current coin → price dict."""
+        """Return a copy of the current RTDS coin → price dict."""
         return {coin: snap.price for coin, snap in self._prices.items()}
+
+    # ── Chainlink oracle (crypto_prices_chainlink) accessors ──────────────────
+
+    def get_mid_chainlink(self, coin: str) -> Optional[float]:
+        """Latest Chainlink oracle mid for `coin`; None if not received yet."""
+        snap = self._chainlink_prices.get(coin)
+        return snap.price if snap is not None else None
+
+    def get_spot_chainlink(self, coin: str) -> Optional[SpotPrice]:
+        """Latest Chainlink SpotPrice snapshot for `coin`; None if not received."""
+        return self._chainlink_prices.get(coin)
+
+    def get_spot_age_chainlink(self, coin: str) -> float:
+        """Seconds since the last Chainlink tick for `coin`; inf if never seen."""
+        snap = self._chainlink_prices.get(coin)
+        return time.time() - snap.timestamp if snap is not None else float("inf")
 
     @property
     def tracked_coins(self) -> set[str]:
@@ -145,7 +201,7 @@ class RTDSClient:
     # ── WebSocket loop ────────────────────────────────────────────────────────
 
     async def _health_log_loop(self) -> None:
-        """Every 60 s log the age of each tracked coin's spot price.
+        """Every 60 s log the age of each tracked coin's spot price (both feeds).
 
         Logs INFO when all coins are fresh (age < 30 s).
         Logs WARNING when any coin is stale, naming which coins and their ages.
@@ -154,19 +210,27 @@ class RTDSClient:
         STALE_THRESH = 30.0   # seconds — matches MOMENTUM_SPOT_MAX_AGE_SECS
         await asyncio.sleep(60)   # first check after 60 s so startup noise settles
         while self._running:
-            ages = {
+            rtds_ages = {
                 coin: round(self.get_spot_age(coin), 1)
                 for coin in sorted(self._tracked_coins)
             }
-            stale = {c: a for c, a in ages.items() if a > STALE_THRESH}
-            if stale:
+            cl_ages = {
+                coin: round(self.get_spot_age_chainlink(coin), 1)
+                for coin in sorted(self._tracked_coins)
+                if coin in _CHAINLINK_SYM_TO_COIN.values()
+            }
+            rtds_stale = {c: a for c, a in rtds_ages.items() if a > STALE_THRESH}
+            cl_stale   = {c: a for c, a in cl_ages.items()   if a > STALE_THRESH}
+            if rtds_stale or cl_stale:
                 log.warning(
                     "RTDSClient: stale spot prices",
-                    stale_coins=stale,
-                    fresh_coins={c: a for c, a in ages.items() if c not in stale},
+                    rtds_stale=rtds_stale or None,
+                    chainlink_stale=cl_stale or None,
+                    rtds_fresh={c: a for c, a in rtds_ages.items() if c not in rtds_stale},
+                    chainlink_fresh={c: a for c, a in cl_ages.items() if c not in cl_stale},
                 )
             else:
-                log.info("RTDSClient: spot prices OK", ages_s=ages)
+                log.info("RTDSClient: spot prices OK", rtds_ages_s=rtds_ages, cl_ages_s=cl_ages)
             await asyncio.sleep(60)
 
     async def _ws_loop(self) -> None:
@@ -292,12 +356,20 @@ class RTDSClient:
             return
 
         snap = SpotPrice(coin=coin, price=price, timestamp=ts_ms / 1000.0)
-        self._prices[coin] = snap
 
-        log.debug("RTDSClient: price update", coin=coin, price=round(price, 6), source=topic)
-
-        for cb in self._callbacks:
-            try:
-                await cb(coin, price)
-            except Exception as exc:
-                log.error("RTDSClient: callback error", exc=str(exc), coin=coin)
+        if topic == "crypto_prices_chainlink":
+            self._chainlink_prices[coin] = snap
+            log.debug("RTDSClient: chainlink update", coin=coin, price=round(price, 6))
+            for cb in self._chainlink_callbacks:
+                try:
+                    await cb(coin, price)
+                except Exception as exc:
+                    log.error("RTDSClient: chainlink callback error", exc=str(exc), coin=coin)
+        else:
+            self._prices[coin] = snap
+            log.debug("RTDSClient: price update", coin=coin, price=round(price, 6), source=topic)
+            for cb in self._callbacks:
+                try:
+                    await cb(coin, price)
+                except Exception as exc:
+                    log.error("RTDSClient: callback error", exc=str(exc), coin=coin)

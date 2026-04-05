@@ -60,24 +60,24 @@ pm_client.run()           ← Polymarket WS + heartbeat
 hl_client.run()           ← Hyperliquid WS + dead-man's switch (execution only)
 rtds_client.start()       ← Polymarket RTDS WS (crypto_prices + crypto_prices_chainlink topics)
 maker_strategy.start()    ← quoting sweep + hedge debounce (reprice trigger = RTDS tick)
-momentum_scanner.start()  ← scan every 5-10 s + event-driven entry (PM ticks + RTDS ticks)
+momentum_scanner.start()  ← scan every 5-10 s + event-driven entry (PM ticks + RTDS/Chainlink ticks)
 mispricing_scanner.start()← scan every 60 s (spot price from RTDS)
 agent_loop()              ← consumes signal queue from scanner
 api_server                ← FastAPI REST for webapp
-state_sync_loop()         ← pushes bot state to API layer (spot_mid from RTDS)
+state_sync_loop()         ← pushes bot state to API layer (spot_mid routed by market type)
 ```
 
-The momentum scanner wakes immediately on **either** a PM CLOB price tick or an RTDS price tick.
+The momentum scanner wakes immediately on **either** a PM CLOB price tick or a spot tick from RTDS **or** Chainlink (whichever feed the market resolves against).
 The position monitor evaluates exit conditions for **all open positions** on every PM WS tick
-and for momentum positions on every RTDS tick, so a spot move through the stop-loss strike is
+and for momentum positions on every RTDS/Chainlink tick, so a spot move through the stop-loss strike is
 detected within one WebSocket round-trip (~100–500 ms) rather than any configured poll delay.
 
 **Spot price source — Polymarket RTDS (`wss://ws-live-data.polymarket.com`):**
 
-| Topic | Coins | Format |
-|-------|-------|--------|
-| `crypto_prices` | BTC, ETH, SOL, XRP, BNB, DOGE, LINK | RTDS usdt-pair format (`btcusdt`, …) |
-| `crypto_prices_chainlink` | HYPE | Chainlink slash-format (`hype/usd`) |
+| Topic | Coins | Format | Used for |
+|-------|-------|--------|----------|
+| `crypto_prices` | BTC, ETH, SOL, XRP, BNB, DOGE, LINK | RTDS usdt-pair format (`btcusdt`, …) | 1h, daily, weekly markets (`get_mid` / `get_spot`) |
+| `crypto_prices_chainlink` | BTC, ETH, SOL, XRP, BNB, DOGE, HYPE | Chainlink slash-format (`btc/usd`, …) | 5m, 15m, 4h markets (`get_mid_chainlink` / `get_spot_chainlink`) |
 
 **Price source split:**
 
@@ -87,8 +87,8 @@ detected within one WebSocket round-trip (~100–500 ms) rather than any confi
 | Hedge sizing (maker) | ✓ `get_mid()` | ✗ |
 | Rolling realized vol (vol_fetcher) | ✓ price feed | ✗ |
 | Black-Scholes spot S (mispricing) | ✓ `get_mid()` | ✗ |
-| Momentum delta SL / scanner entry | ✓ `get_mid()` | ✗ |
-| Exit spot recorded in trades.csv | ✓ at exit time | ✗ |
+| Momentum delta SL / scanner entry | ✓ `get_mid()` or `get_mid_chainlink()` (routed by market type) | ✗ |
+| Exit spot recorded in trades.csv | ✓ oracle-routed at exit time | ✗ |
 | Hedge order placement | ✗ | ✓ |
 | `get_bbo()` for slippage measurement | ✗ | ✓ |
 

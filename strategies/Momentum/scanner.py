@@ -31,7 +31,7 @@ import config
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket, _MARKET_TYPE_DURATION_SECS
 from market_data.hl_client import HLClient
-from market_data.rtds_client import RTDSClient, SpotPrice
+from market_data.rtds_client import RTDSClient, SpotPrice, CHAINLINK_MARKET_TYPES
 from risk import RiskEngine, Position
 from strategies.base import BaseStrategy
 from strategies.Momentum.signal import MomentumSignal
@@ -87,6 +87,17 @@ def _ensure_momentum_fills_csv() -> None:
 
 # Bucket market types that the scanner targets.
 _TARGET_MARKET_TYPES = frozenset(_MARKET_TYPE_DURATION_SECS.keys())
+
+
+def _get_oracle_spot(market_type: str, underlying: str, pyth: RTDSClient) -> Optional[SpotPrice]:
+    """Return the correct oracle SpotPrice for `underlying` given `market_type`.
+
+    5m / 15m / 4h Up/Down markets resolve against Chainlink; all other bucket
+    types (1h, daily, weekly) use the RTDS exchange-aggregated feed.
+    """
+    if market_type in CHAINLINK_MARKET_TYPES:
+        return pyth.get_spot_chainlink(underlying)
+    return pyth.get_spot(underlying)
 
 
 class MomentumScanner(BaseStrategy):
@@ -167,9 +178,11 @@ class MomentumScanner(BaseStrategy):
         # Event-driven entry: wake the scan loop immediately when a YES/NO token
         # price enters the signal band rather than waiting up to SCAN_INTERVAL.
         self._pm.on_price_change(self._on_price_update_entry)
-        # Also wake on RTDS spot ticks — spot moves can cross the strike
-        # likely to create or dissolve a signal as PM CLOB ticks.
+        # Also wake on spot ticks — spot moves can cross the strike and create or
+        # dissolve a signal between PM CLOB ticks.  Register for BOTH feed sources:
+        # RTDS (1h / daily / weekly markets) and Chainlink (5m / 15m / 4h markets).
         self._pyth.on_price_update(self._on_pyth_spot_update_entry)
+        self._pyth.on_chainlink_update(self._on_pyth_spot_update_entry)
         asyncio.create_task(self._scan_loop())
 
     async def stop(self) -> None:
@@ -536,8 +549,10 @@ class MomentumScanner(BaseStrategy):
                 scan_diags.append(_d)
                 continue
 
-            # ── Pyth oracle spot ──────────────────────────────────────────────
-            snap = self._pyth.get_spot(market.underlying)
+            # ── Oracle spot (source depends on market type) ───────────────────
+            # 5m / 15m / 4h → Chainlink (matches Polymarket's resolution oracle).
+            # 1h / daily / weekly → RTDS exchange-aggregated.
+            snap = _get_oracle_spot(market.market_type, market.underlying, self._pyth)
             if snap is None or snap.mid is None:
                 skipped_stale_spot += 1
                 _d["skip_reason"] = "no_spot"
@@ -562,10 +577,13 @@ class MomentumScanner(BaseStrategy):
 
             if strike is None and _is_updown_market(market.title):
                 # Directional "Up or Down" market: the implicit strike is the spot
-                # at window-open time.  We record it on first observation and
-                # persist it so restarts don't lose the open price mid-window.
+                # at window-open time.  Record on first observation using the
+                # oracle-correct price source (Chainlink for 5m/15m/4h markets).
+                # The not_started pre-filter above ensures we only reach here when
+                # tte_seconds <= bucket_duration, so the window has actually opened.
                 mid_id = market.condition_id
                 if mid_id not in self._market_open_spot:
+                    _oracle_src = "chainlink" if market.market_type in CHAINLINK_MARKET_TYPES else "rtds"
                     self._market_open_spot[mid_id] = spot
                     _save_open_spots(self._open_spot_path, self._market_open_spot)
                     log.debug(
@@ -573,6 +591,7 @@ class MomentumScanner(BaseStrategy):
                         market=market.title[:60],
                         market_id=mid_id[:16],
                         open_spot=round(spot, 4),
+                        oracle=_oracle_src,
                     )
                 strike = self._market_open_spot[mid_id]
 

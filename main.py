@@ -50,7 +50,7 @@ import api_server
 from api_server import state as api_state
 from market_data.pm_client import PMClient
 from market_data.hl_client import HLClient
-from market_data.rtds_client import RTDSClient
+from market_data.rtds_client import RTDSClient, CHAINLINK_MARKET_TYPES
 from risk import RiskEngine, Position
 from strategies.maker.strategy import MakerStrategy
 from strategies.mispricing.strategy import MispricingScanner
@@ -500,8 +500,13 @@ async def state_sync_loop(
                     "yes_book_bid": book_yes.best_bid if book_yes else None,
                     "yes_book_ask": book_yes.best_ask if book_yes else None,
                     "yes_book_ts":  book_yes.timestamp  if book_yes else None,
-                    # RTDS spot — authoritative resolution price (same source as Polymarket)
-                    "spot_mid": pyth.get_mid(mkt.underlying),
+                    # Spot price from the correct oracle for this market type:
+                    # Chainlink for 5m/15m/4h, RTDS exchange-aggregated for 1h/daily/weekly.
+                    "spot_mid": (
+                        pyth.get_mid_chainlink(mkt.underlying)
+                        if mkt.market_type in CHAINLINK_MARKET_TYPES
+                        else pyth.get_mid(mkt.underlying)
+                    ),
                 }
             api_state.markets = markets_raw
 

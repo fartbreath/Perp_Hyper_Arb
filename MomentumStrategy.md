@@ -275,7 +275,12 @@ For each open bucket market M:
         continue  # no side in band
 
     # ── Stale spot gate ───────────────────────────────────────────────────
-    pyth_price = pyth.get_mid(M.underlying)  # Pyth oracle spot
+    # Oracle is routed by market type: Chainlink feed for 5m/15m/4h,
+    # RTDS exchange-aggregated feed for 1h/daily/weekly.
+    if M.market_type in CHAINLINK_MARKET_TYPES:
+        pyth_price = pyth.get_mid_chainlink(M.underlying)
+    else:
+        pyth_price = pyth.get_mid(M.underlying)
     if pyth_price is None: continue
     if now_ts - pyth_price.timestamp > MOMENTUM_SPOT_MAX_AGE_SECS: continue
     spot = pyth_price.mid
