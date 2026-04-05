@@ -507,6 +507,17 @@ class MomentumScanner(BaseStrategy):
             # clearly reflect the correct direction; monitor.py and risk.py accept
             # both "YES"/"UP" (long the first token) and "NO"/"DOWN" (long the second).
             _is_updown = _is_updown_market(market.title)
+
+            # Skip markets where YES resolves on a downward price move ("dip to",
+            # "drop below", etc.).  The scanner maps YES-in-band to
+            # spot_above_strike, which inverts the signal for these markets:
+            # spot being ABOVE a dip level produces a large positive delta_pct,
+            # a spurious z-score, and full Kelly sizing on a worthless position.
+            if _is_inverted_direction_market(market.title):
+                _d["skip_reason"] = "inverted_direction_market"
+                scan_diags.append(_d)
+                continue
+
             if band_lo <= p_yes <= band_hi:
                 high_side = "UP" if _is_updown else "YES"
                 token_id = market.token_id_yes
@@ -1223,10 +1234,34 @@ _STRIKE_PATTERNS = [
 
 _UPDOWN_RE = re.compile(r'\bup\s+or\s+down\b', re.IGNORECASE)
 
+# Markets where YES resolves on a DOWNWARD price move.  The scanner's direction
+# mapping assumes YES ≡ spot_above_strike; for these markets that assumption is
+# inverted, which produces a backwards z-score signal (large positive when spot
+# is far ABOVE the dip level) and full Kelly sizing on a doomed trade.
+# Safer to skip until a touch-market model is implemented.
+_INVERTED_DIRECTION_RE = re.compile(
+    r'\b(?:dip|drop|fall|decline|crash)s?\s+(?:to|below|under|beneath)\b'
+    r'|\bdip\s+to\b'
+    r'|\bbelow\s+\$'
+    r'|\bfall\s+to\b'
+    r'|\bdrop\s+to\b',
+    re.IGNORECASE,
+)
+
 
 def _is_updown_market(title: str) -> bool:
     """Return True if the market is a directional 'Up or Down' window market."""
     return bool(_UPDOWN_RE.search(title))
+
+
+def _is_inverted_direction_market(title: str) -> bool:
+    """Return True if YES resolves on a downward price move (dip/drop/fall markets).
+
+    The scanner maps YES-in-band → spot_above_strike.  These markets invert that
+    assumption (YES wins if spot goes DOWN), so they must be excluded to prevent
+    the delta_pct sign being backwards and the z-score blowing up.
+    """
+    return bool(_INVERTED_DIRECTION_RE.search(title))
 
 
 def _load_open_spots(path: str) -> dict[str, float]:
