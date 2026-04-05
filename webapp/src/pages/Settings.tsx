@@ -1407,15 +1407,53 @@ export default function Settings() {
               />
             </div>
 
-            <SectionHead title="Execution" />
+            <SectionHead title="Position Sizing — Fractional Kelly" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              How much collateral to deploy per signal, scaled by how good the signal actually is.
+              <br /><br />
+              <strong>How it works:</strong> Kelly Criterion asks: given our estimated win probability
+              and the payout odds, what fraction of the bankroll is mathematically optimal to bet?
+              We then apply a safety multiplier (<em>Kelly Fraction</em>) to stay conservative — because
+              our win-probability model isn't perfect.
+              <br /><br />
+              <strong>Why this is better than a fixed size:</strong>
+              <ul style={{ margin: "0.4rem 0 0 1.2rem", padding: 0 }}>
+                <li>A signal at 3σ gets more collateral than one at 1.65σ — automatically.</li>
+                <li>A token priced at 0.82 gets more than one at 0.88 — because the payout odds are better low in the band.</li>
+                <li>Marginal signals (barely above threshold) deploy near the $1 floor. Strong signals approach the maximum.</li>
+              </ul>
+              <br />
+              <strong>Quick calibration guide:</strong>
+              <ul style={{ margin: "0.4rem 0 0 1.2rem", padding: 0 }}>
+                <li><strong>1.00</strong> (default) — deploy <em>kelly_f × Max Entry</em> directly. e.g. kelly_f=0.75 → $37.50 at a $50 ceiling.</li>
+                <li><strong>0.50</strong> — half-Kelly: scales every bet to 50% of the above. More conservative.</li>
+                <li><strong>0.25</strong> — quarter-Kelly: sizes every bet at 25% of kelly_f × Max Entry. Most conservative.</li>
+              </ul>
+            </p>
 
             <FloatInput
               label="Max Entry (USD)"
-              description="Maximum USDC collateral per momentum position."
+              description="Absolute ceiling per position. Kelly never deploys more than this."
               value={data.momentum_max_entry_usd ?? 50}
               step={5}
               unit="USD"
               onSubmit={(v) => apply({ momentum_max_entry_usd: v })}
+            />
+
+            {GAP}
+
+            <FloatInput
+              label="Kelly Fraction"
+              description={
+                "Safety multiplier on kelly_f. 1.0 (default) = deploy kelly_f × Max Entry directly. " +
+                "0.5 = half-Kelly (deploy 0.5 × kelly_f × Max Entry). " +
+                "Lower = more conservative; higher is not meaningful above 1.0. " +
+                "Signals near the entry threshold auto-size near the $1 floor; strong signals approach Max Entry."
+              }
+              value={data.momentum_kelly_fraction ?? 1.0}
+              step={0.05}
+              unit=""
+              onSubmit={(v) => apply({ momentum_kelly_fraction: v })}
             />
 
             {GAP}

@@ -269,10 +269,34 @@ MOMENTUM_PRICE_BAND_HIGH: float = 0.90
 
 # Maximum USDC deployed per momentum position.
 MOMENTUM_MAX_ENTRY_USD: float = 50.0
-# Edge-proportional sizing: scale entry size based on signal edge strength.
-# When edge_pct >= MOMENTUM_EDGE_SIZE_ANCHOR the full MAX_ENTRY is deployed.
-# Below the anchor: size = (edge_pct / anchor) * MAX_ENTRY, floored at MIN_ENTRY_USD.
-MOMENTUM_EDGE_SIZE_ANCHOR: float = 0.10  # edge_pct at which full MAX_ENTRY is used
+# ── Fractional Kelly position sizing ──────────────────────────────────────
+# Replaces the old edge_pct anchor approach.  Kelly Criterion sizes each bet
+# in proportion to the mathematical edge: how much better is our win probability
+# than what the odds imply?
+#
+# How it works:
+#   1. win_prob = N(observed_z_total) — the probability the underlying
+#      finishes on the winning side, estimated from our vol model.
+#   2. payout_b = (1 - token_price) / token_price — how many dollars you
+#      win for every dollar you risk (e.g. buying at 0.85 → b = 0.18).
+#   3. Full Kelly fraction = max(0, (win_prob × b − lose_prob) / b)
+#      This is what a perfect model would bet as a fraction of the bankroll.
+#   4. We scale by MOMENTUM_KELLY_FRACTION (a safety multiplier 0–1):
+#        size = MAX_ENTRY × min(1, kelly_f × KELLY_FRACTION)
+#      At KELLY_FRACTION=1.0, size = kelly_f × MAX_ENTRY directly.
+#      Lowering it shrinks every bet proportionally without changing signal rank.
+#
+# Natural behaviour (all three rules without explicit knobs):
+#   • Stronger signal   → higher win_prob → larger kelly_f → bigger size
+#   • Larger gap        → higher win_prob (more σ above zero) → bigger size
+#   • Higher band price → smaller payout_b → smaller kelly_f → smaller size
+#
+# MOMENTUM_KELLY_FRACTION calibration (safety multiplier applied to kelly_f):
+#   1.00 — full Kelly relative to MAX_ENTRY (default).
+#           size = kelly_f × MAX_ENTRY.  e.g. kelly_f=0.85 → $42.50 at $50 max.
+#   0.50 — half-Kelly: size = 0.5 × kelly_f × MAX_ENTRY. Lower variance.
+#   0.25 — quarter-Kelly: most conservative; max effective bet = 25% of MAX.
+MOMENTUM_KELLY_FRACTION: float = 1.0     # safety multiplier on kelly_f (0 < x ≤ 1.0)
 MOMENTUM_MIN_ENTRY_USD: float = 1.0      # floor to avoid dust orders
 
 # Minimum USDC depth on the ask side within 1c of best ask (thin-book guard).

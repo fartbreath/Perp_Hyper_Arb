@@ -61,6 +61,12 @@ MOMENTUM_FILLS_HEADER = [
     "tte_seconds",        # TTE at entry
     "ask_depth_usd",      # CLOB depth at signal time
     "fill_from_ws",       # True = confirmed via WS event, False = REST fallback
+    # ── Kelly sizing debug (added with fractional-Kelly implementation) ──
+    "kelly_win_prob",     # N(observed_z_total) — model's estimated win probability
+    "kelly_payout_b",     # (1-token_price)/token_price — dollars won per dollar risked
+    "kelly_f",            # raw full-Kelly fraction before scaling
+    "kelly_fraction_cfg", # MOMENTUM_KELLY_FRACTION config value used
+    "kelly_size_usd",     # intended position size in USD (=size_usd before fill)
 ]
 
 
@@ -768,6 +774,11 @@ class MomentumScanner(BaseStrategy):
                 vol_source=vol_src,
                 vol_z_score=_vol_z,
             )
+            # ── Kelly sizing preview for diagnostics ─────────────────────
+            # Compute Kelly fields now so the webapp diagnostics row for this
+            # signal shows the full sizing breakdown, not just whether it fired.
+            _kelly_size_preview, _kelly_preview_debug = _compute_kelly_size_usd(signal)
+            _d.update(_kelly_preview_debug)
             _d["skip_reason"] = "signal_fired"
             scan_diags.append(_d)
             log.info(
@@ -1000,15 +1011,8 @@ class MomentumScanner(BaseStrategy):
             )
             return False
 
-        size_usd = config.MOMENTUM_MAX_ENTRY_USD
-        _edge = signal.edge_pct
-        _anchor = config.MOMENTUM_EDGE_SIZE_ANCHOR
-        if _anchor > 0 and _edge > 0:
-            _fraction = min(1.0, _edge / _anchor)
-            size_usd = max(
-                config.MOMENTUM_MIN_ENTRY_USD,
-                round(_fraction * config.MOMENTUM_MAX_ENTRY_USD, 2),
-            )
+        # ── Fractional Kelly sizing ────────────────────────────────────────────
+        size_usd, _kelly_debug = _compute_kelly_size_usd(signal)
 
         # ── Place order ───────────────────────────────────────────────────────
         order_id: Optional[str] = None
@@ -1173,6 +1177,12 @@ class MomentumScanner(BaseStrategy):
                 "tte_seconds": round(signal.tte_seconds, 1),
                 "ask_depth_usd": _ask_depth_usd,
                 "fill_from_ws": actual_fill is not None and not self._pm._paper_mode,
+                # Kelly debug fields
+                "kelly_win_prob":     _kelly_debug["kelly_win_prob"],
+                "kelly_payout_b":     _kelly_debug["kelly_payout_b"],
+                "kelly_f":            _kelly_debug["kelly_f"],
+                "kelly_fraction_cfg": _kelly_debug["kelly_fraction_cfg"],
+                "kelly_size_usd":     _kelly_debug["kelly_size_usd"],
             }
             with MOMENTUM_FILLS_CSV.open("a", newline="") as _f:
                 csv.DictWriter(_f, fieldnames=MOMENTUM_FILLS_HEADER).writerow(_fill_row)
@@ -1193,6 +1203,12 @@ class MomentumScanner(BaseStrategy):
             sigma_ann=round(signal.sigma_ann, 3),
             vol_source=signal.vol_source,
             order_id=order_id,
+            # Kelly sizing breakdown for observability
+            kelly_win_prob=_kelly_debug["kelly_win_prob"],
+            kelly_payout_b=_kelly_debug["kelly_payout_b"],
+            kelly_f=_kelly_debug["kelly_f"],
+            kelly_fraction_cfg=_kelly_debug["kelly_fraction_cfg"],
+            kelly_size_usd=_kelly_debug["kelly_size_usd"],
         )
         return True
 
@@ -1276,6 +1292,96 @@ def _extract_strike(title: str, spot: float) -> Optional[float]:
             except (ValueError, IndexError):
                 continue
     return None
+
+
+def _compute_kelly_size_usd(signal: "MomentumSignal") -> tuple[float, dict]:
+    """Compute position size in USD using fractional Kelly Criterion.
+
+    Kelly Criterion for a binary bet:
+        f* = max(0, (p×b − (1-p)) / b)
+    where:
+        p = win probability  estimated as N(observed_z_total)
+        b = payout per dollar risked = (1 − token_price) / token_price
+
+    The raw Kelly fraction is multiplied by MOMENTUM_KELLY_FRACTION (default 1.0)
+    as a safety dampener.  At 1.0 (no dampening) size = kelly_f × MAX_ENTRY.
+    Lower values scale every bet down proportionally while preserving rank.
+
+    Natural behaviour (all three sizing intuitions without explicit knobs):
+      • Stronger signal (higher delta) → higher win_prob → bigger size
+      • Larger gap above threshold     → higher win_prob → bigger size
+      • Higher token price in band     → smaller payout_b → smaller size
+
+    The sigma_tau denominator is floored at 1 second to prevent the z
+    computation blowing up when TTE approaches zero near expiry.
+
+    Returns (size_usd, debug_dict).  The debug_dict is written to both the
+    fills CSV and the scanner diagnostics so every sizing decision is auditable.
+
+    Debug fields:
+        kelly_sigma_tau     — σ scaled to remaining TTE window
+        kelly_z_total       — total z-score above zero (vol_z + excess)
+        kelly_win_prob      — N(kelly_z_total); model win probability
+        kelly_payout_b      — (1 - token_price) / token_price
+        kelly_f             — raw full-Kelly fraction
+        kelly_fraction_cfg  — MOMENTUM_KELLY_FRACTION config value
+        kelly_size_usd      — resulting USD size (= what will be placed)
+
+    ASCII diagram — how each signal dimension flows to size:
+
+        delta_pct ──┐
+                    ├──▶ observed_z_total ──▶ N(z) = win_prob ──┐
+        threshold ──┘                                            ├──▶ kelly_f ──▶ × fraction ──▶ size_usd
+        sigma_ann ──▶ sigma_tau ──────────────────────────────── ┘                              (capped at MAX)
+        token_price ────────────────────────────────────────────────────▶ payout_b ──┘
+    """
+    # σ_τ = σ_ann × √(TTE_seconds / one_year_seconds)
+    # Floor at 1 s so TTE → 0 near expiry doesn't collapse sigma_tau to 0
+    # and send observed_z_total to +∞ (which would always return MAX_ENTRY).
+    sigma_tau = signal.sigma_ann * math.sqrt(max(signal.tte_seconds, 1.0) / 31_536_000)
+
+    # Total observed z above zero: the configured entry threshold z-score
+    # (from vol model) PLUS how many additional tau-σ units we are above
+    # that threshold.  This is the z at which N(z) gives our win probability.
+    _excess_tau_z = (signal.delta_pct - signal.threshold_pct) / (sigma_tau * 100 + 1e-9)
+    observed_z_total = signal.vol_z_score + _excess_tau_z
+    # Cap at 6σ to prevent erf() overflow on very strong signals
+    observed_z_total = min(observed_z_total, 6.0)
+
+    # Model win probability: P(underlying finishes on the winning side)
+    win_prob = 0.5 * (1.0 + math.erf(observed_z_total / math.sqrt(2.0)))
+
+    # Payout multiple: for a binary token at price p, you risk p dollars to
+    # win (1 - p) dollars, so b = (1 - p) / p.
+    # Safety-clamp token_price so we never divide by 0 or get negative b.
+    token_p = max(0.01, min(0.99, signal.token_price))
+    payout_b = (1.0 - token_p) / token_p
+
+    # Full Kelly fraction: the fraction of bankroll a perfect model would bet.
+    lose_prob = 1.0 - win_prob
+    kelly_f = max(0.0, (win_prob * payout_b - lose_prob) / payout_b)
+
+    # Fractional Kelly: multiply by KELLY_FRACTION safety factor.
+    # KELLY_FRACTION=1.0 → deploy kelly_f × MAX_ENTRY (full-Kelly relative to max).
+    # KELLY_FRACTION=0.5 → deploy 0.5 × kelly_f × MAX_ENTRY (half-Kelly).
+    # KELLY_FRACTION=0.25 → quarter-Kelly.
+    _fraction_cfg = max(0.0, min(1.0, config.MOMENTUM_KELLY_FRACTION))
+    fraction_of_max = min(1.0, kelly_f * _fraction_cfg)
+    size_usd = max(
+        config.MOMENTUM_MIN_ENTRY_USD,
+        round(fraction_of_max * config.MOMENTUM_MAX_ENTRY_USD, 2),
+    )
+
+    debug: dict = {
+        "kelly_sigma_tau":    round(sigma_tau, 6),
+        "kelly_z_total":      round(observed_z_total, 4),
+        "kelly_win_prob":     round(win_prob, 4),
+        "kelly_payout_b":     round(payout_b, 4),
+        "kelly_f":            round(kelly_f, 4),
+        "kelly_fraction_cfg": _fraction_cfg,
+        "kelly_size_usd":     size_usd,
+    }
+    return size_usd, debug
 
 
 def _signal_log_dict(s: MomentumSignal) -> dict:

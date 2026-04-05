@@ -502,6 +502,7 @@ _MUTABLE_CONFIG = {
     "momentum_price_band_low":        ("MOMENTUM_PRICE_BAND_LOW",          float),
     "momentum_price_band_high":       ("MOMENTUM_PRICE_BAND_HIGH",         float),
     "momentum_max_entry_usd":         ("MOMENTUM_MAX_ENTRY_USD",           float),
+    "momentum_kelly_fraction":         ("MOMENTUM_KELLY_FRACTION",          float),
     "momentum_min_clob_depth":        ("MOMENTUM_MIN_CLOB_DEPTH",          float),
     "momentum_order_type":            ("MOMENTUM_ORDER_TYPE",              str),
     "momentum_delta_stop_loss_pct":    ("MOMENTUM_DELTA_STOP_LOSS_PCT",     float),
@@ -629,6 +630,7 @@ class ConfigPatch(BaseModel):
     momentum_price_band_low: float | None = None
     momentum_price_band_high: float | None = None
     momentum_max_entry_usd: float | None = None
+    momentum_kelly_fraction: float | None = None
     momentum_min_clob_depth: float | None = None
     momentum_order_type: str | None = None
     momentum_delta_stop_loss_pct: float | None = None
@@ -770,6 +772,7 @@ def get_config() -> dict:
         "momentum_price_band_low":        config.MOMENTUM_PRICE_BAND_LOW,
         "momentum_price_band_high":       config.MOMENTUM_PRICE_BAND_HIGH,
         "momentum_max_entry_usd":         config.MOMENTUM_MAX_ENTRY_USD,
+        "momentum_kelly_fraction":         config.MOMENTUM_KELLY_FRACTION,
         "momentum_min_clob_depth":        config.MOMENTUM_MIN_CLOB_DEPTH,
         "momentum_order_type":            config.MOMENTUM_ORDER_TYPE,
         "momentum_delta_stop_loss_pct":    config.MOMENTUM_DELTA_STOP_LOSS_PCT,
