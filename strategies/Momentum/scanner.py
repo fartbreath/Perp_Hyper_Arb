@@ -766,7 +766,7 @@ class MomentumScanner(BaseStrategy):
                 token_price=token_price,
                 p_yes=p_yes,
                 delta_pct=delta_pct,
-                threshold_pct=y,
+                threshold_pct=_effective_threshold,  # max(vol_threshold, MIN_DELTA_PCT floor)
                 spot=spot,
                 strike=strike,
                 tte_seconds=tte_seconds,
@@ -1330,21 +1330,27 @@ def _compute_kelly_size_usd(signal: "MomentumSignal") -> tuple[float, dict]:
     ASCII diagram — how each signal dimension flows to size:
 
         delta_pct ──┐
-                    ├──▶ observed_z_total ──▶ N(z) = win_prob ──┐
-        threshold ──┘                                            ├──▶ kelly_f ──▶ × fraction ──▶ size_usd
-        sigma_ann ──▶ sigma_tau ──────────────────────────────── ┘                              (capped at MAX)
-        token_price ────────────────────────────────────────────────────▶ payout_b ──┘
+                    ├──▶ delta / sigma_tau = z ──▶ N(z) = win_prob ──┐
+        sigma_ann ──▶ sigma_tau ──────────────────────────────────────┘ ──▶ kelly_f ──▶ × fraction ──▶ size_usd
+        token_price ────────────────────────────────────────────────────────────▶ payout_b ──┘
+
+    NOTE: VOL_Z_SCORE, MIN_DELTA_PCT, MIN_GAP_PCT affect the *entry gate* but
+    not the Kelly probability estimate once the signal has fired.  The gate
+    config lives on the signal's threshold_pct and vol_z_score fields and is
+    used for signal_score analytics (position meta) — not for sizing.
     """
     # σ_τ = σ_ann × √(TTE_seconds / one_year_seconds)
     # Floor at 1 s so TTE → 0 near expiry doesn't collapse sigma_tau to 0
     # and send observed_z_total to +∞ (which would always return MAX_ENTRY).
     sigma_tau = signal.sigma_ann * math.sqrt(max(signal.tte_seconds, 1.0) / 31_536_000)
 
-    # Total observed z above zero: the configured entry threshold z-score
-    # (from vol model) PLUS how many additional tau-σ units we are above
-    # that threshold.  This is the z at which N(z) gives our win probability.
-    _excess_tau_z = (signal.delta_pct - signal.threshold_pct) / (sigma_tau * 100 + 1e-9)
-    observed_z_total = signal.vol_z_score + _excess_tau_z
+    # Win probability: P(underlying finishes in-the-money at expiry).
+    # z = delta_pct / (sigma_tau * 100) — how many remaining-window σ units
+    # the spot is currently above (YES) or below (NO) the strike.
+    # Using the raw delta/sigma_tau directly is robust to any threshold config:
+    # VOL_Z_SCORE, MIN_DELTA_PCT, MIN_GAP_PCT all affect the gate but not the
+    # actual probability of the trade being in-the-money at settlement.
+    observed_z_total = signal.delta_pct / (sigma_tau * 100 + 1e-9)
     # Cap at 6σ to prevent erf() overflow on very strong signals
     observed_z_total = min(observed_z_total, 6.0)
 
