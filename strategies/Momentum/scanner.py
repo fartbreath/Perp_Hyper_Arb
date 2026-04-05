@@ -508,26 +508,28 @@ class MomentumScanner(BaseStrategy):
             # both "YES"/"UP" (long the first token) and "NO"/"DOWN" (long the second).
             _is_updown = _is_updown_market(market.title)
 
-            # Skip markets where YES resolves on a downward price move ("dip to",
-            # "drop below", etc.).  The scanner maps YES-in-band to
-            # spot_above_strike, which inverts the signal for these markets:
-            # spot being ABOVE a dip level produces a large positive delta_pct,
-            # a spurious z-score, and full Kelly sizing on a worthless position.
-            if _is_inverted_direction_market(market.title):
-                _d["skip_reason"] = "inverted_direction_market"
-                scan_diags.append(_d)
-                continue
+            # For "dip / drop / fall below $X" markets YES resolves on a DOWNWARD
+            # spot move, which is the opposite of a normal YES market.  Invert the
+            # direction assignment so delta_pct is computed correctly:
+            #   normal YES:   required_direction = "spot_above_strike"
+            #   inverted YES: required_direction = "spot_below_strike"  (dip confirmed)
+            # With the correct sign, a spurious signal like the Apr-5 XRP dip trades
+            # (spot $1.317 above the $1.20/$1.25 dip level) produces a NEGATIVE
+            # delta_pct and is rejected by the delta gate — as it should be.
+            # A genuinely confirmed dip (spot already below the strike) produces a
+            # positive delta_pct and is entered correctly.
+            _is_inverted = _is_inverted_direction_market(market.title)
 
             if band_lo <= p_yes <= band_hi:
                 high_side = "UP" if _is_updown else "YES"
                 token_id = market.token_id_yes
                 token_price = p_yes
-                required_direction = "spot_above_strike"
+                required_direction = "spot_below_strike" if _is_inverted else "spot_above_strike"
             elif band_lo <= p_no <= band_hi:
                 high_side = "DOWN" if _is_updown else "NO"
                 token_id = market.token_id_no
                 token_price = p_no
-                required_direction = "spot_below_strike"
+                required_direction = "spot_above_strike" if _is_inverted else "spot_below_strike"
             else:
                 skipped_band += 1
                 # Distance to nearest band edge shows tuning headroom.
