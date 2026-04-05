@@ -469,6 +469,7 @@ export interface ConfigData {
   momentum_price_band_low?: number;
   momentum_price_band_high?: number;
   momentum_max_entry_usd?: number;
+  momentum_kelly_fraction?: number;
   momentum_min_clob_depth?: number;
   momentum_order_type?: string;
   momentum_delta_stop_loss_pct?: number;

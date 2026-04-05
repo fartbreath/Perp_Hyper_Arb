@@ -1408,28 +1408,29 @@ export default function Settings() {
             </div>
 
             <SectionHead title="Position Sizing — Fractional Kelly" />
-            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
-              How much collateral to deploy per signal, scaled by how good the signal actually is.
-              <br /><br />
-              <strong>How it works:</strong> Kelly Criterion asks: given our estimated win probability
-              and the payout odds, what fraction of the bankroll is mathematically optimal to bet?
-              We then apply a safety multiplier (<em>Kelly Fraction</em>) to stay conservative — because
-              our win-probability model isn't perfect.
-              <br /><br />
-              <strong>Why this is better than a fixed size:</strong>
-              <ul style={{ margin: "0.4rem 0 0 1.2rem", padding: 0 }}>
+            <div className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              <p style={{ margin: 0 }}>
+                How much collateral to deploy per signal, scaled by how good the signal actually is.
+              </p>
+              <p style={{ margin: "0.5rem 0 0" }}>
+                <strong>How it works:</strong> Kelly Criterion asks: given our estimated win probability
+                and the payout odds, what fraction of the bankroll is mathematically optimal to bet?
+                We then apply a safety multiplier (<em>Kelly Fraction</em>) to stay conservative — because
+                our win-probability model isn't perfect.
+              </p>
+              <p style={{ margin: "0.5rem 0 0" }}><strong>Why this is better than a fixed size:</strong></p>
+              <ul style={{ margin: "0.25rem 0 0 1.2rem", padding: 0 }}>
                 <li>A signal at 3σ gets more collateral than one at 1.65σ — automatically.</li>
                 <li>A token priced at 0.82 gets more than one at 0.88 — because the payout odds are better low in the band.</li>
                 <li>Marginal signals (barely above threshold) deploy near the $1 floor. Strong signals approach the maximum.</li>
               </ul>
-              <br />
-              <strong>Quick calibration guide:</strong>
-              <ul style={{ margin: "0.4rem 0 0 1.2rem", padding: 0 }}>
+              <p style={{ margin: "0.5rem 0 0" }}><strong>Quick calibration guide:</strong></p>
+              <ul style={{ margin: "0.25rem 0 0 1.2rem", padding: 0 }}>
                 <li><strong>1.00</strong> (default) — deploy <em>kelly_f × Max Entry</em> directly. e.g. kelly_f=0.75 → $37.50 at a $50 ceiling.</li>
                 <li><strong>0.50</strong> — half-Kelly: scales every bet to 50% of the above. More conservative.</li>
                 <li><strong>0.25</strong> — quarter-Kelly: sizes every bet at 25% of kelly_f × Max Entry. Most conservative.</li>
               </ul>
-            </p>
+            </div>
 
             <FloatInput
               label="Max Entry (USD)"
