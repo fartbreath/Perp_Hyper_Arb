@@ -44,8 +44,26 @@ from logger import get_bot_logger
 from risk import Position, RiskEngine
 from strategies.maker.fill_logic import open_position_from_fill
 from strategies.maker.signals import ActiveQuote
+from strategies.Momentum.market_utils import _is_updown_market
 
 log = get_bot_logger(__name__)
+
+
+def _side_for_token(token_id: str, market) -> str:
+    """Return the canonical side label for a token in a market.
+
+    Up/Down markets (title contains "Up or Down") use "UP"/"DOWN" to match
+    the side label that the momentum scanner writes at entry.  All other
+    markets use "YES"/"NO".
+
+    Using the correct label is critical: risk.py keys positions as
+    ``{market_id}:{side}``, so a mismatch creates a duplicate entry rather
+    than merging into the existing position.
+    """
+    is_yes = token_id == market.token_id_yes
+    if _is_updown_market(market.title):
+        return "UP" if is_yes else "DOWN"
+    return "YES" if is_yes else "NO"
 
 
 class LiveFillHandler:
@@ -268,7 +286,7 @@ class LiveFillHandler:
                 # Named outcome ("Up", "Down", "Will X", etc.) or absent field —
                 # match by token_id against the known YES token for this market.
                 is_yes = token_id == market.token_id_yes
-            side = "YES" if is_yes else "NO"
+            side = _side_for_token(token_id, market)
 
             # PM Data API returns avgPrice.  The actual semantics (whether it is
             # in YES-probability space or native NO-token price space) are not
@@ -341,14 +359,18 @@ class LiveFillHandler:
             markets_by_token[mkt.token_id_yes] = mkt
             markets_by_token[mkt.token_id_no] = mkt
 
-        # Build current risk-engine state keyed by token_id
+        # Build current risk-engine state keyed by token_id.
+        # IMPORTANT: UP/DOWN positions hold token_id_yes/token_id_no respectively
+        # (same as YES/NO), so the side-to-token mapping must treat "UP" like
+        # "YES" and "DOWN" like "NO".  Getting this wrong causes the duplicate
+        # check below to miss existing UP positions and import a ghost YES copy.
         bot_by_token: dict[str, object] = {}
         for pos in self._risk.get_positions().values():
             if pos.is_closed:
                 continue
             mkt = self._pm.get_markets().get(pos.market_id)
             if mkt:
-                tid = mkt.token_id_yes if pos.side == "YES" else mkt.token_id_no
+                tid = mkt.token_id_yes if pos.side in ("YES", "UP") else mkt.token_id_no
                 bot_by_token[tid] = pos
 
         imported = 0
@@ -385,12 +407,7 @@ class LiveFillHandler:
                 is_yes = False
             else:
                 is_yes = token_id == market.token_id_yes
-            side = "YES" if is_yes else "NO"
-            # PM Data API returns avgPrice.  The actual semantics (whether it is
-            # in YES-probability space or native NO-token price space) are not
-            # confirmed by official PM API docs.  We store it as-is for both sides.
-            # TODO: verify PM Data API spec for NO avgPrice encoding and update
-            #       entry_price accordingly if it is confirmed to be YES-space.
+            side = _side_for_token(token_id, market)
             entry_price = avg_price if avg_price > 0 else 0.0
             entry_cost = entry_price * size
             saved_strategy = self._risk.get_token_strategy(token_id) or "unknown"

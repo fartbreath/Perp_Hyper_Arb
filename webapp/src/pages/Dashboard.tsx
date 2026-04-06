@@ -285,7 +285,7 @@ function HealthCard() {
   if (!data) return <div className="card skeleton" />;
 
   const hbAge = data.last_heartbeat_age_s;
-  const hbOk = hbAge !== null && hbAge < 30;
+  const hbOk = data.paper_trading ? true : (hbAge !== null && hbAge < 30);
   const dq = data.data_quality;
   const noBookPct = dq && dq.market_count > 0
     ? Math.round(dq.no_book_count / dq.market_count * 100) : 0;
@@ -316,7 +316,7 @@ function HealthCard() {
         <tbody>
           <tr><td>PM WebSocket</td><td><StatusDot ok={data.pm_ws_connected} label="PM WebSocket" /> {data.pm_ws_connected ? "Connected" : "Disconnected"}</td></tr>
           <tr><td>HL WebSocket</td><td><StatusDot ok={data.hl_ws_connected} label="HL WebSocket" /> {data.hl_ws_connected ? "Connected" : "Disconnected"}</td></tr>
-          <tr><td>Heartbeat</td><td><StatusDot ok={hbOk} label="Heartbeat" /> {hbAge !== null ? `${hbAge.toFixed(0)}s ago` : "Never"}</td></tr>
+          <tr><td>Heartbeat</td><td><StatusDot ok={hbOk} label="Heartbeat" /> {hbAge !== null ? `${hbAge.toFixed(0)}s ago` : data.paper_trading ? "N/A (paper)" : "Never"}</td></tr>
           <tr><td>Uptime</td><td>{Math.floor(data.uptime_seconds / 60)}m {Math.floor(data.uptime_seconds % 60)}s</td></tr>
           <tr><td>Mode</td><td>{data.paper_trading ? "📋 Paper" : "🔴 LIVE"}</td></tr>
           <tr><td>Agent</td><td>{data.agent_auto ? "🤖 Auto" : "👤 Shadow"}</td></tr>

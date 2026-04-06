@@ -1,5 +1,5 @@
-"""
-tests/test_momentum_scanner.py — Unit tests for strategies/Momentum/scanner.py
+﻿"""
+tests/test_momentum_scanner.py â€” Unit tests for strategies/Momentum/scanner.py
 
 Run: pytest tests/test_momentum_scanner.py -v
 
@@ -10,7 +10,7 @@ Coverage:
   - MomentumSignal.vol_z_score field and edge_pct property
   - record_trade_close (per-side cooldown, persistence)
   - YES/NO cooldown independence (YES cooling never blocks NO)
-  - E5: edge-proportional sizing formula
+  - E5: Kelly-criterion sizing (_compute_kelly_size_usd)
   - E7: diagnostics() returns pm_feed_health / stale_book_ratio
   - E9: cooldowns loaded on scanner init and saved on every write
   - _on_price_update_entry (band-triggered scan wakeup, per-side)
@@ -34,15 +34,20 @@ from risk import RiskEngine
 from pm_client import PMMarket, OrderBookSnapshot
 from strategies.Momentum.scanner import (
     MomentumScanner,
+    _compute_kelly_size_usd,
     _extract_strike,
     _is_updown_market,
     _load_cooldowns,
     _save_cooldowns,
 )
+from strategies.Momentum.market_utils import (
+    _extract_range_bounds,
+    _is_range_market,
+)
 from strategies.Momentum.signal import MomentumSignal
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
@@ -103,10 +108,10 @@ def _make_scanner(tmp_path=None) -> MomentumScanner:
     vol.get_sigma_ann = AsyncMock(return_value=(0.80, "hl_realized"))
     vol.start_prefetch = MagicMock()
 
-    pyth = MagicMock()
-    pyth.get_mid = MagicMock(side_effect=lambda c: 99_900.0)
+    spot = MagicMock()
+    spot.get_mid = MagicMock(side_effect=lambda c: 99_900.0)
 
-    scanner = MomentumScanner(pm=pm, hl=hl, risk=risk, vol_fetcher=vol, pyth=pyth)
+    scanner = MomentumScanner(pm=pm, hl=hl, risk=risk, vol_fetcher=vol, spot_client=spot)
     if tmp_path is not None:
         scanner._cooldown_path = str(tmp_path / "cooldowns.json")
         scanner._open_spot_path = str(tmp_path / "open_spots.json")
@@ -136,7 +141,7 @@ def _make_signal(**kwargs) -> MomentumSignal:
     return MomentumSignal(**defaults)
 
 
-# ── _extract_strike ───────────────────────────────────────────────────────────
+# â”€â”€ _extract_strike â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestExtractStrike:
     def test_dollar_k(self):
@@ -163,11 +168,11 @@ class TestExtractStrike:
         assert _extract_strike("Will BTC go up or down this hour", 68_000) is None
 
     def test_sanity_guard_filters_tiny_value(self):
-        # "1" in title is way below 1% of spot=68000=680 minimum → filtered out
+        # "1" in title is way below 1% of spot=68000=680 minimum â†’ filtered out
         assert _extract_strike("ETH 1% move", 68_000) is None
 
 
-# ── _is_updown_market ─────────────────────────────────────────────────────────
+# â”€â”€ _is_updown_market â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestIsUpdownMarket:
     def test_detects_up_or_down(self):
@@ -180,7 +185,7 @@ class TestIsUpdownMarket:
         assert _is_updown_market("Will BTC reach $70,000?") is False
 
 
-# ── Cooldown persistence helpers ──────────────────────────────────────────────
+# â”€â”€ Cooldown persistence helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestCooldownPersistence:
     def test_round_trip(self, tmp_path):
@@ -201,11 +206,11 @@ class TestCooldownPersistence:
         assert _load_cooldowns(path) == {}
 
     def test_save_silently_ignores_bad_path(self):
-        # Non-existent root directory — must not raise.
+        # Non-existent root directory â€” must not raise.
         _save_cooldowns("/nonexistent_xyz_root/cd.json", {"k": 1.0})
 
 
-# ── MomentumSignal ────────────────────────────────────────────────────────────
+# â”€â”€ MomentumSignal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestMomentumSignal:
     def test_vol_z_score_field_default(self):
@@ -221,7 +226,7 @@ class TestMomentumSignal:
         assert sig.edge_pct > 0.0
 
     def test_edge_pct_non_negative_at_threshold(self):
-        # delta_pct == threshold_pct → excess_z = 0 → edge_pct is N(z)-price ≥ 0
+        # delta_pct == threshold_pct â†’ excess_z = 0 â†’ edge_pct is N(z)-price â‰¥ 0
         sig = _make_signal(delta_pct=1.5, threshold_pct=1.5, token_price=0.50)
         assert sig.edge_pct >= 0.0
 
@@ -231,7 +236,7 @@ class TestMomentumSignal:
         assert strong.edge_pct > weak.edge_pct
 
 
-# ── record_trade_close ────────────────────────────────────────────────────────
+# â”€â”€ record_trade_close â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestRecordTradeClose:
     def test_sets_both_sides_in_memory(self, tmp_path):
@@ -256,11 +261,11 @@ class TestRecordTradeClose:
         scanner.record_trade_close("cond_001")
         yes_ts = scanner._market_cooldown["cond_001:YES"]
         no_ts = scanner._market_cooldown["cond_001:NO"]
-        # Both sides set inside the same call → identical timestamp
+        # Both sides set inside the same call â†’ identical timestamp
         assert yes_ts == pytest.approx(no_ts, abs=1e-3)
 
 
-# ── YES/NO cooldown independence ──────────────────────────────────────────────
+# â”€â”€ YES/NO cooldown independence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestCooldownIndependence:
     def test_yes_cooled_does_not_block_no(self, tmp_path):
@@ -270,7 +275,7 @@ class TestCooldownIndependence:
         config.MOMENTUM_MARKET_COOLDOWN_SECONDS = 1800
         try:
             scanner._market_cooldown["cond_001:YES"] = time.time()
-            # NO was never touched → elapsed is large → not on cooldown
+            # NO was never touched â†’ elapsed is large â†’ not on cooldown
             no_elapsed = time.time() - scanner._market_cooldown.get("cond_001:NO", 0.0)
             assert no_elapsed >= config.MOMENTUM_MARKET_COOLDOWN_SECONDS
         finally:
@@ -288,58 +293,78 @@ class TestCooldownIndependence:
             config.MOMENTUM_MARKET_COOLDOWN_SECONDS = orig
 
 
-# ── E5: edge-proportional sizing formula ─────────────────────────────────────
+# â”€â”€ E5: Kelly-criterion sizing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-class TestEdgeProportionalSizing:
-    """Tests replicate the sizing formula embedded in _execute_signal."""
-
-    @staticmethod
-    def _compute_size(edge_pct: float) -> float:
-        _anchor = config.MOMENTUM_EDGE_SIZE_ANCHOR
-        _max = config.MOMENTUM_MAX_ENTRY_USD
-        _min = config.MOMENTUM_MIN_ENTRY_USD
-        if _anchor > 0 and edge_pct > 0:
-            _fraction = min(1.0, edge_pct / _anchor)
-            return max(_min, round(_fraction * _max, 2))
-        return _max
+class TestKellySizing:
+    """Tests for _compute_kelly_size_usd â€” the fractional-Kelly position sizer."""
 
     def setup_method(self):
         self._saved = {
-            "MOMENTUM_EDGE_SIZE_ANCHOR": config.MOMENTUM_EDGE_SIZE_ANCHOR,
             "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
             "MOMENTUM_MIN_ENTRY_USD": config.MOMENTUM_MIN_ENTRY_USD,
+            "MOMENTUM_KELLY_FRACTION": config.MOMENTUM_KELLY_FRACTION,
         }
-        config.MOMENTUM_EDGE_SIZE_ANCHOR = 0.10
         config.MOMENTUM_MAX_ENTRY_USD = 50.0
         config.MOMENTUM_MIN_ENTRY_USD = 1.0
+        config.MOMENTUM_KELLY_FRACTION = 1.0
 
     def teardown_method(self):
         for k, v in self._saved.items():
             setattr(config, k, v)
 
-    def test_full_size_at_anchor(self):
-        assert self._compute_size(0.10) == pytest.approx(50.0)
+    def _size(self, **kwargs) -> float:
+        return _compute_kelly_size_usd(_make_signal(**kwargs))[0]
 
-    def test_full_size_above_anchor(self):
-        assert self._compute_size(0.20) == pytest.approx(50.0)
+    def test_very_strong_signal_returns_max(self):
+        # 6Ïƒ+ signal: z capped â†’ win_prob â‰ˆ 1 â†’ kelly_f â‰ˆ 1 â†’ MAX_ENTRY.
+        # Use a coin-flip token (price=0.5, symmetric payout) for a clean result.
+        size = self._size(delta_pct=100.0, sigma_ann=0.8, tte_seconds=3600,
+                          token_price=0.5)
+        assert size == pytest.approx(config.MOMENTUM_MAX_ENTRY_USD)
 
-    def test_half_size_at_half_anchor(self):
-        assert self._compute_size(0.05) == pytest.approx(25.0)
+    def test_negative_ev_signal_returns_min(self):
+        # delta=0 â†’ z=0 â†’ win_prob=0.5; at token_price=0.85 the payout bâ‰ˆ0.18
+        # which makes kelly_f negative â†’ clamped to 0 â†’ size = MIN_ENTRY.
+        size = self._size(delta_pct=0.0, sigma_ann=0.8, tte_seconds=3600,
+                          token_price=0.85)
+        assert size == pytest.approx(config.MOMENTUM_MIN_ENTRY_USD)
 
-    def test_quarter_size_at_quarter_anchor(self):
-        assert self._compute_size(0.025) == pytest.approx(12.5)
+    def test_result_always_within_bounds(self):
+        # A range of signals should always land in [MIN_ENTRY, MAX_ENTRY].
+        for delta in (0.0, 1.0, 3.0, 10.0, 100.0):
+            size = self._size(delta_pct=delta, sigma_ann=0.8, tte_seconds=3600,
+                              token_price=0.5)
+            assert config.MOMENTUM_MIN_ENTRY_USD <= size <= config.MOMENTUM_MAX_ENTRY_USD
 
-    def test_floored_at_min_entry(self):
-        config.MOMENTUM_MIN_ENTRY_USD = 5.0
-        # edge_pct=0.001 → fraction=0.01 → raw=0.5 → floored to 5.0
-        assert self._compute_size(0.001) == pytest.approx(5.0)
+    def test_kelly_fraction_scales_output(self):
+        # token_price=0.5, delta=3, tte=86400: intermediate kelly_f (~0.53).
+        # Halving KELLY_FRACTION should roughly halve the dollar size.
+        sig_kwargs = dict(delta_pct=3.0, sigma_ann=0.8, tte_seconds=86400,
+                          token_price=0.5)
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+        size_full = self._size(**sig_kwargs)
+        config.MOMENTUM_KELLY_FRACTION = 0.5
+        size_half = self._size(**sig_kwargs)
+        assert size_half == pytest.approx(size_full / 2, abs=0.02)
 
-    def test_zero_edge_pct_returns_max(self):
-        # edge=0 → formula bypassed, returns MAX
-        assert self._compute_size(0.0) == pytest.approx(50.0)
+    def test_stronger_delta_gives_larger_or_equal_size(self):
+        # Monotonicity: larger delta â†’ larger or equal Kelly size.
+        sizes = [
+            self._size(delta_pct=d, sigma_ann=0.8, tte_seconds=86400, token_price=0.5)
+            for d in (1.0, 2.0, 3.0, 5.0)
+        ]
+        assert sizes == sorted(sizes)
+
+    def test_debug_dict_has_expected_keys(self):
+        _, debug = _compute_kelly_size_usd(_make_signal())
+        expected = {
+            "kelly_sigma_tau", "kelly_z_total", "kelly_win_prob",
+            "kelly_payout_b", "kelly_f", "kelly_fraction_cfg", "kelly_size_usd",
+        }
+        assert expected.issubset(debug.keys())
 
 
-# ── E7: diagnostics() feed health ────────────────────────────────────────────
+# â”€â”€ E7: diagnostics() feed health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestFeedHealth:
     def test_diagnostics_has_feed_health_keys(self, tmp_path):
@@ -364,7 +389,7 @@ class TestFeedHealth:
         assert result["scan_ts"] == pytest.approx(0.0)
 
 
-# ── E9: cooldown disk persistence on write ───────────────────────────────────
+# â”€â”€ E9: cooldown disk persistence on write â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestCooldownDiskPersistence:
     def test_record_close_updates_disk(self, tmp_path):
@@ -379,7 +404,7 @@ class TestCooldownDiskPersistence:
     def test_scanner_respects_persisted_cooldown_after_restart(self, tmp_path):
         """Simulate restart: pre-write cooldown, reboot scanner, verify it reads it."""
         path = str(tmp_path / "cooldowns.json")
-        recent_ts = time.time() - 5.0   # 5 seconds ago — still cooling
+        recent_ts = time.time() - 5.0   # 5 seconds ago â€” still cooling
         with open(path, "w") as f:
             json.dump({"cond_C:YES": recent_ts, "cond_C:NO": recent_ts}, f)
         # Re-create scanner (restart) by directly calling _load_cooldowns
@@ -396,7 +421,7 @@ class TestCooldownDiskPersistence:
         assert ts_second >= ts_first
 
 
-# ── _on_price_update_entry ────────────────────────────────────────────────────
+# â”€â”€ _on_price_update_entry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestOnPriceUpdateEntry:
 
@@ -482,7 +507,7 @@ class TestOnPriceUpdateEntry:
         assert not scanner._scan_event.is_set()
 
 
-# ── Paper-mode position sizing ────────────────────────────────────────────────
+# â”€â”€ Paper-mode position sizing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestPaperModePositionSizing:
     """
@@ -498,7 +523,6 @@ class TestPaperModePositionSizing:
             "MOMENTUM_PRICE_BAND_HIGH": config.MOMENTUM_PRICE_BAND_HIGH,
             "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
             "MOMENTUM_MIN_ENTRY_USD": config.MOMENTUM_MIN_ENTRY_USD,
-            "MOMENTUM_EDGE_SIZE_ANCHOR": config.MOMENTUM_EDGE_SIZE_ANCHOR,
             "MOMENTUM_ORDER_TYPE": config.MOMENTUM_ORDER_TYPE,
         }
         config.STRATEGY_MOMENTUM_ENABLED = True
@@ -507,7 +531,6 @@ class TestPaperModePositionSizing:
         config.MOMENTUM_PRICE_BAND_HIGH = 0.95
         config.MOMENTUM_MAX_ENTRY_USD = 3.0
         config.MOMENTUM_MIN_ENTRY_USD = 0.5
-        config.MOMENTUM_EDGE_SIZE_ANCHOR = 0.0   # disable edge sizing → always max
         config.MOMENTUM_ORDER_TYPE = "market"
 
     def teardown_method(self):
@@ -522,7 +545,7 @@ class TestPaperModePositionSizing:
         ask_price = 0.85
         size_usd = config.MOMENTUM_MAX_ENTRY_USD   # = 3.0
         scanner = _make_scanner(tmp_path)
-        # _make_book uses mid±0.005; set mid = ask_price - 0.005 so best_ask == ask_price
+        # _make_book uses midÂ±0.005; set mid = ask_price - 0.005 so best_ask == ask_price
         book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
         scanner._pm.get_book = MagicMock(return_value=book)
         mkt = _make_market()
@@ -539,7 +562,7 @@ class TestPaperModePositionSizing:
         )
 
     def test_paper_yes_entry_cost_usd_correct(self, tmp_path):
-        """entry_cost_usd must equal entry_price * token_count ≈ size_usd."""
+        """entry_cost_usd must equal entry_price * token_count â‰ˆ size_usd."""
         ask_price = 0.85
         size_usd = config.MOMENTUM_MAX_ENTRY_USD
         scanner = _make_scanner(tmp_path)
@@ -552,13 +575,13 @@ class TestPaperModePositionSizing:
         pos = scanner._risk.get_open_positions()[0]
         expected_cost = round(pos.entry_price * pos.size, 6)
         assert pos.entry_cost_usd == pytest.approx(expected_cost, abs=1e-4)
-        # Should also be ≈ size_usd (within rounding)
+        # Should also be â‰ˆ size_usd (within rounding)
         assert pos.entry_cost_usd == pytest.approx(size_usd, abs=0.01)
 
     def test_paper_no_size_is_token_count_not_usd(self, tmp_path):
         """NO side: order_price is the NO CLOB ask (e.g. 0.80), converts correctly.
         A NO signal fires when the NO token is in-band (50-95c), meaning YES is low."""
-        no_ask = 0.80   # NO token at 80c (YES ≈ 0.20 — market strongly against)
+        no_ask = 0.80   # NO token at 80c (YES â‰ˆ 0.20 â€” market strongly against)
         size_usd = config.MOMENTUM_MAX_ENTRY_USD
         scanner = _make_scanner(tmp_path)
         # mid = no_ask - 0.005 so best_ask == no_ask exactly
@@ -575,7 +598,7 @@ class TestPaperModePositionSizing:
         assert pos.size == pytest.approx(expected_tokens, rel=1e-4)
 
     def test_paper_no_entry_cost_usd_correct(self, tmp_path):
-        """NO entry_cost_usd = entry_price × token_count (actual NO token price × tokens)."""
+        """NO entry_cost_usd = entry_price Ã— token_count (actual NO token price Ã— tokens)."""
         no_ask = 0.80  # actual NO token price at ask
         size_usd = config.MOMENTUM_MAX_ENTRY_USD
         scanner = _make_scanner(tmp_path)
@@ -588,7 +611,299 @@ class TestPaperModePositionSizing:
         self._run_execute(scanner, sig, mkt)
         pos = scanner._risk.get_open_positions()[0]
         # entry_price for NO = actual NO token price = no_ask
-        # entry_cost = entry_price × size ≈ size_usd
+        # entry_cost = entry_price Ã— size â‰ˆ size_usd
         expected_cost = round(pos.entry_price * pos.size, 6)
         assert pos.entry_cost_usd == pytest.approx(expected_cost, abs=1e-4)
         assert pos.entry_cost_usd == pytest.approx(size_usd, abs=0.01)
+
+
+# â”€â”€ _extract_range_bounds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestExtractRangeBounds:
+    """Unit tests for _extract_range_bounds (market_utils.py)."""
+
+    def test_dollar_comma_format(self):
+        """Standard comma-separated dollar amounts."""
+        result = _extract_range_bounds("Will the price of Bitcoin be between $64,000 and $66,000 on April 5?")
+        assert result == pytest.approx((64_000.0, 66_000.0))
+
+    def test_k_suffix_lowercase(self):
+        """$64k / $66k notation."""
+        result = _extract_range_bounds("Will BTC be between $64k and $66k?")
+        assert result == pytest.approx((64_000.0, 66_000.0))
+
+    def test_k_suffix_uppercase(self):
+        result = _extract_range_bounds("BTC between $64K and $66K by Friday?")
+        assert result == pytest.approx((64_000.0, 66_000.0))
+
+    def test_m_suffix(self):
+        result = _extract_range_bounds("Will ETH be between $2m and $3m?")
+        assert result == pytest.approx((2_000_000.0, 3_000_000.0))
+
+    def test_decimal_values(self):
+        result = _extract_range_bounds("Will ETH be between $2000.50 and $2100.75?")
+        assert result == pytest.approx((2000.50, 2100.75))
+
+    def test_directional_market_returns_none(self):
+        """Directional markets ('above $84k') are not range markets."""
+        assert _extract_range_bounds("Will BTC be above $84k?") is None
+
+    def test_no_numbers_returns_none(self):
+        assert _extract_range_bounds("Will BTC go up?") is None
+
+    def test_inverted_bounds_returns_none(self):
+        """If lo >= hi, should return None (sanity guard)."""
+        # Regex captures in order, but if somehow lo > hi:
+        result = _extract_range_bounds("Will BTC be between $70,000 and $60,000?")
+        assert result is None
+
+    def test_returns_tuple_of_floats(self):
+        result = _extract_range_bounds("Will BTC be between $64k and $66k?")
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert all(isinstance(v, float) for v in result)
+
+
+# â”€â”€ _is_range_market â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestIsRangeMarket:
+    """Unit tests for _is_range_market (market_utils.py)."""
+
+    def test_standard_between_pattern(self):
+        assert _is_range_market("Will the price of Bitcoin be between $64,000 and $66,000?") is True
+
+    def test_k_suffix_between(self):
+        assert _is_range_market("Will BTC be between $64k and $66k?") is True
+
+    def test_directional_above_is_not_range(self):
+        assert _is_range_market("Will BTC be above $84k?") is False
+
+    def test_directional_below_is_not_range(self):
+        assert _is_range_market("Will ETH fall below $2,000?") is False
+
+    def test_general_strike_market_is_not_range(self):
+        assert _is_range_market("Will BTC reach $70k by end of hour?") is False
+
+    def test_empty_string_is_not_range(self):
+        assert _is_range_market("") is False
+
+
+# â”€â”€ Range delta formula â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestRangeDeltaFormula:
+    """
+    Verify the bidirectional delta formula used for range markets in scanner.py.
+    YES (spot_inside_range): delta_pct = min(spot-lo, hi-spot) / mid * 100
+    NO  (spot_above):        delta_pct = (spot - hi) / mid * 100
+    NO  (spot_below):        delta_pct = (lo - spot) / mid * 100
+    where mid = (lo + hi) / 2
+    """
+
+    def _yes_delta(self, spot: float, lo: float, hi: float) -> float:
+        mid = (lo + hi) / 2
+        return min(spot - lo, hi - spot) / mid * 100
+
+    def _no_delta_above(self, spot: float, lo: float, hi: float) -> float:
+        mid = (lo + hi) / 2
+        return (spot - hi) / mid * 100
+
+    def _no_delta_below(self, spot: float, lo: float, hi: float) -> float:
+        mid = (lo + hi) / 2
+        return (lo - spot) / mid * 100
+
+    def test_yes_delta_at_midpoint(self):
+        """Spot at midpoint â†’ equal distance to both bounds â†’ max delta."""
+        lo, hi = 64_000.0, 66_000.0
+        mid = 65_000.0
+        delta = self._yes_delta(mid, lo, hi)
+        assert delta == pytest.approx(1000 / 65_000 * 100, rel=1e-6)
+
+    def test_yes_delta_near_lower_bound(self):
+        """Spot near lo â†’ min distance = spot-lo (small)."""
+        lo, hi = 64_000.0, 66_000.0
+        spot = 64_500.0   # 500 from lo, 1500 from hi
+        delta = self._yes_delta(spot, lo, hi)
+        assert delta == pytest.approx(500 / 65_000 * 100, rel=1e-6)
+
+    def test_yes_delta_near_upper_bound(self):
+        """Spot near hi â†’ min distance = hi-spot (small)."""
+        lo, hi = 64_000.0, 66_000.0
+        spot = 65_800.0   # 200 from hi, 1800 from lo
+        delta = self._yes_delta(spot, lo, hi)
+        assert delta == pytest.approx(200 / 65_000 * 100, rel=1e-6)
+
+    def test_no_delta_above_range(self):
+        """Spot above hi â†’ NO delta = (spot - hi) / mid."""
+        lo, hi = 64_000.0, 66_000.0
+        spot = 68_000.0
+        delta = self._no_delta_above(spot, lo, hi)
+        assert delta == pytest.approx(2_000 / 65_000 * 100, rel=1e-6)
+
+    def test_no_delta_below_range(self):
+        """Spot below lo â†’ NO delta = (lo - spot) / mid."""
+        lo, hi = 64_000.0, 66_000.0
+        spot = 62_000.0
+        delta = self._no_delta_below(spot, lo, hi)
+        assert delta == pytest.approx(2_000 / 65_000 * 100, rel=1e-6)
+
+    def test_symmetry_above_below(self):
+        """Equal distance above and below the range â†’ equal NO deltas."""
+        lo, hi = 64_000.0, 66_000.0
+        delta_above = self._no_delta_above(68_000.0, lo, hi)
+        delta_below = self._no_delta_below(62_000.0, lo, hi)
+        assert delta_above == pytest.approx(delta_below, rel=1e-6)
+
+    def test_yes_delta_always_positive_inside_range(self):
+        lo, hi = 64_000.0, 66_000.0
+        for spot in (64_100, 65_000, 65_900):
+            assert self._yes_delta(float(spot), lo, hi) > 0
+
+    def test_no_delta_positive_outside_range(self):
+        lo, hi = 64_000.0, 66_000.0
+        assert self._no_delta_above(68_000.0, lo, hi) > 0
+        assert self._no_delta_below(62_000.0, lo, hi) > 0
+
+#  Range market integration: _execute_signal strategy label 
+
+class TestRangeStrategyLabel:
+    """
+    Integration tests that verify _execute_signal stamps the correct strategy
+    label on the resulting Position -- "range" for range markets, "momentum"
+    for all other title formats.
+    """
+
+    def setup_method(self):
+        self._saved = {
+            "STRATEGY_MOMENTUM_ENABLED": config.STRATEGY_MOMENTUM_ENABLED,
+            "BOT_ACTIVE": config.BOT_ACTIVE,
+            "MOMENTUM_PRICE_BAND_LOW": config.MOMENTUM_PRICE_BAND_LOW,
+            "MOMENTUM_PRICE_BAND_HIGH": config.MOMENTUM_PRICE_BAND_HIGH,
+            "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
+            "MOMENTUM_MIN_ENTRY_USD": config.MOMENTUM_MIN_ENTRY_USD,
+            "MOMENTUM_ORDER_TYPE": config.MOMENTUM_ORDER_TYPE,
+            "MOMENTUM_RANGE_ENABLED": config.MOMENTUM_RANGE_ENABLED,
+        }
+        config.STRATEGY_MOMENTUM_ENABLED = True
+        config.BOT_ACTIVE = True
+        config.MOMENTUM_PRICE_BAND_LOW = 0.50
+        config.MOMENTUM_PRICE_BAND_HIGH = 0.95
+        config.MOMENTUM_MAX_ENTRY_USD = 3.0
+        config.MOMENTUM_MIN_ENTRY_USD = 0.5
+        config.MOMENTUM_ORDER_TYPE = "market"
+        config.MOMENTUM_RANGE_ENABLED = True
+
+    def teardown_method(self):
+        for k, v in self._saved.items():
+            setattr(config, k, v)
+
+    def _run_execute(self, scanner, signal, market):
+        return _run(scanner._execute_signal(signal, market))
+
+    def test_range_market_gets_range_strategy_label(self, tmp_path):
+        """_execute_signal with a 'between X and Y' title -> position.strategy == 'range'."""
+        ask = 0.82
+        scanner = _make_scanner(tmp_path)
+        book = _make_book(mid=ask - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+
+        mkt = _make_market(title="Will BTC be between $64k and $66k on April 5?")
+        sig = _make_signal(
+            side="YES",
+            token_id=mkt.token_id_yes,
+            token_price=ask,
+            p_yes=ask,
+            delta_pct=3.0,
+            market_title=mkt.title,
+        )
+        result = self._run_execute(scanner, sig, mkt)
+        assert result is True
+        positions = scanner._risk.get_open_positions()
+        assert positions[0].strategy == "range", (
+            f"Expected strategy='range', got '{positions[0].strategy}'"
+        )
+
+    def test_directional_market_gets_momentum_strategy_label(self, tmp_path):
+        """'Will BTC reach $70k?' -> strategy == 'momentum'."""
+        ask = 0.82
+        scanner = _make_scanner(tmp_path)
+        book = _make_book(mid=ask - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+
+        mkt = _make_market(title="Will BTC reach $70k by end of hour?")
+        sig = _make_signal(
+            side="YES",
+            token_id=mkt.token_id_yes,
+            token_price=ask,
+            p_yes=ask,
+            delta_pct=3.0,
+            market_title=mkt.title,
+        )
+        result = self._run_execute(scanner, sig, mkt)
+        assert result is True
+        positions = scanner._risk.get_open_positions()
+        assert positions[0].strategy == "momentum"
+
+    def test_range_and_momentum_both_count_toward_cap(self, tmp_path):
+        """Range and momentum positions together are counted by the concurrent cap."""
+        scanner = _make_scanner(tmp_path)
+        ask = 0.82
+        book = _make_book(mid=ask - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+
+        # Directional momentum position
+        mkt_dir = _make_market(condition_id="cond_dir", title="Will BTC reach $70k?")
+        sig_dir = _make_signal(
+            market_id="cond_dir",
+            side="YES",
+            token_id=mkt_dir.token_id_yes,
+            token_price=ask,
+            p_yes=ask,
+            delta_pct=3.0,
+            market_title=mkt_dir.title,
+        )
+        _run(scanner._execute_signal(sig_dir, mkt_dir))
+
+        # Range position
+        mkt_rng = _make_market(
+            condition_id="cond_range",
+            token_id_yes="tid_rng_yes",
+            token_id_no="tid_rng_no",
+            title="Will BTC be between $64k and $66k?",
+        )
+        sig_rng = _make_signal(
+            market_id="cond_range",
+            side="YES",
+            token_id=mkt_rng.token_id_yes,
+            token_price=ask,
+            p_yes=ask,
+            delta_pct=3.0,
+            market_title=mkt_rng.title,
+        )
+        _run(scanner._execute_signal(sig_rng, mkt_rng))
+
+        all_open = scanner._risk.get_open_positions()
+        live_count = sum(1 for p in all_open if p.strategy in ("momentum", "range"))
+        assert live_count == 2
+        assert any(p.strategy == "momentum" for p in all_open)
+        assert any(p.strategy == "range" for p in all_open)
+
+    def test_range_no_side_gets_range_label(self, tmp_path):
+        """NO leg of a range market -> strategy == 'range'."""
+        no_ask = 0.80
+        scanner = _make_scanner(tmp_path)
+        book = _make_book(mid=no_ask - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+
+        mkt = _make_market(title="Will BTC be between $64k and $66k on April 5?")
+        sig = _make_signal(
+            side="NO",
+            token_id=mkt.token_id_no,
+            token_price=no_ask,
+            p_yes=1.0 - no_ask,
+            delta_pct=3.0,
+            market_title=mkt.title,
+        )
+        result = self._run_execute(scanner, sig, mkt)
+        assert result is True
+        pos = scanner._risk.get_open_positions()[0]
+        assert pos.strategy == "range"

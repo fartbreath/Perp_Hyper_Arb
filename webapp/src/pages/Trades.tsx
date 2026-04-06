@@ -162,6 +162,7 @@ function TypeBadge({ t }: { t: string }) {
   const colour: Record<string, string> = {
     bucket_5m:  "#6366f1", bucket_15m: "#8b5cf6", bucket_1h: "#a855f7",
     bucket_4h:  "#c026d3", milestone:  "#0ea5e9", hl_perp:  "#f97316",
+    range:      "#0d9488",
   };
   return (
     <span style={{
@@ -455,7 +456,12 @@ export default function Trades() {
                       </td>
 
                       {/* type badge */}
-                      <td><TypeBadge t={g.market_type} /></td>
+                      <td>
+                        <TypeBadge t={g.market_type} />
+                        {g.strategy === "range" && (
+                          <span style={{ marginLeft: 4, background: "#0d9488", color: "#fff", fontSize: "0.72em", fontWeight: 700, padding: "2px 6px", borderRadius: 4 }}>RANGE</span>
+                        )}
+                      </td>
 
                       {/* underlying */}
                       <td style={{ fontWeight: 600 }}>{g.underlying}</td>

@@ -70,7 +70,7 @@ class VolFetcher:
         Register the RTDS spot price callback so `_mid_history` stays populated.
         Call once during bot startup, before the first scan.
         """
-        spot.on_price_update(self._on_pyth)
+        spot.on_price_update(self._on_spot_update)
         log.info("VolFetcher registered with spot price feed")
 
     def start_prefetch(self, underlyings: list[str]) -> "asyncio.Task[None]":
@@ -153,7 +153,7 @@ class VolFetcher:
 
     # ── RTDS price callback ─────────────────────────────────────────────────────
 
-    async def _on_pyth(self, coin: str, price: float) -> None:
+    async def _on_spot_update(self, coin: str, price: float) -> None:
         """Append (timestamp, price) to the rolling buffer for `coin`."""
         now_ts = time.time()
         buf = self._mid_history[coin]

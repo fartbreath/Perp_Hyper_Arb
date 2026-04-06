@@ -1775,6 +1775,83 @@ export default function Settings() {
               />
             </Advanced>
           </div>
+
+          {/* ── Range markets sub-strategy ───────────────────── */}
+          <div className="card">
+            <h3>Range Markets</h3>
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              "Will BTC be between $X and $Y?" markets. YES resolves $1 if spot is inside
+              the range at expiry; NO resolves $1 if spot is outside. Treated as a regular
+              single-leg momentum trade with a bidirectional delta formula.
+            </p>
+
+            <Toggle
+              label="Enable Range Markets"
+              description="Include 'between $X and $Y' range markets in the momentum scan."
+              value={data.momentum_range_enabled ?? false}
+              onChange={(v) => apply({ momentum_range_enabled: v })}
+            />
+
+            {GAP}
+
+            <SectionHead title="Price Band" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Override the price band used specifically for range market tokens.
+              Range YES tokens price differently (bidirectional delta) so a separate
+              band lets you tune entries independently of regular momentum.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0" }}>
+              <FloatInput
+                label="Band Low"
+                description="Token price floor for range market entries."
+                value={data.momentum_range_price_band_low ?? 0.6}
+                step={0.01}
+                unit=""
+                onSubmit={(v) => apply({ momentum_range_price_band_low: v })}
+              />
+              <FloatInput
+                label="Band High"
+                description="Token price ceiling for range market entries."
+                value={data.momentum_range_price_band_high ?? 0.95}
+                step={0.01}
+                unit=""
+                onSubmit={(v) => apply({ momentum_range_price_band_high: v })}
+              />
+            </div>
+
+            {GAP}
+
+            <FloatInput
+              label="Max Entry (USD)"
+              description="Position size cap for range market entries. Independent of the standard momentum max entry."
+              value={data.momentum_range_max_entry_usd ?? 25}
+              step={5}
+              unit="USD"
+              onSubmit={(v) => apply({ momentum_range_max_entry_usd: v })}
+            />
+
+            {GAP}
+
+            <FloatInput
+              label="Vol Z-Score"
+              description="Signal strength threshold for range markets. Lower = more trades (weaker confirmation). Higher = fewer, higher-conviction trades."
+              value={data.momentum_range_vol_z_score ?? 0.8}
+              step={0.05}
+              unit="σ"
+              onSubmit={(v) => apply({ momentum_range_vol_z_score: v })}
+            />
+
+            {GAP}
+
+            <NumberInput
+              label="Min TTE (s)"
+              description="Minimum seconds to expiry required before entering a range market. Range markets often have longer durations than bucket markets — set appropriately."
+              value={data.momentum_range_min_tte_seconds ?? 300}
+              step={60}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_range_min_tte_seconds: v })}
+            />
+          </div>
           </>
         )}
       </StrategySection>

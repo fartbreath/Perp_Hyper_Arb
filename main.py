@@ -281,7 +281,7 @@ async def state_sync_loop(
     maker: MakerStrategy,
     agent: AgentDecisionLayer,
     risk: RiskEngine,
-    pyth: "RTDSClient",
+    spot_client: "RTDSClient",
 ) -> None:
     """
     Periodically push live bot state into api_state so the webapp
@@ -445,6 +445,9 @@ async def state_sync_loop(
                     "active_ask_remaining_ct": _ask_rem,
                     "active_ask_filled_ct": _ask_fill,
                     "signal_score": pos.signal_score,
+                    # Legacy field — null for all new positions
+                    "spread_id": pos.spread_id,
+                    "strike": pos.strike if pos.strike else None,
                     # Closed-position visibility (present only when recently closed)
                     "is_closed": pos.is_closed,
                     "closed_at": pos.closed_at.isoformat() if pos.closed_at else None,
@@ -503,9 +506,9 @@ async def state_sync_loop(
                     # Spot price from the correct oracle for this market type:
                     # Chainlink for 5m/15m/4h, RTDS exchange-aggregated for 1h/daily/weekly.
                     "spot_mid": (
-                        pyth.get_mid_chainlink(mkt.underlying)
+                        spot_client.get_mid_chainlink(mkt.underlying)
                         if mkt.market_type in CHAINLINK_MARKET_TYPES
-                        else pyth.get_mid(mkt.underlying)
+                        else spot_client.get_mid(mkt.underlying)
                     ),
                 }
             api_state.markets = markets_raw
@@ -528,10 +531,10 @@ async def state_sync_loop(
                 "fresh_book_count":   _fresh,
                 "stale_book_count":   _stale,
                 "no_book_count":      _no_book,
-                "spot_mids":   pyth.all_mids(),
+                "spot_mids":   spot_client.all_mids(),
                 "spot_ages_s": {
-                    coin: round(pyth.get_spot_age(coin), 1)
-                    for coin in sorted(pyth.tracked_coins)
+                    coin: round(spot_client.get_spot_age(coin), 1)
+                    for coin in sorted(spot_client.tracked_coins)
                 },
             }
             quotes_raw = {}
@@ -653,13 +656,13 @@ async def main() -> None:
     hl = HLClient()
     # Spot price source: Polymarket RTDS — crypto_prices topic for BTC/ETH/SOL/XRP/BNB/DOGE,
     # crypto_prices_chainlink topic for HYPE (not yet in crypto_prices).
-    pyth = RTDSClient()
-    maker = MakerStrategy(pm, hl, risk_engine, pyth=pyth)
-    scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL, pyth=pyth)
+    spot_client = RTDSClient()
+    maker = MakerStrategy(pm, hl, risk_engine, spot_client=spot_client)
+    scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL, spot_client=spot_client)
     agent = AgentDecisionLayer(risk_engine)
     # Strategy 3 — Momentum scanner (direct execution, no agent loop)
     vol_fetcher = VolFetcher()
-    vol_fetcher.register(pyth)   # registers Pyth price callback for rolling realized-vol buffer
+    vol_fetcher.register(spot_client)   # registers RTDS spot price callback for rolling realized-vol buffer
 
     def _on_momentum_signal(sig_dict: dict) -> None:
         api_state.momentum_signals.append(sig_dict)
@@ -668,7 +671,7 @@ async def main() -> None:
             api_state.momentum_signals = api_state.momentum_signals[-200:]
         notify_state_changed()
 
-    momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, pyth=pyth, on_signal=_on_momentum_signal)
+    momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, spot_client=spot_client, on_signal=_on_momentum_signal)
 
     def _on_position_close(market_id: str) -> None:
         """Notify both strategy scanners when any position closes.
@@ -695,7 +698,7 @@ async def main() -> None:
 
     monitor = PositionMonitor(
         pm, risk_engine,
-        pyth_client=pyth,
+        spot_client=spot_client,
         on_close_callback=_on_position_close,
         on_stop_loss_callback=_on_momentum_stop_loss,
     )
@@ -715,8 +718,8 @@ async def main() -> None:
     log.info("Connecting HL client…")
     await hl.start()
 
-    log.info("Connecting Pyth oracle client…")
-    await pyth.start()
+    log.info("Connecting RTDS spot client…")
+    await spot_client.start()
 
     # In live mode: cancel any stale open orders and restore existing positions
     # before the maker strategy begins quoting.  No-op in paper mode.
@@ -735,7 +738,7 @@ async def main() -> None:
         ),
         asyncio.create_task(monitor.start(), name="monitor"),
         asyncio.create_task(
-            state_sync_loop(pm, hl, maker, agent, risk_engine, pyth),
+            state_sync_loop(pm, hl, maker, agent, risk_engine, spot_client),
             name="state_sync",
         ),
         asyncio.create_task(

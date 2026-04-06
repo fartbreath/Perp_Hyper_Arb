@@ -82,6 +82,12 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_MARKET_COOLDOWN_SECONDS` | `300` | Seconds to suppress re-entry after any open/close/failed attempt in a market (deduplication guard) |
 | `MOMENTUM_MAX_TTE_DAYS` | `7` | Days of bucket markets subscribed for WS book data (independent of maker window) |
 | `MOMENTUM_PRESUB_LOOKAHEAD` | `4` | Also subscribe to the next N not-yet-started bucket periods for pre-window data collection |
+| `MOMENTUM_RANGE_ENABLED` | `False` | Enable range market sub-strategy ("between $X and $Y" markets) |
+| `MOMENTUM_RANGE_PRICE_BAND_LOW` | `0.60` | Token price floor for range market entries |
+| `MOMENTUM_RANGE_PRICE_BAND_HIGH` | `0.95` | Token price ceiling for range market entries |
+| `MOMENTUM_RANGE_MAX_ENTRY_USD` | `25.0` | Max position size (USD) for range entries |
+| `MOMENTUM_RANGE_VOL_Z_SCORE` | `0.80` | Vol z-score threshold for range market signals |
+| `MOMENTUM_RANGE_MIN_TTE_SECONDS` | `300` | Min seconds to expiry before entering a range market |
 
 **`MOMENTUM_MIN_TTE_SECONDS` defaults (per bucket type):**
 
@@ -115,7 +121,7 @@ via `config_overrides.json` without restarting the bot.
 | Priority | Source | Coins | TTL |
 |----------|--------|-------|-----|
 | 1 | **Deribit ATM IV** (nearest ~7-day call option, ATM strike ± spot) | BTC, ETH, SOL, XRP | `MOMENTUM_VOL_CACHE_TTL` (5 min) |
-| 2 | **Pyth rolling realized vol** (log-return std from last 24h of Pyth price feed, min 10 samples) | Any coin in `PYTH_PRICE_FEED_IDS` | 60 s |
+| 2 | **RTDS rolling realized vol** (log-return std from last 24h of RTDS price feed, min 10 samples) | Any coin in `config.TRACKED_UNDERLYINGS` | 60 s |
 | 3 | **Skip signal** | Coins with no data | — |
 
 **Why Deribit ATM IV as primary?**
@@ -125,12 +131,12 @@ nearest weekly option already reflects the regime (low vol = small threshold, hi
 threshold). This automatically widens the entry gate during volatile conditions and tightens it 
 in quiet markets — exactly the adaptive behavior we need.
 
-**Why Pyth rolling vol as fallback?**
+**Why RTDS rolling vol as fallback?**
 
-For assets without Deribit options (HYPE, DOGE, HYPE), the Pyth oracle (~400 ms ticks) provides
+For assets without Deribit options (HYPE, DOGE), the Polymarket RTDS feed (~1 tick/s/coin) provides
 tick-level price history free from HL funding-rate basis. Rolling 24h log-return standard deviation
 scaled to the relevant time horizon gives a reasonable realized-vol estimate. The `VolFetcher`
-maintains a circular buffer (max 2,000 samples) per coin from the Pyth feed and recomputes on demand.
+maintains a circular buffer (max 2,000 samples) per coin from the RTDS feed and recomputes on demand.
 
 ### Threshold Computation
 
@@ -224,9 +230,9 @@ Eight independent checks must all pass before a signal is acted upon.
 | **Cooldown** | `now - last_touch < MOMENTUM_MARKET_COOLDOWN_SECONDS` | 300 s | Suppress re-entry after any recent open/close/failed attempt |
 | **Stale PM book** | `time.time() - book.timestamp > MOMENTUM_BOOK_MAX_AGE_SECS` | 60 s | Book may not reflect current market state |
 | **Empty book** | `not book.bids and not book.asks` | — | No levels at all — MMs have withdrawn; no meaningful price |
-| **Stale Pyth price** | `time.time() - pyth_price.timestamp > MOMENTUM_SPOT_MAX_AGE_SECS` | 30 s | Delta computation relies on fresh spot |
+| **Stale spot price** | `time.time() - spot_price.timestamp > MOMENTUM_SPOT_MAX_AGE_SECS` | 30 s | Delta computation relies on fresh spot |
 | **Stale vol** | `MOMENTUM_VOL_CACHE_TTL` exceeded and no fresh Deribit response | 300 s | Threshold computation unreliable with old IV |
-| **Missing spot** | `pyth_price is None or pyth_price.mid is None` | — | No spot = no delta computation |
+| **Missing spot** | `spot_price is None or spot_price.mid is None` | — | No spot = no delta computation |
 | **Missing book** | `book is None or book.best_ask is None` | — | No ask = cannot determine token price or depth |
 | **Price re-check at execution** | Re-fetch book right before placing order; skip if price moved out of band | band + 2c | Market may reprice between signal detection and execution |
 
@@ -275,15 +281,15 @@ For each open bucket market M:
         continue  # no side in band
 
     # ── Stale spot gate ───────────────────────────────────────────────────
-    # Oracle is routed by market type: Chainlink feed for 5m/15m/4h,
-    # RTDS exchange-aggregated feed for 1h/daily/weekly.
+    # Oracle is routed by market type: on-chain Chainlink (primary) / RTDS WS (fallback)
+    # for 5m/15m/4h; RTDS exchange-aggregated feed for 1h/daily/weekly.
     if M.market_type in CHAINLINK_MARKET_TYPES:
-        pyth_price = pyth.get_mid_chainlink(M.underlying)
+        spot_price = spot_client.get_mid_chainlink(M.underlying)
     else:
-        pyth_price = pyth.get_mid(M.underlying)
-    if pyth_price is None: continue
-    if now_ts - pyth_price.timestamp > MOMENTUM_SPOT_MAX_AGE_SECS: continue
-    spot = pyth_price.mid
+        spot_price = spot_client.get_mid(M.underlying)
+    if spot_price is None: continue
+    if now_ts - spot_price.timestamp > MOMENTUM_SPOT_MAX_AGE_SECS: continue
+    spot = spot_price.mid
 
     # ── Parse strike from market title ────────────────────────────────────
     # Standard price-level markets: extract "$68,300", "$68k", etc.
@@ -402,7 +408,7 @@ Four exit conditions evaluated in priority order. **Delta SL is checked first an
 
 | Priority | Condition | Config Key | Default | Action | Rationale |
 |----------|-----------|-----------|---------|--------|-----------|
-| 1 | Spot crosses strike against position by > stop-loss % | `MOMENTUM_DELTA_STOP_LOSS_PCT` | `0.05` | Taker-sell held token | Underlying moved against us — genuine adverse signal. Fires on Pyth oracle ticks even if token CLOB book is drained/empty. |
+| 1 | Spot crosses strike against position by > stop-loss % | `MOMENTUM_DELTA_STOP_LOSS_PCT` | `0.05` | Taker-sell held token | Underlying moved against us — genuine adverse signal. Fires on RTDS/Chainlink oracle ticks even if token CLOB book is drained/empty. |
 | 2 | Near expiry and spot has crossed strike (delta < 0) | `MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS` | 60 s | Taker-sell held token | Avoid binary snap to zero close to resolution when already losing |
 | 3 | Token price >= take-profit | `MOMENTUM_TAKE_PROFIT` | `0.999` | Taker-sell held token | Capture near-certainty gains |
 | 4 | Expiry | — | — | Hold to resolution | If no other trigger fires, let the market resolve naturally |
@@ -440,24 +446,82 @@ Before entering, check all open positions across ALL strategies:
 
 | Scenario | Guard | Resolution |
 |----------|-------|------------|
-| Spot reverses immediately after entry | Delta SL (`MOMENTUM_DELTA_STOP_LOSS_PCT`): exit when spot moves > 0.05% past strike against position | Fires on Pyth oracle ticks (~400 ms); does not require the token CLOB book to be live |
+| Spot reverses immediately after entry | Delta SL (`MOMENTUM_DELTA_STOP_LOSS_PCT`): exit when spot moves > 0.05% past strike against position | Fires on RTDS/Chainlink oracle ticks (~1/s per source); does not require the token CLOB book to be live |
 | NO token book drains near expiry (MMs withdraw) | Delta SL evaluated before any NO-book fetch; book drain no longer silences the stop | Delta SL fires regardless of CLOB state |
 | Market already at 94c when scanner runs | Upper band check (< 0.90 strictly) | Signal filtered out |
 | Signal fires outside entry window | Per-bucket TTE gate (`MOMENTUM_MIN_TTE_SECONDS`) | Signal filtered out |
-| Pyth price data is stale (> 30s old) | Stale Pyth price guard | Signal skipped |
+| Spot price data is stale (> 30s old) | Stale spot price guard | Signal skipped |
 | PM book data is stale (> 60s old) | Stale book guard | Signal skipped |
 | PM book has no levels (MMs withdrawn) | Empty book guard | Signal skipped |
-| Deribit IV fails to fetch | Fallback to Pyth rolling vol; if also absent, skip | Signal skipped; logs at DEBUG |
+| Deribit IV fails to fetch | Fallback to RTDS rolling vol; if also absent, skip | Signal skipped; logs at DEBUG |
 | Pyth rolling vol has < 10 samples | Vol fetcher returns None | Signal skipped (threshold lowered from 20 to reduce cold-start drops) |
 | Marginal signal: delta barely clears threshold | `MOMENTUM_MIN_GAP_PCT` minimum gap above threshold | Blocks signals where a single adverse tick reverses the position |
 | Thin liquidity at ask | CLOB depth gate (> 200 USDC) | Signal skipped |
 | Price moved out of band before execution | Price re-check at execution time (band + 2c tolerance) | Order not placed |
 | Same market already held by any strategy | Duplicate guard + cooldown | Skip entry |
 | Bot restarted mid-window for Up/Down market | `data/market_open_spots.json` persists open-spot cache | Correct strike restored from disk |
-| Pyth WS feed silently stops delivering | Pyth outage detection: log warning if >50% markets skipped for stale spot | Operator alerted to investigate |
+| RTDS WS feed silently stops delivering | Health-log loop: warning if >30 s without exchange prices | Operator alerted to investigate |
+| On-chain Chainlink silent for 120 s | `_onchain_chainlink_loop` zombie-reconnect | Automatic reconnect; RTDS WS fallback serves in the interim |
 | Deribit IV cached from high-vol period | Cache TTL 5 min; stale vol widens threshold | Conservative; may miss some trades |
 | Vol regime spikes 3x (black swan) | z-score scales threshold with vol | Naturally filters out noisy markets |
 | Low-vol coin passes z-gate with tiny gap | `MOMENTUM_MIN_DELTA_PCT` absolute floor (independent of bucket) | Blocks trades where a single tick would cross strike; see [Absolute Floor Principle](#absolute-floor-principle) |
+
+---
+
+## Oracle Routing
+
+The bot uses two independent price sources, both delivered by `RTDSClient`:
+
+| Market type | Primary oracle | Fallback |
+|-------------|---------------|---------|
+| `bucket_5m`, `bucket_15m`, `bucket_4h` | **On-chain Chainlink** (Polygon WSS `AnswerUpdated` events) | RTDS WS `crypto_prices_chainlink` topic |
+| `bucket_1h`, `bucket_daily`, `bucket_weekly` | RTDS WS `crypto_prices` topic | — |
+| HYPE (all types) | RTDS WS `crypto_prices_chainlink` topic | — (no Chainlink contract on Polygon) |
+
+**Why on-chain Chainlink as primary?**
+
+Polymarket resolves 5m/15m/4h markets by reading `latestAnswer()` from the Chainlink AggregatorV3
+contract on Polygon at the exact expiry block. Subscribing to `AnswerUpdated` events directly means
+the bot tracks the exact price that will be used for resolution — not a proxy. This is particularly
+important for the delta stop-loss: using `get_mid_chainlink()` to evaluate SL correctness means we
+exit based on what Polymarket *will* read, not what an exchange-aggregated feed says.
+
+On-chain events fire on ≥0.5% price moves or the ~27-minute heartbeat. Between events, the
+`crypto_prices_chainlink` RTDS WS topic provides ~1 tick/s and bridges gaps, but all SL/entry
+decisions use the on-chain value as first choice.
+
+---
+
+## Range Markets Sub-Strategy
+
+> Controlled by `MOMENTUM_RANGE_ENABLED` (default: `False`).
+
+**Market format:** "Will BTC be between $X and $Y?" — YES resolves $1 if spot at expiry is inside
+the range [lo, hi]; NO resolves $1 if spot is outside.
+
+**Signal logic:** The scanner detects range markets via `_is_range_market()` (regex match on "between
+$X and $Y"). Both boundaries are extracted; the delta formula is bidirectional:
+
+```
+# For YES token (spot must be inside range at expiry):
+delta_to_lower = (spot - lo) / strike_mid * 100   # positive = above lower bound
+delta_to_upper = (hi - spot) / strike_mid * 100   # positive = below upper bound
+delta_pct = min(delta_to_lower, delta_to_upper)    # worst-case distance to either boundary
+```
+
+Treated as a regular single-leg momentum entry after the delta check. Strategy label is `"range"` so
+the Positions page groups range trades separately from directional momentum trades.
+
+**Independent config knobs:**
+
+| Config Key | Default | Description |
+|-----------|---------|-------------|
+| `MOMENTUM_RANGE_ENABLED` | `False` | Master on/off for range market scanning |
+| `MOMENTUM_RANGE_PRICE_BAND_LOW` | `0.60` | Token price floor for range entries |
+| `MOMENTUM_RANGE_PRICE_BAND_HIGH` | `0.95` | Token price ceiling for range entries |
+| `MOMENTUM_RANGE_MAX_ENTRY_USD` | `25.0` | Position size cap for range entries |
+| `MOMENTUM_RANGE_VOL_Z_SCORE` | `0.80` | Signal threshold (lower than directional — range YES decays differently) |
+| `MOMENTUM_RANGE_MIN_TTE_SECONDS` | `300` | Min TTE before entering (range markets often have longer durations) |
 | Concurrent position cap hit | `MOMENTUM_MAX_CONCURRENT` gate | Signal dropped until slot opens |
 | Per-bucket vol bar too strict | `MOMENTUM_VOL_Z_SCORE_BY_TYPE` override for that type | Tune per-type without affecting others |
 

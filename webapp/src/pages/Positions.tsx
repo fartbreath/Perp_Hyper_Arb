@@ -464,7 +464,7 @@ export default function Positions() {
   const makerPositions = pmPositions.filter((p) => p.strategy === "maker");
   const mispricingPositions = pmPositions.filter((p) => p.strategy === "mispricing" && !p.is_closed);
   const momentumPositions = pmPositions.filter((p) => p.strategy === "momentum" && !p.is_closed);
-  // Positions whose strategy could not be determined on restore (no open_positions.json entry)
+  const rangePositions = pmPositions.filter((p) => p.strategy === "range" && !p.is_closed);
   const unknownPositions = pmPositions.filter((p) => p.strategy === "unknown" && !p.is_closed);
 
   // Group maker positions by condition_id -> Map<condition_id, {yes?, no?}>
@@ -488,7 +488,8 @@ export default function Positions() {
             {makerSpreads.size} maker spread{makerSpreads.size !== 1 ? "s" : ""}
             {closedSpreads.size > 0 && ` · ${closedSpreads.size} recently closed`}
             {mispricingPositions.length > 0 && ` \u00B7 ${mispricingPositions.length} mispricing`}
-            {momentumPositions.length > 0 && ` \u00B7 ${momentumPositions.length} momentum`}
+            {momentumPositions.length > 0 && ` · ${momentumPositions.length} momentum`}
+            {rangePositions.length > 0 && ` · ${rangePositions.length} range`}
             {unknownPositions.length > 0 && ` \u00B7 ${unknownPositions.length} unknown`}
             {" · "}{hlHedges.length} HL hedge{hlHedges.length !== 1 ? "s" : ""}
           </span>
@@ -706,6 +707,49 @@ export default function Positions() {
             })}
           </tbody>
         </table>
+      )}
+
+      {/* -- Range positions ----------------------------------- */}
+      {rangePositions.length > 0 && (
+        <>
+          <h3 style={{ marginTop: "2rem", marginBottom: "0.5rem", fontSize: "0.9rem", color: "#9ca3af" }}>
+            Range Positions
+          </h3>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>Underlying</th>
+                <th>Side</th>
+                <th>Entry</th>
+                <th>Current</th>
+                <th>Stop … TP</th>
+                <th>Deployed</th>
+                <th>Unrealised P&amp;L</th>
+                <th>Opened</th>
+                <th>Ends</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rangePositions.map((pos) => {
+                const slug = pos.market_slug || slugMap[pos.condition_id];
+                const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+                return (
+                  <MomentumRow
+                    key={pos.condition_id + pos.side}
+                    pos={pos}
+                    closeState={closeState[pos.condition_id]}
+                    onClose={handleClose}
+                    marketUrl={marketUrl}
+                    stopLoss={stopLoss}
+                    takeProfit={takeProfit}
+                  />
+                );
+              })}
+            </tbody>
+          </table>
+        </>
       )}
 
       {/* -- Unknown strategy positions (no open_positions.json entry) ------- */}

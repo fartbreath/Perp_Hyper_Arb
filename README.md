@@ -10,7 +10,7 @@ A semi-automated crypto trading bot that runs three complementary strategies: ma
 
 **Strategy 2 — Mispricing Scanner:** Scans Polymarket milestone markets against matching Kalshi markets. When both venues list the same crypto event (e.g. "Will BTC close above $90k on March 31?"), any price divergence above the fee hurdle is a candidate trade. Deribit N(d₂) can optionally be used as a second-layer confirmation signal. Spot price for Black-Scholes is sourced from **Polymarket RTDS**.
 
-**Strategy 3 — Momentum Scanner:** Runs a price-confirmation taker strategy that enters high-probability contracts when Polymarket token prices and spot movement jointly confirm momentum. It supports volatility-aware thresholds, per-market cooldowns, stop-loss / take-profit exits, and a near-expiry protective exit.
+**Strategy 3 — Momentum Scanner:** Runs a price-confirmation taker strategy that enters high-probability contracts when Polymarket token prices and spot movement jointly confirm momentum. It supports volatility-aware thresholds, per-market cooldowns, stop-loss / take-profit exits, a near-expiry protective exit, and an optional range-market sub-strategy for "Will BTC be between $X and $Y?" markets.
 
 All strategies start in **paper trading mode** (no real funds). Switching to live is a single config change.
 
@@ -36,7 +36,7 @@ Perp_Hyper_Arb/
 ├── market_data/
 │   ├── pm_client.py          # Polymarket CLOB REST + WS + Gamma API
 │   ├── hl_client.py          # Hyperliquid REST + WS (execution only)
-│   ├── rtds_client.py        # Polymarket RTDS WS (authoritative spot prices)
+│   ├── rtds_client.py        # RTDS WS + on-chain Chainlink oracle (Polygon WSS)
 │   ├── kalshi_client.py      # Kalshi REST (read-only, no auth required)
 │   └── deribit.py            # Deribit implied vol / N(d₂) data
 │
@@ -44,8 +44,10 @@ Perp_Hyper_Arb/
 │   ├── maker/                # Strategy 1: quoting, repricing, inventory skew, hedge
 │   ├── mispricing/           # Strategy 2: signal generation, Kalshi + N(d₂) filters
 │   └── Momentum/             # Strategy 3: momentum scanner + taker execution
+│       ├── market_utils.py   #   shared market-classification + strike-extraction helpers
+│       └── ...
 │
-├── tests/                    # Pytest suite (741 passed, 7 skipped)
+├── tests/                    # Pytest suite (887 unit tests)
 ├── data/                     # CSV trade logs, paper trade records
 │
 └── webapp/                   # Vite + React monitoring dashboard (port 5173)
@@ -59,6 +61,7 @@ Perp_Hyper_Arb/
 pm_client.run()           ← Polymarket WS + heartbeat
 hl_client.run()           ← Hyperliquid WS + dead-man's switch (execution only)
 rtds_client.start()       ← Polymarket RTDS WS (crypto_prices + crypto_prices_chainlink topics)
+                            + Polygon WSS on-chain Chainlink oracle (AggregatorV3 AnswerUpdated)
 maker_strategy.start()    ← quoting sweep + hedge debounce (reprice trigger = RTDS tick)
 momentum_scanner.start()  ← scan every 5-10 s + event-driven entry (PM ticks + RTDS/Chainlink ticks)
 mispricing_scanner.start()← scan every 60 s (spot price from RTDS)
@@ -72,12 +75,13 @@ The position monitor evaluates exit conditions for **all open positions** on eve
 and for momentum positions on every RTDS/Chainlink tick, so a spot move through the stop-loss strike is
 detected within one WebSocket round-trip (~100–500 ms) rather than any configured poll delay.
 
-**Spot price source — Polymarket RTDS (`wss://ws-live-data.polymarket.com`):**
+**Spot price sources:**
 
-| Topic | Coins | Format | Used for |
-|-------|-------|--------|----------|
-| `crypto_prices` | BTC, ETH, SOL, XRP, BNB, DOGE, LINK | RTDS usdt-pair format (`btcusdt`, …) | 1h, daily, weekly markets (`get_mid` / `get_spot`) |
-| `crypto_prices_chainlink` | BTC, ETH, SOL, XRP, BNB, DOGE, HYPE | Chainlink slash-format (`btc/usd`, …) | 5m, 15m, 4h markets (`get_mid_chainlink` / `get_spot_chainlink`) |
+| Source | Coins | Format | Used for |
+|--------|-------|--------|----------|
+| RTDS WS `crypto_prices` | BTC, ETH, SOL, XRP, BNB, DOGE | RTDS usdt-pair format (`btcusdt`, …) | 1h, daily, weekly markets (`get_mid` / `get_spot`) |
+| RTDS WS `crypto_prices_chainlink` | HYPE (+ fallback for others) | Chainlink slash-format (`btc/usd`, …) | HYPE oracle; bridge between on-chain heartbeats |
+| **On-chain Chainlink** (Polygon WSS) | BTC, ETH, SOL, XRP, BNB, DOGE | AggregatorV3 `AnswerUpdated` events | **Primary oracle** for 5m/15m/4h market resolution (`get_mid_chainlink`) |
 
 **Price source split:**
 
@@ -87,7 +91,7 @@ detected within one WebSocket round-trip (~100–500 ms) rather than any confi
 | Hedge sizing (maker) | ✓ `get_mid()` | ✗ |
 | Rolling realized vol (vol_fetcher) | ✓ price feed | ✗ |
 | Black-Scholes spot S (mispricing) | ✓ `get_mid()` | ✗ |
-| Momentum delta SL / scanner entry | ✓ `get_mid()` or `get_mid_chainlink()` (routed by market type) | ✗ |
+| Momentum delta SL / scanner entry | ✓ `get_mid()` (RTDS) or `get_mid_chainlink()` (on-chain primary / RTDS WS fallback) | ✗ |
 | Exit spot recorded in trades.csv | ✓ oracle-routed at exit time | ✗ |
 | Hedge order placement | ✗ | ✓ |
 | `get_bbo()` for slippage measurement | ✗ | ✓ |
@@ -187,6 +191,7 @@ Key parameters:
 | `STRATEGY_MAKER_ENABLED` | `False` | Enable the market making strategy |
 | `STRATEGY_MISPRICING_ENABLED` | `False` | Enable the mispricing scanner |
 | `STRATEGY_MOMENTUM_ENABLED` | `False` | Enable the momentum scanner |
+| `MOMENTUM_RANGE_ENABLED` | `False` | Include range ("between $X and $Y") markets in the momentum scan |
 | `HEDGE_THRESHOLD_USD` | `100` | Net inventory before a perp hedge fires (USD) |
 | `MOMENTUM_SCAN_INTERVAL` | `10` | Seconds between momentum scan passes |
 | `MAX_QUOTE_AGE_SECONDS` | `30` | Backstop reprice interval |
@@ -256,7 +261,7 @@ The React dashboard at `http://localhost:5173` gives real-time visibility into e
 |------|-------------|
 | **Dashboard** | Bot status, P&L summary, open positions, system health |
 | **Trades** | Full trade history with search / filter; each leg shows entry & exit spot prices (RTDS) |
-| **Positions** | Open positions, momentum positions, recently closed spreads, and settlement/redemption state |
+| **Positions** | Open positions, momentum positions, range positions, recently closed spreads, and settlement/redemption state |
 | **Performance** | Analytics breakdowns by market type, underlying, and strategy leg |
 | **Signals** | Strategy 1/2/3 panel: maker opportunities, mispricing queue, and live momentum scan diagnostics |
 | **Risk** | Exposure utilization, per-coin inventory, hedge status |
@@ -280,7 +285,7 @@ pytest tests/test_maker.py -v
 pytest --cov=. --cov-report=term-missing
 ```
 
-**733 tests passed, 2 skipped, 0 failing** as of the current release.
+**887 tests collected** (unit tests; live RTDS/on-chain tests excluded from default run) as of the current release.
 
 Test files:
 - `tests/test_maker.py` — strategy quoting, repricing, inventory skew, edge filters

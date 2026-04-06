@@ -483,14 +483,14 @@ class TestShouldExit:
 
 # ── PositionMonitor ───────────────────────────────────────────────────────────
 
-def _make_mock_pyth(spot: float, coin: str = "BTC") -> MagicMock:
-    """Return a mock PythClient whose get_mid(coin) returns the given spot price."""
-    pyth = MagicMock()
-    pyth.get_mid = MagicMock(side_effect=lambda c: spot if c == coin else None)
-    return pyth
+def _make_mock_spot(spot: float, coin: str = "BTC") -> MagicMock:
+    """Return a mock RTDSClient whose get_mid(coin) returns the given spot price."""
+    mock_spot = MagicMock()
+    mock_spot.get_mid = MagicMock(side_effect=lambda c: spot if c == coin else None)
+    return mock_spot
 
 
-def _make_monitor(pyth_client=None):
+def _make_monitor(spot_client=None):
     pm = MagicMock()
     pm._markets = {}
     pm._books = {}
@@ -501,7 +501,7 @@ def _make_monitor(pyth_client=None):
     # Return None so the code falls back to pos.size (safe in tests).
     pm.get_token_balance = AsyncMock(return_value=None)
     risk = RiskEngine()
-    monitor = PositionMonitor(pm=pm, risk=risk, interval=30, pyth_client=pyth_client)
+    monitor = PositionMonitor(pm=pm, risk=risk, interval=30, spot_client=spot_client)
     return monitor, pm, risk
 
 
@@ -703,7 +703,7 @@ def _make_monitor_with_market(
     yes_mid=0.30, yes_bid=0.29, yes_ask=0.31,
     no_mid=None, no_bid=None, no_ask=None,
     end_date=None,
-    pyth_client=None,
+    spot_client=None,
 ):
     """Return (monitor, pm, risk, mkt) with a single market in the PM books cache.
 
@@ -712,7 +712,7 @@ def _make_monitor_with_market(
     (simulating a fully drained CLOB near expiry — the key precondition for
     the delta-SL-when-book-empty tests).
     """
-    monitor, pm, risk = _make_monitor(pyth_client=pyth_client)
+    monitor, pm, risk = _make_monitor(spot_client=spot_client)
 
     mkt = MagicMock()
     mkt.condition_id = "mkt_001"
@@ -892,12 +892,12 @@ class TestYesNoBookIndependence:
 
         # For NO: NE fires when spot > strike (delta_no < 0).
         # strike=100, spot=101 → delta_no = (100-101)/100×100 = −1% < 0
-        pyth = _make_mock_pyth(spot=101.0)
+        spot = _make_mock_spot(spot=101.0)
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
             no_mid=0.60, no_bid=0.58, no_ask=0.62,  # independent of YES
             end_date=future,
-            pyth_client=pyth,
+            spot_client=spot,
         )
         no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
                                 seconds_ago=120, now=now, strike=100.0)
@@ -929,12 +929,12 @@ class TestYesNoBookIndependence:
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 100.0  # prevent delta SL; NE fires
         config.MOMENTUM_TAKE_PROFIT = 0.999
 
-        pyth = _make_mock_pyth(spot=101.0)
+        spot = _make_mock_spot(spot=101.0)
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
             no_mid=None,   # NO book absent
             end_date=future,
-            pyth_client=pyth,
+            spot_client=spot,
         )
         no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
                                 seconds_ago=120, now=now, strike=100.0)
@@ -963,12 +963,12 @@ class TestYesNoBookIndependence:
 
         # NO position in-the-money (spot < strike) with delta well above SL threshold
         # spot=99_900 → delta_no = (100000−99900)/100000×100 = +0.1% > +0.05% → no delta SL
-        pyth = _make_mock_pyth(spot=99_900.0)  # 0.1% BELOW strike → NO in-the-money
+        spot = _make_mock_spot(spot=99_900.0)  # 0.1% BELOW strike → NO in-the-money
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=self.YES_MID, yes_bid=0.29, yes_ask=0.31,
             no_mid=None,   # NO book absent
             end_date=future,
-            pyth_client=pyth,
+            spot_client=spot,
         )
         no_pos = _make_position(side="NO", entry_price=0.85, size=100.0, strategy="momentum",
                                 seconds_ago=120, now=now, strike=100_000.0)
@@ -998,11 +998,11 @@ class TestYesNoBookIndependence:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 30  # below 120s TTE — NE won't fire
 
         # spot 0.1% below strike (100_000) → delta = −0.1% < −0.05% → SL fires
-        pyth = _make_mock_pyth(spot=99_900.0)
+        spot = _make_mock_spot(spot=99_900.0)
         monitor, pm, risk, _ = _make_monitor_with_market(
-            yes_mid=None,  # YES CLOB book drained — only Pyth spot is available
+            yes_mid=None,  # YES CLOB book drained — only RTDS spot is available
             end_date=future,
-            pyth_client=pyth,
+            spot_client=spot,
         )
         yes_pos = _make_position(
             side="YES", entry_price=0.85, size=100.0,
@@ -1031,11 +1031,11 @@ class TestYesNoBookIndependence:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 30
 
         # spot 0.1% ABOVE strike → YES is clearly in-the-money, delta = +0.1% > +0.05% → no SL
-        pyth = _make_mock_pyth(spot=100_100.0)
+        spot = _make_mock_spot(spot=100_100.0)
         monitor, pm, risk, _ = _make_monitor_with_market(
             yes_mid=None,  # YES CLOB book drained
             end_date=future,
-            pyth_client=pyth,
+            spot_client=spot,
         )
         yes_pos = _make_position(
             side="YES", entry_price=0.85, size=100.0,
@@ -1169,8 +1169,8 @@ class TestEventDrivenStopLoss:
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        pyth = _make_mock_pyth(spot=99_899.0)  # 0.101% below strike → exceeds 0.05% threshold
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=99_899.0)  # 0.101% below strike → exceeds 0.05% threshold
+        monitor, pm, risk = _make_monitor(spot_client=spot)
         pos = _make_position(
             strategy="momentum", side="YES", entry_price=0.80,
             size=100.0, seconds_ago=120, strike=100_000.0,
@@ -1248,8 +1248,8 @@ class TestEventDrivenStopLoss:
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        pyth = _make_mock_pyth(spot=99_899.0)  # would trigger SL if correct token fires
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=99_899.0)  # would trigger SL if correct token fires
+        monitor, pm, risk = _make_monitor(spot_client=spot)
         pos = _make_position(strategy="momentum", side="YES", entry_price=0.80,
                              seconds_ago=120, strike=100_000.0)
         risk.open_position(pos)
@@ -1268,8 +1268,8 @@ class TestEventDrivenStopLoss:
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        pyth = _make_mock_pyth(spot=99_899.0)  # would trigger SL but guard fires first
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=99_899.0)  # would trigger SL but guard fires first
+        monitor, pm, risk = _make_monitor(spot_client=spot)
         pos = _make_position(strategy="momentum", side="YES", entry_price=0.80,
                              seconds_ago=120, strike=100_000.0)
         risk.open_position(pos)
@@ -1291,8 +1291,8 @@ class TestEventDrivenStopLoss:
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
         config.MIN_HOLD_SECONDS = 0
 
-        pyth = _make_mock_pyth(spot=99_899.0)  # 0.101% below strike → delta SL fires
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=99_899.0)  # 0.101% below strike → delta SL fires
+        monitor, pm, risk = _make_monitor(spot_client=spot)
         pos = _make_position(strategy="momentum", side="YES", entry_price=0.80,
                              seconds_ago=120, strike=100_000.0)
         risk.open_position(pos)
@@ -1410,14 +1410,14 @@ class TestMomentumHoldFloorRemoval:
         assert reason == ExitReason.STOP_LOSS
 
 
-# ── Pyth oracle event path (_on_pyth_spot_update) ─────────────────────────────
+# ── RTDS spot event path (_on_spot_update) ─────────────────────────────
 
-class TestPythOracleEventPath:
-    """Tests for PositionMonitor._on_pyth_spot_update — the Pyth oracle event path.
+class TestSpotOracleEventPath:
+    """Tests for PositionMonitor._on_spot_update — the RTDS spot event path.
 
     This is the critical path that must fire the delta SL when the PM CLOB book
     drains near expiry (the root-cause scenario for the missed stop-losses).
-    Unlike _on_price_update (PM book ticks), this fires purely on Pyth spot price
+    Unlike _on_price_update (PM book ticks), this fires purely on RTDS spot price
     updates and does NOT require the PM book to have a valid mid.
     """
 
@@ -1444,13 +1444,13 @@ class TestPythOracleEventPath:
 
     # ── Root-cause scenario ───────────────────────────────────────────────────
 
-    def test_pyth_tick_fires_delta_sl_when_yes_book_empty(self):
+    def test_spot_tick_fires_delta_sl_when_yes_book_empty(self):
         """THE ROOT-CAUSE SCENARIO.
 
         Spot moves past the strike while the YES CLOB book is completely drained
         (near expiry).  The PM tick path (_on_price_update) is silent because
         pm_client only fires _fire_price_change when book.mid is not None.
-        The Pyth oracle path must still trigger the delta SL.
+        The RTDS spot path must still trigger the delta SL.
 
         Before the fix: YES book guard returned early → SL missed → RESOLVED wipeout.
         After the fix:  momentum bypasses the guard → delta SL fires.
@@ -1460,8 +1460,8 @@ class TestPythOracleEventPath:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 10  # only fire NE if <10s TTE
 
         # spot 0.1% below strike → delta = −0.1% < −0.05% → SL fires
-        pyth = _make_mock_pyth(spot=99_900.0)
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(spot_client=spot)
 
         now = datetime.now(timezone.utc)
         # YES CLOB book completely empty (simulates market near expiry)
@@ -1474,15 +1474,15 @@ class TestPythOracleEventPath:
         )
         risk.open_position(pos)
 
-        # Fire the Pyth oracle path — as if Pyth WS received a price tick for BTC
-        _run(monitor._on_pyth_spot_update("BTC", 99_900.0))
+        # Fire the RTDS spot path — as if Pyth WS received a price tick for BTC
+        _run(monitor._on_spot_update("BTC", 99_900.0))
 
         assert risk._positions["mkt_001:YES"].is_closed, (
-            "Delta SL must fire via Pyth oracle path even when YES CLOB book is empty"
+            "Delta SL must fire via RTDS spot path even when YES CLOB book is empty"
         )
         pm.place_market.assert_called_once()  # force_taker=True for stop-loss
 
-    def test_pyth_tick_no_fire_when_spot_within_threshold(self):
+    def test_spot_tick_no_fire_when_spot_within_threshold(self):
         """Delta SL does NOT fire when position is still clearly in-the-money.
 
         With protective-buffer semantics, SL fires when delta < +SL_PCT.
@@ -1493,8 +1493,8 @@ class TestPythOracleEventPath:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 10
 
         # spot 0.1% ABOVE strike → YES is in-the-money, delta = +0.1% > +0.05% → no fire
-        pyth = _make_mock_pyth(spot=100_100.0)
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=100_100.0)
+        monitor, pm, risk = _make_monitor(spot_client=spot)
 
         now = datetime.now(timezone.utc)
         self._make_market_and_books(pm, yes_mid=None,
@@ -1506,18 +1506,18 @@ class TestPythOracleEventPath:
         )
         risk.open_position(pos)
 
-        _run(monitor._on_pyth_spot_update("BTC", 100_100.0))
+        _run(monitor._on_spot_update("BTC", 100_100.0))
 
         assert not risk._positions["mkt_001:YES"].is_closed, (
             "Delta SL must NOT fire when position is still clearly in-the-money"
         )
 
-    def test_pyth_tick_ignores_wrong_coin(self):
+    def test_spot_tick_ignores_wrong_coin(self):
         """ETH tick does not affect a BTC position."""
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
 
-        pyth = _make_mock_pyth(spot=99_900.0)
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(spot_client=spot)
 
         now = datetime.now(timezone.utc)
         self._make_market_and_books(pm, yes_mid=None,
@@ -1530,18 +1530,18 @@ class TestPythOracleEventPath:
         risk.open_position(pos)
 
         # ETH tick — underlying is BTC, so this should be filtered out
-        _run(monitor._on_pyth_spot_update("ETH", 2_905.0))
+        _run(monitor._on_spot_update("ETH", 2_905.0))
 
         assert not risk._positions["mkt_001:YES"].is_closed, (
             "ETH tick must not trigger a check on a BTC momentum position"
         )
 
-    def test_pyth_tick_skips_non_momentum_positions(self):
-        """Pyth oracle path only checks momentum positions, not maker/mispricing."""
+    def test_spot_tick_skips_non_momentum_positions(self):
+        """RTDS spot path only checks momentum positions, not maker/mispricing."""
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
 
-        pyth = _make_mock_pyth(spot=99_900.0)
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(spot_client=spot)
 
         now = datetime.now(timezone.utc)
         self._make_market_and_books(pm, yes_mid=0.50,
@@ -1553,18 +1553,18 @@ class TestPythOracleEventPath:
         )
         risk.open_position(pos)
 
-        _run(monitor._on_pyth_spot_update("BTC", 99_900.0))
+        _run(monitor._on_spot_update("BTC", 99_900.0))
 
         assert not risk._positions["mkt_001:YES"].is_closed, (
-            "Pyth oracle path must skip non-momentum positions"
+            "RTDS spot path must skip non-momentum positions"
         )
 
-    def test_pyth_tick_double_exit_guard(self):
-        """Exit already in-flight is not re-triggered by a second Pyth oracle tick."""
+    def test_spot_tick_double_exit_guard(self):
+        """Exit already in-flight is not re-triggered by a second RTDS spot tick."""
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.05
 
-        pyth = _make_mock_pyth(spot=99_900.0)
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(spot_client=spot)
 
         now = datetime.now(timezone.utc)
         self._make_market_and_books(pm, yes_mid=None,
@@ -1579,14 +1579,14 @@ class TestPythOracleEventPath:
         # Pre-mark as exiting (simulates first exit in-flight)
         monitor._exiting_positions.add("mkt_001:YES")
 
-        _run(monitor._on_pyth_spot_update("BTC", 99_900.0))
+        _run(monitor._on_spot_update("BTC", 99_900.0))
 
         pm.place_market.assert_not_called()
 
-    def test_pyth_no_client_does_not_crash(self):
-        """Monitor without pyth_client wired does not register price callback — no crash."""
-        monitor, pm, risk = _make_monitor(pyth_client=None)
-        # _on_pyth_spot_update is never called when pyth_client is None (not registered),
+    def test_spot_no_client_does_not_crash(self):
+        """Monitor without spot_client wired does not register price callback — no crash."""
+        monitor, pm, risk = _make_monitor(spot_client=None)
+        # _on_spot_update is never called when spot_client is None (not registered),
         # but if somehow called manually it should be a no-op (no positions match).
         now = datetime.now(timezone.utc)
         self._make_market_and_books(pm, yes_mid=0.50,
@@ -1594,16 +1594,16 @@ class TestPythOracleEventPath:
         pos = _make_position(strategy="momentum", side="YES", seconds_ago=60, now=now)
         risk.open_position(pos)
 
-        # Should not raise even without pyth_client
-        _run(monitor._on_pyth_spot_update("BTC", 99_050.0))
+        # Should not raise even without spot_client
+        _run(monitor._on_spot_update("BTC", 99_050.0))
 
-    def test_pyth_tick_no_position_does_not_crash(self):
-        """Pyth oracle tick with no open positions is a no-op."""
-        pyth = _make_mock_pyth(spot=99_900.0)
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+    def test_spot_tick_no_position_does_not_crash(self):
+        """RTDS spot tick with no open positions is a no-op."""
+        spot = _make_mock_spot(spot=99_900.0)
+        monitor, pm, risk = _make_monitor(spot_client=spot)
         self._make_market_and_books(pm)
         # No positions registered
-        _run(monitor._on_pyth_spot_update("BTC", 99_900.0))
+        _run(monitor._on_spot_update("BTC", 99_900.0))
 
     def test_pyth_tick_fires_delta_sl_no_position_both_books_empty(self):
         """NO position: spot crosses above strike, both YES and NO books are empty.
@@ -1613,8 +1613,8 @@ class TestPythOracleEventPath:
         config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS = 10
 
         # spot 0.1% above strike → delta_no = −0.1% < −0.05% → SL fires for NO position
-        pyth = _make_mock_pyth(spot=100_100.0)
-        monitor, pm, risk = _make_monitor(pyth_client=pyth)
+        spot = _make_mock_spot(spot=100_100.0)
+        monitor, pm, risk = _make_monitor(spot_client=spot)
 
         now = datetime.now(timezone.utc)
         # Both books empty
@@ -1627,7 +1627,7 @@ class TestPythOracleEventPath:
         )
         risk.open_position(pos)
 
-        _run(monitor._on_pyth_spot_update("BTC", 100_100.0))
+        _run(monitor._on_spot_update("BTC", 100_100.0))
 
         assert risk._positions["mkt_001:NO"].is_closed, (
             "Delta SL must fire for NO position even when both YES and NO books are empty"

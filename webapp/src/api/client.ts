@@ -147,6 +147,9 @@ export interface Position {
   is_closed?: boolean;
   closed_at?: string | null;
   realized_pnl?: number | null;
+  // Legacy field — null for all new positions
+  spread_id?: string | null;
+  strike?: number | null;
 }
 
 export interface Trade {
@@ -168,6 +171,7 @@ export interface Trade {
   timestamp: string;
   signal_score?: string;    // 0–100 signal quality score at fill time
   resolved_outcome?: string; // "WIN" | "LOSS" | "" — set on RESOLVED exits; empty for taker/stop
+  spread_id?: string;        // legacy field; null for all new positions
 }
 
 export interface PnlData {
@@ -498,6 +502,13 @@ export interface ConfigData {
   momentum_near_expiry_time_stop_secs?: number;
   momentum_min_delta_pct?: number;
   monitor_interval?: number;
+  // Range markets sub-strategy
+  momentum_range_enabled?: boolean;
+  momentum_range_price_band_low?: number;
+  momentum_range_price_band_high?: number;
+  momentum_range_max_entry_usd?: number;
+  momentum_range_vol_z_score?: number;
+  momentum_range_min_tte_seconds?: number;
 }
 
 export interface InventoryData {

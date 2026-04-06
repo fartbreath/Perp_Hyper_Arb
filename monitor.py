@@ -1,19 +1,45 @@
 """
 monitor.py — Position exit monitor.
 
-Runs as an asyncio task, checking all open positions every MONITOR_INTERVAL
-seconds.  Exit logic is **strategy-isolated**: each strategy has its own
-explicit exit conditions and no position can be exited by a rule belonging to
-a different strategy.
+MOMENTUM STRATEGY — core logic (do not lose sight of this):
+============================================================
+1. ENTER NEAR EXPIRY (intentional, not a bug)
+   Entry gate places us in the last seconds/minutes of the bucket.  At low TTE
+   the remaining spot vol (sigma_tau) is very small, making adverse moves
+   unlikely.  This IS the edge.  Do not add TTE floors /Kelly nerfs to fight it.
+
+2. EXIT DRIVEN BY ORACLE SPOT, not CLOB alone
+   • Delta SL  (MOMENTUM_DELTA_STOP_LOSS_PCT): exit when live oracle spot
+     retreats to within SL_PCT% of the strike — fires on every RTDS/Chainlink
+     tick, not on a polling loop.
+   • Near-expiry delta cross (MOMENTUM_NEAR_EXPIRY): exit when TTE is very
+     short AND spot has already crossed the strike (delta < 0).
+   • Take-profit (MOMENTUM_TAKE_PROFIT): CLOB mid ≥ 0.999 (token converges to 1).
+   • NEVER use CLOB alone for stop-losses: CLOB reprices forward and can drop
+     on noise even when spot is stable and the position resolves as a WIN.
+
+3. ORACLE ROUTING
+   — bucket_5m, bucket_15m, bucket_4h   → Chainlink ticks (RTDSClient)
+   — bucket_1h, bucket_daily, bucket_weekly → RTDS exchange-aggregated ticks
+   Both arrive via a single RTDSClient WebSocket.  NOT from HL price feed.
+
+4. CLOB vs ORACLE PRICES — never confuse these
+   • current_token_price  = PM CLOB mid of the HELD token (YES or NO side)
+   • current_spot         = oracle price of the underlying asset
+   The delta SL compares current_spot vs pos.strike.
+   Take-profit compares current_token_price vs MOMENTUM_TAKE_PROFIT.
+
+5. KELLY IS CORRECT AT LOW TTE
+   Near expiry sigma_tau → 0, so z = delta/sigma_tau is large → high win_prob
+   → Kelly bets bigger.  This is correct: we are more certain when spot is well
+   past strike with seconds left.  Do not floor sigma_tau for Kelly.
 
 Strategy exit rules
 -------------------
   * **maker**   — TIME_STOP for non-bucket (milestone/daily) markets within
                   MAKER_EXIT_HOURS of expiry.  Bucket positions hold to
                   RESOLVED.  No per-position profit target or stop-loss.
-  * **momentum** — token-price exits (MOMENTUM_STOP_LOSS / MOMENTUM_TAKE_PROFIT).
-                  No time-stop; the min-TTE entry gate already places entries
-                  close to expiry.
+  * **momentum** — Oracle delta SL + CLOB take-profit (see above).
   * **mispricing** — EXIT_DAYS_BEFORE_RESOLUTION time-stop, PROFIT_TARGET and
                   STOP_LOSS in USD P&L space.
   * **unknown** / any other label — NO triggers at all.  The position is held
@@ -34,6 +60,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -57,9 +84,10 @@ class ExitReason:
     TIME_STOP              = "time_stop"
     RESOLVED               = "resolved"
     COIN_LOSS_LIMIT        = "coin_loss_limit"       # maker: aggregate coin P&L exceeded threshold
-    MOMENTUM_STOP_LOSS     = "momentum_stop_loss"    # momentum: held token fell below MOMENTUM_STOP_LOSS
-    MOMENTUM_TAKE_PROFIT   = "momentum_take_profit"  # momentum: held token rose above MOMENTUM_TAKE_PROFIT
-    MOMENTUM_NEAR_EXPIRY   = "momentum_near_expiry"  # momentum: near expiry and in loss territory
+    MOMENTUM_STOP_LOSS          = "momentum_stop_loss"          # momentum: oracle delta dropped below delta SL threshold
+    MOMENTUM_TAKE_PROFIT        = "momentum_take_profit"        # momentum: held token rose above MOMENTUM_TAKE_PROFIT
+    MOMENTUM_NEAR_EXPIRY        = "momentum_near_expiry"        # momentum: near expiry and spot has crossed strike
+
 
 
 # ── Market outcome persistence ─────────────────────────────────────────────────
@@ -69,6 +97,92 @@ class ExitReason:
 _DATA_DIR               = Path(__file__).parent / "data"
 _MARKET_OUTCOMES_PATH   = _DATA_DIR / "market_outcomes.json"
 _PENDING_RESOLUTIONS_PATH = _DATA_DIR / "pending_resolutions.json"
+
+# ── Momentum tick CSV ─────────────────────────────────────────────────────────
+# Dedicated file for every intra-hold price check on open momentum positions.
+# Separate from bot.log so it can be analysed in isolation without grepping
+# through unrelated log noise.  Used to calibrate combined exit stop thresholds.
+#
+# Columns:
+#   ts            — UTC ISO timestamp of this tick
+#   market_id     — first 20 chars of condition_id
+#   market_title  — human label (truncated)
+#   underlying    — BTC / ETH / SOL / …
+#   side          — UP / DOWN / YES / NO
+#   tte_s         — seconds until market expiry at this tick
+#   entry_tok     — token price at entry
+#   token         — current CLOB mid of the held token
+#   tok_drop_pct  — (entry_tok - token) / entry_tok * 100  (+ve = token losing value)
+#   entry_spot    — oracle spot price at entry (pos.spot_price)
+#   spot          — current oracle spot price
+#   entry_delta   — (entry_spot - strike) / strike * 100 for UP; reversed for DOWN
+#   current_delta — live delta at this tick
+#   delta_retreat_pct — (entry_delta - current_delta) / entry_delta * 100
+#   exit          — True if this tick triggered an exit
+#   reason        — exit reason label or empty
+
+MOMENTUM_TICKS_CSV   = _DATA_DIR / "momentum_ticks.csv"
+_MOMENTUM_TICKS_HEADER = [
+    "ts", "market_id", "market_title", "underlying", "side",
+    "tte_s", "entry_tok", "token", "tok_drop_pct",
+    "entry_spot", "spot", "entry_delta", "current_delta", "delta_retreat_pct",
+    "exit", "reason",
+]
+
+def _ensure_momentum_ticks_csv() -> None:
+    _DATA_DIR.mkdir(exist_ok=True)
+    if not MOMENTUM_TICKS_CSV.exists():
+        with MOMENTUM_TICKS_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=_MOMENTUM_TICKS_HEADER).writeheader()
+
+def _write_momentum_tick(
+    pos: "Position",
+    tte_seconds: Optional[float],
+    current_token_price: Optional[float],
+    current_spot: Optional[float],
+    current_delta_pct: Optional[float],
+    exit_flag: bool,
+    reason: str,
+) -> None:
+    """Append one row to momentum_ticks.csv."""
+    try:
+        _ensure_momentum_ticks_csv()
+        entry_delta: Optional[float] = None
+        if pos.spot_price > 0 and pos.strike > 0:
+            if pos.side in ("YES", "BUY_YES", "UP"):
+                entry_delta = round((pos.spot_price - pos.strike) / pos.strike * 100, 6)
+            else:
+                entry_delta = round((pos.strike - pos.spot_price) / pos.strike * 100, 6)
+        tok_drop = (
+            round((pos.entry_price - current_token_price) / pos.entry_price * 100, 4)
+            if current_token_price is not None and pos.entry_price > 0 else None
+        )
+        delta_retreat = (
+            round((entry_delta - current_delta_pct) / entry_delta * 100, 4)
+            if entry_delta is not None and entry_delta != 0 and current_delta_pct is not None else None
+        )
+        row = {
+            "ts":               datetime.now(timezone.utc).isoformat(),
+            "market_id":        pos.market_id[:20],
+            "market_title":     pos.market_title[:60],
+            "underlying":       pos.underlying,
+            "side":             pos.side,
+            "tte_s":            round(tte_seconds, 2) if tte_seconds is not None else "",
+            "entry_tok":        pos.entry_price,
+            "token":            current_token_price if current_token_price is not None else "",
+            "tok_drop_pct":     tok_drop if tok_drop is not None else "",
+            "entry_spot":       pos.spot_price,
+            "spot":             current_spot if current_spot is not None else "",
+            "entry_delta":      entry_delta if entry_delta is not None else "",
+            "current_delta":    round(current_delta_pct, 6) if current_delta_pct is not None else "",
+            "delta_retreat_pct": delta_retreat if delta_retreat is not None else "",
+            "exit":             exit_flag,
+            "reason":           reason,
+        }
+        with MOMENTUM_TICKS_CSV.open("a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=_MOMENTUM_TICKS_HEADER).writerow(row)
+    except Exception as _ex:
+        log.debug("_write_momentum_tick failed", exc=str(_ex))  # never let tick logging crash the monitor
 
 
 def _load_market_outcomes() -> dict:
@@ -316,13 +430,13 @@ class PositionMonitor:
         pm: PMClient,
         risk: RiskEngine,
         interval: int = config.MONITOR_INTERVAL,
-        pyth_client: Optional[RTDSClient] = None,
+        spot_client: Optional[RTDSClient] = None,
         on_close_callback: Optional[Callable[[str], None]] = None,
         on_stop_loss_callback: Optional[Callable[[str, float], None]] = None,
     ) -> None:
         self._pm = pm
         self._risk = risk
-        self._pyth = pyth_client  # RTDSClient; spot price source for momentum SL
+        self._spot = spot_client  # RTDSClient; spot price source for momentum SL
         self._interval = interval
         # Called with market_id whenever a position is successfully closed.
         # Used by MispricingScanner to reset the per-market cooldown clock.
@@ -365,11 +479,11 @@ class PositionMonitor:
         # rapid underlying move triggers the delta SL immediately, without
         # waiting for the next PM WS tick (which may not come if the PM book
         # goes quiet near expiry — exactly when the SL matters most).
-        if self._pyth is not None:
-            self._pyth.on_price_update(self._on_pyth_spot_update)
+        if self._spot is not None:
+            self._spot.on_price_update(self._on_spot_update)
             # Also fire on Chainlink ticks so 5m/15m/4h position SLs are
             # evaluated the moment a Chainlink oracle price update arrives.
-            self._pyth.on_chainlink_update(self._on_pyth_spot_update)
+            self._spot.on_chainlink_update(self._on_spot_update)
         log.info("PositionMonitor started (event-driven)")
         asyncio.create_task(self._auto_redeem_loop())
         # Rare backstop sweep: catches resolved markets that PM WS never echoes
@@ -413,8 +527,8 @@ class PositionMonitor:
                 continue  # exit already in progress for this leg
             await self._check_position(pos, triggering_token_id=token_id, triggering_mid=mid)
 
-    async def _on_pyth_spot_update(self, coin: str, price: float) -> None:
-        """Triggered on every spot price tick (RTDS or Pyth fallback).
+    async def _on_spot_update(self, coin: str, price: float) -> None:
+        """Triggered on every spot price tick (RTDS).
 
         Checks open momentum positions whose underlying matches `coin`.
         Ensures that a rapid spot move (e.g. BTC flash crash through the
@@ -784,9 +898,9 @@ class PositionMonitor:
                 # Non-momentum positions need book data for all exit types.
                 log.debug("Monitor: no book data yet", market_id=pos.market_id, token_id=market.token_id_yes)
                 return
-            # Momentum: YES book drained (common near expiry), but the HL-spot-based
-            # delta SL must still fire — it requires only HL spot + pos.strike, NOT
-            # the CLOB book.  Use entry_price as a stub for the P&L calculation;
+            # Momentum: YES book drained (common near expiry), but the oracle-spot-based
+            # delta SL must still fire — it requires only the oracle spot + pos.strike,
+            # NOT the CLOB book.  Use entry_price as a stub for the P&L calculation;
             # the actual fill price is determined by place_market in _exit_position.
             log.debug(
                 "Monitor: YES book empty for momentum position — delta SL still active",
@@ -805,7 +919,7 @@ class PositionMonitor:
         book_no = None
         if pos.strategy == "momentum":
             if pos.side in ("YES", "BUY_YES", "UP"):
-                # YES/UP CLOB mid; None when book is drained (delta SL still active via HL spot).
+                # YES/UP CLOB mid; None when book is drained (delta SL still active via oracle spot).
                 current_token_price = book.mid if book is not None else None
             else:
                 book_no = self._pm._books.get(market.token_id_no)
@@ -842,11 +956,11 @@ class PositionMonitor:
         # resolve against the Chainlink oracle), RTDS exchange-aggregated for
         # 1h/daily/weekly markets.
         current_spot: Optional[float] = None
-        if pos.strategy == "momentum" and self._pyth is not None and pos.underlying:
+        if pos.strategy == "momentum" and self._spot is not None and pos.underlying:
             if pos.market_type in CHAINLINK_MARKET_TYPES:
-                current_spot = self._pyth.get_mid_chainlink(pos.underlying)
+                current_spot = self._spot.get_mid_chainlink(pos.underlying)
             else:
-                current_spot = self._pyth.get_mid(pos.underlying)
+                current_spot = self._spot.get_mid(pos.underlying)
 
         exit_flag, reason, unrealised = should_exit(
             pos=pos,
@@ -859,17 +973,37 @@ class PositionMonitor:
             current_spot=current_spot,
         )
 
-        log.debug(
-            "Monitor: position check",
-            market_id=pos.market_id,
-            entry=round(pos.entry_price, 4),
-            mid=round(current_price, 4),
-            bid=round(book.best_bid, 4) if book is not None and book.best_bid is not None else None,
-            ask=round(book.best_ask, 4) if book is not None and book.best_ask is not None else None,
-            unrealised_usd=round(unrealised, 4),
-            exit=exit_flag,
-            reason=reason or "—",
-        )
+        # Write every intra-hold price check to momentum_ticks.csv for momentum
+        # positions. Kept out of bot.log to avoid noise; the dedicated CSV is
+        # easy to filter and analyse for calibrating exit stop thresholds.
+        if pos.strategy == "momentum":
+            _tick_delta: Optional[float] = None
+            if current_spot is not None and pos.strike > 0:
+                if pos.side in ("YES", "BUY_YES", "UP"):
+                    _tick_delta = (current_spot - pos.strike) / pos.strike * 100
+                else:
+                    _tick_delta = (pos.strike - current_spot) / pos.strike * 100
+            _write_momentum_tick(
+                pos=pos,
+                tte_seconds=tte_seconds,
+                current_token_price=current_token_price,
+                current_spot=current_spot,
+                current_delta_pct=_tick_delta,
+                exit_flag=exit_flag,
+                reason=reason,
+            )
+        else:
+            log.debug(
+                "Monitor: position check",
+                market_id=pos.market_id,
+                entry=round(pos.entry_price, 4),
+                mid=round(current_price, 4),
+                bid=round(book.best_bid, 4) if book is not None and book.best_bid is not None else None,
+                ask=round(book.best_ask, 4) if book is not None and book.best_ask is not None else None,
+                unrealised_usd=round(unrealised, 4),
+                exit=exit_flag,
+                reason=reason or "—",
+            )
 
         if exit_flag:
             # Guard: prevent double-exit when both the poll loop and the
@@ -1095,11 +1229,11 @@ class PositionMonitor:
         # Capture the underlying spot price at exit time.
         # Use the same oracle that the market resolves against: Chainlink for
         # 5m/15m/4h markets, RTDS exchange-aggregated for 1h/daily/weekly.
-        if self._pyth is not None and pos.underlying:
+        if self._spot is not None and pos.underlying:
             if pos.market_type in CHAINLINK_MARKET_TYPES:
-                _exit_spot = self._pyth.get_mid_chainlink(pos.underlying) or 0.0
+                _exit_spot = self._spot.get_mid_chainlink(pos.underlying) or 0.0
             else:
-                _exit_spot = self._pyth.get_mid(pos.underlying) or 0.0
+                _exit_spot = self._spot.get_mid(pos.underlying) or 0.0
         else:
             _exit_spot = 0.0
         closed = self._risk.close_position(

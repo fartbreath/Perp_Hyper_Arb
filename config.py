@@ -15,12 +15,16 @@ POLY_FUNDER: str = os.getenv("POLY_FUNDER", "") or os.getenv("POLY_ADDRESS", "")
 POLY_HOST: str = "https://clob.polymarket.com"
 GAMMA_HOST: str = "https://gamma-api.polymarket.com"
 POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+# WebSocket RPC for Polygon — used to subscribe to Chainlink AnswerUpdated
+# events on-chain (the authoritative price PM uses for 5m/15m/4h resolution).
+# Public endpoint — replace with Alchemy/Infura wss:// for production reliability.
+POLYGON_WS_URL: str = os.getenv("POLYGON_WS_URL", "wss://polygon-bor-rpc.publicnode.com")
 RELAYER_API_KEY: str = os.getenv("RELAYER_API_KEY", "")
 RELAYER_API_KEY_ADDRESS: str = os.getenv("RELAYER_API_KEY_ADDRESS", "")
 
 # Token IDs of underlying assets tracked. Used to label markets.
 TRACKED_UNDERLYINGS: list[str] = [
-    "BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP", "LINK",
+    "BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP",
 ]
 
 # How often (seconds) to refresh the market list from Gamma API
@@ -41,7 +45,7 @@ HL_ADDRESS: str = os.getenv("HL_ADDRESS", "")
 HL_SECRET_KEY: str = os.getenv("HL_SECRET_KEY", "")
 HL_BASE_URL: str = "https://api.hyperliquid.xyz"
 
-HL_PERP_COINS: list[str] = ["BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP", "LINK"]
+HL_PERP_COINS: list[str] = ["BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP"]
 HL_DEFAULT_SLIPPAGE: float = 0.003   # 0.3% max slippage for hedge market orders
 
 HL_DEAD_MAN_INTERVAL: int = 300      # seconds — refresh dead man's switch every 5 min
@@ -261,6 +265,7 @@ BOT_ACTIVE: bool = True
 STRATEGY_MISPRICING_ENABLED: bool = False   # Strategy 2: Deribit implied-prob mispricing
 STRATEGY_MAKER_ENABLED: bool = False        # Strategy 1: PM market making + HL delta hedge
 STRATEGY_MOMENTUM_ENABLED: bool = False     # Strategy 3: Momentum / price-confirmation taker
+STRATEGY_SPREAD_ENABLED: bool = False       # Strategy 4: Calendar spread / relative-value
 
 # ── Strategy 3 — Momentum Scanner ─────────────────────────────────────────
 # Price band: scanner fires when held-side is in [LOW, HIGH].
@@ -384,6 +389,18 @@ MOMENTUM_PRESUB_LOOKAHEAD: int = 4
 # window so we can watch markets that are "near certain" but not yet in the
 # maker's quoting horizon.  Increase if 76% no_book persists after market refresh.
 MOMENTUM_MAX_TTE_DAYS: int = 7
+
+# ── Range markets (sub-strategy of Momentum) ─────────────────────────────────
+# "Will BTC be between $X and $Y?" — YES resolves $1 if spot inside [lo, hi],
+# NO resolves $1 if spot outside [lo, hi].  Treated as a regular single-leg
+# momentum trade; the bidirectional delta formula uses both boundaries.
+MOMENTUM_RANGE_ENABLED: bool = False  # Include range markets in momentum scans
+# Per-range overrides (fall back to standard momentum values if not set separately):
+MOMENTUM_RANGE_PRICE_BAND_LOW: float = 0.6    # Token price floor for range market entries
+MOMENTUM_RANGE_PRICE_BAND_HIGH: float = 0.95  # Token price ceiling for range market entries
+MOMENTUM_RANGE_MAX_ENTRY_USD: float = 25.0    # Max position size (USD) for range entries
+MOMENTUM_RANGE_VOL_Z_SCORE: float = 0.8       # Vol z-score threshold for range market signals
+MOMENTUM_RANGE_MIN_TTE_SECONDS: int = 300     # Minimum seconds to expiry for range entries
 
 # ── Strategy 2 — Mispricing Scanner ─────────────────────────────────────────
 MILESTONE_MIN_DAYS: int = 1           # Only scan markets resolving > 1 day away

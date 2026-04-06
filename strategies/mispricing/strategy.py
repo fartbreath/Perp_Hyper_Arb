@@ -49,11 +49,11 @@ class MispricingScanner(BaseStrategy):
         hl: HLClient,
         signal_callback,   # async callable(signal: MispricingSignal)
         scan_interval: int = 300,
-        pyth: Optional[RTDSClient] = None,
+        spot_client: Optional[RTDSClient] = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
-        self._pyth = pyth  # RTDSClient — authoritative spot, same as Polymarket resolution source
+        self._spot = spot_client  # RTDSClient — authoritative spot, same as Polymarket resolution source
         self._on_signal = signal_callback
         self._default_scan_interval = scan_interval
         self._deribit = DeribitFetcher()
@@ -164,8 +164,8 @@ class MispricingScanner(BaseStrategy):
 
             # Use RTDS spot if wired (authoritative resolution price); fall back to HL perp.
             spot = (
-                self._pyth.get_mid(market.underlying)
-                if self._pyth is not None
+                self._spot.get_mid(market.underlying)
+                if self._spot is not None
                 else self._hl.get_mid(market.underlying)
             )
             if spot is None:

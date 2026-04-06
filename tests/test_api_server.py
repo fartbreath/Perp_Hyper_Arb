@@ -582,6 +582,60 @@ class TestConfigMakerExcludedTypes:
         client.post("/config", json={"paper_fill_probability": 0.9})
         assert config.MAKER_EXCLUDED_MARKET_TYPES == ["bucket_1h"]
 
+
+# ── Range market config endpoint ──────────────────────────────────────────────
+
+class TestConfigRangeMarket:
+    """
+    Tests for the momentum_range_enabled config key added by the range-market
+    refactor (replacing the 17-key calendar-spread block).
+    """
+
+    def setup_method(self):
+        _reset_state()
+        config.MOMENTUM_RANGE_ENABLED = False
+
+    def teardown_method(self):
+        config.MOMENTUM_RANGE_ENABLED = False
+
+    def test_get_config_returns_range_enabled_key(self):
+        """GET /config must include momentum_range_enabled in the response."""
+        r = client.get("/config")
+        assert r.status_code == 200
+        assert "momentum_range_enabled" in r.json()
+
+    def test_get_config_range_enabled_default_false(self):
+        r = client.get("/config")
+        assert r.json()["momentum_range_enabled"] is False
+
+    def test_patch_enables_range_markets(self):
+        r = client.post("/config", json={"momentum_range_enabled": True})
+        assert r.status_code == 200
+        assert config.MOMENTUM_RANGE_ENABLED is True
+        assert r.json()["current"]["momentum_range_enabled"] is True
+
+    def test_patch_disables_range_markets(self):
+        config.MOMENTUM_RANGE_ENABLED = True
+        r = client.post("/config", json={"momentum_range_enabled": False})
+        assert r.status_code == 200
+        assert config.MOMENTUM_RANGE_ENABLED is False
+        assert r.json()["current"]["momentum_range_enabled"] is False
+
+    def test_null_leaves_range_enabled_unchanged(self):
+        """Patching an unrelated field must not change momentum_range_enabled."""
+        config.MOMENTUM_RANGE_ENABLED = True
+        client.post("/config", json={"paper_fill_probability": 0.75})
+        assert config.MOMENTUM_RANGE_ENABLED is True
+
+    def test_get_config_no_stale_calendar_spread_key(self):
+        """None of the old calendar-spread keys should appear in GET /config."""
+        r = client.get("/config")
+        body = r.json()
+        stale_keys = [k for k in body if "calendar_spread" in k or
+                      (k.startswith("momentum_spread") and k != "momentum_range_enabled")]
+        assert stale_keys == [], f"Stale calendar-spread keys still in /config: {stale_keys}"
+
+
 # ── Regression: BUG-B — _row_age_days tz-aware timestamp handling ─────────────
 
 class TestRowAgeDays:

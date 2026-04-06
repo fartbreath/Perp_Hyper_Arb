@@ -518,6 +518,13 @@ _MUTABLE_CONFIG = {
     "momentum_min_gap_pct":           ("MOMENTUM_MIN_GAP_PCT",             float),
     "momentum_near_expiry_time_stop_secs": ("MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS", int),
     "monitor_interval":               ("MONITOR_INTERVAL",                 int),
+    # Range markets (sub-strategy of Momentum)
+    "momentum_range_enabled":              ("MOMENTUM_RANGE_ENABLED",              bool),
+    "momentum_range_price_band_low":       ("MOMENTUM_RANGE_PRICE_BAND_LOW",       float),
+    "momentum_range_price_band_high":      ("MOMENTUM_RANGE_PRICE_BAND_HIGH",      float),
+    "momentum_range_max_entry_usd":        ("MOMENTUM_RANGE_MAX_ENTRY_USD",        float),
+    "momentum_range_vol_z_score":          ("MOMENTUM_RANGE_VOL_Z_SCORE",          float),
+    "momentum_range_min_tte_seconds":      ("MOMENTUM_RANGE_MIN_TTE_SECONDS",      int),
 }
 
 
@@ -658,6 +665,13 @@ class ConfigPatch(BaseModel):
     momentum_min_gap_pct: float | None = None
     momentum_near_expiry_time_stop_secs: int | None = None
     monitor_interval: int | None = None
+    # Range markets sub-strategy
+    momentum_range_enabled: bool | None = None
+    momentum_range_price_band_low: float | None = None
+    momentum_range_price_band_high: float | None = None
+    momentum_range_max_entry_usd: float | None = None
+    momentum_range_vol_z_score: float | None = None
+    momentum_range_min_tte_seconds: int | None = None
 
 
 @app.get("/config")
@@ -800,6 +814,13 @@ def get_config() -> dict:
         "momentum_min_gap_pct":           config.MOMENTUM_MIN_GAP_PCT,
         "momentum_near_expiry_time_stop_secs": config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS,
         "monitor_interval":               config.MONITOR_INTERVAL,
+        # Range markets sub-strategy
+        "momentum_range_enabled":              config.MOMENTUM_RANGE_ENABLED,
+        "momentum_range_price_band_low":       config.MOMENTUM_RANGE_PRICE_BAND_LOW,
+        "momentum_range_price_band_high":      config.MOMENTUM_RANGE_PRICE_BAND_HIGH,
+        "momentum_range_max_entry_usd":        config.MOMENTUM_RANGE_MAX_ENTRY_USD,
+        "momentum_range_vol_z_score":          config.MOMENTUM_RANGE_VOL_Z_SCORE,
+        "momentum_range_min_tte_seconds":      config.MOMENTUM_RANGE_MIN_TTE_SECONDS,
         "timestamp":            time.time(),
     }
 
@@ -976,6 +997,13 @@ def patch_config(patch: ConfigPatch) -> dict:
             "maker_min_spread_profit_margin": config.MAKER_MIN_SPREAD_PROFIT_MARGIN,
             # Market type exclusion
             "maker_excluded_market_types": list(config.MAKER_EXCLUDED_MARKET_TYPES),
+            # Range markets sub-strategy
+            "momentum_range_enabled":              config.MOMENTUM_RANGE_ENABLED,
+            "momentum_range_price_band_low":       config.MOMENTUM_RANGE_PRICE_BAND_LOW,
+            "momentum_range_price_band_high":      config.MOMENTUM_RANGE_PRICE_BAND_HIGH,
+            "momentum_range_max_entry_usd":        config.MOMENTUM_RANGE_MAX_ENTRY_USD,
+            "momentum_range_vol_z_score":          config.MOMENTUM_RANGE_VOL_Z_SCORE,
+            "momentum_range_min_tte_seconds":      config.MOMENTUM_RANGE_MIN_TTE_SECONDS,
         },
         "timestamp": time.time(),
     }

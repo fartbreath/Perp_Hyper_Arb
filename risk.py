@@ -28,7 +28,7 @@ OPEN_POSITIONS_JSON = DATA_DIR / "open_positions.json"
 TRADES_HEADER = [
     "timestamp", "entry_timestamp", "market_id", "market_title", "market_type", "underlying", "side", "size", "price",
     "fees_paid", "rebates_earned", "hl_hedge_size", "hl_entry_price",
-    "strategy", "pnl",
+    "strategy", "spread_id", "pnl",
     # Signal context — populated for mispricing strategy; 0.0 for maker
     "entry_deviation",  # |pm_price - N(d2)| at signal time
     "implied_prob",     # Deribit N(d2) value
@@ -115,6 +115,10 @@ class Position:
     # order_id: the PM order ID of the order that produced this position's fills.
     # Updated when a reprice fires a new order so logs can follow order lifecycle.
     order_id: str = ""
+
+    # Spread pair tracking: when this position is one leg of a calendar spread,
+    # both legs share the same spread_id (uuid4().hex).  None for single-leg positions.
+    spread_id: Optional[str] = None
 
     @property
     def pm_delta_notional(self) -> float:
@@ -556,6 +560,7 @@ class RiskEngine:
                 "hl_hedge_size": pos.hl_hedge_size,
                 "hl_entry_price": pos.hl_entry_price,
                 "strategy": pos.strategy,
+                "spread_id": pos.spread_id or "",
                 "pnl": pnl,
                 "entry_deviation": pos.entry_deviation,
                 "implied_prob": pos.implied_prob,

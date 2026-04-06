@@ -78,11 +78,11 @@ class MakerStrategy(BaseStrategy):
         hl: HLClient,
         risk: RiskEngine,
         quote_size_usd: Optional[float] = None,
-        pyth: Optional[RTDSClient] = None,
+        spot_client: Optional[RTDSClient] = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
-        self._pyth = pyth  # RTDSClient; authoritative RTDS spot for all pricing decisions
+        self._spot = spot_client  # RTDSClient; authoritative RTDS spot for all pricing decisions
         self._risk = risk
         self._quote_size_override = quote_size_usd
         self._active_quotes: dict[str, ActiveQuote] = {}  # token_id → quote
@@ -126,8 +126,8 @@ class MakerStrategy(BaseStrategy):
         # Reprice on RTDS spot ticks — authoritative RTDS price, not HL perp.
         # HL perp carries funding-rate basis and diverges from the settlement oracle;
         # using RTDS ensures reprice triggers match what Polymarket actually resolves on.
-        if self._pyth is not None:
-            self._pyth.on_price_update(self._on_pyth_price_update)
+        if self._spot is not None:
+            self._spot.on_price_update(self._on_spot_update)
         log.info("MakerStrategy started", quote_size_override=self._quote_size_override)
         asyncio.create_task(self._quote_age_watchdog())
         await self._refresh_all_quotes()
@@ -162,7 +162,7 @@ class MakerStrategy(BaseStrategy):
                 log.warning("PM price-change reprice failed",
                             market=market.condition_id, exc=str(exc))
 
-    async def _on_pyth_price_update(self, coin: str, price: float) -> None:
+    async def _on_spot_update(self, coin: str, price: float) -> None:
         """Triggered on every RTDS spot tick.
 
         Maintains a rate-limited price history for the volatility filter and fires
@@ -462,7 +462,7 @@ class MakerStrategy(BaseStrategy):
         move = self._get_recent_move_pct(market.underlying, window_s=_vol_window)
         if move is not None and move > config.MAKER_VOL_FILTER_PCT:
             log.debug(
-                "Skipping quote — underlying moving hard (Pyth oracle)",
+                "Skipping quote — underlying moving hard (RTDS spot)",
                 underlying=market.underlying,
                 move_5m_pct=round(move * 100, 2),
             )
@@ -1202,9 +1202,9 @@ class MakerStrategy(BaseStrategy):
         if abs(net_delta) < config.HEDGE_THRESHOLD_USD:
             if coin in self._coin_hedges:
                 existing = self._coin_hedges[coin]
-                # Use Pyth oracle for reference close price; fall back to recorded open price.
+                # Use RTDS spot for reference close price; fall back to recorded open price.
                 close_mid = (
-                    (self._pyth.get_mid(coin) if self._pyth is not None else None)
+                    (self._spot.get_mid(coin) if self._spot is not None else None)
                     or self._hl.get_mid(coin)
                     or existing["price"]
                 )
@@ -1222,11 +1222,11 @@ class MakerStrategy(BaseStrategy):
             return
 
         hl_mid = (
-            (self._pyth.get_mid(coin) if self._pyth is not None else None)
+            (self._spot.get_mid(coin) if self._spot is not None else None)
             or self._hl.get_mid(coin)
         )
         if hl_mid is None:
-            log.warning("No Pyth oracle mid — cannot size hedge", coin=coin)
+            log.warning("No RTDS spot mid — cannot size hedge", coin=coin)
             return
 
         direction = "SHORT" if net_delta > 0 else "LONG"
@@ -1497,17 +1497,17 @@ class MakerStrategy(BaseStrategy):
         return list(self._hedge_quality)[:limit]
 
     def get_hl_mid(self, coin: str) -> Optional[float]:
-        """Spot mid price for `coin` (Pyth oracle; HL perp fallback).
+        """Spot mid price for `coin` (RTDS spot; HL perp fallback).
 
         Used by FillSimulator for paper-mode hedge simulation.  Method name
         kept for backward compat with tests that mock this attribute.
         """
-        if self._pyth is not None:
-            return self._pyth.get_mid(coin)
+        if self._spot is not None:
+            return self._spot.get_mid(coin)
         return self._hl.get_mid(coin)
 
     def _get_recent_move_pct(self, coin: str, window_s: float = 300.0) -> Optional[float]:
-        """Abs % price change over the last *window_s* seconds from Pyth oracle history."""
+        """Abs % price change over the last *window_s* seconds from RTDS spot history."""
         hist = self._spot_price_history.get(coin)
         if not hist or len(hist) < 2:
             return None

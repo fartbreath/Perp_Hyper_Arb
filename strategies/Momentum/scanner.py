@@ -1,8 +1,40 @@
 """
 strategies.Momentum.scanner — Strategy 3: Momentum / price-confirmation taker.
 
-Signal detection + direct execution (no agent loop):
+MOMENTUM STRATEGY — core logic (do not lose sight of this):
+============================================================
+1. ENTER NEAR EXPIRY
+   The entry gate (MOMENTUM_MIN_TTE_SECONDS) requires the market to be
+   close to expiry — e.g. last 60 s of a 15 m bucket.  This is intentional:
+   at low TTE, sigma_tau (remaining vol) is tiny, so the spot has very little
+   room to reverse an in-the-money position before the market resolves.  The
+   near-expiry entry is the SOURCE OF EDGE, not a risk to fix.
 
+2. PROFIT WHEN SPOT STAYS ON-SIDE
+   We hold a YES/UP token if spot > strike at entry; NO/DOWN if spot < strike.
+   The market resolves at oracle price at expiry.  If spot stays on the correct
+   side, the token resolves to 1.0 (full profit).  Entry token price (0.6–0.95)
+   represents the market’s current implied probability.
+
+3. STOP-LOSS TRIGGERED BY ORACLE SPOT, NOT CLOB ALONE
+   The oracle delta SL (MOMENTUM_DELTA_STOP_LOSS_PCT) fires when current spot
+   retreats within SL_PCT% of the strike.  This is the primary exit signal.
+   The CLOB token price is used ONLY for take-profit (token → 0.999).  Using
+   the CLOB for stop-losses risks adverse exits: CLOB reprices forward and can
+   temporarily drop on noise even when spot is stable and the position wins.
+
+4. KELLY SIZES PROPORTIONAL TO CONVICTION
+   Near expiry, sigma_tau → 0, so observed_z = delta / sigma_tau is large →
+   high win_prob → Kelly bets larger.  This is correct behaviour: when spot
+   is well past strike with only seconds left, we ARE more certain.  Do not
+   nerf Kelly at low TTE — that would destroy the edge.
+
+5. ORACLE ROUTING
+   — bucket_5m, bucket_15m, bucket_4h   → Chainlink (via RTDSClient)
+   — bucket_1h, bucket_daily, bucket_weekly → RTDS exchange-aggregated
+   Both come from the single RTDSClient WebSocket connection, not from HL.
+
+Signal detection + direct execution (no agent loop):
   1. Every MOMENTUM_SCAN_INTERVAL seconds, scan all open bucket markets.
   2. Find markets where one side is in the 0.80-0.90 price band.
   3. Compute signed spot delta toward the winning direction.
@@ -34,6 +66,17 @@ from market_data.hl_client import HLClient
 from market_data.rtds_client import RTDSClient, SpotPrice, CHAINLINK_MARKET_TYPES
 from risk import RiskEngine, Position
 from strategies.base import BaseStrategy
+from strategies.Momentum.market_utils import (
+    _STRIKE_PATTERNS,
+    _UPDOWN_RE,
+    _INVERTED_DIRECTION_RE,
+    _RANGE_MARKET_RE,
+    _extract_strike,
+    _extract_range_bounds,
+    _is_updown_market,
+    _is_range_market,
+    _is_inverted_direction_market,
+)
 from strategies.Momentum.signal import MomentumSignal
 from strategies.Momentum.vol_fetcher import VolFetcher
 
@@ -95,22 +138,25 @@ def _ensure_momentum_fills_csv() -> None:
 _TARGET_MARKET_TYPES = frozenset(_MARKET_TYPE_DURATION_SECS.keys())
 
 
-def _get_oracle_spot(market_type: str, underlying: str, pyth: RTDSClient) -> Optional[SpotPrice]:
+def _get_oracle_spot(market_type: str, underlying: str, spot_client: RTDSClient) -> Optional[SpotPrice]:
     """Return the correct oracle SpotPrice for `underlying` given `market_type`.
 
     5m / 15m / 4h Up/Down markets resolve against Chainlink; all other bucket
     types (1h, daily, weekly) use the RTDS exchange-aggregated feed.
     """
     if market_type in CHAINLINK_MARKET_TYPES:
-        return pyth.get_spot_chainlink(underlying)
-    return pyth.get_spot(underlying)
+        return spot_client.get_spot_chainlink(underlying)
+    return spot_client.get_spot(underlying)
 
 
 class MomentumScanner(BaseStrategy):
     """
     Async scanner loop for the momentum / price-confirmation strategy.
 
-    Instantiate in main.py and call await scanner.start().
+    Calendar-spread scanning (MOMENTUM_CALENDAR_SPREAD_ENABLED) is integrated
+    as a sub-strategy via CalendarSpreadMixin: it runs in its own asyncio task
+    spawned inside start(), shares the same PMClient and RiskEngine, and
+    is controlled independently of the per-bucket momentum scan.
     """
 
     def __init__(
@@ -119,12 +165,12 @@ class MomentumScanner(BaseStrategy):
         hl: HLClient,
         risk: RiskEngine,
         vol_fetcher: VolFetcher,
-        pyth: RTDSClient,
+        spot_client: RTDSClient,
         on_signal: Any = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
-        self._pyth = pyth
+        self._spot = spot_client
         self._risk = risk
         self._vol = vol_fetcher
         self._running = False
@@ -187,8 +233,8 @@ class MomentumScanner(BaseStrategy):
         # Also wake on spot ticks — spot moves can cross the strike and create or
         # dissolve a signal between PM CLOB ticks.  Register for BOTH feed sources:
         # RTDS (1h / daily / weekly markets) and Chainlink (5m / 15m / 4h markets).
-        self._pyth.on_price_update(self._on_pyth_spot_update_entry)
-        self._pyth.on_chainlink_update(self._on_pyth_spot_update_entry)
+        self._spot.on_price_update(self._on_spot_update_entry)
+        self._spot.on_chainlink_update(self._on_spot_update_entry)
         asyncio.create_task(self._scan_loop())
 
     async def stop(self) -> None:
@@ -519,24 +565,48 @@ class MomentumScanner(BaseStrategy):
             # A genuinely confirmed dip (spot already below the strike) produces a
             # positive delta_pct and is entered correctly.
             _is_inverted = _is_inverted_direction_market(market.title)
+            _is_range = _is_range_market(market.title)
 
-            if band_lo <= p_yes <= band_hi:
+            # For range markets the RANGE_ENABLED flag acts as an on/off switch.
+            if _is_range and not config.MOMENTUM_RANGE_ENABLED:
+                skipped_band += 1
+                _d["skip_reason"] = "range_disabled"
+                scan_diags.append(_d)
+                continue
+
+            # Per-market price band: range markets may use a separate band.
+            _b_lo = config.MOMENTUM_RANGE_PRICE_BAND_LOW if _is_range else band_lo
+            _b_hi = config.MOMENTUM_RANGE_PRICE_BAND_HIGH if _is_range else band_hi
+            _d["band_lo"] = _b_lo
+            _d["band_hi"] = _b_hi
+
+            if _b_lo <= p_yes <= _b_hi:
                 high_side = "UP" if _is_updown else "YES"
                 token_id = market.token_id_yes
                 token_price = p_yes
-                required_direction = "spot_below_strike" if _is_inverted else "spot_above_strike"
-            elif band_lo <= p_no <= band_hi:
+                if _is_range:
+                    required_direction = "spot_inside_range"
+                elif _is_inverted:
+                    required_direction = "spot_below_strike"
+                else:
+                    required_direction = "spot_above_strike"
+            elif _b_lo <= p_no <= _b_hi:
                 high_side = "DOWN" if _is_updown else "NO"
                 token_id = market.token_id_no
                 token_price = p_no
-                required_direction = "spot_above_strike" if _is_inverted else "spot_below_strike"
+                if _is_range:
+                    required_direction = "spot_outside_range"
+                elif _is_inverted:
+                    required_direction = "spot_above_strike"
+                else:
+                    required_direction = "spot_below_strike"
             else:
                 skipped_band += 1
                 # Distance to nearest band edge shows tuning headroom.
                 _d["skip_reason"] = "out_of_band"
                 _d["dist_to_band"] = round(
-                    min(abs(p_yes - band_lo), abs(p_yes - band_hi),
-                        abs(p_no - band_lo), abs(p_no - band_hi)), 4)
+                    min(abs(p_yes - _b_lo), abs(p_yes - _b_hi),
+                        abs(p_no - _b_lo), abs(p_no - _b_hi)), 4)
                 if _tte_pre is not None:
                     _d["tte_seconds"] = round(_tte_pre)
                 scan_diags.append(_d)
@@ -571,7 +641,7 @@ class MomentumScanner(BaseStrategy):
             # ── Oracle spot (source depends on market type) ───────────────────
             # 5m / 15m / 4h → Chainlink (matches Polymarket's resolution oracle).
             # 1h / daily / weekly → RTDS exchange-aggregated.
-            snap = _get_oracle_spot(market.market_type, market.underlying, self._pyth)
+            snap = _get_oracle_spot(market.market_type, market.underlying, self._spot)
             if snap is None or snap.mid is None:
                 skipped_stale_spot += 1
                 _d["skip_reason"] = "no_spot"
@@ -592,7 +662,20 @@ class MomentumScanner(BaseStrategy):
             _d["spot"] = round(spot, 4)
 
             # ── Parse strike from market title ───────────────────────────────
-            strike = _extract_strike(market.title, spot)
+            # For range markets extract both boundaries; use midpoint as the
+            # representative strike stored in MomentumSignal.
+            _range_bounds: Optional[tuple[float, float]] = None
+            if _is_range:
+                _range_bounds = _extract_range_bounds(market.title)
+                if _range_bounds is None:
+                    skipped_no_strike += 1
+                    _d["skip_reason"] = "no_range_bounds"
+                    scan_diags.append(_d)
+                    continue
+                range_lo, range_hi = _range_bounds
+                strike = (range_lo + range_hi) / 2.0
+            else:
+                strike = _extract_strike(market.title, spot)
 
             if strike is None and _is_updown_market(market.title):
                 # Directional "Up or Down" market: the implicit strike is the spot
@@ -628,7 +711,11 @@ class MomentumScanner(BaseStrategy):
                 continue
             tte_seconds = (market.end_date - now).total_seconds()
             _d["tte_seconds"] = round(tte_seconds)
-            _min_tte = _min_tte_by_type.get(market.market_type, _min_tte_default)
+            _min_tte = (
+                config.MOMENTUM_RANGE_MIN_TTE_SECONDS
+                if _is_range
+                else _min_tte_by_type.get(market.market_type, _min_tte_default)
+            )
             _d["min_tte_s"] = _min_tte
 
             # Entry window ceiling: flag markets with too much time left.
@@ -650,7 +737,11 @@ class MomentumScanner(BaseStrategy):
             sigma_ann, vol_src = vol_result
 
             sigma_tau = sigma_ann * math.sqrt(tte_seconds / 31_536_000)
-            _vol_z = _z_by_type.get(market.market_type, config.MOMENTUM_VOL_Z_SCORE)
+            _vol_z = (
+                config.MOMENTUM_RANGE_VOL_Z_SCORE
+                if _is_range
+                else _z_by_type.get(market.market_type, config.MOMENTUM_VOL_Z_SCORE)
+            )
             y = _vol_z * sigma_tau * 100  # percent
 
             _d["sigma_ann"]     = round(sigma_ann, 6)
@@ -660,7 +751,19 @@ class MomentumScanner(BaseStrategy):
             _d["vol_source"]    = vol_src
 
             # ── Signed delta toward winning direction ────────────────────────
-            if required_direction == "spot_above_strike":
+            if required_direction == "spot_inside_range":
+                # YES on a range market: spot must be inside [lo, hi].
+                # Distance to the nearer boundary / midpoint of range.
+                _mid = (range_lo + range_hi) / 2.0
+                delta_pct = min(spot - range_lo, range_hi - spot) / _mid * 100
+            elif required_direction == "spot_outside_range":
+                # NO on a range market: spot must be outside [lo, hi].
+                _mid = (range_lo + range_hi) / 2.0
+                if spot > range_hi:
+                    delta_pct = (spot - range_hi) / _mid * 100
+                else:
+                    delta_pct = (range_lo - spot) / _mid * 100
+            elif required_direction == "spot_above_strike":
                 delta_pct = (spot - strike) / strike * 100
             else:
                 delta_pct = (strike - spot) / strike * 100
@@ -719,7 +822,7 @@ class MomentumScanner(BaseStrategy):
             # _on_price_update_entry waking _scan_loop early) may have added
             # positions during the awaits above, making the snapshot stale.
             _live_momentum = sum(
-                1 for p in self._risk.get_open_positions() if p.strategy == "momentum"
+                1 for p in self._risk.get_open_positions() if p.strategy in ("momentum", "range")
             )
             if _live_momentum >= config.MOMENTUM_MAX_CONCURRENT:
                 skipped_cap += 1
@@ -790,7 +893,8 @@ class MomentumScanner(BaseStrategy):
             # ── Kelly sizing preview for diagnostics ─────────────────────
             # Compute Kelly fields now so the webapp diagnostics row for this
             # signal shows the full sizing breakdown, not just whether it fired.
-            _kelly_size_preview, _kelly_preview_debug = _compute_kelly_size_usd(signal)
+            _range_max_entry = config.MOMENTUM_RANGE_MAX_ENTRY_USD if _is_range else None
+            _kelly_size_preview, _kelly_preview_debug = _compute_kelly_size_usd(signal, max_entry_usd=_range_max_entry)
             _d.update(_kelly_preview_debug)
             _d["skip_reason"] = "signal_fired"
             scan_diags.append(_d)
@@ -942,7 +1046,7 @@ class MomentumScanner(BaseStrategy):
         # Signal the scan loop to wake up and run a full evaluation now.
         self._scan_event.set()
 
-    async def _on_pyth_spot_update_entry(self, coin: str, price: float) -> None:
+    async def _on_spot_update_entry(self, coin: str, price: float) -> None:
         """Wake the scan loop when the RTDS spot price for `coin` changes.
 
         Mirrors _on_price_update_entry but fires on RTDS ticks rather
@@ -1025,7 +1129,8 @@ class MomentumScanner(BaseStrategy):
             return False
 
         # ── Fractional Kelly sizing ────────────────────────────────────────────
-        size_usd, _kelly_debug = _compute_kelly_size_usd(signal)
+        _range_max_entry = config.MOMENTUM_RANGE_MAX_ENTRY_USD if _is_range_market(signal.market_title) else None
+        size_usd, _kelly_debug = _compute_kelly_size_usd(signal, max_entry_usd=_range_max_entry)
 
         # ── Place order ───────────────────────────────────────────────────────
         order_id: Optional[str] = None
@@ -1141,7 +1246,7 @@ class MomentumScanner(BaseStrategy):
             size=entry_size,
             entry_price=entry_price,
             entry_cost_usd=_entry_cost,
-            strategy="momentum",
+            strategy="range" if _is_range_market(market.title) else "momentum",
             token_id=signal.token_id,
             market_title=market.title,
             order_id=order_id,
@@ -1228,44 +1333,6 @@ class MomentumScanner(BaseStrategy):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-_STRIKE_PATTERNS = [
-    r"\$([0-9,]+(?:\.[0-9]+)?)([kKmM]?)",                      # "$68,300" / "$68k" / "$1.5m"
-    r"([0-9,]+(?:\.[0-9]+)?)([kKmM]?)\s*(?:above|below|at)",  # "68000 above"
-    r"(?:above|below|at)\s+([0-9,]+(?:\.[0-9]+)?)([kKmM]?)",  # "above 64,200"
-]
-
-_UPDOWN_RE = re.compile(r'\bup\s+or\s+down\b', re.IGNORECASE)
-
-# Markets where YES resolves on a DOWNWARD price move.  The scanner's direction
-# mapping assumes YES ≡ spot_above_strike; for these markets that assumption is
-# inverted, which produces a backwards z-score signal (large positive when spot
-# is far ABOVE the dip level) and full Kelly sizing on a doomed trade.
-# Safer to skip until a touch-market model is implemented.
-_INVERTED_DIRECTION_RE = re.compile(
-    r'\b(?:dip|drop|fall|decline|crash)s?\s+(?:to|below|under|beneath)\b'
-    r'|\bdip\s+to\b'
-    r'|\bbelow\s+\$'
-    r'|\bfall\s+to\b'
-    r'|\bdrop\s+to\b',
-    re.IGNORECASE,
-)
-
-
-def _is_updown_market(title: str) -> bool:
-    """Return True if the market is a directional 'Up or Down' window market."""
-    return bool(_UPDOWN_RE.search(title))
-
-
-def _is_inverted_direction_market(title: str) -> bool:
-    """Return True if YES resolves on a downward price move (dip/drop/fall markets).
-
-    The scanner maps YES-in-band → spot_above_strike.  These markets invert that
-    assumption (YES wins if spot goes DOWN), so they must be excluded to prevent
-    the delta_pct sign being backwards and the z-score blowing up.
-    """
-    return bool(_INVERTED_DIRECTION_RE.search(title))
-
-
 def _load_open_spots(path: str) -> dict[str, float]:
     """Load persisted open-spot cache from disk, or return empty dict on error."""
     try:
@@ -1306,32 +1373,7 @@ def _save_cooldowns(path: str, cache: dict[str, float]) -> None:
         pass  # non-critical — cooldown continues in-memory; only loses persistence on restart
 
 
-def _extract_strike(title: str, spot: float) -> Optional[float]:
-    """
-    Extract a numeric strike from a market title string.
-
-    Handles '$68,300', '$68k', '$1.5m' and the like.
-    Returns None if no plausible value is found.
-    """
-    for pattern in _STRIKE_PATTERNS:
-        match = re.search(pattern, title.replace(",", ""))
-        if match:
-            try:
-                value = float(match.group(1).replace(",", ""))
-                suffix = match.group(2).lower()
-                if suffix == "k":
-                    value *= 1_000
-                elif suffix == "m":
-                    value *= 1_000_000
-                # Sanity: must be at least 1% of current spot (catches unitless noise)
-                if value > spot * 0.01:
-                    return value
-            except (ValueError, IndexError):
-                continue
-    return None
-
-
-def _compute_kelly_size_usd(signal: "MomentumSignal") -> tuple[float, dict]:
+def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | None = None) -> tuple[float, dict]:
     """Compute position size in USD using fractional Kelly Criterion.
 
     Kelly Criterion for a binary bet:
@@ -1410,9 +1452,10 @@ def _compute_kelly_size_usd(signal: "MomentumSignal") -> tuple[float, dict]:
     # KELLY_FRACTION=0.25 → quarter-Kelly.
     _fraction_cfg = max(0.0, min(1.0, config.MOMENTUM_KELLY_FRACTION))
     fraction_of_max = min(1.0, kelly_f * _fraction_cfg)
+    _max_entry = max_entry_usd if max_entry_usd is not None else config.MOMENTUM_MAX_ENTRY_USD
     size_usd = max(
         config.MOMENTUM_MIN_ENTRY_USD,
-        round(fraction_of_max * config.MOMENTUM_MAX_ENTRY_USD, 2),
+        round(fraction_of_max * _max_entry, 2),
     )
 
     debug: dict = {
