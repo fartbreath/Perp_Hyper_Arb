@@ -30,9 +30,9 @@ MOMENTUM STRATEGY — core logic (do not lose sight of this):
    nerf Kelly at low TTE — that would destroy the edge.
 
 5. ORACLE ROUTING
-   — bucket_5m, bucket_15m, bucket_4h   → Chainlink (via RTDSClient)
+   — bucket_5m, bucket_15m, bucket_4h   → on-chain Chainlink HTTP polling (ChainlinkPollClient)
    — bucket_1h, bucket_daily, bucket_weekly → RTDS exchange-aggregated
-   Both come from the single RTDSClient WebSocket connection, not from HL.
+   Oracle routing is handled by SpotOracle facade.
 
 Signal detection + direct execution (no agent loop):
   1. Every MOMENTUM_SCAN_INTERVAL seconds, scan all open bucket markets.
@@ -63,7 +63,8 @@ import config
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket, _MARKET_TYPE_DURATION_SECS
 from market_data.hl_client import HLClient
-from market_data.rtds_client import RTDSClient, SpotPrice, CHAINLINK_MARKET_TYPES
+from market_data.rtds_client import SpotPrice
+from market_data.spot_oracle import SpotOracle, CHAINLINK_MARKET_TYPES
 from risk import RiskEngine, Position
 from strategies.base import BaseStrategy
 from strategies.Momentum.market_utils import (
@@ -138,16 +139,6 @@ def _ensure_momentum_fills_csv() -> None:
 _TARGET_MARKET_TYPES = frozenset(_MARKET_TYPE_DURATION_SECS.keys())
 
 
-def _get_oracle_spot(market_type: str, underlying: str, spot_client: RTDSClient) -> Optional[SpotPrice]:
-    """Return the correct oracle SpotPrice for `underlying` given `market_type`.
-
-    5m / 15m / 4h Up/Down markets resolve against Chainlink; all other bucket
-    types (1h, daily, weekly) use the RTDS exchange-aggregated feed.
-    """
-    if market_type in CHAINLINK_MARKET_TYPES:
-        return spot_client.get_spot_chainlink(underlying)
-    return spot_client.get_spot(underlying)
-
 
 class MomentumScanner(BaseStrategy):
     """
@@ -165,7 +156,7 @@ class MomentumScanner(BaseStrategy):
         hl: HLClient,
         risk: RiskEngine,
         vol_fetcher: VolFetcher,
-        spot_client: RTDSClient,
+        spot_client: SpotOracle,
         on_signal: Any = None,
     ) -> None:
         self._pm = pm
@@ -233,7 +224,7 @@ class MomentumScanner(BaseStrategy):
         # Also wake on spot ticks — spot moves can cross the strike and create or
         # dissolve a signal between PM CLOB ticks.  Register for BOTH feed sources:
         # RTDS (1h / daily / weekly markets) and Chainlink (5m / 15m / 4h markets).
-        self._spot.on_price_update(self._on_spot_update_entry)
+        self._spot.on_rtds_update(self._on_spot_update_entry)
         self._spot.on_chainlink_update(self._on_spot_update_entry)
         asyncio.create_task(self._scan_loop())
 
@@ -641,7 +632,7 @@ class MomentumScanner(BaseStrategy):
             # ── Oracle spot (source depends on market type) ───────────────────
             # 5m / 15m / 4h → Chainlink (matches Polymarket's resolution oracle).
             # 1h / daily / weekly → RTDS exchange-aggregated.
-            snap = _get_oracle_spot(market.market_type, market.underlying, self._spot)
+            snap = self._spot.get_spot(market.underlying, market.market_type)
             if snap is None or snap.mid is None:
                 skipped_stale_spot += 1
                 _d["skip_reason"] = "no_spot"

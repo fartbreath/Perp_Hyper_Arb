@@ -14,11 +14,24 @@ POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
 POLY_FUNDER: str = os.getenv("POLY_FUNDER", "") or os.getenv("POLY_ADDRESS", "")
 POLY_HOST: str = "https://clob.polymarket.com"
 GAMMA_HOST: str = "https://gamma-api.polymarket.com"
-POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
-# WebSocket RPC for Polygon — used to subscribe to Chainlink AnswerUpdated
-# events on-chain (the authoritative price PM uses for 5m/15m/4h resolution).
-# Public endpoint — replace with Alchemy/Infura wss:// for production reliability.
+POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+# WebSocket RPC for Polygon — eth_subscribe logs for Chainlink AnswerUpdated events.
+# Default: PublicNode free endpoint — reliable eth_subscribe, no API key required.
+# For higher reliability / lower latency, set POLYGON_WS_URL to a paid endpoint:
+#   wss://polygon-mainnet.g.alchemy.com/v2/<KEY>     (Alchemy — recommended)
+#   wss://polygon-mainnet.infura.io/ws/v3/<KEY>       (Infura)
+#   wss://polygon.getblock.io/<KEY>/mainnet/           (GetBlock)
 POLYGON_WS_URL: str = os.getenv("POLYGON_WS_URL", "wss://polygon-bor-rpc.publicnode.com")
+
+# Chainlink Data Streams — direct WebSocket feed for HYPE/USD.
+# Obtain a free sponsored key at: https://pm-ds-request.streams.chain.link/
+# Leave empty to run in RTDS-only mode (HYPE price still delivered sub-second via
+# the crypto_prices_chainlink RTDS topic, but without direct oracle access).
+CHAINLINK_DS_API_KEY: str = os.getenv("CHAINLINK_DS_API_KEY", "")
+CHAINLINK_DS_API_SECRET: str = os.getenv("CHAINLINK_DS_API_SECRET", "")
+# Feed ID for HYPE/USD on Chainlink Data Streams — provided with your API key.
+CHAINLINK_DS_HYPE_FEED_ID: str = os.getenv("CHAINLINK_DS_HYPE_FEED_ID", "")
+
 RELAYER_API_KEY: str = os.getenv("RELAYER_API_KEY", "")
 RELAYER_API_KEY_ADDRESS: str = os.getenv("RELAYER_API_KEY_ADDRESS", "")
 
@@ -315,7 +328,7 @@ MOMENTUM_ORDER_TYPE: str = "limit"
 # Delta-based stop-loss: exit when live HL spot has moved this % past the
 # strike against the position (e.g. 0.05 → exit when spot is 0.05% below
 # strike for YES, or 0.05% above strike for NO).
-MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.1  # protective buffer: exit when delta (in-the-money %) drops BELOW this threshold (fires before strike is crossed)
+MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.01  # protective buffer: exit when delta (in-the-money %) drops BELOW this threshold (fires before strike is crossed)
 MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
 
 # Near-expiry time-stop: when TTE is very short and spot has already crossed

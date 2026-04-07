@@ -4,7 +4,7 @@
  * Changes are sent to POST /config and take effect immediately.
  * The page polls GET /config every 5s so out-of-band changes are reflected.
  */
-import { useState, useEffect, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useConfig, updateConfig } from "../api/client";
 import type { ConfigData } from "../api/client";
 
@@ -58,7 +58,8 @@ function NumberInput({
   onSubmit: (v: number) => void;
 }) {
   const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
+  const [prevValue, setPrevValue] = useState(value);
+  if (prevValue !== value) { setPrevValue(value); setDraft(String(value)); }
   const commit = () => {
     const n = parseInt(draft, 10);
     if (!Number.isNaN(n)) onSubmit(n);
@@ -104,7 +105,8 @@ function FloatInput({
   onSubmit: (v: number) => void;
 }) {
   const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
+  const [prevValue, setPrevValue] = useState(value);
+  if (prevValue !== value) { setPrevValue(value); setDraft(String(value)); }
   const commit = () => {
     const n = parseFloat(draft);
     if (!Number.isNaN(n)) onSubmit(n);

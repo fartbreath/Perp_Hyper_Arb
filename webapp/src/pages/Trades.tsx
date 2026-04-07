@@ -389,7 +389,7 @@ export default function Trades() {
   function toggleExpand(mid: string) {
     setExpanded((prev) => {
       const next = new Set(prev);
-      next.has(mid) ? next.delete(mid) : next.add(mid);
+      if (next.has(mid)) next.delete(mid); else next.add(mid);
       return next;
     });
   }

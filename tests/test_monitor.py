@@ -484,9 +484,9 @@ class TestShouldExit:
 # ── PositionMonitor ───────────────────────────────────────────────────────────
 
 def _make_mock_spot(spot: float, coin: str = "BTC") -> MagicMock:
-    """Return a mock RTDSClient whose get_mid(coin) returns the given spot price."""
+    """Return a mock SpotOracle whose get_mid(coin, market_type) returns the given spot price."""
     mock_spot = MagicMock()
-    mock_spot.get_mid = MagicMock(side_effect=lambda c: spot if c == coin else None)
+    mock_spot.get_mid = MagicMock(side_effect=lambda c, mt=None: spot if c == coin else None)
     return mock_spot
 
 

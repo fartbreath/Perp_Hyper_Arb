@@ -198,6 +198,18 @@ Key parameters:
 | `MAKER_EXIT_HOURS` | `0.0` | Non-bucket time-stop (hours before expiry); `0.0` disables this gate |
 | `MAX_PM_EXPOSURE_PER_MARKET` | `500` | Max USD deployed per market |
 | `MAX_TOTAL_PM_EXPOSURE` | `5000` | Total PM exposure cap (USD) |
+
+---
+
+## Recent Changes (2026-04-07)
+
+- RTDS Chainlink routing: 5m / 15m / 4h markets now route to the RTDS `crypto_prices_chainlink` relay by default (production constraint: ChainlinkWSClient eth_subscribe on public RPCs is not reliable). This ensures sub-second Chainlink-relayed prices are used for short-bucket oracle resolution.
+- RTDS coverage expanded: `crypto_prices_chainlink` mapping was extended from HYPE-only to include BTC/ETH/SOL/XRP/BNB/DOGE (Polymarket relay). The `RTDSClient` now exposes `get_chainlink_spot(coin)` for all supported coins.
+- Chainlink on-chain address fix: the Polygon AggregatorV3 BNB contract address was corrected to the official `0x82a6c4AF830caa6c97bb504425f6A66165C2c26e`.
+- `SpotOracle` routing simplified: short-bucket markets (5m/15m/4h) use RTDS chainlink as the primary source; HYPE still races with Chainlink Streams when configured.
+- New comparison script: `data/_compare_chainlink_sources.py` compares RTDS `crypto_prices_chainlink` vs direct AggregatorV3 HTTP polling (helpful for audit and latency checks).
+
+These changes were made to eliminate silent HTTP-polling fallbacks and ensure the production path uses the RTDS Chainlink relay (institutional-grade, no HTTP polling requirement). See `market_data/rtds_client.py` and `market_data/spot_oracle.py` for the routing logic.
 | `KALSHI_ENABLED` | `True` | Require Kalshi confirmation for mispricing signals |
 
 Full parameter reference: [MAKER_STRATEGY.md — Appendix A](MAKER_STRATEGY.md#appendix-a--configuration-reference)

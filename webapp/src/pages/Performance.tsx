@@ -221,12 +221,17 @@ export default function Performance() {
               <table className="data-table">
                 <thead><tr><th>Market</th><th>P&L</th></tr></thead>
                 <tbody>
-                  {data.worst_trades.map((t, i) => (
-                    <tr key={i}>
-                      <td className="mono">{(t.market_id ?? "").slice(0, 10)}…</td>
-                      <td style={{ color: "#ef4444" }}>-${Math.abs(Number(t.pnl)).toFixed(4)}</td>
-                    </tr>
-                  ))}
+                  {data.worst_trades.map((t, i) => {
+                    const pnl = Number(t.pnl);
+                    return (
+                      <tr key={i}>
+                        <td className="mono">{(t.market_id ?? "").slice(0, 10)}…</td>
+                        <td style={{ color: pnl >= 0 ? "#22c55e" : "#ef4444" }}>
+                          {pnl >= 0 ? `+$${pnl.toFixed(4)}` : `-$${Math.abs(pnl).toFixed(4)}`}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

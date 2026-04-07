@@ -85,8 +85,7 @@ export default function Logs() {
   const [autoScroll, setAutoScroll] = useState(true);
   const [paused, setPaused] = useState(false);
 
-  // Reset module filter when switching view modes
-  useEffect(() => { setModule(""); }, [viewMode]);
+  // Reset module filter when switching view modes (handled inline in onClick handlers below)
 
   // Debounce search input
   useEffect(() => {

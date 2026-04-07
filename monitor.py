@@ -19,9 +19,10 @@ MOMENTUM STRATEGY — core logic (do not lose sight of this):
      on noise even when spot is stable and the position resolves as a WIN.
 
 3. ORACLE ROUTING
-   — bucket_5m, bucket_15m, bucket_4h   → Chainlink ticks (RTDSClient)
-   — bucket_1h, bucket_daily, bucket_weekly → RTDS exchange-aggregated ticks
-   Both arrive via a single RTDSClient WebSocket.  NOT from HL price feed.
+   — bucket_5m, bucket_15m, bucket_4h, non-HYPE  → ChainlinkWSClient (AggregatorV3 eth_subscribe, event-driven)
+   — bucket_5m, bucket_15m, bucket_4h, HYPE       → freshest of ChainlinkStreamsClient + RTDS chainlink relay
+   — bucket_1h, bucket_daily, bucket_weekly        → RTDS exchange-aggregated ticks
+   Oracle routing is handled by SpotOracle facade.  NOT from HL price feed.
 
 4. CLOB vs ORACLE PRICES — never confuse these
    • current_token_price  = PM CLOB mid of the HELD token (YES or NO side)
@@ -70,7 +71,8 @@ import config
 from logger import get_bot_logger
 from risk import RiskEngine, Position
 from market_data.pm_client import PMClient, _MARKET_TYPE_DURATION_SECS
-from market_data.rtds_client import RTDSClient, CHAINLINK_MARKET_TYPES
+from market_data.rtds_client import RTDSClient
+from market_data.spot_oracle import SpotOracle
 from ctf_utils import _redeem_ctf_via_safe
 
 log = get_bot_logger(__name__)
@@ -430,13 +432,13 @@ class PositionMonitor:
         pm: PMClient,
         risk: RiskEngine,
         interval: int = config.MONITOR_INTERVAL,
-        spot_client: Optional[RTDSClient] = None,
+        spot_client: Optional[SpotOracle] = None,
         on_close_callback: Optional[Callable[[str], None]] = None,
         on_stop_loss_callback: Optional[Callable[[str, float], None]] = None,
     ) -> None:
         self._pm = pm
         self._risk = risk
-        self._spot = spot_client  # RTDSClient; spot price source for momentum SL
+        self._spot = spot_client  # SpotOracle facade; routes to correct oracle per market type
         self._interval = interval
         # Called with market_id whenever a position is successfully closed.
         # Used by MispricingScanner to reset the per-market cooldown clock.
@@ -480,7 +482,7 @@ class PositionMonitor:
         # waiting for the next PM WS tick (which may not come if the PM book
         # goes quiet near expiry — exactly when the SL matters most).
         if self._spot is not None:
-            self._spot.on_price_update(self._on_spot_update)
+            self._spot.on_rtds_update(self._on_spot_update)
             # Also fire on Chainlink ticks so 5m/15m/4h position SLs are
             # evaluated the moment a Chainlink oracle price update arrives.
             self._spot.on_chainlink_update(self._on_spot_update)
@@ -957,10 +959,7 @@ class PositionMonitor:
         # 1h/daily/weekly markets.
         current_spot: Optional[float] = None
         if pos.strategy == "momentum" and self._spot is not None and pos.underlying:
-            if pos.market_type in CHAINLINK_MARKET_TYPES:
-                current_spot = self._spot.get_mid_chainlink(pos.underlying)
-            else:
-                current_spot = self._spot.get_mid(pos.underlying)
+            current_spot = self._spot.get_mid(pos.underlying, pos.market_type)
 
         exit_flag, reason, unrealised = should_exit(
             pos=pos,
@@ -1230,10 +1229,7 @@ class PositionMonitor:
         # Use the same oracle that the market resolves against: Chainlink for
         # 5m/15m/4h markets, RTDS exchange-aggregated for 1h/daily/weekly.
         if self._spot is not None and pos.underlying:
-            if pos.market_type in CHAINLINK_MARKET_TYPES:
-                _exit_spot = self._spot.get_mid_chainlink(pos.underlying) or 0.0
-            else:
-                _exit_spot = self._spot.get_mid(pos.underlying) or 0.0
+            _exit_spot = self._spot.get_mid(pos.underlying, pos.market_type) or 0.0
         else:
             _exit_spot = 0.0
         closed = self._risk.close_position(

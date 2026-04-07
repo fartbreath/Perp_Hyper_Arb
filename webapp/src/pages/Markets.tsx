@@ -55,7 +55,6 @@ export default function Markets() {
   useEffect(() => {
     if (mkData) {
       refreshedAt.current = Date.now();
-      setSecondsAgo(0);
     }
   }, [mkData]);
 

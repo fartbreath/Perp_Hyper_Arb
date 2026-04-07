@@ -50,7 +50,10 @@ import api_server
 from api_server import state as api_state
 from market_data.pm_client import PMClient
 from market_data.hl_client import HLClient
-from market_data.rtds_client import RTDSClient, CHAINLINK_MARKET_TYPES
+from market_data.rtds_client import RTDSClient
+from market_data.chainlink_ws_client import ChainlinkWSClient
+from market_data.chainlink_streams_client import ChainlinkStreamsClient
+from market_data.spot_oracle import SpotOracle
 from risk import RiskEngine, Position
 from strategies.maker.strategy import MakerStrategy
 from strategies.mispricing.strategy import MispricingScanner
@@ -281,7 +284,7 @@ async def state_sync_loop(
     maker: MakerStrategy,
     agent: AgentDecisionLayer,
     risk: RiskEngine,
-    spot_client: "RTDSClient",
+    spot_client: "SpotOracle",
 ) -> None:
     """
     Periodically push live bot state into api_state so the webapp
@@ -503,13 +506,7 @@ async def state_sync_loop(
                     "yes_book_bid": book_yes.best_bid if book_yes else None,
                     "yes_book_ask": book_yes.best_ask if book_yes else None,
                     "yes_book_ts":  book_yes.timestamp  if book_yes else None,
-                    # Spot price from the correct oracle for this market type:
-                    # Chainlink for 5m/15m/4h, RTDS exchange-aggregated for 1h/daily/weekly.
-                    "spot_mid": (
-                        spot_client.get_mid_chainlink(mkt.underlying)
-                        if mkt.market_type in CHAINLINK_MARKET_TYPES
-                        else spot_client.get_mid(mkt.underlying)
-                    ),
+                    "spot_mid": spot_client.get_mid(mkt.underlying, mkt.market_type),
                 }
             api_state.markets = markets_raw
 
@@ -533,7 +530,7 @@ async def state_sync_loop(
                 "no_book_count":      _no_book,
                 "spot_mids":   spot_client.all_mids(),
                 "spot_ages_s": {
-                    coin: round(spot_client.get_spot_age(coin), 1)
+                    coin: round(spot_client.get_spot_age_rtds(coin), 1)
                     for coin in sorted(spot_client.tracked_coins)
                 },
             }
@@ -654,16 +651,28 @@ async def main() -> None:
     risk_engine = RiskEngine()
     pm = PMClient()
     hl = HLClient()
-    # Spot price source: Polymarket RTDS — crypto_prices topic for BTC/ETH/SOL/XRP/BNB/DOGE,
-    # crypto_prices_chainlink topic for HYPE (not yet in crypto_prices).
+    # Spot price source: RTDS (crypto_prices) for 1h/daily/weekly markets;
+    # on-chain Chainlink HTTP polling for 5m/15m/4h markets.
+    # SpotOracle facade routes get_mid/get_spot/get_spot_age to the right client.
     spot_client = RTDSClient()
-    maker = MakerStrategy(pm, hl, risk_engine, spot_client=spot_client)
-    scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL, spot_client=spot_client)
+    # Chainlink oracles — event-driven, zero polling:
+    #   ChainlinkWSClient: AnswerUpdated events on Polygon for BTC/ETH/SOL/XRP/BNB/DOGE
+    #   ChainlinkStreamsClient: direct Data Streams WebSocket for HYPE/USD (requires
+    #     free sponsored key from https://pm-ds-request.streams.chain.link/)
+    # SpotOracle picks the freshest snapshot from both HYPE feeds automatically.
+    chainlink_ws = ChainlinkWSClient()
+    chainlink_streams = ChainlinkStreamsClient()
+    spot_oracle = SpotOracle(spot_client, chainlink_ws, chainlink_streams)
+    # Enable raw oracle tick CSV logging (data/oracle_ticks.csv).
+    # Records every oracle event from all sources regardless of open positions.
+    # Used for post-trade analysis, feed-liveness checks, and inter-feed latency.
+    spot_oracle.enable_oracle_tick_log()
+    maker = MakerStrategy(pm, hl, risk_engine, spot_client=spot_oracle)
+    scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL, spot_client=spot_oracle)
     agent = AgentDecisionLayer(risk_engine)
     # Strategy 3 — Momentum scanner (direct execution, no agent loop)
     vol_fetcher = VolFetcher()
     vol_fetcher.register(spot_client)   # registers RTDS spot price callback for rolling realized-vol buffer
-
     def _on_momentum_signal(sig_dict: dict) -> None:
         api_state.momentum_signals.append(sig_dict)
         # Cap in-memory list to last 200 signals
@@ -671,7 +680,7 @@ async def main() -> None:
             api_state.momentum_signals = api_state.momentum_signals[-200:]
         notify_state_changed()
 
-    momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, spot_client=spot_client, on_signal=_on_momentum_signal)
+    momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, spot_client=spot_oracle, on_signal=_on_momentum_signal)
 
     def _on_position_close(market_id: str) -> None:
         """Notify both strategy scanners when any position closes.
@@ -698,7 +707,7 @@ async def main() -> None:
 
     monitor = PositionMonitor(
         pm, risk_engine,
-        spot_client=spot_client,
+        spot_client=spot_oracle,
         on_close_callback=_on_position_close,
         on_stop_loss_callback=_on_momentum_stop_loss,
     )
@@ -721,6 +730,12 @@ async def main() -> None:
     log.info("Connecting RTDS spot client…")
     await spot_client.start()
 
+    log.info("Starting Chainlink WS client (AggregatorV3 events)…")
+    await chainlink_ws.start()
+
+    log.info("Starting Chainlink Streams client (HYPE/USD direct feed)…")
+    await chainlink_streams.start()
+
     # In live mode: cancel any stale open orders and restore existing positions
     # before the maker strategy begins quoting.  No-op in paper mode.
     if not config.PAPER_TRADING:
@@ -738,7 +753,7 @@ async def main() -> None:
         ),
         asyncio.create_task(monitor.start(), name="monitor"),
         asyncio.create_task(
-            state_sync_loop(pm, hl, maker, agent, risk_engine, spot_client),
+            state_sync_loop(pm, hl, maker, agent, risk_engine, spot_oracle),
             name="state_sync",
         ),
         asyncio.create_task(

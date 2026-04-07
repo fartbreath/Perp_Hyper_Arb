@@ -3,13 +3,11 @@ tests/test_rtds_live.py — Live end-to-end tests for RTDSClient.
 
 Connects to the real Polymarket RTDS WebSocket and verifies that:
   1. The crypto_prices topic delivers prices for all RTDS coins
-     (BTC, ETH, SOL, XRP, BNB, DOGE, LINK).
-  2. The crypto_prices_chainlink topic delivers prices for HYPE.
-  3. The RTDSClient correctly merges both topics into a single price cache.
-  4. SpotPrice dataclass is populated correctly (coin, price > 0, timestamp, .mid).
-  5. on_price_update callbacks fire for coins from both topics.
-  6. get_mid / get_spot / get_spot_age all return sensible values.
-  7. RTDSClient shuts down cleanly via stop().
+     (BTC, ETH, SOL, XRP, BNB, DOGE).
+  2. SpotPrice dataclass is populated correctly (coin, price > 0, timestamp, .mid).
+  3. on_price_update callbacks fire for RTDS coins.
+  4. get_mid / get_spot / get_spot_age all return sensible values.
+  5. RTDSClient shuts down cleanly via stop().
 
 Run:
     pytest tests/test_rtds_live.py -v -m live
@@ -28,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import config
 
-config.TRACKED_UNDERLYINGS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"]
+config.TRACKED_UNDERLYINGS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"]
 
 from market_data.rtds_client import RTDSClient, SpotPrice
 
@@ -74,11 +72,7 @@ def live_rtds_prices() -> dict[str, SpotPrice]:
     Start an RTDSClient, wait until prices arrive for every configured coin
     (up to _TIMEOUT_S seconds), then stop the client and return the snapshot.
 
-    RTDS coins (BTC, ETH, SOL, XRP, BNB, DOGE, LINK) come from the
-    ``crypto_prices`` topic → stored in client._prices.
-    Chainlink coins (HYPE, plus all the above) come from
-    ``crypto_prices_chainlink`` → stored in client._chainlink_rtds.
-    The fixture merges both caches so tests can look up any coin.
+    All coins come from the ``crypto_prices`` topic → stored in client._prices.
     """
     async def _collect() -> dict[str, SpotPrice]:
         client = RTDSClient()
@@ -89,15 +83,12 @@ def live_rtds_prices() -> dict[str, SpotPrice]:
 
         while time.monotonic() < deadline:
             await asyncio.sleep(0.5)
-            # Merge both caches: RTDS exchange-aggregated + Chainlink oracle.
-            have = set(client.all_mids().keys()) | set(client.all_chainlink_mids().keys())
+            have = set(client.all_mids().keys())
             if expected.issubset(have):
                 break
 
         await client.stop()
-        # Return merged snapshot; Chainlink values overwrite RTDS for same coin
-        # (both are valid; the merge ensures HYPE is visible).
-        return {**client._prices, **client._chainlink_rtds}
+        return dict(client._prices)
 
     return _run(_collect())
 
@@ -160,46 +151,6 @@ class TestRTDSCoins:
         if snap is None:
             pytest.skip("No ETH price")
         assert 10 < snap.price < 100_000, f"ETH price out of plausible range: {snap.price}"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# crypto_prices_chainlink topic — HYPE
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestRTDSChainlinkCoins:
-    """Verify HYPE is populated from the crypto_prices_chainlink topic."""
-
-    def test_hype_price_received(self, live_rtds_prices):
-        snap = live_rtds_prices.get("HYPE")
-        assert snap is not None, (
-            "No price received for HYPE from crypto_prices_chainlink topic. "
-            "Check that Chainlink subscription is working."
-        )
-
-    def test_hype_price_positive(self, live_rtds_prices):
-        snap = live_rtds_prices.get("HYPE")
-        if snap is None:
-            pytest.skip("No HYPE price")
-        assert snap.price > 0, f"HYPE price {snap.price} is not positive"
-
-    def test_hype_mid_matches_price(self, live_rtds_prices):
-        snap = live_rtds_prices.get("HYPE")
-        if snap is None:
-            pytest.skip("No HYPE price")
-        assert snap.mid == snap.price
-
-    def test_hype_price_plausible(self, live_rtds_prices):
-        """HYPE price sanity check: should be between $0.01 and $10k."""
-        snap = live_rtds_prices.get("HYPE")
-        if snap is None:
-            pytest.skip("No HYPE price")
-        assert 0.01 < snap.price < 10_000, f"HYPE price out of plausible range: {snap.price}"
-
-    def test_hype_coin_field(self, live_rtds_prices):
-        snap = live_rtds_prices.get("HYPE")
-        if snap is None:
-            pytest.skip("No HYPE price")
-        assert snap.coin == "HYPE", f"SpotPrice.coin field is '{snap.coin}', expected 'HYPE'"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,8 +222,8 @@ class TestRTDSPublicAPI:
 
 class TestRTDSCallback:
 
-    def test_callback_fires_for_rtds_and_chainlink(self):
-        """on_price_update fires for RTDS coins; on_chainlink_update fires for HYPE."""
+    def test_callback_fires_for_rtds_coins(self):
+        """on_price_update fires for RTDS coins (BTC/ETH/SOL/XRP/BNB/DOGE)."""
         received: dict[str, float] = {}
 
         async def _collect() -> None:
@@ -281,37 +232,26 @@ class TestRTDSCallback:
             async def _cb(coin: str, price: float) -> None:
                 received[coin] = price
 
-            # RTDS exchange-aggregated ticks → on_price_update
             client.on_price_update(_cb)
-            # Chainlink oracle ticks → on_chainlink_update (HYPE lives here)
-            client.on_chainlink_update(_cb)
             await client.start()
 
             deadline = time.monotonic() + _TIMEOUT_S
-            # Wait until we have at least one RTDS coin AND HYPE (Chainlink)
             while time.monotonic() < deadline:
                 await asyncio.sleep(0.5)
                 has_rtds = any(c in received for c in ["BTC", "ETH", "SOL"])
-                has_hype = "HYPE" in received
-                if has_rtds and has_hype:
+                if has_rtds:
                     break
 
             await client.stop()
 
         _run(_collect())
 
-        rtds_coins = {"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "LINK"}
+        rtds_coins = {"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"}
         received_rtds = rtds_coins & set(received.keys())
         assert received_rtds, (
             "No RTDS crypto_prices coins received via callback — "
             f"crypto_prices subscription may be broken. Received: {list(received.keys())}"
         )
-        assert "HYPE" in received, (
-            "HYPE not received via callback — "
-            "crypto_prices_chainlink subscription may be broken. "
-            f"Received coins: {list(received.keys())}"
-        )
-        # All prices should be positive
         for coin, price in received.items():
             assert price > 0, f"Callback received non-positive price for {coin}: {price}"
 
@@ -341,7 +281,6 @@ def live_rtds_sustained() -> dict[str, list[float]]:
             tick_times[coin].append(time.monotonic())
 
         client.on_price_update(_record)
-        client.on_chainlink_update(_record)
         await client.start()
         await asyncio.sleep(_SCAN_DURATION_S)
         await client.stop()
@@ -356,11 +295,9 @@ class TestRTDSSustainedFeed:
     a 30-second window — the minimum bar for reliable stop-loss monitoring.
     """
 
-    RTDS_COINS      = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"]
-    CHAINLINK_COINS = ["HYPE"]
-    ALL_COINS       = RTDS_COINS + CHAINLINK_COINS
+    RTDS_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"]
 
-    @pytest.mark.parametrize("coin", ALL_COINS)
+    @pytest.mark.parametrize("coin", RTDS_COINS)
     def test_coin_receives_minimum_ticks(self, coin, live_rtds_sustained):
         """Each coin must deliver at least _MIN_TICKS_PER_COIN ticks in 30 s."""
         ticks = live_rtds_sustained.get(coin, [])
@@ -370,7 +307,7 @@ class TestRTDSSustainedFeed:
             "Feed may be stalling or subscription failed."
         )
 
-    @pytest.mark.parametrize("coin", ALL_COINS)
+    @pytest.mark.parametrize("coin", RTDS_COINS)
     def test_coin_max_gap_under_threshold(self, coin, live_rtds_sustained):
         """No gap between consecutive ticks should exceed _MAX_GAP_S seconds."""
         ticks = live_rtds_sustained.get(coin, [])
@@ -392,27 +329,18 @@ class TestRTDSSustainedFeed:
             f"{coin}: zero ticks received via on_price_update in {_SCAN_DURATION_S}s"
         )
 
-    def test_chainlink_hype_callback_path(self, live_rtds_sustained):
-        """HYPE fires on_chainlink_update continuously (Chainlink oracle feed)."""
-        ticks = live_rtds_sustained.get("HYPE", [])
-        assert len(ticks) > 0, (
-            f"HYPE: zero ticks received via on_chainlink_update in {_SCAN_DURATION_S}s"
-        )
-
     def test_no_coin_goes_silent_midway(self, live_rtds_sustained):
         """
         Split the 30 s window into two 15 s halves and verify every coin got
         at least one tick in EACH half.  Catches feeds that update once then die.
         """
         half = _SCAN_DURATION_S / 2.0
-        # tick_times are monotonic offsets from fixture start; reconstruct relative
-        # to the earliest tick to make the halving meaningful.
         all_ticks_flat = [t for ts in live_rtds_sustained.values() for t in ts]
         if not all_ticks_flat:
             pytest.skip("No ticks received at all")
         origin = min(all_ticks_flat)
 
-        for coin in self.ALL_COINS:
+        for coin in self.RTDS_COINS:
             ticks = live_rtds_sustained.get(coin, [])
             rel = [t - origin for t in ticks]
             first_half  = [t for t in rel if t < half]
@@ -439,133 +367,6 @@ class TestRTDSSustainedFeed:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Separated source test: RTDS vs Chainlink callbacks recorded independently
-#
-# The previous fixture writes both sources to the same dict, so we can't tell
-# which source is responsible for BTC/ETH/SOL/XRP/BNB/DOGE ticks.
-# This fixture tracks them in two separate dicts with 30 s observation.
-# ─────────────────────────────────────────────────────────────────────────────
-
-@pytest.fixture(scope="module")
-def live_rtds_separated() -> dict[str, dict[str, list[float]]]:
-    """
-    Run RTDSClient for _SCAN_DURATION_S seconds with RTDS and Chainlink
-    callbacks writing to separate dicts.
-
-    Returns {"rtds": {coin: [timestamps]}, "chainlink": {coin: [timestamps]}}
-    """
-    async def _observe() -> dict[str, dict[str, list[float]]]:
-        rtds_ticks: dict[str, list[float]]      = collections.defaultdict(list)
-        chainlink_ticks: dict[str, list[float]] = collections.defaultdict(list)
-        client = RTDSClient()
-
-        async def _rtds_cb(coin: str, price: float) -> None:
-            rtds_ticks[coin].append(time.monotonic())
-
-        async def _chainlink_cb(coin: str, price: float) -> None:
-            chainlink_ticks[coin].append(time.monotonic())
-
-        client.on_price_update(_rtds_cb)
-        client.on_chainlink_update(_chainlink_cb)
-        await client.start()
-        await asyncio.sleep(_SCAN_DURATION_S)
-        await client.stop()
-        return {
-            "rtds":      {c: sorted(ts) for c, ts in rtds_ticks.items()},
-            "chainlink": {c: sorted(ts) for c, ts in chainlink_ticks.items()},
-        }
-
-    return _run(_observe())
-
-
-class TestRTDSSourcesSeparated:
-    """
-    Verify RTDS (exchange-aggregated) and Chainlink oracle feeds deliver
-    ticks independently over 30 s — each source is tested in isolation.
-    """
-
-    RTDS_COINS      = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"]
-    CHAINLINK_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"]
-
-    # ── RTDS exchange-aggregated (crypto_prices topic) ────────────────────────
-
-    @pytest.mark.parametrize("coin", RTDS_COINS)
-    def test_rtds_source_delivers_ticks(self, coin, live_rtds_separated):
-        """on_price_update fires ≥ _MIN_TICKS_PER_COIN times for RTDS coins."""
-        ticks = live_rtds_separated["rtds"].get(coin, [])
-        assert len(ticks) >= _MIN_TICKS_PER_COIN, (
-            f"{coin}: RTDS exchange-aggregated feed delivered only {len(ticks)} ticks "
-            f"in {_SCAN_DURATION_S}s via on_price_update "
-            f"(expected ≥{_MIN_TICKS_PER_COIN})"
-        )
-
-    @pytest.mark.parametrize("coin", RTDS_COINS)
-    def test_rtds_source_max_gap(self, coin, live_rtds_separated):
-        """RTDS feed: no gap between consecutive ticks exceeds _MAX_GAP_S."""
-        ticks = live_rtds_separated["rtds"].get(coin, [])
-        if len(ticks) < 2:
-            pytest.skip(f"{coin}: not enough RTDS ticks to measure gaps")
-        worst = max(ticks[i+1] - ticks[i] for i in range(len(ticks) - 1))
-        assert worst < _MAX_GAP_S, (
-            f"{coin}: RTDS feed gap of {worst:.1f}s via on_price_update "
-            f"(threshold {_MAX_GAP_S}s) — SL monitor would be blind"
-        )
-
-    # ── Chainlink oracle (crypto_prices_chainlink RTDS + on-chain Polygon) ───
-
-    @pytest.mark.parametrize("coin", CHAINLINK_COINS)
-    def test_chainlink_source_delivers_ticks(self, coin, live_rtds_separated):
-        """on_chainlink_update fires ≥ _MIN_TICKS_PER_COIN times for every coin."""
-        ticks = live_rtds_separated["chainlink"].get(coin, [])
-        assert len(ticks) >= _MIN_TICKS_PER_COIN, (
-            f"{coin}: Chainlink feed delivered only {len(ticks)} ticks "
-            f"in {_SCAN_DURATION_S}s via on_chainlink_update "
-            f"(expected ≥{_MIN_TICKS_PER_COIN}). "
-            "Check that the blindspot fix (fire for ALL coins) is active."
-        )
-
-    @pytest.mark.parametrize("coin", CHAINLINK_COINS)
-    def test_chainlink_source_max_gap(self, coin, live_rtds_separated):
-        """Chainlink feed: no gap between consecutive ticks exceeds _MAX_GAP_S."""
-        ticks = live_rtds_separated["chainlink"].get(coin, [])
-        if len(ticks) < 2:
-            pytest.skip(f"{coin}: not enough Chainlink ticks to measure gaps")
-        worst = max(ticks[i+1] - ticks[i] for i in range(len(ticks) - 1))
-        assert worst < _MAX_GAP_S, (
-            f"{coin}: Chainlink feed gap of {worst:.1f}s via on_chainlink_update "
-            f"(threshold {_MAX_GAP_S}s) — 5m/15m/4h SL monitor would be blind"
-        )
-
-    def test_hype_only_in_chainlink_not_rtds(self, live_rtds_separated):
-        """HYPE has no crypto_prices RTDS entry — it must not appear in on_price_update."""
-        rtds_hype = live_rtds_separated["rtds"].get("HYPE", [])
-        assert len(rtds_hype) == 0, (
-            f"HYPE received {len(rtds_hype)} ticks via on_price_update — "
-            "unexpected: HYPE should only come through on_chainlink_update"
-        )
-
-    def test_separated_source_summary(self, live_rtds_separated):
-        """Print per-coin, per-source tick counts (informational — always passes)."""
-        rtds      = live_rtds_separated["rtds"]
-        chainlink = live_rtds_separated["chainlink"]
-        all_coins = sorted(set(rtds.keys()) | set(chainlink.keys()))
-        lines = [
-            f"\n{'Coin':<8} {'RTDS ticks':>12} {'CL ticks':>10} {'RTDS gap':>10} {'CL gap':>8}",
-            "-" * 54,
-        ]
-        for coin in all_coins:
-            r = rtds.get(coin, [])
-            c = chainlink.get(coin, [])
-            r_gap = max(r[i+1]-r[i] for i in range(len(r)-1)) if len(r) > 1 else float("inf")
-            c_gap = max(c[i+1]-c[i] for i in range(len(c)-1)) if len(c) > 1 else float("inf")
-            lines.append(
-                f"{coin:<8} {len(r):>12}  {len(c):>9}  {r_gap:>8.1f}s  {c_gap:>6.1f}s"
-            )
-        print("\n".join(lines))
-        assert True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Raw WS throughput: count frames BEFORE any per-coin filtering
 #
 # Answers: is 1 tick/s the feed ceiling, or is the client discarding frames?
@@ -581,12 +382,11 @@ class TestRTDSRawThroughput:
     def test_raw_frame_rate_vs_processed_ticks(self):
         """
         Monkey-patch _handle_message to count raw frames before processing,
-        while also counting per-coin RTDS and Chainlink ticks normally.
+        while also counting per-coin RTDS ticks normally.
         Run for _SCAN_DURATION_S seconds and print the comparison.
         """
         raw_frames: list[float] = []
-        rtds_ticks:      dict[str, list[float]] = collections.defaultdict(list)
-        chainlink_ticks: dict[str, list[float]] = collections.defaultdict(list)
+        rtds_ticks: dict[str, list[float]] = collections.defaultdict(list)
 
         async def _run_probe() -> dict:
             client = RTDSClient()
@@ -601,32 +401,22 @@ class TestRTDSRawThroughput:
             async def _rtds_cb(coin: str, price: float) -> None:
                 rtds_ticks[coin].append(time.monotonic())
 
-            async def _cl_cb(coin: str, price: float) -> None:
-                chainlink_ticks[coin].append(time.monotonic())
-
             client.on_price_update(_rtds_cb)
-            client.on_chainlink_update(_cl_cb)
             await client.start()
             await asyncio.sleep(_SCAN_DURATION_S)
             await client.stop()
 
-            # Compute stats
-            total_raw   = len(raw_frames)
-            total_rtds  = sum(len(v) for v in rtds_ticks.values())
-            total_cl    = sum(len(v) for v in chainlink_ticks.values())
-            raw_rate    = total_raw   / _SCAN_DURATION_S
-            rtds_rate   = total_rtds  / _SCAN_DURATION_S
-            cl_rate     = total_cl    / _SCAN_DURATION_S
+            total_raw  = len(raw_frames)
+            total_rtds = sum(len(v) for v in rtds_ticks.values())
+            raw_rate   = total_raw  / _SCAN_DURATION_S
+            rtds_rate  = total_rtds / _SCAN_DURATION_S
 
             return {
                 "total_raw": total_raw,
                 "total_rtds_processed": total_rtds,
-                "total_cl_processed": total_cl,
                 "raw_fps": raw_rate,
                 "rtds_fps": rtds_rate,
-                "cl_fps": cl_rate,
                 "rtds_coins": {c: len(v) for c, v in rtds_ticks.items()},
-                "cl_coins": {c: len(v) for c, v in chainlink_ticks.items()},
             }
 
         stats = _run(_run_probe())
@@ -638,11 +428,8 @@ class TestRTDSRawThroughput:
             f"{'Raw frame rate (fps)':<35} {stats['raw_fps']:>10.1f}",
             f"{'RTDS processed ticks (all coins)':<35} {stats['total_rtds_processed']:>10}",
             f"{'RTDS tick rate (all coins, fps)':<35} {stats['rtds_fps']:>10.1f}",
-            f"{'Chainlink processed ticks (all)':<35} {stats['total_cl_processed']:>10}",
-            f"{'Chainlink tick rate (all coins)':<35} {stats['cl_fps']:>10.1f}",
-            f"{'Combined processed fps':<35} {stats['rtds_fps'] + stats['cl_fps']:>10.1f}",
             "",
-            f"{'Unaccounted frames':<35} {stats['total_raw'] - stats['total_rtds_processed'] - stats['total_cl_processed']:>10}",
+            f"{'Unaccounted frames':<35} {stats['total_raw'] - stats['total_rtds_processed']:>10}",
             "  (PONG frames, sub confirmations, unknown symbols)",
             "",
             "Per-coin RTDS ticks:",
@@ -650,23 +437,15 @@ class TestRTDSRawThroughput:
         for coin in sorted(stats["rtds_coins"]):
             lines.append(f"  {coin:<8} {stats['rtds_coins'][coin]:>4} ticks  "
                          f"({stats['rtds_coins'][coin]/_SCAN_DURATION_S*60:.0f}/min)")
-        lines.append("Per-coin Chainlink ticks:")
-        for coin in sorted(stats["cl_coins"]):
-            lines.append(f"  {coin:<8} {stats['cl_coins'][coin]:>4} ticks  "
-                         f"({stats['cl_coins'][coin]/_SCAN_DURATION_S*60:.0f}/min)")
         print("\n".join(lines))
 
-        # Unaccounted frames = overhead: PONG heartbeats (1 per 5s = 6/30s),
-        # subscription confirmation messages, and RTDS coins we don't track
-        # (e.g. LINK appears in crypto_prices but is not in TRACKED_UNDERLYINGS).
-        # These are expected — not dropped frames.  Allow up to 150 overhead.
-        overhead = stats["total_raw"] - stats["total_rtds_processed"] - stats["total_cl_processed"]
+        overhead = stats["total_raw"] - stats["total_rtds_processed"]
         assert overhead >= 0, "More processed ticks than raw frames — impossible"
         assert overhead < 150, (
             f"Unexpectedly high unaccounted frames ({overhead}) — "
             "client may be dropping frames silently"
         )
-        # Both feeds should be delivering at least 1 fps combined
-        assert stats["rtds_fps"] + stats["cl_fps"] >= 1.0, (
-            "Combined RTDS + Chainlink tick rate < 1 fps — feed appears stalled"
+        assert stats["rtds_fps"] >= 1.0, (
+            f"RTDS tick rate {stats['rtds_fps']:.2f} fps < 1 fps — feed appears stalled"
         )
+

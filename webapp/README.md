@@ -44,6 +44,19 @@ Notable hooks and routes added in the latest release:
 - `redeemPosition()` → `POST /positions/redeem`
 - `usePolymarketEventSlugs()` now fetches via backend proxy: `GET /proxy/polymarket/events`
 
+## Latest Fixes (2026-04-07)
+
+This release includes several front-end bug fixes discovered during QA:
+
+- `Performance` page: fixed display of "Worst 5 Trades" so values and colors reflect actual P&L (previously forced negative display).
+- `Logs` page: removed synchronous `setState` inside an effect; switching view modes now resets module filter from the view-mode handlers.
+- `Markets` page: removed a synchronous `setSecondsAgo(0)` inside an effect; the existing 1s ticker now updates the age reliably.
+- `Settings` inputs: replaced `useEffect`-based state syncing with a render-time derivation to avoid unnecessary effect-based setState calls.
+- `Trades` page: fixed a lint error where a ternary expression was used as a statement; replaced with a proper `if/else` toggle.
+- `usePolymarketEventSlugs` util: removed an `any` escape hatch and added a small `PolyEvent` type for safer parsing of the backend proxy response.
+
+These fixes eliminate ESLint warnings, ensure consistent UI behaviour, and make the webapp TypeScript/ESLint clean.
+
 ## Tech Stack
 
 - React 18 + TypeScript

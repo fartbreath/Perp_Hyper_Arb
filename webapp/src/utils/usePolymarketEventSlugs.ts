@@ -14,7 +14,8 @@ export function usePolymarketEventSlugs() {
       .then((r) => r.json())
       .then((json) => {
         if (cancelled) return;
-        const events: any[] = Array.isArray(json) ? json : (json.events ?? []);
+        type PolyEvent = { slug?: string; markets?: { conditionId?: string; slug?: string }[] };
+        const events: PolyEvent[] = Array.isArray(json) ? json : ((json as { events?: PolyEvent[] }).events ?? []);
         const map: Record<string, string> = {};
         for (const ev of events) {
           for (const m of ev.markets ?? []) {

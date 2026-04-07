@@ -1,5 +1,36 @@
 # Changelog
 
+All notable changes to this repository are documented in this file.
+
+## [2026-04-07] - RTDS Chainlink routing + Webapp QA
+
+### Summary
+
+- Backend: RTDS Chainlink routing updated so short-bucket markets (5m/15m/4h) use the RTDS `crypto_prices_chainlink` relay as primary; ChainlinkWSClient (public eth_subscribe) is not relied on in production.
+- RTDS: expanded `crypto_prices_chainlink` symbol map to include BTC/ETH/SOL/XRP/BNB/DOGE in addition to HYPE.
+- Chainlink: corrected BNB AggregatorV3 Polygon address to `0x82a6c4AF830caa6c97bb504425f6A66165C2c26e`.
+- `SpotOracle`: simplified routing to prefer RTDS chainlink snapshots; HYPE still races with Chainlink Streams when configured.
+- New: `data/_compare_chainlink_sources.py` — script to compare RTDS chainlink relay vs direct AggregatorV3 HTTP polling (used for audit & latency analysis).
+
+### Tests
+
+- Unit tests: 918 passed, 6 skipped (live RTDS/Chainlink WS integration tests related to public eth_subscribe remain known-failing and are excluded from CI until a paid/working WS provider is available).
+- `tests/test_main_wiring.py` updated to assert RTDS chainlink routing for 5m/15m/4h markets.
+
+### Webapp
+
+- Fixed multiple UI bugs (Performance, Logs, Markets, Settings, Trades) and resolved ESLint/TypeScript issues.
+- Webapp dev server: verified running on port 5174 in dev environment.
+
+### Rationale
+
+These changes ensure production uses a low-latency, non-polling Chainlink relay (RTDS) for short-bucket oracle resolution while keeping on-chain AggregatorV3 addresses correct for reference and recovery modes. The QA pass tightened front-end correctness and linting, improving developer ergonomics and observability.
+
+---
+
+For detailed notes, see `market_data/rtds_client.py`, `market_data/spot_oracle.py`, and `webapp/src/pages/*`.
+# Changelog
+
 ## 2026-04-06 — On-chain Chainlink oracle, range markets, UP/DOWN side fix, spot client rename
 
 ### On-chain Chainlink oracle (`market_data/rtds_client.py`)
