@@ -329,6 +329,7 @@ MOMENTUM_ORDER_TYPE: str = "limit"
 # strike against the position (e.g. 0.05 → exit when spot is 0.05% below
 # strike for YES, or 0.05% above strike for NO).
 MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.01  # protective buffer: exit when delta (in-the-money %) drops BELOW this threshold (fires before strike is crossed)
+MOMENTUM_DELTA_SL_MIN_TICKS: int = 2        # hysteresis: delta SL only fires after this many consecutive below-threshold ticks (prevents single-tick noise from triggering exit)
 MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
 
 # Near-expiry time-stop: when TTE is very short and spot has already crossed
@@ -374,6 +375,15 @@ MOMENTUM_VOL_Z_SCORE_BY_TYPE: dict[str, float] = {}
 # or below (NO) the strike; signals smaller than this are ignored even if they
 # technically exceed the vol-scaled z-threshold.
 MOMENTUM_MIN_DELTA_PCT: float = 0.0
+# Per-coin overrides for MOMENTUM_MIN_DELTA_PCT.  If a coin is listed here its
+# value replaces the global floor; unlisted coins use MOMENTUM_MIN_DELTA_PCT.
+MOMENTUM_MIN_DELTA_PCT_BY_COIN: dict[str, float] = {}
+
+# Per-coin overrides for MOMENTUM_DELTA_STOP_LOSS_PCT.  Higher-IV coins (DOGE,
+# SOL, HYPE) need a wider stop because a single oracle tick routinely exceeds
+# the global 0.04% threshold.  Falls back to MOMENTUM_DELTA_STOP_LOSS_PCT when
+# the coin is not listed.  See PER_COIN_CONFIG.md for calibration rationale.
+MOMENTUM_DELTA_SL_PCT_BY_COIN: dict[str, float] = {}
 
 # Minimum additional gap required above the vol-scaled threshold (percentage
 # points of |(spot - strike) / strike|).  Prevents marginal signals where the

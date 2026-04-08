@@ -468,7 +468,7 @@ class TestAutoRedeemDedup:
             "asset": "tok_winning",
             "redeemable": True,
             "size": "50",
-            "curPrice": "1.0",
+            "currentPrice": "1.0",
             "conditionId": "cond_win",
             "title": "Test market",
         }])

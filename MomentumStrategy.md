@@ -65,6 +65,8 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_MIN_CLOB_DEPTH` | `200.0` | Minimum USDC depth on the ask side within 1c of best ask (thin-book guard) |
 | `MOMENTUM_ORDER_TYPE` | `"limit"` | `"limit"` = taker limit at ask+0.5c; `"market"` = market order |
 | `MOMENTUM_DELTA_STOP_LOSS_PCT` | `0.05` | Exit when \|(spot − strike) / strike\| reverses past this % against the position. Applied to HL spot vs strike — not the token CLOB price. Fires even when the token book is empty near expiry. |
+| `MOMENTUM_DELTA_SL_MIN_TICKS` | `2` | Hysteresis: delta SL only fires after this many **consecutive** below-threshold oracle ticks. Prevents a single noisy tick from triggering an exit. Set to `1` to disable hysteresis. |
+| `MOMENTUM_DELTA_SL_PCT_BY_COIN` | `{}` | Per-coin override for `MOMENTUM_DELTA_STOP_LOSS_PCT`. Higher-IV coins need wider stops — a single DOGE or HYPE tick routinely exceeds the global default. Falls back to the global value when the coin is not listed. Example: `{"BTC": 0.03, "SOL": 0.06, "DOGE": 0.08, "HYPE": 0.10}` |
 | `MOMENTUM_TAKE_PROFIT` | `0.999` | Exit if held token rises above this |
 | `MOMENTUM_MIN_TTE_SECONDS` | see below | Per-bucket-type dict of entry-window ceilings (seconds to expiry); markets with more TTE are outside the entry window and skipped |
 | `MOMENTUM_MIN_TTE_SECONDS_DEFAULT` | `120` | Fallback TTE ceiling for any market type not listed in the dict |
@@ -77,6 +79,7 @@ via `config_overrides.json` without restarting the bot.
 | `MOMENTUM_VOL_Z_SCORE` | `1.6449` | Global z-score for the probability threshold (1.6449 ≈ 95th percentile) |
 | `MOMENTUM_VOL_Z_SCORE_BY_TYPE` | `{}` | Per-bucket-type z-score overrides; unlisted types use the global default. Example: `{"bucket_daily": 1.0, "bucket_15m": 1.3}` |
 | `MOMENTUM_MIN_DELTA_PCT` | `0.0` | Absolute minimum spot-to-strike gap (%) required to enter, independent of time bucket or vol regime. See [Absolute Floor Principle](#absolute-floor-principle). |
+| `MOMENTUM_MIN_DELTA_PCT_BY_COIN` | `{}` | Per-coin override for `MOMENTUM_MIN_DELTA_PCT`. Low-priority under normal conditions (the vol-derived threshold usually dominates), but provides a tighter safety net for low-IV periods or oracle lag on high-vol coins. Falls back to the global value when the coin is not listed. Example: `{"SOL": 0.08, "DOGE": 0.10, "HYPE": 0.14}` |
 | `MOMENTUM_MIN_GAP_PCT` | `0.0` | Minimum *additional* gap required above the effective vol-scaled threshold. Blocks marginal signals where delta barely clears the bar. `0.0` = disabled. Recommended live value: `0.02`. |
 | `MOMENTUM_MAX_CONCURRENT` | `3` | Maximum simultaneous momentum positions |
 | `MOMENTUM_MARKET_COOLDOWN_SECONDS` | `300` | Seconds to suppress re-entry after any open/close/failed attempt in a market (deduplication guard) |

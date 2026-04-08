@@ -125,9 +125,9 @@ class RTDSClient:
     ) -> None:
         """Register async callback(coin, price) fired on every crypto_prices_chainlink tick.
 
-        Currently fires for HYPE/USD only.  Used by SpotOracle so the position
-        monitor re-evaluates on every HYPE oracle event exactly like it does for
-        AggregatorV3 events from ChainlinkWSClient.
+        Fires for all coins tracked in _RTDS_CL_SYM_TO_COIN (BTC/ETH/SOL/XRP/BNB/DOGE/HYPE).
+        Used by SpotOracle so the position monitor re-evaluates on every Chainlink relay
+        event exactly like it does for AggregatorV3 events from ChainlinkWSClient.
         """
         self._cl_callbacks.append(callback)
 

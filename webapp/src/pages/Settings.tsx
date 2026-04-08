@@ -1615,6 +1615,71 @@ export default function Settings() {
               onSubmit={(v) => apply({ momentum_delta_stop_loss_pct: v })}
             />
 
+            <SectionHead title="Per-Coin Stop-Loss Overrides" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Higher-IV coins need wider stops — a single DOGE/SOL oracle tick routinely exceeds the global 0.04% stop.
+              These values override the global Delta Stop-Loss for the named coin. See PER_COIN_CONFIG.md for calibration rationale.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0" }}>
+              <FloatInput
+                label="BTC"
+                description="BTC — lowest IV (~0.50–0.60 σ_ann). Recommended: 0.03."
+                value={data.momentum_delta_sl_pct_btc ?? data.momentum_delta_stop_loss_pct ?? 0.04}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_delta_sl_pct_btc: v })}
+              />
+              <FloatInput
+                label="ETH"
+                description="ETH — moderate IV (~0.70–0.85 σ_ann). Recommended: 0.04."
+                value={data.momentum_delta_sl_pct_eth ?? data.momentum_delta_stop_loss_pct ?? 0.04}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_delta_sl_pct_eth: v })}
+              />
+              <FloatInput
+                label="BNB"
+                description="BNB — moderate IV (~0.65–0.80 σ_ann). Recommended: 0.04."
+                value={data.momentum_delta_sl_pct_bnb ?? data.momentum_delta_stop_loss_pct ?? 0.04}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_delta_sl_pct_bnb: v })}
+              />
+              <FloatInput
+                label="XRP"
+                description="XRP — elevated IV from news spikes (~0.75–1.00 σ_ann). Recommended: 0.05."
+                value={data.momentum_delta_sl_pct_xrp ?? data.momentum_delta_stop_loss_pct ?? 0.04}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_delta_sl_pct_xrp: v })}
+              />
+              <FloatInput
+                label="SOL"
+                description="SOL — high IV from ecosystem events (~1.00–1.40 σ_ann). Recommended: 0.06."
+                value={data.momentum_delta_sl_pct_sol ?? data.momentum_delta_stop_loss_pct ?? 0.04}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_delta_sl_pct_sol: v })}
+              />
+              <FloatInput
+                label="DOGE"
+                description="DOGE — very high meme-driven IV (~1.20–1.80 σ_ann). Recommended: 0.08."
+                value={data.momentum_delta_sl_pct_doge ?? data.momentum_delta_stop_loss_pct ?? 0.04}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_delta_sl_pct_doge: v })}
+              />
+            </div>
+            {GAP}
+            <FloatInput
+              label="HYPE"
+              description="HYPE — nascent token, widest regime uncertainty (~1.50–2.50 σ_ann). Recommended: 0.10."
+              value={data.momentum_delta_sl_pct_hype ?? data.momentum_delta_stop_loss_pct ?? 0.04}
+              step={0.01}
+              unit="%"
+              onSubmit={(v) => apply({ momentum_delta_sl_pct_hype: v })}
+            />
+
             {GAP}
 
             <FloatInput
@@ -1683,6 +1748,72 @@ export default function Settings() {
               step={0.01}
               unit="%"
               onSubmit={(v) => apply({ momentum_min_delta_pct: v })}
+            />
+
+            <SectionHead title="Per-Coin Entry Floor Overrides" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Per-coin minimum delta required to enter, overriding the global floor.
+              Low priority under normal conditions — the vol-derived threshold dominates.
+              Useful as insurance during low-vol periods or oracle lag.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0" }}>
+              <FloatInput
+                label="BTC"
+                description="BTC entry floor. Recommended: 0.04."
+                value={data.momentum_min_delta_pct_btc ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_btc: v })}
+              />
+              <FloatInput
+                label="ETH"
+                description="ETH entry floor. Recommended: 0.05."
+                value={data.momentum_min_delta_pct_eth ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_eth: v })}
+              />
+              <FloatInput
+                label="BNB"
+                description="BNB entry floor. Recommended: 0.05."
+                value={data.momentum_min_delta_pct_bnb ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_bnb: v })}
+              />
+              <FloatInput
+                label="XRP"
+                description="XRP entry floor. Recommended: 0.06."
+                value={data.momentum_min_delta_pct_xrp ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_xrp: v })}
+              />
+              <FloatInput
+                label="SOL"
+                description="SOL entry floor. Recommended: 0.08."
+                value={data.momentum_min_delta_pct_sol ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_sol: v })}
+              />
+              <FloatInput
+                label="DOGE"
+                description="DOGE entry floor. Recommended: 0.10."
+                value={data.momentum_min_delta_pct_doge ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_doge: v })}
+              />
+            </div>
+            {GAP}
+            <FloatInput
+              label="HYPE"
+              description="HYPE entry floor. Recommended: 0.14."
+              value={data.momentum_min_delta_pct_hype ?? data.momentum_min_delta_pct ?? 0}
+              step={0.01}
+              unit="%"
+              onSubmit={(v) => apply({ momentum_min_delta_pct_hype: v })}
             />
 
             <SectionHead title="Per-Bucket Z-Score Overrides" />

@@ -765,8 +765,11 @@ class MomentumScanner(BaseStrategy):
 
             # Effective threshold: vol-scaled y or the configured absolute floor,
             # whichever is larger.  Recorded so diagnostics reflect the actual gate.
-            _effective_threshold = max(y, config.MOMENTUM_MIN_DELTA_PCT)
-            _d["min_delta_floor"]      = round(config.MOMENTUM_MIN_DELTA_PCT, 6)
+            _coin_floor = config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get(
+                market.underlying, config.MOMENTUM_MIN_DELTA_PCT
+            )
+            _effective_threshold = max(y, _coin_floor)
+            _d["min_delta_floor"]      = round(_coin_floor, 6)
             _d["effective_threshold"]  = round(_effective_threshold, 6)
             _d["effective_gap_pct"]    = round(delta_pct - _effective_threshold, 6)  # +ve = passed gate
 

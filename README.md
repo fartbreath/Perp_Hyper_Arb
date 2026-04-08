@@ -47,8 +47,8 @@ Perp_Hyper_Arb/
 │       ├── market_utils.py   #   shared market-classification + strike-extraction helpers
 │       └── ...
 │
-├── tests/                    # Pytest suite (887 unit tests)
-├── data/                     # CSV trade logs, paper trade records
+├── tests/                    # Pytest suite
+├── data/                     # CSV trade logs, paper trade records, analysis scripts (data/_*.py)
 │
 └── webapp/                   # Vite + React monitoring dashboard (port 5173)
     └── src/pages/            # Dashboard, Trades, Positions, Performance,
@@ -201,8 +201,18 @@ Key parameters:
 
 ---
 
-## Recent Changes (2026-04-07)
+## Recent Changes
 
+### 2026-05 — Per-coin config + delta SL hysteresis
+
+- **Per-coin stop-loss overrides** (`MOMENTUM_DELTA_SL_PCT_BY_COIN`): each coin can now have a tailored delta stop-loss threshold instead of the global default. Higher-IV assets (DOGE, HYPE) use wider stops; BTC/ETH use tighter ones. Falls back to `MOMENTUM_DELTA_STOP_LOSS_PCT` when the coin is not listed.
+- **Per-coin entry floor** (`MOMENTUM_MIN_DELTA_PCT_BY_COIN`): same pattern for the absolute minimum entry gap. Provides per-coin safety insurance during low-vol or oracle-lag conditions.
+- **Delta SL hysteresis** (`MOMENTUM_DELTA_SL_MIN_TICKS = 2`): the stop-loss now only fires after 2 consecutive below-threshold oracle ticks, preventing single-tick noise from triggering premature exits.
+- Both per-coin dicts are exposed via `GET /config` and `PATCH /config` (webapp Settings page includes dedicated per-coin grid sections for both stop-loss and entry floor).
+- Default calibrated values are pre-populated in `config_overrides.json`.
+- Analysis scripts moved to `data/` (prefixed `_*.py`).
+
+### 2026-04-07 — RTDS Chainlink routing
 - RTDS Chainlink routing: 5m / 15m / 4h markets now route to the RTDS `crypto_prices_chainlink` relay by default (production constraint: ChainlinkWSClient eth_subscribe on public RPCs is not reliable). This ensures sub-second Chainlink-relayed prices are used for short-bucket oracle resolution.
 - RTDS coverage expanded: `crypto_prices_chainlink` mapping was extended from HYPE-only to include BTC/ETH/SOL/XRP/BNB/DOGE (Polymarket relay). The `RTDSClient` now exposes `get_chainlink_spot(coin)` for all supported coins.
 - Chainlink on-chain address fix: the Polygon AggregatorV3 BNB contract address was corrected to the official `0x82a6c4AF830caa6c97bb504425f6A66165C2c26e`.

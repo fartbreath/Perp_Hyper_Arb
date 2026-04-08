@@ -165,7 +165,7 @@ def _write_momentum_tick(
         )
         row = {
             "ts":               datetime.now(timezone.utc).isoformat(),
-            "market_id":        pos.market_id[:20],
+            "market_id":        pos.market_id,
             "market_title":     pos.market_title[:60],
             "underlying":       pos.underlying,
             "side":             pos.side,
@@ -262,6 +262,7 @@ def should_exit(
     current_token_price: Optional[float] = None,
     tte_seconds: Optional[float] = None,
     current_spot: Optional[float] = None,
+    delta_sl_pct: Optional[float] = None,
 ) -> tuple[bool, str, float]:
     """
     Decide whether a position should be exited.
@@ -369,7 +370,8 @@ def should_exit(
             # still in-the-money but within SL_PCT% of the strike.  With
             # SL_PCT=0.1 the bot exits when still 0.1% ahead, before the oracle
             # crosses and Polymarket resolves against the position.
-            if current_delta_pct < config.MOMENTUM_DELTA_STOP_LOSS_PCT:
+            _sl = delta_sl_pct if delta_sl_pct is not None else config.MOMENTUM_DELTA_STOP_LOSS_PCT
+            if current_delta_pct < _sl:
                 return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
             # Near-expiry: only exit if spot has already crossed the strike
             # (delta < 0).  Avoids premature exits from CLOB price collapse.
@@ -449,9 +451,13 @@ class PositionMonitor:
         # Stores the initial |deviation| for each market_id; used for profit target
         self._initial_deviations: dict[str, float] = {}
         self._running = False
-        # Token IDs for which an on-chain redemption has already been submitted
-        # this session (avoids re-submitting on every poll cycle).
+        # Token IDs for which an on-chain redemption (or dismissal) has already
+        # been processed this session — avoids re-submitting on every poll cycle.
         self._redeemed_tokens: set[str] = set()
+        # Hysteresis counter for delta stop-loss: tracks how many consecutive oracle
+        # ticks each momentum position has been below MOMENTUM_DELTA_STOP_LOSS_PCT.
+        # SL only fires once the count reaches MOMENTUM_DELTA_SL_MIN_TICKS.
+        self._delta_sl_ticks: dict[str, int] = {}
         # Tracks positions currently being exited to prevent double-exit races
         # between the poll loop and the event-driven on_price_update path.
         self._exiting_positions: set[str] = set()  # "market_id:side"
@@ -624,7 +630,13 @@ class PositionMonitor:
             await asyncio.sleep(config.REDEEM_POLL_INTERVAL)
 
     async def _redeem_ready_positions(self) -> None:
-        """Fetch wallet positions and submit on-chain redemption for each redeemable token."""
+        """Fetch wallet positions and submit on-chain redemption for each redeemable token.
+
+        Live API is the source of truth:
+        - redeemable=False  → oracle still pending, skip
+        - redeemable=True, payout=0  → genuine loser, dismiss
+        - redeemable=True, payout>0  → submit on-chain redemption
+        """
         raw = await self._pm.get_live_positions()
         if not raw:
             return
@@ -634,59 +646,48 @@ class PositionMonitor:
             if not token_id or token_id in self._redeemed_tokens:
                 continue
             if not pos_data.get("redeemable", False):
-                continue
+                continue  # Oracle still pending — nothing to do yet
 
             size = float(pos_data.get("size", 0) or 0)
-            cur_price = float(pos_data.get("currentPrice") or pos_data.get("curPrice") or pos_data.get("cur_price") or 0)
-            # The `outcome` field labels WHICH TOKEN the user holds ("Yes"/"No"/"Up"/"Down"),
-            # NOT whether that token won the market.  The correct signal is currentPrice:
-            # winning tokens settle at 1.0, losing tokens at 0.0.
-            won = cur_price > 0.5
-            condition_id: str = pos_data.get("conditionId") or pos_data.get("condition_id") or ""
+            cur_price = float(pos_data.get("currentPrice") or 0)
             payout = round(size * cur_price, 4)
             title = pos_data.get("title") or token_id[:20]
+            condition_id: str = pos_data.get("conditionId") or pos_data.get("condition_id") or ""
 
-            # For losing positions (payout=0): just close bot tracking, skip on-chain call.
-            # Mark in _redeemed_tokens immediately so we don't re-log every poll cycle.
-            settlement_price = 1.0 if won else 0.0
-            markets_snap = self._pm.get_markets()
-            target_market_id: Optional[str] = None
-            for mkt in markets_snap.values():
-                if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
-                    target_market_id = mkt.condition_id
-                    break
+            # Genuine loser — nothing to redeem on-chain
+            if payout == 0:
+                self._redeemed_tokens.add(token_id)
+                log.info(
+                    "Auto-redeem: lost position dismissed (payout=0)",
+                    token_id=token_id[:20],
+                    title=title[:60],
+                )
+                continue
 
-            # Fallback: API sometimes omits conditionId; use the market cache entry.
-            condition_id = condition_id or target_market_id or ""
+            if not condition_id:
+                log.warning("Auto-redeem: no condition_id — will retry next cycle", token_id=token_id[:20])
+                continue
 
             log.info(
                 "Auto-redeem: redeemable position found",
                 token_id=token_id[:20],
                 title=title[:60],
-                won=won,
                 size=round(size, 2),
                 payout_usd=payout,
-                condition_id=condition_id[:20] if condition_id else "(missing)",
+                condition_id=condition_id[:20],
             )
 
-            if target_market_id:
-                for rp in list(self._risk.get_positions().values()):
-                    if rp.market_id == target_market_id and not rp.is_closed:
-                        self._risk.close_position(
-                            target_market_id, exit_price=settlement_price, side=rp.side,
-                            resolved_outcome="WIN" if won else "LOSS",
-                        )
-
-            if not won:
-                # Nothing to redeem on-chain for a losing position — suppress future re-logging.
-                self._redeemed_tokens.add(token_id)
-                log.info("Auto-redeem: lost position dismissed (payout=0)", token_id=token_id[:20])
-                continue
-
-            if not condition_id:
-                # Do NOT mark as redeemed — allow retry next cycle when condition_id arrives.
-                log.warning("Auto-redeem: no condition_id — will retry next cycle", token_id=token_id[:20])
-                continue
+            # Close risk position if tracked internally
+            markets_snap = self._pm.get_markets()
+            for mkt in markets_snap.values():
+                if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
+                    for rp in list(self._risk.get_positions().values()):
+                        if rp.market_id == mkt.condition_id and not rp.is_closed:
+                            self._risk.close_position(
+                                mkt.condition_id, exit_price=cur_price, side=rp.side,
+                                resolved_outcome="WIN",
+                            )
+                    break
 
             # Mark BEFORE the async call so a crash doesn't cause a double-submit.
             self._redeemed_tokens.add(token_id)
@@ -708,7 +709,6 @@ class PositionMonitor:
                     payout_usd=payout,
                 )
             except Exception as exc:
-                # Remove from redeemed set so it can be retried next cycle
                 self._redeemed_tokens.discard(token_id)
                 log.warning(
                     "Auto-redeem: on-chain call failed — will retry next cycle",
@@ -961,6 +961,9 @@ class PositionMonitor:
         if pos.strategy == "momentum" and self._spot is not None and pos.underlying:
             current_spot = self._spot.get_mid(pos.underlying, pos.market_type)
 
+        coin_sl = config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get(
+            pos.underlying, config.MOMENTUM_DELTA_STOP_LOSS_PCT
+        ) if pos.underlying else config.MOMENTUM_DELTA_STOP_LOSS_PCT
         exit_flag, reason, unrealised = should_exit(
             pos=pos,
             current_price=current_price,
@@ -970,7 +973,24 @@ class PositionMonitor:
             current_token_price=current_token_price,
             tte_seconds=tte_seconds,
             current_spot=current_spot,
+            delta_sl_pct=coin_sl,
         )
+
+        # Hysteresis: suppress delta SL until it holds for MOMENTUM_DELTA_SL_MIN_TICKS
+        # consecutive ticks. Prevents single-tick noise from blipping below threshold.
+        if reason == ExitReason.MOMENTUM_STOP_LOSS:
+            self._delta_sl_ticks[pos.market_id] = self._delta_sl_ticks.get(pos.market_id, 0) + 1
+            if self._delta_sl_ticks[pos.market_id] < config.MOMENTUM_DELTA_SL_MIN_TICKS:
+                log.debug(
+                    "Monitor: delta SL below threshold — waiting for hysteresis",
+                    market_id=pos.market_id[:20],
+                    ticks=self._delta_sl_ticks[pos.market_id],
+                    required=config.MOMENTUM_DELTA_SL_MIN_TICKS,
+                )
+                exit_flag, reason = False, ""
+        else:
+            # Reset counter whenever delta is back above threshold
+            self._delta_sl_ticks.pop(pos.market_id, None)
 
         # Write every intra-hold price check to momentum_ticks.csv for momentum
         # positions. Kept out of bot.log to avoid noise; the dedicated CSV is

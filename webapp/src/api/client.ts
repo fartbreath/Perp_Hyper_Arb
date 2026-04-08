@@ -496,6 +496,22 @@ export interface ConfigData {
   momentum_vol_z_score_1h?: number;
   momentum_vol_z_score_4h?: number;
   momentum_vol_z_score_daily?: number;
+  // Per-coin delta stop-loss overrides
+  momentum_delta_sl_pct_btc?: number;
+  momentum_delta_sl_pct_eth?: number;
+  momentum_delta_sl_pct_bnb?: number;
+  momentum_delta_sl_pct_xrp?: number;
+  momentum_delta_sl_pct_sol?: number;
+  momentum_delta_sl_pct_doge?: number;
+  momentum_delta_sl_pct_hype?: number;
+  // Per-coin minimum delta entry floor overrides
+  momentum_min_delta_pct_btc?: number;
+  momentum_min_delta_pct_eth?: number;
+  momentum_min_delta_pct_bnb?: number;
+  momentum_min_delta_pct_xrp?: number;
+  momentum_min_delta_pct_sol?: number;
+  momentum_min_delta_pct_doge?: number;
+  momentum_min_delta_pct_hype?: number;
   momentum_scan_interval?: number;
   momentum_max_concurrent?: number;
   momentum_min_gap_pct?: number;

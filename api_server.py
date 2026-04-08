@@ -660,6 +660,22 @@ class ConfigPatch(BaseModel):
     momentum_vol_z_score_1h: float | None = None
     momentum_vol_z_score_4h: float | None = None
     momentum_vol_z_score_daily: float | None = None
+    # Per-coin delta stop-loss overrides
+    momentum_delta_sl_pct_btc: float | None = None
+    momentum_delta_sl_pct_eth: float | None = None
+    momentum_delta_sl_pct_bnb: float | None = None
+    momentum_delta_sl_pct_xrp: float | None = None
+    momentum_delta_sl_pct_sol: float | None = None
+    momentum_delta_sl_pct_doge: float | None = None
+    momentum_delta_sl_pct_hype: float | None = None
+    # Per-coin minimum delta entry floor overrides
+    momentum_min_delta_pct_btc: float | None = None
+    momentum_min_delta_pct_eth: float | None = None
+    momentum_min_delta_pct_bnb: float | None = None
+    momentum_min_delta_pct_xrp: float | None = None
+    momentum_min_delta_pct_sol: float | None = None
+    momentum_min_delta_pct_doge: float | None = None
+    momentum_min_delta_pct_hype: float | None = None
     momentum_scan_interval: int | None = None
     momentum_max_concurrent: int | None = None
     momentum_min_gap_pct: float | None = None
@@ -809,6 +825,22 @@ def get_config() -> dict:
         "momentum_vol_z_score_1h":         config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_1h",    config.MOMENTUM_VOL_Z_SCORE),
         "momentum_vol_z_score_4h":         config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_4h",    config.MOMENTUM_VOL_Z_SCORE),
         "momentum_vol_z_score_daily":      config.MOMENTUM_VOL_Z_SCORE_BY_TYPE.get("bucket_daily",  config.MOMENTUM_VOL_Z_SCORE),
+        # Per-coin delta stop-loss overrides
+        "momentum_delta_sl_pct_btc":   config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get("BTC",  config.MOMENTUM_DELTA_STOP_LOSS_PCT),
+        "momentum_delta_sl_pct_eth":   config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get("ETH",  config.MOMENTUM_DELTA_STOP_LOSS_PCT),
+        "momentum_delta_sl_pct_bnb":   config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get("BNB",  config.MOMENTUM_DELTA_STOP_LOSS_PCT),
+        "momentum_delta_sl_pct_xrp":   config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get("XRP",  config.MOMENTUM_DELTA_STOP_LOSS_PCT),
+        "momentum_delta_sl_pct_sol":   config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get("SOL",  config.MOMENTUM_DELTA_STOP_LOSS_PCT),
+        "momentum_delta_sl_pct_doge":  config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get("DOGE", config.MOMENTUM_DELTA_STOP_LOSS_PCT),
+        "momentum_delta_sl_pct_hype":  config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get("HYPE", config.MOMENTUM_DELTA_STOP_LOSS_PCT),
+        # Per-coin minimum delta entry floor overrides
+        "momentum_min_delta_pct_btc":  config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("BTC",  config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_eth":  config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("ETH",  config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_bnb":  config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("BNB",  config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_xrp":  config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("XRP",  config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_sol":  config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("SOL",  config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_doge": config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("DOGE", config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_hype": config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("HYPE", config.MOMENTUM_MIN_DELTA_PCT),
         "momentum_scan_interval":         config.MOMENTUM_SCAN_INTERVAL,
         "momentum_max_concurrent":        config.MOMENTUM_MAX_CONCURRENT,
         "momentum_min_gap_pct":           config.MOMENTUM_MIN_GAP_PCT,
@@ -875,6 +907,38 @@ def patch_config(patch: ConfigPatch) -> dict:
             config.MOMENTUM_VOL_Z_SCORE_BY_TYPE[bucket_key] = float(v)
             updated[field] = float(v)
             log.info("Config updated via API", key=f"MOMENTUM_VOL_Z_SCORE_BY_TYPE[{bucket_key}]", value=float(v))
+    # Per-coin delta stop-loss overrides — written directly into the dict
+    _delta_sl_coin_map = {
+        "momentum_delta_sl_pct_btc":  "BTC",
+        "momentum_delta_sl_pct_eth":  "ETH",
+        "momentum_delta_sl_pct_bnb":  "BNB",
+        "momentum_delta_sl_pct_xrp":  "XRP",
+        "momentum_delta_sl_pct_sol":  "SOL",
+        "momentum_delta_sl_pct_doge": "DOGE",
+        "momentum_delta_sl_pct_hype": "HYPE",
+    }
+    for field, coin in _delta_sl_coin_map.items():
+        v = getattr(patch, field)
+        if v is not None:
+            config.MOMENTUM_DELTA_SL_PCT_BY_COIN[coin] = float(v)
+            updated[field] = float(v)
+            log.info("Config updated via API", key=f"MOMENTUM_DELTA_SL_PCT_BY_COIN[{coin}]", value=float(v))
+    # Per-coin minimum delta entry floor overrides — written directly into the dict
+    _min_delta_coin_map = {
+        "momentum_min_delta_pct_btc":  "BTC",
+        "momentum_min_delta_pct_eth":  "ETH",
+        "momentum_min_delta_pct_bnb":  "BNB",
+        "momentum_min_delta_pct_xrp":  "XRP",
+        "momentum_min_delta_pct_sol":  "SOL",
+        "momentum_min_delta_pct_doge": "DOGE",
+        "momentum_min_delta_pct_hype": "HYPE",
+    }
+    for field, coin in _min_delta_coin_map.items():
+        v = getattr(patch, field)
+        if v is not None:
+            config.MOMENTUM_MIN_DELTA_PCT_BY_COIN[coin] = float(v)
+            updated[field] = float(v)
+            log.info("Config updated via API", key=f"MOMENTUM_MIN_DELTA_PCT_BY_COIN[{coin}]", value=float(v))
     if updated:
         # Build attr-name → value dict for only the keys that changed so that
         # _save_overrides does a targeted merge (not a full overwrite).
@@ -891,6 +955,10 @@ def patch_config(patch: ConfigPatch) -> dict:
             attr_changes["MOMENTUM_MIN_TTE_SECONDS_DEFAULT"] = config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
         if any(f in updated for f in _z_score_map):
             attr_changes["MOMENTUM_VOL_Z_SCORE_BY_TYPE"] = dict(config.MOMENTUM_VOL_Z_SCORE_BY_TYPE)
+        if any(f in updated for f in _delta_sl_coin_map):
+            attr_changes["MOMENTUM_DELTA_SL_PCT_BY_COIN"] = dict(config.MOMENTUM_DELTA_SL_PCT_BY_COIN)
+        if any(f in updated for f in _min_delta_coin_map):
+            attr_changes["MOMENTUM_MIN_DELTA_PCT_BY_COIN"] = dict(config.MOMENTUM_MIN_DELTA_PCT_BY_COIN)
         _save_overrides(attr_changes)
     return {
         "updated": updated,

@@ -378,6 +378,54 @@ class TestShouldExit:
         )
         assert not exit_flag
 
+    def test_per_coin_delta_sl_pct_kwarg_overrides_global(self):
+        """delta_sl_pct kwarg takes precedence over global MOMENTUM_DELTA_STOP_LOSS_PCT.
+
+        Global SL is set to 0.03% — which would NOT fire on a +0.05% delta.
+        Per-coin SL is set to 0.07% — which DOES fire on a +0.05% delta (fires sooner).
+        The higher per-coin value provides a wider ITM buffer for high-IV coins.
+        """
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.03
+        pos = _make_position(
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
+            strike=100_000.0,
+        )
+        # delta_yes = (100050−100000)/100000×100 = +0.05% → global 0.03 would NOT fire (0.05 >= 0.03)
+        exit_flag_global, _, _ = should_exit(
+            pos=pos, current_price=0.50, current_spot=100_050.0,
+            initial_deviation=0.0, market_end_date=self.NOW + timedelta(minutes=10), now=self.NOW,
+        )
+        assert not exit_flag_global  # confirm global doesn't fire here
+
+        # with per-coin SL = 0.07%: 0.05 < 0.07 → DOES fire (wider protective buffer)
+        exit_flag_coin, reason, _ = should_exit(
+            pos=pos, current_price=0.50, current_spot=100_050.0,
+            initial_deviation=0.0, market_end_date=self.NOW + timedelta(minutes=10), now=self.NOW,
+            delta_sl_pct=0.07,
+        )
+        assert exit_flag_coin
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_per_coin_delta_sl_pct_kwarg_none_falls_back_to_global(self):
+        """delta_sl_pct=None (default) falls back to global MOMENTUM_DELTA_STOP_LOSS_PCT.
+
+        Ensures backwards-compatibility: callers that don't pass delta_sl_pct
+        get the same behaviour as before the parameter was added.
+        """
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.07
+        pos = _make_position(
+            entry_price=0.85, size=50.0, seconds_ago=120, strategy="momentum", side="YES",
+            strike=100_000.0,
+        )
+        # delta_yes = +0.05% → 0.05 < global 0.07 → fires via global fallback
+        exit_flag, reason, _ = should_exit(
+            pos=pos, current_price=0.50, current_spot=100_050.0,
+            initial_deviation=0.0, market_end_date=self.NOW + timedelta(minutes=10), now=self.NOW,
+            # delta_sl_pct not passed — defaults to None → falls back to global 0.07
+        )
+        assert exit_flag
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
     # ── Near-expiry stop ──────────────────────────────────────────────────
 
     def test_momentum_near_expiry_stop_triggers(self):
@@ -501,6 +549,8 @@ def _make_monitor(spot_client=None):
     # Return None so the code falls back to pos.size (safe in tests).
     pm.get_token_balance = AsyncMock(return_value=None)
     risk = RiskEngine()
+    # Tests call _check_position once and expect SL to fire immediately.
+    config.MOMENTUM_DELTA_SL_MIN_TICKS = 1
     monitor = PositionMonitor(pm=pm, risk=risk, interval=30, spot_client=spot_client)
     return monitor, pm, risk
 
