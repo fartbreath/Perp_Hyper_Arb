@@ -2,6 +2,32 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-10b] - RESOLVED exit uses oracle vs. strike instead of CLOB mid
+
+### Monitor — RESOLVED momentum exit: oracle overrides CLOB price
+
+**Bug:** At the exact settlement second, the Chainlink oracle can move BTC above (or
+below) the market strike while the CLOB order book has not yet absorbed the update.
+A DOWN token trading at ~$1.00 on the CLOB in the final second can suddenly settle to
+$0 once the oracle update propagates.  The `_check_position` RESOLVED fast-path was
+using `book_no_res.mid` as `exit_mid`, which snapped to `1.0` → `resolved_outcome="WIN"`
+→ `pnl=+$0.15`.  No actual sell order is placed on RESOLVED exits (PM distributes
+settlement directly), so this paper gain was **never received**.
+
+**Example:** Bitcoin Up or Down 2:35–2:40 AM ET on 2026-04-10.
+- Entry: DOWN at $0.90, size 1.51111
+- CLOB mid for DOWN at 06:40:01: ~$1.00 → bot recorded WIN +$0.15
+- RTDS oracle at exit: BTC = $72,015.76 > strike $71,983.31 → DOWN LOST
+- Actual payout from Polymarket: $0 (real P&L: −$1.36)
+
+**Fix:** After computing `exit_mid` from the CLOB book in the RESOLVED fast-path,
+apply an oracle override for momentum positions: fetch `self._spot.get_mid()` and
+compare it against `pos.strike` to determine the true settlement direction, setting
+`exit_mid = 1.0` (WIN) or `0.0` (LOSS) accordingly.  Falls back to CLOB mid if the
+oracle is unavailable (`_res_spot is None`).
+
+---
+
 ## [2026-04-10] - Momentum bug fixes: hysteresis, auto-redeem LOSS, slippage guard, strike diagnostics
 
 ### Monitor — Hysteresis reset guard (P2)

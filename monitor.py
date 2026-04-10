@@ -893,6 +893,31 @@ class PositionMonitor:
                         market_id=pos.market_id,
                     )
                     exit_mid = pos.entry_price
+            # For momentum positions: override CLOB mid with oracle vs. strike.
+            # At the exact resolution second the CLOB may still show ~$1.00 for
+            # a token that is about to be settled to $0 (Chainlink propagates
+            # faster than the CLOB order book reacts).  Use the spot oracle as
+            # the authoritative source for the settlement outcome.
+            if (
+                pos.strategy == "momentum"
+                and pos.strike > 0
+                and self._spot is not None
+                and pos.underlying
+            ):
+                _res_spot = self._spot.get_mid(pos.underlying, pos.market_type)
+                if _res_spot is not None and _res_spot > 0:
+                    if pos.side in ("YES", "BUY_YES", "UP"):
+                        exit_mid = 1.0 if _res_spot > pos.strike else 0.0
+                    else:
+                        exit_mid = 1.0 if _res_spot < pos.strike else 0.0
+                    log.info(
+                        "Monitor: RESOLVED momentum — oracle vs. strike overrides CLOB mid",
+                        market_id=pos.market_id,
+                        spot=round(_res_spot, 4),
+                        strike=round(pos.strike, 4),
+                        side=pos.side,
+                        oracle_exit_mid=exit_mid,
+                    )
             unrealised = compute_unrealised_pnl(pos, exit_mid)
             log.info(
                 "Monitor: resolved market — closing position",
