@@ -2,29 +2,38 @@
 
 All notable changes to this repository are documented in this file.
 
-## [2026-04-10b] - RESOLVED exit uses oracle vs. strike instead of CLOB mid
+## [2026-04-10b] - RESOLVED exit: 3-level outcome hierarchy (PM API → oracle → CLOB mid)
 
-### Monitor — RESOLVED momentum exit: oracle overrides CLOB price
+### Monitor — RESOLVED exit now uses PM settlement data as primary source
 
-**Bug:** At the exact settlement second, the Chainlink oracle can move BTC above (or
-below) the market strike while the CLOB order book has not yet absorbed the update.
-A DOWN token trading at ~$1.00 on the CLOB in the final second can suddenly settle to
-$0 once the oracle update propagates.  The `_check_position` RESOLVED fast-path was
-using `book_no_res.mid` as `exit_mid`, which snapped to `1.0` → `resolved_outcome="WIN"`
-→ `pnl=+$0.15`.  No actual sell order is placed on RESOLVED exits (PM distributes
-settlement directly), so this paper gain was **never received**.
+**Bug:** At the exact settlement second, the CLOB order book shows a stale mid price
+(e.g. DOWN token ≈ $1.00) before it has absorbed the Chainlink oracle update.  The
+RESOLVED fast-path was using `book_no_res.mid` as `exit_mid`, which snapped to `1.0`
+→ `resolved_outcome="WIN"` → `pnl=+$0.15`.  No sell order is placed for RESOLVED exits
+(PM distributes settlement directly), so this paper gain was **never received**.
 
-**Example:** Bitcoin Up or Down 2:35–2:40 AM ET on 2026-04-10.
-- Entry: DOWN at $0.90, size 1.51111
-- CLOB mid for DOWN at 06:40:01: ~$1.00 → bot recorded WIN +$0.15
-- RTDS oracle at exit: BTC = $72,015.76 > strike $71,983.31 → DOWN LOST
-- Actual payout from Polymarket: $0 (real P&L: −$1.36)
+**Example trade:** Bitcoin Up or Down 2:35–2:40 AM ET on 2026-04-10.
+- Entered DOWN at $0.90, size 1.511
+- CLOB book mid for DOWN at 06:40:01: ~$1.00 → bot recorded WIN +$0.15
+- Chainlink settled BTC = $72,015.76 > strike $71,983.31 → DOWN lost
+- Actual payout from Polymarket: $0 (real P&L: −$1.36; accounting error: +$1.51)
 
-**Fix:** After computing `exit_mid` from the CLOB book in the RESOLVED fast-path,
-apply an oracle override for momentum positions: fetch `self._spot.get_mid()` and
-compare it against `pos.strike` to determine the true settlement direction, setting
-`exit_mid = 1.0` (WIN) or `0.0` (LOSS) accordingly.  Falls back to CLOB mid if the
-oracle is unavailable (`_res_spot is None`).
+**Fix:** The RESOLVED fast-path now uses a three-level hierarchy to determine
+`exit_mid`, from most to least authoritative:
+
+1. **PM CLOB settlement API** (`fetch_market_resolution(condition_id)`):
+   Queries `GET /markets/{condition_id}`, returns the settled YES-token price
+   (0.0 or 1.0) once `closed=True`.  This is PM's own statement of the outcome,
+   independent of order book state.  For NO/DOWN positions, `exit_mid = 1 − yes_price`.
+
+2. **Oracle spot vs. strike** (momentum positions only, when L1 is still `None`):
+   Compares the RTDS/Chainlink oracle spot price against `pos.strike` to infer the
+   settlement direction.  Catches the window before the CLOB market object is marked
+   closed on PM's side.
+
+3. **CLOB book mid** (fallback, original behaviour):
+   Used only when L1 and L2 both fail.  `_redeem_ready_positions()` acts as a final
+   safety net in live mode — it re-closes with the correct payout from the Data API.
 
 ---
 

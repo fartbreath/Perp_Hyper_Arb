@@ -871,35 +871,52 @@ class PositionMonitor:
             market.end_date is not None
             and now >= market.end_date
         ):
-            book = self._pm._books.get(market.token_id_yes)
-            # Use last known mid for the held token; fall back to entry_price.
-            if pos.side in ("YES", "BUY_YES", "UP"):
-                exit_mid = (
-                    book.mid
-                    if book is not None and book.mid is not None
-                    else pos.entry_price
-                )
-            else:
-                book_no_res = self._pm._books.get(market.token_id_no)
-                if book_no_res is not None and book_no_res.mid is not None:
-                    exit_mid = book_no_res.mid
+            # ── Determine exit_mid — three levels, most authoritative first ───
+            #
+            # L1: PM CLOB settlement API.
+            #     GET /markets/{condition_id} returns closed=True and each
+            #     token's settled price (0.0 or 1.0) once PM has processed the
+            #     oracle resolution.  This is PM's own statement of the outcome
+            #     and is more authoritative than either the order book or our
+            #     local oracle snapshot.
+            #
+            # L2: Oracle spot vs. strike (momentum only).
+            #     The Chainlink / RTDS oracle can reflect the settlement price
+            #     before the CLOB market object is updated to closed=True.  This
+            #     catches the window where L1 is still None.
+            #
+            # L3: CLOB book mid (last resort).
+            #     At the exact settlement second the book may show ~$1.00 for a
+            #     token that will settle to $0.  Used only when L1 and L2 both
+            #     fail (e.g. no oracle data and PM API unavailable).
+            #     _redeem_ready_positions() acts as a final safety-net in live
+            #     mode — it re-closes with the correct payout from the Data API.
+
+            exit_mid: Optional[float] = None
+
+            # L1 — PM CLOB market resolution
+            _pm_yes_price = await self._pm.fetch_market_resolution(pos.market_id)
+            if _pm_yes_price is not None:
+                # _pm_yes_price is the settled YES/UP token price (0.0 or 1.0).
+                # Convert to price-of-held-token space so the existing snap and
+                # WIN/LOSS logic in _exit_position works correctly.
+                if pos.side in ("YES", "BUY_YES", "UP"):
+                    exit_mid = _pm_yes_price
                 else:
-                    # NO/DOWN book gone at resolution — cannot derive the outcome from
-                    # the YES/UP book (both CLOBs are independent).  Fall back
-                    # to entry_price (zero P&L); the risk engine still closes the
-                    # position and records the trade.
-                    log.warning(
-                        "Monitor: NO/DOWN book gone at resolution — using entry_price (zero P&L)",
-                        market_id=pos.market_id,
-                    )
-                    exit_mid = pos.entry_price
-            # For momentum positions: override CLOB mid with oracle vs. strike.
-            # At the exact resolution second the CLOB may still show ~$1.00 for
-            # a token that is about to be settled to $0 (Chainlink propagates
-            # faster than the CLOB order book reacts).  Use the spot oracle as
-            # the authoritative source for the settlement outcome.
+                    exit_mid = 1.0 - _pm_yes_price
+                log.info(
+                    "Monitor: RESOLVED — PM CLOB settlement confirms outcome",
+                    market_id=pos.market_id,
+                    pm_yes_price=_pm_yes_price,
+                    side=pos.side,
+                    exit_mid=exit_mid,
+                )
+
+            # L2 — oracle spot vs. strike (momentum positions; fills the gap
+            # before the CLOB market object is marked closed=True)
             if (
-                pos.strategy == "momentum"
+                exit_mid is None
+                and pos.strategy == "momentum"
                 and pos.strike > 0
                 and self._spot is not None
                 and pos.underlying
@@ -911,13 +928,34 @@ class PositionMonitor:
                     else:
                         exit_mid = 1.0 if _res_spot < pos.strike else 0.0
                     log.info(
-                        "Monitor: RESOLVED momentum — oracle vs. strike overrides CLOB mid",
+                        "Monitor: RESOLVED momentum — oracle vs. strike (PM API not yet closed)",
                         market_id=pos.market_id,
                         spot=round(_res_spot, 4),
                         strike=round(pos.strike, 4),
                         side=pos.side,
                         oracle_exit_mid=exit_mid,
                     )
+
+            # L3 — CLOB book mid
+            book = self._pm._books.get(market.token_id_yes)
+            if exit_mid is None:
+                if pos.side in ("YES", "BUY_YES", "UP"):
+                    exit_mid = (
+                        book.mid
+                        if book is not None and book.mid is not None
+                        else pos.entry_price
+                    )
+                else:
+                    book_no_res = self._pm._books.get(market.token_id_no)
+                    if book_no_res is not None and book_no_res.mid is not None:
+                        exit_mid = book_no_res.mid
+                    else:
+                        log.warning(
+                            "Monitor: NO/DOWN book gone at resolution — using entry_price (zero P&L)",
+                            market_id=pos.market_id,
+                        )
+                        exit_mid = pos.entry_price
+
             unrealised = compute_unrealised_pnl(pos, exit_mid)
             log.info(
                 "Monitor: resolved market — closing position",
