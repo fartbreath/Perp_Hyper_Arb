@@ -269,7 +269,7 @@ function SummaryBar({ groups }: { groups: MarketGroup[] }) {
 function LegDetail({ legs, outcomes }: { legs: Trade[]; outcomes: Record<string, { resolved_yes_price: number }> | null }) {
   return (
     <tr>
-      <td colSpan={13} style={{ padding: "6px 16px 10px 32px", background: "rgba(0,0,0,0.25)" }}>
+      <td colSpan={14} style={{ padding: "6px 16px 10px 32px", background: "rgba(0,0,0,0.25)" }}>
         <table style={{ width: "100%", fontSize: "0.8em", borderCollapse: "collapse" }}>
           <thead>
             <tr style={{ color: "#94a3b8", borderBottom: "1px solid #334155" }}>
@@ -279,6 +279,7 @@ function LegDetail({ legs, outcomes }: { legs: Trade[]; outcomes: Record<string,
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Entry</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Exit (calc)</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Resolved</th>
+              <th style={{ textAlign: "right", padding: "3px 8px" }}>Strike</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Spot Entry</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Spot Exit</th>
               <th style={{ textAlign: "right", padding: "3px 8px" }}>Gross</th>
@@ -331,6 +332,12 @@ function LegDetail({ legs, outcomes }: { legs: Trade[]; outcomes: Record<string,
                         ? <span style={{ color: "#ef4444", fontWeight: 700 }}>✘ LOSS</span>
                         : <span style={{ color: "#475569" }}>—</span>
                     }
+                  </td>
+                  {/* Strike price */}
+                  <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#a78bfa" }}>
+                    {t.strike && Number(t.strike) > 0
+                      ? `$${Number(t.strike).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`
+                      : "—"}
                   </td>
                   {/* Underlying spot at entry */}
                   <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#cbd5e1" }}>

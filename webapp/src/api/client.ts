@@ -172,6 +172,7 @@ export interface Trade {
   signal_score?: string;    // 0–100 signal quality score at fill time
   resolved_outcome?: string; // "WIN" | "LOSS" | "" — set on RESOLVED exits; empty for taker/stop
   spread_id?: string;        // legacy field; null for all new positions
+  strike?: string;           // recorded strike price (window-open spot for Up/Down, parsed from title otherwise)
 }
 
 export interface PnlData {
