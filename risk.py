@@ -197,6 +197,108 @@ class RiskEngine:
             with TRADES_CSV.open("a", newline="") as f:
                 csv.DictWriter(f, fieldnames=TRADES_HEADER).writerow(row)
 
+    def patch_trade_outcome(
+        self,
+        market_id: str,
+        resolved_yes_price: float,
+        *,
+        force: bool = False,
+    ) -> int:
+        """Correct resolved_outcome (and optionally pnl) for trades.csv records.
+
+        For each record with a matching market_id, derives the correct outcome from
+        resolved_yes_price + the record's side:
+            YES / UP   → WIN if resolved_yes_price == 1.0
+            NO  / DOWN → WIN if resolved_yes_price == 0.0
+
+        force=False (default, SL/taker exits):
+            Only patches records where resolved_outcome is blank / "nan" /  "None".
+            pnl is NOT changed — it already reflects the actual CLOB fill price.
+            resolved_outcome is set for informational purposes (did the market
+            ultimately resolve in the direction we bet on?).
+
+        force=True (RESOLVED exits with wrong outcome):
+            Also corrects records where the stored outcome contradicts
+            resolved_yes_price (e.g., bot recorded WIN but PM settled as LOSS).
+            exit_price is reset to the settlement value (1.0 or 0.0) and pnl is
+            recomputed as (exit_price − entry_price) × size − fees + rebates.
+
+        Returns the number of records changed.
+        """
+        _blank = {"", "nan", "None", "none"}
+        _yes_sides = {"YES", "UP", "BUY_YES"}
+
+        with self._csv_write_lock:
+            if not TRADES_CSV.exists():
+                return 0
+            try:
+                with TRADES_CSV.open(newline="", encoding="utf-8") as f:
+                    rows = list(csv.DictReader(f))
+            except Exception as exc:
+                log.error("patch_trade_outcome: read failed", exc=str(exc))
+                return 0
+
+            patched = 0
+            for row in rows:
+                if row.get("market_id") != market_id:
+                    continue
+                side = row.get("side", "")
+                is_yes_side = side in _yes_sides
+                # Settlement value of the token held by this record (0.0 or 1.0)
+                settlement = resolved_yes_price if is_yes_side else (1.0 - resolved_yes_price)
+                correct_outcome = "WIN" if settlement >= 0.5 else "LOSS"
+                stored = (row.get("resolved_outcome") or "").strip()
+
+                if stored in _blank:
+                    # SL/taker exit missing an outcome: fill in resolved_outcome only.
+                    # pnl already reflects the actual CLOB fill — do NOT recompute.
+                    row["resolved_outcome"] = correct_outcome
+                    patched += 1
+                    log.info(
+                        "patch_trade_outcome: resolved_outcome filled (SL exit)",
+                        market_id=market_id[:20],
+                        side=side,
+                        new_outcome=correct_outcome,
+                    )
+                elif force and stored != correct_outcome:
+                    # RESOLVED exit with wrong outcome: update outcome AND recompute pnl.
+                    try:
+                        entry   = float(row.get("price",          0) or 0)
+                        size    = float(row.get("size",           0) or 0)
+                        fees    = float(row.get("fees_paid",      0) or 0)
+                        rebates = float(row.get("rebates_earned", 0) or 0)
+                        new_pnl = (settlement - entry) * size - fees + rebates
+                        row["resolved_outcome"] = correct_outcome
+                        row["pnl"]              = str(round(new_pnl, 10))
+                        patched += 1
+                        log.info(
+                            "patch_trade_outcome: outcome+pnl corrected (RESOLVED wrong)",
+                            market_id=market_id[:20],
+                            side=side,
+                            old_outcome=stored,
+                            new_outcome=correct_outcome,
+                            new_pnl=round(new_pnl, 4),
+                        )
+                    except (ValueError, TypeError) as exc:
+                        log.warning("patch_trade_outcome: numeric parse error", exc=str(exc))
+
+            if patched == 0:
+                return 0
+
+            # Atomically rewrite the whole file via a .tmp sibling
+            try:
+                tmp = TRADES_CSV.with_suffix(".tmp")
+                with tmp.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=TRADES_HEADER)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                tmp.replace(TRADES_CSV)
+            except Exception as exc:
+                log.error("patch_trade_outcome: rewrite failed", exc=str(exc))
+                return 0
+
+            return patched
+
     def _load_token_strategy(self) -> dict[str, str]:
         """Load persisted token_id → strategy map from disk."""
         if OPEN_POSITIONS_JSON.exists():

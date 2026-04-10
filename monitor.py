@@ -606,6 +606,23 @@ class PositionMonitor:
                     condition_id=cid[:16],
                     resolved_yes_price=resolved_yes_price,
                 )
+                # Back-fill resolved_outcome in trades.csv for SL/taker exits
+                # that never received an outcome (resolved_outcome is blank).
+                # force=False so we don't override outcomes already set by
+                # _redeem_ready_positions() or the RESOLVED fast-path.
+                try:
+                    patched = self._risk.patch_trade_outcome(
+                        cid, resolved_yes_price, force=False
+                    )
+                    if patched:
+                        log.info(
+                            "patch_trade_outcome: filled outcome for SL exit(s)",
+                            condition_id=cid[:16], patched=patched,
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "patch_trade_outcome failed", cid=cid[:16], exc=str(exc)
+                    )
         if changed:
             _save_pending_resolutions(pending)
 
@@ -664,17 +681,43 @@ class PositionMonitor:
                     token_id=token_id[:20],
                     title=title[:60],
                 )
-                # Close in risk engine so the position is removed and recorded as LOSS
+                # PM's payout=0 is the definitive source of truth for the outcome.
+                # Close any still-open position AND force-correct any already-closed
+                # record that was written with the wrong outcome (e.g., the RESOLVED
+                # fast-path used a stale CLOB/oracle and recorded WIN).
                 if condition_id:
                     markets_snap = self._pm.get_markets()
                     for mkt in markets_snap.values():
                         if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
+                            # token settled to 0 → that token's side lost
+                            # YES token=0  → YES lost  → resolved_yes_price=0.0
+                            # NO  token=0  → NO  lost  → resolved_yes_price=1.0
+                            is_yes_token = (mkt.token_id_yes == token_id)
+                            pm_resolved_yes = 0.0 if is_yes_token else 1.0
+                            # Close any open position
                             for rp in list(self._risk.get_positions().values()):
                                 if rp.market_id == mkt.condition_id and not rp.is_closed:
                                     self._risk.close_position(
                                         mkt.condition_id, exit_price=0.0, side=rp.side,
                                         resolved_outcome="LOSS",
                                     )
+                            # Correct any already-closed record with wrong outcome
+                            try:
+                                patched = self._risk.patch_trade_outcome(
+                                    mkt.condition_id, pm_resolved_yes, force=True
+                                )
+                                if patched:
+                                    log.info(
+                                        "Auto-redeem: corrected trades.csv via PM payout=0",
+                                        condition_id=mkt.condition_id[:20],
+                                        is_yes_token=is_yes_token,
+                                        patched=patched,
+                                    )
+                            except Exception as exc:
+                                log.warning(
+                                    "Auto-redeem: patch_trade_outcome failed",
+                                    exc=str(exc), condition_id=condition_id[:20],
+                                )
                             break
                 continue
 
@@ -691,16 +734,41 @@ class PositionMonitor:
                 condition_id=condition_id[:20],
             )
 
-            # Close risk position if tracked internally
+            # PM's payout>0 is the definitive source of truth for the outcome.
+            # Close any still-open position AND force-correct any already-closed
+            # record that was written with the wrong outcome (e.g., RESOLVED fast-path
+            # used stale oracle and recorded LOSS when market actually paid out).
             markets_snap = self._pm.get_markets()
             for mkt in markets_snap.values():
                 if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
+                    # cur_price=1.0 for a settled winner
+                    # YES token=1  → YES won  → resolved_yes_price=1.0
+                    # NO  token=1  → NO  won  → resolved_yes_price=0.0
+                    is_yes_token = (mkt.token_id_yes == token_id)
+                    pm_resolved_yes = 1.0 if is_yes_token else 0.0
                     for rp in list(self._risk.get_positions().values()):
                         if rp.market_id == mkt.condition_id and not rp.is_closed:
                             self._risk.close_position(
                                 mkt.condition_id, exit_price=cur_price, side=rp.side,
                                 resolved_outcome="WIN",
                             )
+                    # Correct any already-closed record with wrong outcome
+                    try:
+                        patched = self._risk.patch_trade_outcome(
+                            mkt.condition_id, pm_resolved_yes, force=True
+                        )
+                        if patched:
+                            log.info(
+                                "Auto-redeem: corrected trades.csv via PM payout>0",
+                                condition_id=mkt.condition_id[:20],
+                                payout_usd=payout,
+                                patched=patched,
+                            )
+                    except Exception as exc:
+                        log.warning(
+                            "Auto-redeem: patch_trade_outcome failed",
+                            exc=str(exc), condition_id=condition_id[:20],
+                        )
                     break
 
             # Mark BEFORE the async call so a crash doesn't cause a double-submit.
