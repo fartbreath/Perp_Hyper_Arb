@@ -452,6 +452,37 @@ class MomentumScanner(BaseStrategy):
                     scan_diags.append(_d)
                     continue
 
+            # ── Record window-open spot for Up/Down markets ──────────────────
+            # Must happen here — BEFORE the signal band filter — so that markets
+            # whose token starts out-of-band (e.g. high-confidence at window open)
+            # still get their strike locked to the oracle price at window-open time.
+            # If we recorded only when in-band, the strike gets set minutes later
+            # when the token finally dips into the band, after the oracle price has
+            # already moved, causing the bot to trade against the wrong strike.
+            if _is_updown_market(market.title):
+                _mid_pre = market.condition_id
+                if _mid_pre not in self._market_open_spot:
+                    _open_snap = self._spot.get_spot(market.underlying, market.market_type)
+                    if _open_snap is not None and _open_snap.mid is not None:
+                        self._market_open_spot[_mid_pre] = _open_snap.mid
+                        _save_open_spots(self._open_spot_path, self._market_open_spot)
+                        log.debug(
+                            "MomentumScanner: recorded window-open spot for Up/Down market",
+                            market=market.title[:60],
+                            market_id=_mid_pre[:16],
+                            open_spot=round(_open_snap.mid, 4),
+                        )
+                # Surface the recorded strike in diag at every scan state,
+                # even for out-of-band / not-yet-in-band rows.
+                if _mid_pre in self._market_open_spot:
+                    _d["strike"] = round(self._market_open_spot[_mid_pre], 4)
+            else:
+                # For explicit-strike markets the strike is in the title — extract
+                # it without spot (sanity check becomes value > 0 when spot=0).
+                _title_strike = _extract_strike(market.title, 0.0)
+                if _title_strike is not None:
+                    _d["strike"] = round(_title_strike, 4)
+
             # ── Cooldown pre-filter ──────────────────────────────────────────
             # Each side has an independent cooldown clock keyed by condition_id:side.
             # Up/Down markets use "UP"/"DOWN" keys; standard markets use "YES"/"NO".
@@ -670,23 +701,20 @@ class MomentumScanner(BaseStrategy):
 
             if strike is None and _is_updown_market(market.title):
                 # Directional "Up or Down" market: the implicit strike is the spot
-                # at window-open time.  Record on first observation using the
-                # oracle-correct price source (Chainlink for 5m/15m/4h markets).
-                # The not_started pre-filter above ensures we only reach here when
-                # tte_seconds <= bucket_duration, so the window has actually opened.
+                # at window-open time.  It must have been recorded by the pre-band
+                # block above (before the signal band filter).  If it is missing
+                # here we are already in-band but the oracle returned None at window
+                # open — trading with a stale or guessed strike would be worse than
+                # not trading at all, so skip.
                 mid_id = market.condition_id
-                if mid_id not in self._market_open_spot:
-                    _oracle_src = "chainlink" if market.market_type in CHAINLINK_MARKET_TYPES else "rtds"
-                    self._market_open_spot[mid_id] = spot
-                    _save_open_spots(self._open_spot_path, self._market_open_spot)
-                    log.debug(
-                        "MomentumScanner: recorded window-open spot for Up/Down market",
+                if mid_id in self._market_open_spot:
+                    strike = self._market_open_spot[mid_id]
+                else:
+                    log.warning(
+                        "MomentumScanner: no window-open spot recorded for Up/Down market — skipping",
                         market=market.title[:60],
                         market_id=mid_id[:16],
-                        open_spot=round(spot, 4),
-                        oracle=_oracle_src,
                     )
-                strike = self._market_open_spot[mid_id]
 
             if strike is None:
                 skipped_no_strike += 1
@@ -1196,6 +1224,25 @@ class MomentumScanner(BaseStrategy):
 
         if actual_fill is not None:
             raw_fill_price, actual_size = actual_fill
+
+            # ── Post-fill slippage guard ─────────────────────────────────────
+            # Abort if the fill landed below the signal band floor.  A fill
+            # below band_lo means the book was swept during order transit
+            # (e.g. 0.925 → 0.12 when a seller drained the ask stack).
+            # The token is no longer in a valid signal state at this price.
+            _band_lo = config.MOMENTUM_PRICE_BAND_LOW
+            if raw_fill_price < _band_lo:
+                log.warning(
+                    "Momentum: fill price below band floor — aborting position",
+                    market=signal.market_title[:60],
+                    signal_price=signal.token_price,
+                    fill_price=raw_fill_price,
+                    band_lo=_band_lo,
+                    order_id=order_id[:20],
+                )
+                await self._pm.cancel_order(order_id)
+                return False
+
             entry_price = raw_fill_price  # actual token fill price for both YES and NO
             entry_size = actual_size
         else:

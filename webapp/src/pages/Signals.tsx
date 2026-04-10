@@ -421,6 +421,7 @@ export default function Signals() {
                           <th style={{ padding: "0.4rem 0.6rem" }}>Bucket</th>
                           <th style={{ padding: "0.4rem 0.6rem" }}>Side</th>
                           <th style={{ padding: "0.4rem 0.6rem" }} title="Token price in YES-space">Price</th>
+                          <th style={{ padding: "0.4rem 0.6rem" }} title="Recorded strike — window-open spot for Up/Down, parsed from title otherwise">Strike / Spot</th>
                           <th style={{ padding: "0.4rem 0.6rem" }} title="Spot move vs vol-adjusted threshold">Δ% vs ≥Threshold</th>
                           <th style={{ padding: "0.4rem 0.6rem" }} title="Time to expiry">TTE</th>
                           <th style={{ padding: "0.4rem 0.6rem" }}>Status</th>
@@ -449,6 +450,16 @@ export default function Signals() {
                               </td>
                               <td style={{ padding: "0.4rem 0.6rem", fontFamily: "monospace" }}>
                                 {m.token_price != null ? `${(m.token_price * 100).toFixed(1)}\u00a2` : "—"}
+                              </td>
+                              <td style={{ padding: "0.4rem 0.6rem", fontFamily: "monospace", fontSize: "0.78rem" }}>
+                                {m.strike != null ? (
+                                  <span>
+                                    <span style={{ color: "#e2e8f0" }}>{m.strike.toLocaleString(undefined, { maximumFractionDigits: 4 })}</span>
+                                    {m.spot != null && (
+                                      <span style={{ color: "#64748b" }}> / {m.spot.toLocaleString(undefined, { maximumFractionDigits: 4 })}</span>
+                                    )}
+                                  </span>
+                                ) : <span style={{ color: "#475569" }}>—</span>}
                               </td>
                               <td style={{ padding: "0.4rem 0.6rem", fontFamily: "monospace" }}>
                                 {m.delta_pct != null && m.threshold_pct != null ? (

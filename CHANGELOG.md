@@ -2,6 +2,83 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-10] - Momentum bug fixes: hysteresis, auto-redeem LOSS, slippage guard, strike diagnostics
+
+### Monitor — Hysteresis reset guard (P2)
+
+Previously `_delta_sl_ticks` (the 2-tick consecutive-below-threshold counter) was reset
+on **any** non-STOP event, including oracle data gaps where `current_spot is None`.
+A brief WebSocket interruption before the second tick would silently clear the counter,
+effectively disabling the SL until the position crossed the threshold again from scratch.
+
+Fix: the counter is now only reset when `current_spot is not None and pos.strike > 0`
+— i.e., only when we have a valid oracle reading that genuinely showed delta is above
+threshold.  Data gaps no longer reset the in-progress hysteresis accumulation.
+
+### Monitor — Auto-redeem records LOSS outcome (P3)
+
+When the PM wallet returned `redeemable=True, payout=0` (position resolved against),
+`close_position()` was never called.  The position stayed open in the risk engine
+indefinitely, `resolved_outcome="LOSS"` was never written to `trades.csv`, and the
+risk engine's USD exposure remained inflated.
+
+Fix: `_redeem_ready_positions()` now calls `close_position(exit_price=0.0, resolved_outcome="LOSS")`
+for every zero-payout resolution, using the same market/token lookup as the WIN path.
+Also fixed the `curPrice` field resolution to handle all PM API field name variants
+(`curPrice`, `currentPrice`, `cur_price`).
+
+### Scanner — Post-fill slippage guard
+
+Added a post-fill check that aborts and cancels the order if the confirmed fill price
+is below `MOMENTUM_PRICE_BAND_LOW`.  A fill significantly below the band means the ask
+stack was swept during order transit (e.g. 0.925 → 0.12 with 87% slippage); the token
+is no longer in a valid signal state and holding it is uneconomical.
+
+### Scanner — Strike surfaced in diagnostics early (P1 partial)
+
+The window-open spot recording for Up/Down markets was moved to a **pre-band** block
+that runs before the signal band filter.  This ensures the strike is locked at the
+moment the window opens, even for markets that start out-of-band.  Previously the
+strike could be recorded minutes late after the price had already moved.
+
+The recorded strike is now written to `_d["strike"]` at every scan-loop state —
+including markets that are skipped by band/cooldown/delta filters — so the Signals page
+can display it for all in-window markets.  Explicit-strike markets (e.g. "BTC above
+$72,000") also surface their title-parsed strike.
+
+### Webapp — Strike / Spot column on Signals page
+
+The momentum diagnostics table now has a **Strike / Spot** column showing the recorded
+strike price (white) alongside the current live oracle spot (grey) for every in-window
+market.  This allows visual validation that the recorded strike aligns with Polymarket's
+actual settlement oracle before deciding on P1 (strike recording alignment fix).
+
+### pm_client — Taker order support
+
+`place_limit_order()` accepts a `post_only=False` flag that switches the order type to
+FAK (Fill-And-Kill) for immediate taker execution.  The "crosses book" retry is skipped
+for taker orders since a crossing price is intentional.
+
+### live_fill_handler — Skip duplicate reconciliation of closed markets
+
+The PM wallet retains won tokens until they are manually redeemed on-chain.  Without
+this guard, the reconciler would re-import already-closed positions, triggering a
+duplicate `close_position()` call and a second row in `trades.csv`.
+
+Fix: `closed_market_ids` is now built from the risk engine before the wallet loop, and
+any wallet position whose `condition_id` is already closed is skipped.
+
+### market_data — ChainlinkWSClient targets OCR2 aggregator addresses
+
+Corrected the `eth_subscribe` filter to target the underlying OCR2 aggregator addresses
+(not the proxy contracts) so `AnswerUpdated` events are actually received.  Proxy
+contracts emit no logs directly — events come from the aggregator.
+`SpotOracle` updated to include `ChainlinkWSClient` as a first-class source in the
+freshest-wins race for non-HYPE Chainlink coins, with documentation clarifying that
+live WS events require a paid Polygon RPC endpoint (Alchemy/Infura).
+
+---
+
 ## [2026-04-07] - RTDS Chainlink routing + Webapp QA
 
 ### Summary

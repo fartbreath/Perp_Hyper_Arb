@@ -5,12 +5,18 @@ Subscribes to AnswerUpdated(int256 indexed current, uint256 indexed roundId,
 uint256 updatedAt) events on Polygon Mainnet using eth_subscribe/logs over a
 persistent WebSocket connection.
 
+Polygon Chainlink uses OCR2 (OffchainAggregatorV2) aggregators. The proxy
+contract itself emits NO logs — events are emitted by the underlying OCR2
+aggregator. AnswerUpdated IS emitted by the aggregator for backwards
+compatibility alongside NewTransmission.
+
 Architecture:
   • On start(): seed current prices via concurrent latestRoundData() HTTP eth_call
     so the position monitor has ground-truth data before the first oracle event.
   • _ws_loop(): persistent WebSocket to POLYGON_WS_URL; single eth_subscribe filter
-    covering all 6 contract addresses.
-  • On each AnswerUpdated log: decode price, update cache, fire callbacks.
+    covering all 6 OCR2 aggregator addresses.
+  • On each AnswerUpdated log from the aggregator: decode price from topics[1],
+    update cache, fire callbacks.
   • On reconnect: reseed via latestRoundData() to catch any rounds missed during
     the downtime window.
   • 120 s silence on an established connection → force reconnect (zombie TCP guard).
@@ -20,21 +26,28 @@ Requires a WebSocket-capable Polygon JSON-RPC endpoint.
 Set POLYGON_WS_URL in .env:
   wss://polygon-mainnet.g.alchemy.com/v2/<KEY>     (Alchemy — recommended)
   wss://polygon-mainnet.infura.io/ws/v3/<KEY>       (Infura)
-  wss://polygon.getblock.io/<KEY>/mainnet/           (GetBlock)
 
-AnswerUpdated event ABI:
+AnswerUpdated event ABI (emitted by underlying OCR2 aggregator):
   topics[0] = 0x0559884fd3a460db3073b7fc896cc77986f16e378210ded43186175bf646fc5f
   topics[1] = int256 indexed current    ← oracle price (signed, 8 decimals)
   topics[2] = uint256 indexed roundId
   data      = uint256 updatedAt         ← on-chain unix timestamp
 
-Coins and contracts (Polygon Mainnet, 8 decimal places):
+Proxy contracts (Polygon Mainnet) — used only for HTTP latestRoundData() seed:
   BTC   0xc907E116054Ad103354f2D350FD2514433D57F6f
   ETH   0xF9680D99D6C9589e2a93a78A04A279e509205945
   SOL   0x10C8264C0935b3B9870013e057f330Ff3e9C56dC
   XRP   0x785ba89291f676b5386652eB12b30cF361020694
-  BNB   0x82a6c4AF830caa6c97bb504425f6A992840839be
+  BNB   0x82a6c4AF830caa6c97bb504425f6A66165C2c26e
   DOGE  0xbaf9327b6564454F4a3364C33eFeEf032b4b4444
+
+Underlying OCR2 aggregators — where AnswerUpdated events actually emit:
+  BTC   0x014497a2aef847c7021b17bff70a68221d22aa63
+  ETH   0x63db7e86391f5d31bab58808bcf75edb272f4f5c
+  SOL   0x35b19a67a41282e39c32650b863f714eb95dacf5
+  XRP   0x8d5e29ff3b3f55d58abb165ea9ce3886c0a43fc7
+  BNB   0x30395df79a543a2308ab0668661fcefc229a19b2
+  DOGE  0x2aebe03d31e904ade377f651f9a75519d5d61135
 
 HYPE is absent — no Chainlink AggregatorV3 on Polygon for HYPE.
 """
@@ -56,6 +69,7 @@ from market_data.rtds_client import SpotPrice
 log = get_bot_logger(__name__)
 
 # AnswerUpdated(int256,uint256,uint256) — keccak256 of the event signature.
+# Emitted by the underlying OCR2 aggregator (NOT the proxy) for backwards compatibility.
 _ANSWER_UPDATED_TOPIC = (
     "0x0559884fd3a460db3073b7fc896cc77986f16e378210ded43186175bf646fc5f"
 )
@@ -72,7 +86,7 @@ _HTTP_TIMEOUT_S = 5.0
 # Seconds of WS silence before forcing a reconnect (zombie TCP guard).
 _WS_SILENCE_TIMEOUT_S = 120.0
 
-# Polygon Mainnet Chainlink AggregatorV3 contract addresses.
+# Polygon Mainnet Chainlink proxy addresses — used only for HTTP latestRoundData() seed.
 # Must match exactly what Polymarket settlement contracts read at expiry.
 _CL_CONTRACTS: dict[str, str] = {
     "BTC":  "0xc907E116054Ad103354f2D350FD2514433D57F6f",
@@ -83,9 +97,20 @@ _CL_CONTRACTS: dict[str, str] = {
     "DOGE": "0xbaf9327b6564454F4a3364C33eFeEf032b4b4444",
 }
 
-# Reverse map: lowercase address → coin label, for O(1) lookup in event handler.
-_ADDR_TO_COIN: dict[str, str] = {
-    addr.lower(): coin for coin, addr in _CL_CONTRACTS.items()
+# Underlying OCR2 aggregator addresses — NewTransmission events are emitted here,
+# NOT on the proxy.  Resolved via aggregator() (selector 0x245a7bfc) on each proxy.
+_CL_AGGREGATORS: dict[str, str] = {
+    "BTC":  "0x014497a2aef847c7021b17bff70a68221d22aa63",
+    "ETH":  "0x63db7e86391f5d31bab58808bcf75edb272f4f5c",
+    "SOL":  "0x35b19a67a41282e39c32650b863f714eb95dacf5",
+    "XRP":  "0x8d5e29ff3b3f55d58abb165ea9ce3886c0a43fc7",
+    "BNB":  "0x30395df79a543a2308ab0668661fcefc229a19b2",
+    "DOGE": "0x2aebe03d31e904ade377f651f9a75519d5d61135",
+}
+
+# Reverse map: lowercase aggregator address → coin label, for O(1) lookup in event handler.
+_AGG_TO_COIN: dict[str, str] = {
+    addr.lower(): coin for coin, addr in _CL_AGGREGATORS.items()
 }
 
 
@@ -94,8 +119,9 @@ class ChainlinkWSClient:
     Event-driven Chainlink oracle feed via WebSocket eth_subscribe.
 
     Connects to a Polygon WebSocket JSON-RPC endpoint (POLYGON_WS_URL) and
-    subscribes to AnswerUpdated log events for all tracked AggregatorV3 contracts
-    in a single filter.  Callbacks fire within milliseconds of block inclusion —
+    subscribes to AnswerUpdated log events from all tracked OCR2 aggregators
+    in a single filter. Events come from the underlying aggregator, not the proxy.
+    Callbacks fire within milliseconds of block inclusion —
     no polling interval, no artificial latency.
 
     On first connect and every reconnect, the current oracle state is seeded via
@@ -235,12 +261,13 @@ class ChainlinkWSClient:
     async def _ws_loop(self) -> None:
         """Persistent WebSocket subscription to AnswerUpdated events.
 
-        A single eth_subscribe filter covers all 6 contract addresses.
+        A single eth_subscribe filter covers all 6 OCR2 aggregator addresses.
+        (AnswerUpdated is emitted by the aggregator, not the proxy.)
         Reconnects with exponential backoff; reseeds prices via HTTP on each
         reconnect to close any gap in coverage.
         """
         backoff = 1.0
-        addresses = [addr.lower() for addr in _CL_CONTRACTS.values()]
+        addresses = [addr.lower() for addr in _CL_AGGREGATORS.values()]
         sub_request = json.dumps({
             "jsonrpc": "2.0",
             "id": 1,
@@ -275,9 +302,9 @@ class ChainlinkWSClient:
                         )
 
                     log.info(
-                        "ChainlinkWSClient: subscribed to AnswerUpdated",
+                        "ChainlinkWSClient: subscribed to AnswerUpdated (from OCR2 aggregators)",
                         sub_id=sub_id,
-                        contracts=len(addresses),
+                        aggregators=len(addresses),
                     )
 
                     # Reseed on reconnect — catches rounds emitted while WS was down.
@@ -321,7 +348,7 @@ class ChainlinkWSClient:
               "params": {
                 "subscription": "0x...",
                 "result": {
-                  "address": "0x<contract>",
+                  "address": "0x<ocr2_aggregator>",
                   "topics": [
                     "0x0559884f...",   # AnswerUpdated event signature
                     "0x<int256>",      # indexed current (price, signed)
@@ -341,7 +368,7 @@ class ChainlinkWSClient:
             return
 
         address = result.get("address", "").lower()
-        coin = _ADDR_TO_COIN.get(address)
+        coin = _AGG_TO_COIN.get(address)
         if coin is None:
             return
 
@@ -366,7 +393,7 @@ class ChainlinkWSClient:
             return
 
         if price <= 0:
-            log.warning("ChainlinkWSClient: non-positive price in event", coin=coin, price=price)
+            log.warning("ChainlinkWSClient: non-positive price", coin=coin, price=price)
             return
 
         snap = SpotPrice(coin=coin, price=price, timestamp=time.time())

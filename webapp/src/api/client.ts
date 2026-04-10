@@ -723,6 +723,8 @@ export interface MomentumDiagnosticMarket {
   // Optional extras
   cooldown_remaining_s?: number | null;
   dist_to_band?: number | null;
+  strike?: number | null;           // recorded window-open spot (Up/Down) or title-parsed strike
+  spot?: number | null;             // live oracle spot at scan time
 }
 
 export interface MomentumDiagnosticsResponse {

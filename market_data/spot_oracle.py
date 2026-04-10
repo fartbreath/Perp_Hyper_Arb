@@ -4,28 +4,33 @@ market_data/spot_oracle.py — Unified spot oracle facade.
 Routes get_mid / get_spot / get_spot_age calls to the correct price source
 based on market type and underlying, matching Polymarket's actual settlement logic.
 
-    bucket_5m / bucket_15m / bucket_4h, all coins   →  freshest of RTDSClient chainlink relay
-                                                        + ChainlinkWSClient (HTTP-seeded fallback)
-    all other bucket types                           →  RTDSClient (exchange-aggregated)
+    bucket_5m / bucket_15m / bucket_4h
+      non-HYPE  →  freshest of: ChainlinkWSClient (on-chain Polygon AnswerUpdated)
+                                 + RTDSClient crypto_prices_chainlink relay
+      HYPE      →  freshest of: RTDSClient crypto_prices_chainlink relay
+                                 + ChainlinkStreamsClient (if API key configured)
+    all other bucket types  →  RTDSClient exchange-aggregated
 
 Oracle sources by coin × market type:
-  - ALL coins on 5m/15m/4h: RTDSClient crypto_prices_chainlink relay is the primary
-    live feed (Polymarket's own Chainlink Data Streams push, ~1 tick/sec per coin).
-    ChainlinkWSClient provides an HTTP-seeded price baseline (latestRoundData() on
-    startup) that fills in until RTDS chainlink delivers its first tick, and
-    thereafter acts as a warm backup.  The fresher timestamp always wins.
-  - HYPE on 5m/15m/4h additionally races against ChainlinkStreamsClient when keys
-    are configured (direct Data Streams WebSocket, sub-millisecond latency).
+  - Non-HYPE coins on 5m/15m/4h: three-way freshest-wins race:
+      1. ChainlinkWSClient — direct on-chain Polygon AnswerUpdated events, no API key
+         required.  Seeds via HTTP latestRoundData() on start/reconnect; thereafter
+         driven by eth_subscribe log events.  Requires a WebSocket-capable Polygon
+         RPC endpoint (set POLYGON_WS_URL).  Free public endpoints (publicnode) do
+         not deliver eth_subscribe log events; use a paid endpoint (Alchemy/Infura)
+         for live WS events.  HTTP seed provides a valid price baseline regardless.
+      2. RTDSClient crypto_prices_chainlink relay — Polymarket's own Data Streams
+         push, ~1 tick/sec.  No API key required.
+      The fresher timestamp always wins.  If ChainlinkWSClient has no live WS events
+      (e.g. free endpoint), its seed timestamp rapidly ages out and RTDS relay wins.
+  - HYPE on 5m/15m/4h: RTDS relay vs ChainlinkStreamsClient (direct Data Streams
+    WebSocket, requires CHAINLINK_DS_* env vars; gracefully disabled if unset).
   - All coins on 1h/daily/weekly: RTDSClient exchange-aggregated prices.
-
-Note: ChainlinkWSClient's eth_subscribe path is unreliable on public RPC endpoints
-(publicnode delivers zero log events).  RTDS chainlink relay is the confirmed working
-primary for all Chainlink-oracle coins.
 
 Callers register callbacks via:
   on_chainlink_update(cb)   — fires on every event from ChainlinkWSClient (non-HYPE
-                              Chainlink coins) AND RTDSClient chainlink relay (HYPE)
-                              AND ChainlinkStreamsClient (HYPE direct stream).
+                              Chainlink coins) AND RTDSClient chainlink relay (all
+                              coins) AND ChainlinkStreamsClient (HYPE direct stream).
   on_rtds_update(cb)        — fires on every RTDS exchange-aggregated tick.
 
 CHAINLINK_MARKET_TYPES is the single canonical definition of which market types
@@ -105,19 +110,28 @@ class SpotOracle:
     # ── Chainlink dual-feed arbiter (all coins) ───────────────────────────────
 
     def _get_chainlink_spot(self, coin: str) -> Optional[SpotPrice]:
-        """Chainlink price for `coin` from live WebSocket feeds only.
+        """Chainlink price for `coin` — freshest-wins across all available sources.
 
-        Sources (freshest timestamp wins):
-          - RTDSClient crypto_prices_chainlink relay — primary for all coins.
-          - ChainlinkStreamsClient — HYPE only, races with RTDS relay.
+        Sources tried (all non-None candidates; winner = latest timestamp):
+          - ChainlinkWSClient    — on-chain Polygon AnswerUpdated events (non-HYPE).
+                                   HTTP-seeded on start; WS events require a paid
+                                   Polygon WSS endpoint (POLYGON_WS_URL).  Seed
+                                   timestamp ages out quickly if WS is silent.
+          - RTDSClient relay     — Polymarket's Data Streams push for all coins.
+          - ChainlinkStreamsClient — HYPE only, direct Data Streams (API key needed).
         """
         rtds_snap = self._rtds.get_chainlink_spot(coin)
+        # On-chain Polygon AggregatorV3 — covers BTC/ETH/SOL/XRP/BNB/DOGE.
+        # HYPE has no AggregatorV3 on Polygon; skip to avoid stale seed wins.
+        cl_ws_snap = self._cl.get_spot(coin) if coin != "HYPE" else None
+        # Direct Data Streams feed — HYPE only, optional (API key required).
         streams_snap = (
             self._streams.get_spot(coin) if self._streams and coin == "HYPE" else None
         )
-        if rtds_snap is not None and streams_snap is not None:
-            return rtds_snap if rtds_snap.timestamp >= streams_snap.timestamp else streams_snap
-        return rtds_snap if rtds_snap is not None else streams_snap
+        candidates = [s for s in (rtds_snap, cl_ws_snap, streams_snap) if s is not None]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda s: s.timestamp)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -128,7 +142,7 @@ class SpotOracle:
 
         Fires on:
           - AnswerUpdated events for BTC/ETH/SOL/XRP/BNB/DOGE (ChainlinkWSClient)
-          - crypto_prices_chainlink RTDS relay for HYPE (RTDSClient)
+          - crypto_prices_chainlink RTDS relay for all coins including HYPE (RTDSClient)
           - Direct Data Streams reports for HYPE (ChainlinkStreamsClient, if enabled)
         """
         self._cl.on_price_update(callback)

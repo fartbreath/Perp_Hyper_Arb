@@ -364,9 +364,17 @@ class LiveFillHandler:
         # (same as YES/NO), so the side-to-token mapping must treat "UP" like
         # "YES" and "DOWN" like "NO".  Getting this wrong causes the duplicate
         # check below to miss existing UP positions and import a ghost YES copy.
+        #
+        # Also track market_ids of CLOSED positions.  PM wallet retains won
+        # tokens until they are manually redeemed.  Without this set, the
+        # reconciler would re-import the already-settled position, the monitor
+        # would immediately re-close it, and a duplicate trade row would be
+        # written to trades.csv.
         bot_by_token: dict[str, object] = {}
+        closed_market_ids: set[str] = set()
         for pos in self._risk.get_positions().values():
             if pos.is_closed:
+                closed_market_ids.add(pos.market_id)
                 continue
             mkt = self._pm.get_markets().get(pos.market_id)
             if mkt:
@@ -397,6 +405,17 @@ class LiveFillHandler:
                 log.warning(
                     "Reconciliation: found wallet position for unknown market",
                     token_id=token_id[:24],
+                )
+                continue
+
+            # Skip already-closed markets.  PM wallet retains won tokens until
+            # they are redeemed; without this guard the reconciler would
+            # re-import the settled position, the monitor would close it again
+            # immediately, and a duplicate trade row would appear in trades.csv.
+            if market.condition_id in closed_market_ids:
+                log.debug(
+                    "Reconciliation: skipping already-closed market",
+                    market=market.title[:60],
                 )
                 continue
 

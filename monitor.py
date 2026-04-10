@@ -649,7 +649,9 @@ class PositionMonitor:
                 continue  # Oracle still pending — nothing to do yet
 
             size = float(pos_data.get("size", 0) or 0)
-            cur_price = float(pos_data.get("currentPrice") or 0)
+            cur_price = float(
+                pos_data.get("curPrice") or pos_data.get("currentPrice") or pos_data.get("cur_price") or 0
+            )
             payout = round(size * cur_price, 4)
             title = pos_data.get("title") or token_id[:20]
             condition_id: str = pos_data.get("conditionId") or pos_data.get("condition_id") or ""
@@ -662,6 +664,18 @@ class PositionMonitor:
                     token_id=token_id[:20],
                     title=title[:60],
                 )
+                # Close in risk engine so the position is removed and recorded as LOSS
+                if condition_id:
+                    markets_snap = self._pm.get_markets()
+                    for mkt in markets_snap.values():
+                        if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
+                            for rp in list(self._risk.get_positions().values()):
+                                if rp.market_id == mkt.condition_id and not rp.is_closed:
+                                    self._risk.close_position(
+                                        mkt.condition_id, exit_price=0.0, side=rp.side,
+                                        resolved_outcome="LOSS",
+                                    )
+                            break
                 continue
 
             if not condition_id:
@@ -989,8 +1003,12 @@ class PositionMonitor:
                 )
                 exit_flag, reason = False, ""
         else:
-            # Reset counter whenever delta is back above threshold
-            self._delta_sl_ticks.pop(pos.market_id, None)
+            # Only reset counter when we had a valid spot reading that did NOT
+            # trigger the SL — meaning delta genuinely recovered above threshold.
+            # If current_spot is None (oracle temporarily unavailable) we leave
+            # the counter in place so a brief data gap can't clear a pending SL.
+            if current_spot is not None and pos.strike > 0:
+                self._delta_sl_ticks.pop(pos.market_id, None)
 
         # Write every intra-hold price check to momentum_ticks.csv for momentum
         # positions. Kept out of bot.log to avoid noise; the dedicated CSV is

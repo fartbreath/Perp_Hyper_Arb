@@ -1138,9 +1138,15 @@ class PMClient:
         price: float,
         size: float,
         market: Optional[PMMarket] = None,
+        post_only: bool = True,
     ) -> Optional[str]:
         """
-        Place a post-only limit order.  Returns order_id on success, None on failure.
+        Place a GTC limit order.  Returns order_id on success, None on failure.
+
+        post_only=True  (default): maker-only — rejected if it would cross the book.
+            The "crosses book" retry backs off one tick so the order rests passively.
+        post_only=False: taker limit — crosses the spread immediately for a fast fill.
+            No retry logic; if the order is rejected the caller gets None.
 
         Always fetches feeRateBps dynamically (NEVER uses a hardcoded value).
         """
@@ -1162,14 +1168,17 @@ class PMClient:
                 size=size,
                 side=side,
             )
-            # post_only ensures we're always a maker (order rejected if it would cross)
             # NOTE: post_only goes to post_order(), NOT create_order() — passing a dict
             # to create_order(options=) causes "'dict' object has no attribute 'tick_size'"
             signed = self._clob.create_order(order_args)
-            resp = self._clob.post_order(signed, OrderType.GTC, post_only=True)
+            # Taker orders (post_only=False) use FAK so any unfilled remainder is
+            # immediately cancelled rather than resting as a passive maker bid.
+            order_type_enum = OrderType.GTC if post_only else OrderType.FAK
+            resp = self._clob.post_order(signed, order_type_enum, post_only=post_only)
             order_id = resp.get("orderID")
             log.info("Limit order posted", token_id=token_id, side=side,
-                     price=rounded_price, size=size, order_id=order_id)
+                     price=rounded_price, size=size, post_only=post_only,
+                     order_type=order_type_enum, order_id=order_id)
             if order_id:
                 _append_order_event(
                     order_id=order_id,
@@ -1177,19 +1186,17 @@ class PMClient:
                     side=side,
                     price=rounded_price,
                     size=size,
-                    order_type="limit",
+                    order_type="limit_taker_fak" if not post_only else "limit",
                     action="placed",
                     market_id=market.condition_id if market else "",
                 )
             return order_id
         except Exception as exc:
             exc_str = str(exc)
-            # "crosses book" means our post-only price would immediately fill.
-            # Back off one tick (away from the inside) and retry once before giving up.
-            # This is a safety net — _deploy_quote now pre-checks the NO book, so this
-            # path should only be reached on rare race conditions (book moved between
-            # the check and the actual POST).
-            if "crosses book" in exc_str and tick > 0:
+            # "crosses book" only applies to post_only orders: a taker limit at a
+            # crossing price is valid and fills immediately — no retry needed.
+            if post_only and "crosses book" in exc_str and tick > 0:
+                # Back off one tick (away from the inside) and retry once.
                 retry_price = self._round_to_tick(
                     rounded_price - tick if side == "BUY" else rounded_price + tick, tick
                 )
