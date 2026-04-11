@@ -112,6 +112,8 @@ _CL_AGGREGATORS: dict[str, str] = {
 _AGG_TO_COIN: dict[str, str] = {
     addr.lower(): coin for coin, addr in _CL_AGGREGATORS.items()
 }
+# Legacy alias kept for backward compatibility with test imports.
+_ADDR_TO_COIN = _AGG_TO_COIN
 
 
 class ChainlinkWSClient:
@@ -398,6 +400,43 @@ class ChainlinkWSClient:
 
         snap = SpotPrice(coin=coin, price=price, timestamp=time.time())
         self._prices[coin] = snap
+
+        # ── Phase C: boundary tick logging ────────────────────────────────────
+        # Extract on-chain updatedAt from the event's `data` field (raw uint256).
+        try:
+            _data_hex = result.get("data", "0x")
+            _updated_at_onchain: Optional[float] = None
+            if _data_hex and len(_data_hex) >= 2:
+                _raw = int.from_bytes(
+                    bytes.fromhex(_data_hex.removeprefix("0x").zfill(64)),
+                    byteorder="big",
+                    signed=False,
+                )
+                if _raw > 0:
+                    _updated_at_onchain = float(_raw)
+        except (ValueError, AttributeError):
+            _updated_at_onchain = None
+
+        # Detect ticks landing within [-15 s, +5 s] of Chainlink round boundaries
+        # (bucket_5m=300 s, bucket_15m=900 s, bucket_4h=14400 s).
+        _local_ts = snap.timestamp
+        for _period_s in (300, 900, 14400):
+            _last_boundary = (_local_ts // _period_s) * _period_s
+            _secs_after = _local_ts - _last_boundary
+            _secs_before_next = _period_s - _secs_after
+            if _secs_after <= 5.0 or _secs_before_next <= 15.0:
+                log.info(
+                    "CL_BOUNDARY_TICK",
+                    coin=coin,
+                    price=round(price, 6),
+                    period_s=_period_s,
+                    secs_after_boundary=round(_secs_after, 3),
+                    secs_before_next=round(_secs_before_next, 3),
+                    local_ts=round(_local_ts, 3),
+                    onchain_updated_at=_updated_at_onchain,
+                )
+                break
+
         log.debug("ChainlinkWSClient: AnswerUpdated", coin=coin, price=round(price, 6))
 
         for cb in self._callbacks:

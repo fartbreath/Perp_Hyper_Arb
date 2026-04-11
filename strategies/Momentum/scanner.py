@@ -49,6 +49,7 @@ See MomentumStrategy.md for full specification.
 from __future__ import annotations
 
 import asyncio
+import collections
 import csv
 import json
 import math
@@ -177,6 +178,24 @@ class MomentumScanner(BaseStrategy):
         # blocked until the market's remaining TTE expires to prevent compounding losses.
         # key: condition_id  value: unix timestamp at which the block lifts
         self._stop_loss_blocked: dict[str, float] = {}
+        # Tracks the Unix timestamp when each market's signal first continuously cleared
+        # all gates.  Used to compute signal_valid_since_ts on MomentumSignal objects,
+        # which feeds the Kelly persistence z-boost.
+        # key: condition_id  value: unix timestamp of first valid pass
+        # Phase P3: persist to disk so the persistence clock survives bot restarts.
+        self._signal_first_valid_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "data", "signal_first_valid.json"
+        )
+        self._signal_first_valid: dict[str, float] = _load_cooldowns(
+            self._signal_first_valid_path
+        )
+        # Rolling intra-bucket spot history per underlying coin.
+        # Populated by _on_spot_update_entry on every RTDS / Chainlink tick.
+        # Used by _compute_bucket_intra_sigma to estimate realised vol within the bucket.
+        # maxlen = 300 s worth of ~1 Hz ticks — enough for any bucket type.
+        self._spot_mid_history: dict[str, collections.deque] = collections.defaultdict(
+            lambda: collections.deque(maxlen=300)
+        )
         # Open-spot cache for "Up or Down" directional markets.
         # key: condition_id  value: RTDS spot price at the moment the window opened.
         # Persisted to disk so restarts don't lose recorded opens mid-window.
@@ -201,6 +220,14 @@ class MomentumScanner(BaseStrategy):
         self._vol_prefetch_task: Optional[asyncio.Task] = None
         # Throttle: last unix timestamp we emitted a log.info for started markets.
         self._last_live_log_ts: float = 0.0
+        # Phase E: empirical win-rate table for win-rate gate.
+        # Loaded once at startup; None if data files missing or insufficient.
+        self._win_rate: Any = None
+        try:
+            from strategies.Momentum.win_rate import WinRateTable as _WRT
+            self._win_rate = _WRT()
+        except Exception:
+            pass  # no fills/trades data yet — Phase E gate skipped until available
 
     # ── BaseStrategy interface ────────────────────────────────────────────────
 
@@ -387,11 +414,13 @@ class MomentumScanner(BaseStrategy):
         skipped_no_strike = 0
         skipped_delta = 0
         skipped_tte = 0
+        skipped_too_early = 0    # Phase C: elapsed-time guard
         skipped_duplicate = 0
         skipped_depth = 0
         skipped_vol = 0
         skipped_cooldown = 0
         skipped_cap = 0
+        skipped_win_rate = 0     # Phase E: empirical win-rate gate
         skipped_beyond_horizon = 0
         skipped_not_started = 0
 
@@ -807,6 +836,22 @@ class MomentumScanner(BaseStrategy):
                 scan_diags.append(_d)
                 continue
 
+            # ── Gate: minimum elapsed time since market open ───────────────────
+            # Guards against early-market thin-book entries where spot/strike gaps
+            # may be real but the bid stack is not yet established.  Per-type via
+            # MOMENTUM_MIN_ELAPSED_SECONDS; 0 = disabled (no cost when empty dict).
+            _min_elapsed = config.MOMENTUM_MIN_ELAPSED_SECONDS.get(market.market_type, 0)
+            if _min_elapsed > 0:
+                _mkt_dur = _MARKET_TYPE_DURATION_SECS.get(market.market_type, 0)
+                _elapsed_s = _mkt_dur - tte_seconds
+                _d["elapsed_s"] = round(_elapsed_s, 1)
+                if _elapsed_s < _min_elapsed:
+                    skipped_too_early += 1
+                    self._signal_first_valid.pop(market.condition_id, None)
+                    _d["skip_reason"] = "too_early"
+                    scan_diags.append(_d)
+                    continue
+
             # ── Gate: delta must exceed threshold ────────────────────────────
             # max() enforces an absolute floor independent of time bucket.
             # The floor guards against tick risk: if the spot-to-strike gap is
@@ -816,6 +861,9 @@ class MomentumScanner(BaseStrategy):
             # 1h market; the absolute price distance determines survival, not TTE.
             if delta_pct < _effective_threshold:
                 skipped_delta += 1
+                # Signal dropped below threshold — reset persistence clock so a
+                # future re-entry starts fresh.
+                self._signal_first_valid.pop(market.condition_id, None)
                 _d["skip_reason"] = "delta_below_threshold"
                 scan_diags.append(_d)
                 continue
@@ -826,6 +874,8 @@ class MomentumScanner(BaseStrategy):
             _min_gap = config.MOMENTUM_MIN_GAP_PCT
             if _min_gap > 0 and (delta_pct - _effective_threshold) < _min_gap:
                 skipped_delta += 1
+                # Gap insufficient — also reset persistence (same logic as delta miss).
+                self._signal_first_valid.pop(market.condition_id, None)
                 _d["skip_reason"] = "gap_below_minimum"
                 scan_diags.append(_d)
                 continue
@@ -912,12 +962,41 @@ class MomentumScanner(BaseStrategy):
                 vol_source=vol_src,
                 vol_z_score=_vol_z,
             )
+            # ── Populate Phase-A path-history fields ─────────────────────────
+            # signal_valid_since_ts: first time this market's signal cleared all gates.
+            _fv_key = market.condition_id
+            if _fv_key not in self._signal_first_valid:
+                self._signal_first_valid[_fv_key] = now_ts
+            signal.signal_valid_since_ts = self._signal_first_valid[_fv_key]
+            # bucket_intra_sigma: realised annualised vol from recent ticks (may be None).
+            _mid_hist = list(self._spot_mid_history.get(market.underlying, []))
+            signal.bucket_intra_sigma = _compute_bucket_intra_sigma(_mid_hist)
             # ── Kelly sizing preview for diagnostics ─────────────────────
             # Compute Kelly fields now so the webapp diagnostics row for this
             # signal shows the full sizing breakdown, not just whether it fired.
             _range_max_entry = config.MOMENTUM_RANGE_MAX_ENTRY_USD if _is_range else None
             _kelly_size_preview, _kelly_preview_debug = _compute_kelly_size_usd(signal, max_entry_usd=_range_max_entry)
             _d.update(_kelly_preview_debug)
+
+            # ── Gate: empirical win-rate (Phase E) ───────────────────────────
+            # Compare empirical win rate from historical fills to the model's
+            # Kelly win_prob.  Gate fires when emp_wr < model_wr * MIN_FACTOR.
+            # Only active when MOMENTUM_WIN_RATE_GATE_ENABLED and win-rate table
+            # has ≥ MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES fills in the bucket.
+            if config.MOMENTUM_WIN_RATE_GATE_ENABLED and self._win_rate is not None:
+                _emp_wr = self._win_rate.get(
+                    market.market_type, token_price, tte_seconds
+                )
+                _model_wr: float = _kelly_preview_debug["kelly_win_prob"]
+                if _emp_wr is not None and _emp_wr < _model_wr * config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR:
+                    skipped_win_rate += 1
+                    self._signal_first_valid.pop(market.condition_id, None)
+                    _d["skip_reason"] = "win_rate_gate"
+                    _d["emp_win_rate"] = round(_emp_wr, 4)
+                    _d["model_win_rate"] = round(_model_wr, 4)
+                    scan_diags.append(_d)
+                    continue
+
             _d["skip_reason"] = "signal_fired"
             scan_diags.append(_d)
             log.info(
@@ -934,6 +1013,9 @@ class MomentumScanner(BaseStrategy):
             # per second while the async order-placement coroutine is awaited.
             self._market_cooldown[f"{market.condition_id}:{high_side}"] = now_ts
             _save_cooldowns(self._cooldown_path, self._market_cooldown)
+            # Reset persistence clock — once we've entered the market, the next
+            # signal for the same condition_id should start a fresh persistence window.
+            self._signal_first_valid.pop(market.condition_id, None)
             executed = await self._execute_signal(signal, market)
             if executed:
                 signals_fired += 1
@@ -965,11 +1047,13 @@ class MomentumScanner(BaseStrategy):
             skipped_no_strike=skipped_no_strike,
             skipped_delta=skipped_delta,
             skipped_tte=skipped_tte,
+            skipped_too_early=skipped_too_early,
             skipped_duplicate=skipped_duplicate,
             skipped_depth=skipped_depth,
             skipped_vol=skipped_vol,
             skipped_cooldown=skipped_cooldown,
             skipped_cap=skipped_cap,
+            skipped_win_rate=skipped_win_rate,
         )
         # Persist diags for /momentum/diagnostics — no vol re-calls needed.
         self._last_scan_diags = scan_diags
@@ -984,13 +1068,18 @@ class MomentumScanner(BaseStrategy):
             "skipped_no_strike":       skipped_no_strike,
             "skipped_delta":           skipped_delta,
             "skipped_tte":             skipped_tte,
+            "skipped_too_early":       skipped_too_early,
             "skipped_duplicate":       skipped_duplicate,
             "skipped_depth":           skipped_depth,
             "skipped_vol":             skipped_vol,
             "skipped_cooldown":        skipped_cooldown,
             "skipped_cap":             skipped_cap,
+            "skipped_win_rate":        skipped_win_rate,
         }
         self._last_scan_ts = now_ts
+
+        # Phase P3: persist signal_first_valid to survive bot restarts.
+        _save_cooldowns(self._signal_first_valid_path, self._signal_first_valid)
 
         # ── Scanner log: started markets (throttled to once per minute) ──────
         # "Started" = passed the horizon + not_started gates (i.e. market is
@@ -1080,6 +1169,9 @@ class MomentumScanner(BaseStrategy):
         """
         if not config.STRATEGY_MOMENTUM_ENABLED or not config.BOT_ACTIVE:
             return
+        # Record every tick for intra-bucket realised vol computation.
+        if price > 0:
+            self._spot_mid_history[coin].append(price)
         for mkt in self._token_to_market.values():
             if mkt.underlying == coin:
                 self._scan_event.set()
@@ -1303,6 +1395,39 @@ class MomentumScanner(BaseStrategy):
         )
         self._risk.open_position(pos)
 
+        # ── Phase D: GTD hedge ────────────────────────────────────────────────
+        # Place a GTC maker limit BUY on the opposite token at HEDGE_PRICE.
+        # If the held token loses (→ $0), the opposite token resolves at $1.00.
+        # A resting bid at $0.02 may fill in the secondary market before expiry.
+        # Cost ≈ entry_size × HEDGE_PRICE ≈ 2–3 % of entry_cost_usd.
+        if config.MOMENTUM_HEDGE_ENABLED:
+            _opp_token = (
+                market.token_id_no
+                if signal.side in ("YES", "UP")
+                else market.token_id_yes
+            )
+            _hedge_cost_usd = round(entry_size * config.MOMENTUM_HEDGE_PRICE, 4)
+            try:
+                _hedge_id = await self._pm.place_limit(
+                    token_id=_opp_token,
+                    side="BUY",
+                    price=config.MOMENTUM_HEDGE_PRICE,
+                    size=_hedge_cost_usd,
+                    market=market,
+                    post_only=True,
+                )
+            except Exception as _hex:
+                _hedge_id = None
+                log.warning("Momentum: GTD hedge error", exc=str(_hex))
+            if _hedge_id:
+                log.info(
+                    "Momentum: GTD hedge placed",
+                    hedge_order_id=_hedge_id[:20],
+                    opp_token=_opp_token[:16],
+                    hedge_price=config.MOMENTUM_HEDGE_PRICE,
+                    hedge_cost_usd=_hedge_cost_usd,
+                )
+
         # ── Write momentum fills CSV for execution-quality analysis ──────────
         try:
             _ensure_momentum_fills_csv()
@@ -1414,6 +1539,45 @@ def _save_cooldowns(path: str, cache: dict[str, float]) -> None:
         pass  # non-critical — cooldown continues in-memory; only loses persistence on restart
 
 
+def _compute_bucket_intra_sigma(
+    mid_prices: list[float],
+    *,
+    min_samples: int = 10,
+) -> float | None:
+    """Compute intra-bucket realised annualised volatility from a list of mid prices.
+
+    Uses log-return standard deviation scaled to 1-year.  Assumes the prices were
+    sampled at 1-second intervals (consistent with RTDS / Chainlink tick rate).
+
+    Returns None if fewer than `min_samples` prices are available so callers can
+    fall back to the Deribit/HL sigma_ann without masking a data gap.
+
+    Args:
+        mid_prices: Ordered list of recent spot mid prices (oldest first).
+        min_samples: Minimum number of prices required (default 10).
+
+    Returns:
+        Annualised σ as a float, or None if insufficient data.
+    """
+    if len(mid_prices) < min_samples:
+        return None
+    import math as _math
+    log_returns = [
+        _math.log(mid_prices[i] / mid_prices[i - 1])
+        for i in range(1, len(mid_prices))
+        if mid_prices[i - 1] > 0 and mid_prices[i] > 0
+    ]
+    if len(log_returns) < min_samples - 1:
+        return None
+    n = len(log_returns)
+    mean = sum(log_returns) / n
+    variance = sum((r - mean) ** 2 for r in log_returns) / max(n - 1, 1)
+    sigma_per_second = variance ** 0.5
+    # Annualise: √(seconds_per_year) = √31_536_000 ≈ 5615.7
+    sigma_ann = sigma_per_second * (31_536_000 ** 0.5)
+    return sigma_ann
+
+
 def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | None = None) -> tuple[float, dict]:
     """Compute position size in USD using fractional Kelly Criterion.
 
@@ -1462,17 +1626,47 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     # σ_τ = σ_ann × √(TTE_seconds / one_year_seconds)
     # Floor at 1 s so TTE → 0 near expiry doesn't collapse sigma_tau to 0
     # and send observed_z_total to +∞ (which would always return MAX_ENTRY).
-    sigma_tau = signal.sigma_ann * math.sqrt(max(signal.tte_seconds, 1.0) / 31_536_000)
+    # TTE floor — prevent sigma_tau collapsing near expiry and sending z → ∞,
+    # which would always return MAX_ENTRY regardless of signal strength.
+    # Use the same bucket-aware floor that gates entry (MOMENTUM_MIN_TTE_SECONDS).
+    _min_tte_floor = float(
+        config.MOMENTUM_MIN_TTE_SECONDS.get(
+            signal.market_type,
+            config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT,
+        )
+    )
+    tte_eff = max(signal.tte_seconds, _min_tte_floor)
+
+    # Effective annualised sigma — fall back to intra-bucket realized vol when:
+    #   (a) the feature flag is on, and
+    #   (b) we have enough ticks to compute it (not None), and
+    #   (c) it implies a wider distribution (i.e. is larger than sigma_ann).
+    # Taking max() is conservative: it admits the higher uncertainty estimate,
+    # which lowers z → lowers win_prob → smaller Kelly size (anti-overfit).
+    if config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED and signal.bucket_intra_sigma is not None:
+        sigma_eff = max(signal.sigma_ann, signal.bucket_intra_sigma)
+    else:
+        sigma_eff = signal.sigma_ann
+
+    sigma_tau = sigma_eff * math.sqrt(tte_eff / 31_536_000)
 
     # Win probability: P(underlying finishes in-the-money at expiry).
     # z = delta_pct / (sigma_tau * 100) — how many remaining-window σ units
     # the spot is currently above (YES) or below (NO) the strike.
-    # Using the raw delta/sigma_tau directly is robust to any threshold config:
-    # VOL_Z_SCORE, MIN_DELTA_PCT, MIN_GAP_PCT all affect the gate but not the
-    # actual probability of the trade being in-the-money at settlement.
-    observed_z_total = signal.delta_pct / (sigma_tau * 100 + 1e-9)
+    observed_z_raw = signal.delta_pct / (sigma_tau * 100 + 1e-9)
+
+    # Persistence z-boost — reward signals that have been continuously valid
+    # for at least one full min-TTE window, up to MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX.
+    # Scales linearly from 0 (just fired) to max (held ≥ _min_tte_floor seconds).
+    _z_boost = 0.0
+    _persistence_pct = 0.0
+    if config.MOMENTUM_KELLY_PERSISTENCE_ENABLED and signal.signal_valid_since_ts > 0:
+        _elapsed = time.time() - signal.signal_valid_since_ts
+        _persistence_pct = min(1.0, _elapsed / max(_min_tte_floor, 1.0))
+        _z_boost = config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX * _persistence_pct
+
     # Cap at 6σ to prevent erf() overflow on very strong signals
-    observed_z_total = min(observed_z_total, 6.0)
+    observed_z_total = min(observed_z_raw + _z_boost, 6.0)
 
     # Model win probability: P(underlying finishes on the winning side)
     win_prob = 0.5 * (1.0 + math.erf(observed_z_total / math.sqrt(2.0)))
@@ -1500,6 +1694,13 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     )
 
     debug: dict = {
+        "kelly_tte_floor_s":  _min_tte_floor,
+        "kelly_tte_eff_s":    round(tte_eff, 1),
+        "kelly_sigma_eff":    round(sigma_eff, 6),
+        "kelly_intra_sigma":  round(signal.bucket_intra_sigma, 6) if signal.bucket_intra_sigma is not None else None,
+        "kelly_persistence_pct": round(_persistence_pct, 3),
+        "kelly_z_boost":      round(_z_boost, 4),
+        "kelly_z_before_boost": round(observed_z_raw, 4),
         "kelly_sigma_tau":    round(sigma_tau, 6),
         "kelly_z_total":      round(observed_z_total, 4),
         "kelly_win_prob":     round(win_prob, 4),

@@ -2,6 +2,176 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-11] - Phase B/B2/C/D/E + Kelly extensions: near-expiry oracle, hedging, win-rate gate
+
+### Phase B — Two-oracle near-expiry strategy (`monitor.py`, `spot_oracle.py`, `config.py`)
+
+**Problem:** The delta stop-loss and L2 oracle-vs-strike resolution path both used
+`SpotOracle.get_mid()` (freshest-wins between RTDS relay and AggregatorV3).  Near expiry
+the RTDS relay leads AggregatorV3 by up to ~15 s.  Polymarket's resolution contract calls
+`latestRoundData()` on AggregatorV3 — not the relay — so a brief sub-strike dip captured
+only by the relay can fire the SL even though AggregatorV3 (and therefore PM resolution)
+never saw it.
+
+**Fix:** New `SpotOracle.get_mid_resolution_oracle(underlying, market_type)` returns the
+ChainlinkWSClient AggregatorV3-only price for Chainlink market types (non-HYPE), falling
+back to `get_mid()` for HYPE and non-Chainlink types.
+
+New config flag `MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY` (default `True`).  When
+enabled:
+- Near-expiry delta SL (`tte_seconds < MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS`) uses
+  `get_mid_resolution_oracle()` instead of `get_mid()` so the SL matches PM's settlement.
+- RESOLVED exit L2 path uses the same AggregatorV3-only feed.
+
+**Caveat:** If PM's resolution bot itself uses the Data Streams relay in future, this fix
+would need to be revisited.  Cross-check `oracle_ticks.csv` against known resolved
+outcomes before disabling the flag.
+
+### Phase B2 — LiveFillHandler per-market state reset (`live_fill_handler.py`)
+
+**Problem:** `_matched_so_far` accumulated `{order_id: cumulative_fill_usd}` entries for
+the lifetime of the process.  On a busy session with many markets the dict grew without
+bound.  More critically, a late fill event from a previous market's WS recovery window
+could be misread as belonging to the current market if order IDs ever collided.
+
+**Fix:**
+- New reverse index `_cond_to_order_ids: dict[str, set[str]]` tracks which order IDs
+  belong to each condition ID.
+- New `reset_market_state(condition_id)` method atomically removes all associated
+  `_matched_so_far` entries when a market is closed/expired.
+- `startup_restore()` now skips tokens with `redeemable=True` **or** a settled
+  `cur_price` (≤ 0.01 or ≥ 0.99) — both categories are owned by
+  `_redeem_ready_positions()`.  Restoring them as open positions caused a duplicate
+  `trades.csv` row on every bot restart until they were redeemed on-chain.
+
+### Phase C — Minimum elapsed-time guard (`scanner.py`, `config.py`)
+
+New per-type dict `MOMENTUM_MIN_ELAPSED_SECONDS` (default empty → disabled).  When a
+bucket type has a value set (e.g. `{"bucket_5m": 30}`), entries fired before that many
+seconds have elapsed since market open are suppressed with `skip_reason="too_early"`.
+
+**Rationale:** Early-window entries face a thin order book with wide spreads and noisy
+initial ticks.  The elapsed-time guard gives the book time to stabilise before committing
+capital.  The persistence clock (`signal_first_valid`) is also reset so a re-entry after
+the guard window starts a fresh persistence accumulation.
+
+`skipped_too_early` counter added to scanner summary and diagnostics API.
+
+### Phase C (Chainlink) — Boundary tick logging (`market_data/chainlink_ws_client.py`)
+
+For every AggregatorV3 `AnswerUpdated` event that lands within **[-15 s, +5 s]** of a
+bucket boundary (300 s / 900 s / 14 400 s), a structured `CL_BOUNDARY_TICK` log entry
+is emitted at INFO level including:
+
+```
+coin, price, period_s, secs_after_boundary, secs_before_next, local_ts, onchain_updated_at
+```
+
+`onchain_updated_at` is decoded from the event `data` field (raw `uint256` epoch seconds),
+enabling post-hoc validation of whether the anchor was captured in the correct Chainlink
+round.  Also added `_ADDR_TO_COIN` legacy alias for backward-compatible test imports.
+
+### Phase D — GTD hedge (`scanner.py`, `config.py`)
+
+After a confirmed momentum entry, optionally place a GTC maker limit BUY on the
+**opposite** token at `MOMENTUM_HEDGE_PRICE` (default `$0.02`).
+
+**Economics:** A fill at $0.02 that redeems at $1.00 returns $0.98/contract.  If the
+held token loses, the opposite token resolves at $1.00, providing partial downside cover
+that requires no oracle knowledge.  Maximum hedge cost ≈ `entry_size × 0.02` ≈ 2–3 % of
+entry cost.
+
+**Config:**
+- `MOMENTUM_HEDGE_ENABLED` (default `True`) — master switch
+- `MOMENTUM_HEDGE_PRICE` (default `0.02`) — GTC bid price on the opposite token
+
+Hedge order is placed as `post_only=True` (maker).  Errors are logged at WARNING and do
+not abort the primary position.  Hedge order IDs are not tracked (GTC orders are
+self-managing and expire when the market closes).
+
+### Phase E — Empirical win-rate gate (`strategies/Momentum/win_rate.py`, `scanner.py`, `config.py`)
+
+New `WinRateTable` class (`win_rate.py`) builds a historical win-rate matrix from
+`data/trades.csv` bucketed by `(market_type, price_band_5ct, time_bin_per_minute)`.
+Loaded once at scanner startup; silently disabled if the data file is missing or has
+insufficient fills.
+
+**Gate logic:** If `MOMENTUM_WIN_RATE_GATE_ENABLED` is `True` and the win-rate table
+has ≥ `MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES` fills in a bucket, an entry is suppressed
+when `empirical_win_rate < model_win_prob × MOMENTUM_WIN_RATE_GATE_MIN_FACTOR`.
+
+**Config:**
+- `MOMENTUM_WIN_RATE_GATE_ENABLED` (default `False`) — disabled until ≥ 100 fills/bucket
+- `MOMENTUM_WIN_RATE_GATE_MIN_FACTOR` (default `0.9`) — empirical WR must be ≥ 90 % of model WR
+- `MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES` (default `10`) — minimum samples before gate activates
+
+`skipped_win_rate` counter added to scanner summary.  Diagnostics fields `emp_win_rate`
+and `model_win_rate` written to scan_diags when the gate fires.
+
+### Kelly extensions: intra-sigma + persistence z-boost (`scanner.py`, `signal.py`, `config.py`)
+
+Two optional extensions to the Kelly sizing formula:
+
+**Intra-bucket realised sigma** (`MOMENTUM_KELLY_INTRA_SIGMA_ENABLED`, default `True`):
+- Rolling `_spot_mid_history` deque (maxlen 300) records every RTDS/Chainlink tick per
+  underlying coin.  `_compute_bucket_intra_sigma()` returns the annualised realised vol
+  from the recent tick history.
+- Kelly uses `max(sigma_ann, bucket_intra_sigma)` so elevated intra-bucket vol
+  (e.g. after a sudden move) is captured even if the historical annual sigma is low.
+
+**Persistence z-boost** (`MOMENTUM_KELLY_PERSISTENCE_ENABLED`, default `True`):
+- `signal_first_valid` tracks the Unix timestamp when each market's signal first
+  continuously cleared all gates.  Persisted to `data/signal_first_valid.json` so the
+  clock survives bot restarts.
+- `MomentumSignal.signal_valid_since_ts` exposes the clock to `_compute_kelly_size_usd()`.
+- A z-boost up to `MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX` (default `0.5`) is blended in
+  as the signal ages, rewarding durable edge vs. brief transient spikes.
+
+**New `MomentumSignal` fields:** `bucket_intra_sigma: Optional[float]`,
+`signal_valid_since_ts: float`.
+
+### Monitor — External redemption detection + stale curPrice resolution (`monitor.py`)
+
+`_redeem_ready_positions()` now handles two additional cases that previously leaked:
+
+1. **Externally redeemed tokens (`redeemable=False`, settled `curPrice`):**
+   When `cur_price ≤ 0.01` or `≥ 0.99` but `redeemable=False`, the token was already
+   redeemed via the PM UI (or another bot instance).  The code now:
+   - Infers the settlement direction from `cur_price` and whether the token is YES/NO,
+   - Closes any ghost open position,
+   - Calls `patch_trade_outcome(force=True)` to correct `trades.csv`.
+
+2. **Stale mid-price on redeemable tokens:**
+   When `redeemable=True` but `curPrice` is in `(0.01, 0.99)` (PM API hasn't updated
+   from CLOB mid to settlement yet), the code now queries `fetch_market_resolution()` and
+   resolves the correct YES-token settlement price before computing the payout.
+
+`_check_pending_resolutions()` upgraded to `force=True` so PM CLOB settlement data
+always overrides any earlier incorrect outcome recorded by the RESOLVED fast-path.
+
+### Webapp — Phase B/C/D/E settings UI (`webapp/src/pages/Settings.tsx`, `webapp/src/api/client.ts`)
+
+New **"Momentum — Advanced Phases"** card in Settings with controls for:
+- Phase B: resolution oracle near-expiry toggle
+- Phase C: per-type elapsed-time guards (5m / 15m / 1h / 4h / daily / weekly / milestone)
+- Phase D: hedge enabled / hedge price
+- Phase E: win-rate gate enabled / min factor / min samples
+
+All fields wired to API server (`api_server.py`) via `ConfigPatch` model and
+`_MUTABLE_CONFIG` registry.  `MOMENTUM_SCAN_INTERVAL` reduced to 1 s;
+`MOMENTUM_MAX_CONCURRENT` raised to 20 to match live throughput requirements.
+
+### Tests
+
+- New test files: `tests/test_live_data_integrity.py`, `tests/test_spot_oracle.py`,
+  `tests/test_win_rate.py`
+- Significant additions to `tests/test_chainlink_ws_client.py` (boundary tick logging),
+  `tests/test_live_fill_handler.py` (reset_market_state, settled-token skip),
+  `tests/test_momentum_scanner.py` (Phase C/D/E gates, Kelly extensions),
+  `tests/test_e2e_live.py`
+
+---
+
 ## [2026-04-10b] - RESOLVED exit: 3-level outcome hierarchy (PM API → oracle → CLOB mid)
 
 ### Monitor — RESOLVED exit now uses PM settlement data as primary source

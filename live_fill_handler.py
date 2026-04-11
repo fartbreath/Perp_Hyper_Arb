@@ -89,6 +89,10 @@ class LiveFillHandler:
         # amount of the most-recent trade.  We diff against our running total to
         # get the incremental slice that this particular event added.
         self._matched_so_far: dict[str, float] = {}
+        # Phase B2: reverse mapping condition_id → set[order_id].
+        # Enables reset_market_state() to clear fill-tracking state atomically
+        # when a market is removed, preventing stale entries from accumulating.
+        self._cond_to_order_ids: dict[str, set[str]] = {}
         self._fills_total: int = 0
         # HL mid snapshot per underlying coin at last fill — used to detect
         # adverse price moves between consecutive fills on the same coin.
@@ -105,6 +109,25 @@ class LiveFillHandler:
         # reconciled by re-fetching the PM Data API position snapshot.
         self._pm.on_user_ws_reconnect(self._reconcile_after_reconnect)
         log.info("LiveFillHandler started — listening for order fill events")
+
+    def reset_market_state(self, condition_id: str) -> None:
+        """Clear fill-tracking state for a closed/expired condition.
+
+        Phase B2: removes all order_ids associated with `condition_id` from
+        _matched_so_far, preventing stale cumulative-fill entries from
+        contaminating any future order with the same order_id (extremely
+        unlikely, but correct-by-construction).
+        Call this when the market is removed from active tracking.
+        """
+        order_ids = self._cond_to_order_ids.pop(condition_id, set())
+        for oid in order_ids:
+            self._matched_so_far.pop(oid, None)
+        if order_ids:
+            log.info(
+                "LiveFillHandler: reset fill state",
+                condition_id=condition_id[:22],
+                cleared_orders=len(order_ids),
+            )
 
     async def startup_restore(self) -> None:
         """Restore live state from a previous session.
@@ -260,6 +283,41 @@ class LiveFillHandler:
             # SOURCE OF TRUTH: PM says we hold it → we hold it.
             # Only skip truly empty/malformed records. Never filter on avgPrice.
             if size <= 0 or not token_id:
+                continue
+
+            # Skip settled tokens that PM has marked as redeemable — the token
+            # is fully resolved (cur_price ≈ 0 or 1) and owned by
+            # _redeem_ready_positions() which handles redemption + trades.csv
+            # correction via patch_trade_outcome(force=True).
+            # If we restore these as open positions the monitor would close them
+            # and write a duplicate row to trades.csv every restart until the
+            # tokens are redeemed on-chain.
+            _redeemable = pos_data.get("redeemable", False)
+            _cur_price_raw_str = (
+                pos_data.get("curPrice") or pos_data.get("currentPrice")
+                or pos_data.get("cur_price")
+            )
+            _cur_price_raw = float(_cur_price_raw_str) if _cur_price_raw_str is not None else None
+            _price_is_settled = (
+                _cur_price_raw is not None
+                and (_cur_price_raw <= 0.01 or _cur_price_raw >= 0.99)
+            )
+            if _redeemable or _price_is_settled:
+                # Skip two categories:
+                # 1. redeemable=True  — PM has marked the position fully settled;
+                #    _redeem_ready_positions() owns redemption + trades.csv correction.
+                # 2. redeemable=False but curPrice settled (≤0.01 or ≥0.99) — oracle
+                #    resolved but PM hasn't yet flipped the redeemable flag, OR the
+                #    position was already redeemed externally.  Restoring either as an
+                #    open position causes the monitor to close it and write a duplicate
+                #    trades.csv row on every restart.
+                log.debug(
+                    "startup_restore: skipping settled token"
+                    " — _redeem_ready_positions will handle it",
+                    token_id=token_id[:24],
+                    redeemable=_redeemable,
+                    cur_price=_cur_price_raw,
+                )
                 continue
 
             market = markets_by_token.get(token_id)
@@ -546,6 +604,9 @@ class LiveFillHandler:
                 key=key[:40],
             )
             return
+
+        # Phase B2: register order → condition mapping for cleanup.
+        self._cond_to_order_ids.setdefault(market.condition_id, set()).add(order_id)
 
         await self._process_fill_slice(
             key, order_id, fill_price, side_raw, incremental, market

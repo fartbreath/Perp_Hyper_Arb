@@ -653,3 +653,87 @@ class TestYesNoEntryPriceRestore:
         assert abs(pos.entry_price - 0.18) < 1e-6, (
             f"entry_price must be avg_price=0.18 (not derived 0.82), got {pos.entry_price}"
         )
+
+
+# ── Phase B2: reset_market_state + _cond_to_order_ids ─────────────────────────
+
+class TestResetMarketState:
+    """Phase B2: fill-state cleanup per condition_id."""
+
+    def test_init_has_empty_cond_to_order_ids(self):
+        handler, *_ = _make_handler()
+        assert hasattr(handler, "_cond_to_order_ids")
+        assert handler._cond_to_order_ids == {}
+
+    def test_reset_on_empty_state_is_noop(self):
+        """reset_market_state with no tracked orders must not raise."""
+        handler, *_ = _make_handler()
+        handler.reset_market_state("cond_nonexistent")  # must not raise
+
+    def test_reset_clears_matched_so_far(self):
+        """After registering order_ids for a condition, reset clears them."""
+        handler, *_ = _make_handler()
+        # Manually seed state as the internal flow would
+        handler._matched_so_far["ord_001"] = 50.0
+        handler._matched_so_far["ord_002"] = 25.0
+        handler._cond_to_order_ids["cond_001"] = {"ord_001", "ord_002"}
+
+        handler.reset_market_state("cond_001")
+
+        assert "ord_001" not in handler._matched_so_far
+        assert "ord_002" not in handler._matched_so_far
+        assert "cond_001" not in handler._cond_to_order_ids
+
+    def test_reset_only_affects_target_condition(self):
+        """reset_market_state must not touch orders from other conditions."""
+        handler, *_ = _make_handler()
+        handler._matched_so_far["ord_001"] = 50.0
+        handler._matched_so_far["ord_999"] = 99.0
+        handler._cond_to_order_ids["cond_001"] = {"ord_001"}
+        handler._cond_to_order_ids["cond_999"] = {"ord_999"}
+
+        handler.reset_market_state("cond_001")
+
+        # cond_001 cleared
+        assert "ord_001" not in handler._matched_so_far
+        assert "cond_001" not in handler._cond_to_order_ids
+        # cond_999 untouched
+        assert handler._matched_so_far["ord_999"] == pytest.approx(99.0)
+        assert "cond_999" in handler._cond_to_order_ids
+
+    def test_reset_is_idempotent(self):
+        """Calling reset twice for the same condition must not raise."""
+        handler, *_ = _make_handler()
+        handler._matched_so_far["ord_001"] = 50.0
+        handler._cond_to_order_ids["cond_001"] = {"ord_001"}
+
+        handler.reset_market_state("cond_001")
+        handler.reset_market_state("cond_001")  # second call must not raise
+
+        assert "ord_001" not in handler._matched_so_far
+
+    def test_cond_to_order_ids_registered_during_fill(self):
+        """After a successful fill, the order_id must be registered in _cond_to_order_ids."""
+        config.PAPER_TRADING = False
+        handler, pm, maker, risk, monitor = _make_handler(paper=False)
+
+        mkt = _make_market(condition_id="cond_abc")
+        quote = _make_quote(order_id="ord_fill_001")
+
+        maker.get_active_quotes = MagicMock(return_value={"tok_yes": quote})
+        maker.find_market_for_token = MagicMock(return_value=mkt)
+        maker.consume_fill = MagicMock(return_value=None)
+
+        fill_event = {
+            "id": "ord_fill_001",
+            "asset_id": "tok_yes",
+            "side": "BUY",
+            "price": "0.45",
+            "size_matched": "50.0",
+        }
+        asyncio.get_event_loop().run_until_complete(handler._on_order_fill(fill_event))
+
+        assert "cond_abc" in handler._cond_to_order_ids
+        assert "ord_fill_001" in handler._cond_to_order_ids["cond_abc"]
+        config.PAPER_TRADING = True
+

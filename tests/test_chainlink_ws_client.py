@@ -35,6 +35,7 @@ from market_data.chainlink_ws_client import (
     ChainlinkWSClient,
     decode_latest_round_data,
     _CL_CONTRACTS,
+    _CL_AGGREGATORS,
     _DECIMALS,
     _ANSWER_UPDATED_TOPIC,
     _ADDR_TO_COIN,
@@ -216,7 +217,7 @@ class TestHandleEvent:
 
     def test_valid_event_updates_price_cache(self):
         """A valid AnswerUpdated log stores the price with the correct coin."""
-        eth_addr = _CL_CONTRACTS["ETH"]
+        eth_addr = _CL_AGGREGATORS["ETH"]
         msg = _make_log_msg(eth_addr, 3_200.0)
 
         async def _inner():
@@ -236,7 +237,7 @@ class TestHandleEvent:
         async def _inner():
             client = ChainlinkWSClient()
             for coin, price in expected.items():
-                await client._handle_event(_make_log_msg(_CL_CONTRACTS[coin], price))
+                await client._handle_event(_make_log_msg(_CL_AGGREGATORS[coin], price))
             return client
 
         client = _run(_inner())
@@ -255,7 +256,7 @@ class TestHandleEvent:
         async def _inner():
             client = ChainlinkWSClient()
             client.on_price_update(_cb)
-            await client._handle_event(_make_log_msg(_CL_CONTRACTS["BTC"], 65_000.0))
+            await client._handle_event(_make_log_msg(_CL_AGGREGATORS["BTC"], 65_000.0))
 
         _run(_inner())
         assert len(received) == 1
@@ -272,7 +273,7 @@ class TestHandleEvent:
             async def _cb_b(c, p): log_b.append(f"b:{c}")
             client.on_price_update(_cb_a)
             client.on_price_update(_cb_b)
-            await client._handle_event(_make_log_msg(_CL_CONTRACTS["ETH"], 3_100.0))
+            await client._handle_event(_make_log_msg(_CL_AGGREGATORS["ETH"], 3_100.0))
 
         _run(_inner())
         assert any("a:ETH" in s for s in log_a)
@@ -293,7 +294,7 @@ class TestHandleEvent:
 
     def test_non_positive_price_ignored(self):
         """A non-positive value in topics[1] does not enter the cache."""
-        eth_addr = _CL_CONTRACTS["ETH"]
+        eth_addr = _CL_AGGREGATORS["ETH"]
         # Craft a zero price
         topic1_zero = "0x" + (0).to_bytes(32, byteorder="big", signed=True).hex()
         msg = {
@@ -329,7 +330,7 @@ class TestHandleEvent:
         msg = {
             "params": {
                 "result": {
-                    "address": _CL_CONTRACTS["BTC"],
+                    "address": _CL_AGGREGATORS["BTC"],
                     "topics": [_ANSWER_UPDATED_TOPIC],  # missing topics[1]
                     "data": "0x00",
                 },
@@ -340,12 +341,145 @@ class TestHandleEvent:
             client = ChainlinkWSClient()
             await client._handle_event(msg)
 
+
+# ── Phase C: boundary tick logging ────────────────────────────────────────────
+
+def _make_log_msg_at_ts(address: str, price_usd: float, local_ts: float) -> dict:
+    """Build AnswerUpdated log with a specific on-chain updatedAt timestamp."""
+    price_raw = int(round(price_usd * 10 ** _DECIMALS))
+    topic1 = "0x" + price_raw.to_bytes(32, byteorder="big", signed=True).hex()
+    topic2 = "0x" + (1000).to_bytes(32, byteorder="big", signed=False).hex()
+    updated_at = "0x" + int(local_ts).to_bytes(32, byteorder="big", signed=False).hex()
+    return {
+        "jsonrpc": "2.0",
+        "method": "eth_subscription",
+        "params": {
+            "subscription": "0xsubid",
+            "result": {
+                "address": address,
+                "topics": [_ANSWER_UPDATED_TOPIC, topic1, topic2],
+                "data": updated_at,
+            },
+        },
+    }
+
+
+class TestBoundaryTickLogging:
+    """Phase C: detect Chainlink ticks near bucket-boundary windows."""
+
+    def test_tick_5s_after_5m_boundary_is_near(self):
+        """Tick arriving 5 s after a 5-minute boundary should trigger CL_BOUNDARY_TICK."""
+        btc_addr = _CL_AGGREGATORS["BTC"]
+        # 5m boundaries at t=0, 300, 600, ... Choose t=305 (5 s after 300)
+        ts = 300 + 5  # exactly on the 5-second after-boundary edge
+
+        logged_events: list[str] = []
+
+        async def _inner():
+            client = ChainlinkWSClient()
+            with patch("market_data.chainlink_ws_client.log") as mock_log:
+                mock_log.info = MagicMock(side_effect=lambda msg, **kw: logged_events.append(msg))
+                mock_log.debug = MagicMock()
+                mock_log.warning = MagicMock()
+                with patch("time.time", return_value=float(ts)):
+                    await client._handle_event(_make_log_msg_at_ts(btc_addr, 70_000.0, ts))
+
+        _run(_inner())
+        assert any("CL_BOUNDARY_TICK" in e for e in logged_events), (
+            f"Expected CL_BOUNDARY_TICK in: {logged_events}"
+        )
+
+    def test_tick_15s_before_5m_boundary_is_near(self):
+        """Tick 15 s before a boundary should trigger boundary logging."""
+        btc_addr = _CL_AGGREGATORS["BTC"]
+        # 15 s before 300 s boundary → ts = 285
+        ts = 285.0
+
+        logged_events: list[str] = []
+
+        async def _inner():
+            client = ChainlinkWSClient()
+            with patch("market_data.chainlink_ws_client.log") as mock_log:
+                mock_log.info = MagicMock(side_effect=lambda msg, **kw: logged_events.append(msg))
+                mock_log.debug = MagicMock()
+                mock_log.warning = MagicMock()
+                with patch("time.time", return_value=float(ts)):
+                    await client._handle_event(_make_log_msg_at_ts(btc_addr, 70_000.0, ts))
+
+        _run(_inner())
+        assert any("CL_BOUNDARY_TICK" in e for e in logged_events)
+
+    def test_tick_mid_period_not_logged_as_boundary(self):
+        """Tick arriving in the middle of a period must NOT be logged as boundary."""
+        btc_addr = _CL_AGGREGATORS["BTC"]
+        # t=150 is exactly mid-period for 5m (300/2); neither within 5s after nor 15s before
+        ts = 150.0
+
+        logged_events: list[str] = []
+
+        async def _inner():
+            client = ChainlinkWSClient()
+            with patch("market_data.chainlink_ws_client.log") as mock_log:
+                mock_log.info = MagicMock(side_effect=lambda msg, **kw: logged_events.append(msg))
+                mock_log.debug = MagicMock()
+                mock_log.warning = MagicMock()
+                with patch("time.time", return_value=float(ts)):
+                    await client._handle_event(_make_log_msg_at_ts(btc_addr, 70_000.0, ts))
+
+        _run(_inner())
+        assert not any("CL_BOUNDARY_TICK" in e for e in logged_events)
+
+    def test_onchain_updated_at_included_in_boundary_log(self):
+        """The on-chain updatedAt from `data` field must be logged in CL_BOUNDARY_TICK."""
+        btc_addr = _CL_AGGREGATORS["BTC"]
+        ts = 300 + 3  # 3 s after boundary, within the 5 s window
+        onchain_ts = 299  # on-chain was set 1 s BEFORE the boundary
+
+        logged_kwargs: list[dict] = []
+
+        async def _inner():
+            client = ChainlinkWSClient()
+            with patch("market_data.chainlink_ws_client.log") as mock_log:
+                def _capture_info(msg, **kwargs):
+                    if "CL_BOUNDARY_TICK" in msg:
+                        logged_kwargs.append(kwargs)
+                mock_log.info = MagicMock(side_effect=_capture_info)
+                mock_log.debug = MagicMock()
+                mock_log.warning = MagicMock()
+                with patch("time.time", return_value=float(ts)):
+                    await client._handle_event(
+                        _make_log_msg_at_ts(btc_addr, 70_000.0, onchain_ts)
+                    )
+
+        _run(_inner())
+        assert len(logged_kwargs) > 0, "Expected CL_BOUNDARY_TICK log"
+        kw = logged_kwargs[0]
+        assert "onchain_updated_at" in kw
+        assert kw["onchain_updated_at"] == float(onchain_ts)
+
+    def test_price_still_stored_at_boundary(self):
+        """Even at a boundary, the price must still be stored in the cache."""
+        btc_addr = _CL_AGGREGATORS["BTC"]
+        ts = 300 + 2  # within boundary window
+
+        async def _inner():
+            client = ChainlinkWSClient()
+            with patch("market_data.chainlink_ws_client.log"):
+                with patch("time.time", return_value=float(ts)):
+                    await client._handle_event(_make_log_msg_at_ts(btc_addr, 71_000.0, ts))
+            return client
+
+        client = _run(_inner())
+        assert client.get_mid("BTC") is not None
+        assert abs(client.get_mid("BTC") - 71_000.0) < 1e-4
+
+
         _run(_inner())   # must not raise
 
     def test_spotprice_timestamp_is_local_receipt_time(self):
         """SpotPrice.timestamp must be local event-receipt time, not on-chain updatedAt."""
         on_chain_ts = 1_000_000_000   # year 2001 — must NOT appear in SpotPrice.timestamp
-        eth_addr = _CL_CONTRACTS["ETH"]
+        eth_addr = _CL_AGGREGATORS["ETH"]
         price_raw = int(3_100.0 * 10 ** _DECIMALS)
         topic1 = "0x" + price_raw.to_bytes(32, byteorder="big", signed=True).hex()
         old_data = "0x" + on_chain_ts.to_bytes(32, byteorder="big", signed=False).hex()
@@ -430,5 +564,5 @@ class TestContractMap:
         assert "HYPE" not in _CL_CONTRACTS
 
     def test_addr_to_coin_reverse_map(self):
-        for coin, addr in _CL_CONTRACTS.items():
+        for coin, addr in _CL_AGGREGATORS.items():
             assert _ADDR_TO_COIN[addr.lower()] == coin

@@ -608,15 +608,19 @@ class PositionMonitor:
                 )
                 # Back-fill resolved_outcome in trades.csv for SL/taker exits
                 # that never received an outcome (resolved_outcome is blank).
-                # force=False so we don't override outcomes already set by
-                # _redeem_ready_positions() or the RESOLVED fast-path.
+                # force=True: this is PM CLOB API data — the definitive source.
+                # patch_trade_outcome is idempotent on correct records (patched=0).
+                # This also covers the external-redemption gap: if tokens were
+                # redeemed via PM UI before the bot processed them and
+                # _redeem_ready_positions() missed the redeemable=True window,
+                # _check_pending_resolutions() acts as a final safety-net catch-all.
                 try:
                     patched = self._risk.patch_trade_outcome(
-                        cid, resolved_yes_price, force=False
+                        cid, resolved_yes_price, force=True
                     )
                     if patched:
                         log.info(
-                            "patch_trade_outcome: filled outcome for SL exit(s)",
+                            "patch_trade_outcome: corrected outcome for exit(s)",
                             condition_id=cid[:16], patched=patched,
                         )
                 except Exception as exc:
@@ -650,7 +654,9 @@ class PositionMonitor:
         """Fetch wallet positions and submit on-chain redemption for each redeemable token.
 
         Live API is the source of truth:
-        - redeemable=False  → oracle still pending, skip
+        - redeemable=False, cur_price mid (0.01–0.99) → oracle still pending, skip
+        - redeemable=False, cur_price settled (≤0.01 or ≥0.99) → already redeemed
+          externally (e.g. via PM UI); correct trades.csv and mark as done
         - redeemable=True, payout=0  → genuine loser, dismiss
         - redeemable=True, payout>0  → submit on-chain redemption
         """
@@ -663,15 +669,125 @@ class PositionMonitor:
             if not token_id or token_id in self._redeemed_tokens:
                 continue
             if not pos_data.get("redeemable", False):
-                continue  # Oracle still pending — nothing to do yet
+                # cur_price tells us whether the oracle has settled or is still pending.
+                # A settled token lands at 0 (loser) or 1 (winner); anything in between
+                # means the oracle has not published yet — nothing to do.
+                _ext_price = float(
+                    pos_data.get("curPrice") or pos_data.get("currentPrice")
+                    or pos_data.get("cur_price") or 0
+                )
+                if not (_ext_price <= 0.01 or _ext_price >= 0.99):
+                    continue  # Oracle still pending — nothing to do yet
+
+                # Settled but redeemable=False → already redeemed externally.
+                # Correct trades.csv (force=True is idempotent on correct records)
+                # and mark the token so we don't process it again this session.
+                _ext_condition_id: str = (
+                    pos_data.get("conditionId") or pos_data.get("condition_id") or ""
+                )
+                _ext_title = pos_data.get("title") or token_id[:20]
+                if _ext_condition_id:
+                    markets_snap = self._pm.get_markets()
+                    for mkt in markets_snap.values():
+                        if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
+                            is_yes_token = (mkt.token_id_yes == token_id)
+                            if _ext_price >= 0.99:
+                                # This token won (→1); YES won if this is the YES token
+                                pm_resolved_yes = 1.0 if is_yes_token else 0.0
+                                _outcome_str, _exit_p = "WIN", _ext_price
+                            else:
+                                # This token lost (→0)
+                                pm_resolved_yes = 0.0 if is_yes_token else 1.0
+                                _outcome_str, _exit_p = "LOSS", 0.0
+                            # Close any open (ghost) position
+                            for rp in list(self._risk.get_positions().values()):
+                                if rp.market_id == mkt.condition_id and not rp.is_closed:
+                                    self._risk.close_position(
+                                        mkt.condition_id, exit_price=_exit_p,
+                                        side=rp.side, resolved_outcome=_outcome_str,
+                                    )
+                            # Force-correct any already-closed record with wrong outcome
+                            try:
+                                patched = self._risk.patch_trade_outcome(
+                                    mkt.condition_id, pm_resolved_yes, force=True
+                                )
+                                log.info(
+                                    "Auto-redeem: externally-redeemed token detected"
+                                    " — trades.csv corrected",
+                                    condition_id=mkt.condition_id[:20],
+                                    title=_ext_title[:60],
+                                    is_yes_token=is_yes_token,
+                                    pm_resolved_yes=pm_resolved_yes,
+                                    patched=patched,
+                                )
+                            except Exception as exc:
+                                log.warning(
+                                    "Auto-redeem: patch_trade_outcome failed"
+                                    " (external redemption)",
+                                    exc=str(exc),
+                                    condition_id=_ext_condition_id[:20],
+                                )
+                            break
+                # Do NOT add to _redeemed_tokens here.  The PM API sometimes
+                # returns redeemable=False for a brief window after oracle
+                # settlement before flipping to redeemable=True.  If we block the
+                # token now it will never be redeemed on-chain.
+                # patch_trade_outcome(force=True) is idempotent so repeated calls
+                # on consecutive polls are safe.  Once the position disappears from
+                # the wallet (post on-chain redemption) it won't appear here again.
+                continue
 
             size = float(pos_data.get("size", 0) or 0)
             cur_price = float(
                 pos_data.get("curPrice") or pos_data.get("currentPrice") or pos_data.get("cur_price") or 0
             )
-            payout = round(size * cur_price, 4)
             title = pos_data.get("title") or token_id[:20]
             condition_id: str = pos_data.get("conditionId") or pos_data.get("condition_id") or ""
+
+            # The PM positions API sets redeemable=True before curPrice updates
+            # from the stale CLOB mid-price to the final settlement value (0 or 1).
+            # A mid-range curPrice on a redeemable position is unreliable — using
+            # it as the payout would produce the wrong WIN/LOSS determination.
+            # Binary rule: >=0.99 → this token won (payout=size), <=0.01 → lost
+            # (payout=0).  For anything in between, fall back to the CLOB resolution
+            # API which is always authoritative once the condition is on-chain settled.
+            if cur_price >= 0.99:
+                settled_price = 1.0
+            elif cur_price <= 0.01:
+                settled_price = 0.0
+            else:
+                # Stale mid-price — ask the CLOB for the authoritative settlement.
+                if condition_id:
+                    resolved_yes = await self._pm.fetch_market_resolution(condition_id)
+                else:
+                    resolved_yes = None
+                if resolved_yes is None:
+                    log.debug(
+                        "Auto-redeem: redeemable but curPrice stale and CLOB"
+                        " not settled yet — will retry next cycle",
+                        token_id=token_id[:20],
+                        cur_price=round(cur_price, 4),
+                    )
+                    continue
+                # Determine settlement price for this specific token (YES or NO).
+                markets_snap = self._pm.get_markets()
+                settled_price = 0.0  # default: assume loser until proven otherwise
+                for _mkt in markets_snap.values():
+                    if _mkt.token_id_yes == token_id:
+                        settled_price = resolved_yes          # 1.0 if YES won
+                        break
+                    if _mkt.token_id_no == token_id:
+                        settled_price = 1.0 - resolved_yes    # 1.0 if NO won
+                        break
+                log.debug(
+                    "Auto-redeem: resolved stale curPrice via CLOB API",
+                    token_id=token_id[:20],
+                    old_cur_price=round(cur_price, 4),
+                    settled_price=settled_price,
+                )
+                cur_price = settled_price
+
+            payout = round(size * cur_price, 4)
 
             # Genuine loser — nothing to redeem on-chain
             if payout == 0:
@@ -989,7 +1105,14 @@ class PositionMonitor:
                 and self._spot is not None
                 and pos.underlying
             ):
-                _res_spot = self._spot.get_mid(pos.underlying, pos.market_type)
+                # Phase B: always use AggregatorV3-only feed for L2 resolution
+                # matching (post-expiry path) when flag is enabled.
+                if config.MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY:
+                    _res_spot = self._spot.get_mid_resolution_oracle(
+                        pos.underlying, pos.market_type
+                    )
+                else:
+                    _res_spot = self._spot.get_mid(pos.underlying, pos.market_type)
                 if _res_spot is not None and _res_spot > 0:
                     if pos.side in ("YES", "BUY_YES", "UP"):
                         exit_mid = 1.0 if _res_spot > pos.strike else 0.0
@@ -1104,7 +1227,18 @@ class PositionMonitor:
         # 1h/daily/weekly markets.
         current_spot: Optional[float] = None
         if pos.strategy == "momentum" and self._spot is not None and pos.underlying:
-            current_spot = self._spot.get_mid(pos.underlying, pos.market_type)
+            if (
+                config.MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY
+                and tte_seconds is not None
+                and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
+            ):
+                # Phase B: AggregatorV3-only near-expiry — matches Polymarket's
+                # settlement contract which calls latestRoundData(), not the relay.
+                current_spot = self._spot.get_mid_resolution_oracle(
+                    pos.underlying, pos.market_type
+                )
+            else:
+                current_spot = self._spot.get_mid(pos.underlying, pos.market_type)
 
         coin_sl = config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get(
             pos.underlying, config.MOMENTUM_DELTA_STOP_LOSS_PCT

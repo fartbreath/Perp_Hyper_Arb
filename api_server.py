@@ -518,6 +518,19 @@ _MUTABLE_CONFIG = {
     "momentum_min_gap_pct":           ("MOMENTUM_MIN_GAP_PCT",             float),
     "momentum_near_expiry_time_stop_secs": ("MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS", int),
     "monitor_interval":               ("MONITOR_INTERVAL",                 int),
+    # Phase B — resolution oracle near expiry
+    "momentum_use_resolution_oracle_near_expiry": ("MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY", bool),
+    # Phase D — hedge
+    "momentum_hedge_enabled":          ("MOMENTUM_HEDGE_ENABLED",           bool),
+    "momentum_hedge_price":            ("MOMENTUM_HEDGE_PRICE",             float),
+    # Phase E — empirical win-rate gate
+    "momentum_win_rate_gate_enabled":  ("MOMENTUM_WIN_RATE_GATE_ENABLED",   bool),
+    "momentum_win_rate_gate_min_factor": ("MOMENTUM_WIN_RATE_GATE_MIN_FACTOR", float),
+    "momentum_win_rate_gate_min_samples": ("MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES", int),
+    # Kelly extensions
+    "momentum_kelly_intra_sigma_enabled":    ("MOMENTUM_KELLY_INTRA_SIGMA_ENABLED",    bool),
+    "momentum_kelly_persistence_enabled":    ("MOMENTUM_KELLY_PERSISTENCE_ENABLED",    bool),
+    "momentum_kelly_persistence_z_boost_max": ("MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX", float),
     # Range markets (sub-strategy of Momentum)
     "momentum_range_enabled":              ("MOMENTUM_RANGE_ENABLED",              bool),
     "momentum_range_price_band_low":       ("MOMENTUM_RANGE_PRICE_BAND_LOW",       float),
@@ -681,6 +694,27 @@ class ConfigPatch(BaseModel):
     momentum_min_gap_pct: float | None = None
     momentum_near_expiry_time_stop_secs: int | None = None
     monitor_interval: int | None = None
+    # Phase B — resolution oracle near expiry
+    momentum_use_resolution_oracle_near_expiry: bool | None = None
+    # Phase C — per-type elapsed-time guard (flattened)
+    momentum_min_elapsed_5m: int | None = None
+    momentum_min_elapsed_15m: int | None = None
+    momentum_min_elapsed_1h: int | None = None
+    momentum_min_elapsed_4h: int | None = None
+    momentum_min_elapsed_daily: int | None = None
+    momentum_min_elapsed_weekly: int | None = None
+    momentum_min_elapsed_milestone: int | None = None
+    # Phase D — hedge
+    momentum_hedge_enabled: bool | None = None
+    momentum_hedge_price: float | None = None
+    # Phase E — empirical win-rate gate
+    momentum_win_rate_gate_enabled: bool | None = None
+    momentum_win_rate_gate_min_factor: float | None = None
+    momentum_win_rate_gate_min_samples: int | None = None
+    # Kelly extensions
+    momentum_kelly_intra_sigma_enabled: bool | None = None
+    momentum_kelly_persistence_enabled: bool | None = None
+    momentum_kelly_persistence_z_boost_max: float | None = None
     # Range markets sub-strategy
     momentum_range_enabled: bool | None = None
     momentum_range_price_band_low: float | None = None
@@ -846,6 +880,27 @@ def get_config() -> dict:
         "momentum_min_gap_pct":           config.MOMENTUM_MIN_GAP_PCT,
         "momentum_near_expiry_time_stop_secs": config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS,
         "monitor_interval":               config.MONITOR_INTERVAL,
+        # Phase B — resolution oracle near expiry
+        "momentum_use_resolution_oracle_near_expiry": config.MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY,
+        # Phase C — per-type elapsed-time guard (flattened)
+        "momentum_min_elapsed_5m":        config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_5m",    0),
+        "momentum_min_elapsed_15m":       config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_15m",   0),
+        "momentum_min_elapsed_1h":        config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_1h",    0),
+        "momentum_min_elapsed_4h":        config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_4h",    0),
+        "momentum_min_elapsed_daily":     config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_daily", 0),
+        "momentum_min_elapsed_weekly":    config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_weekly",0),
+        "momentum_min_elapsed_milestone": config.MOMENTUM_MIN_ELAPSED_SECONDS.get("milestone",    0),
+        # Phase D — hedge
+        "momentum_hedge_enabled":         config.MOMENTUM_HEDGE_ENABLED,
+        "momentum_hedge_price":           config.MOMENTUM_HEDGE_PRICE,
+        # Phase E — empirical win-rate gate
+        "momentum_win_rate_gate_enabled":     config.MOMENTUM_WIN_RATE_GATE_ENABLED,
+        "momentum_win_rate_gate_min_factor":  config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR,
+        "momentum_win_rate_gate_min_samples": config.MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES,
+        # Kelly extensions
+        "momentum_kelly_intra_sigma_enabled":    config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED,
+        "momentum_kelly_persistence_enabled":    config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
+        "momentum_kelly_persistence_z_boost_max": config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX,
         # Range markets sub-strategy
         "momentum_range_enabled":              config.MOMENTUM_RANGE_ENABLED,
         "momentum_range_price_band_low":       config.MOMENTUM_RANGE_PRICE_BAND_LOW,
@@ -907,6 +962,22 @@ def patch_config(patch: ConfigPatch) -> dict:
             config.MOMENTUM_VOL_Z_SCORE_BY_TYPE[bucket_key] = float(v)
             updated[field] = float(v)
             log.info("Config updated via API", key=f"MOMENTUM_VOL_Z_SCORE_BY_TYPE[{bucket_key}]", value=float(v))
+    # Phase C — per-type elapsed-time guard — written directly into the dict
+    _elapsed_map = {
+        "momentum_min_elapsed_5m":        "bucket_5m",
+        "momentum_min_elapsed_15m":       "bucket_15m",
+        "momentum_min_elapsed_1h":        "bucket_1h",
+        "momentum_min_elapsed_4h":        "bucket_4h",
+        "momentum_min_elapsed_daily":     "bucket_daily",
+        "momentum_min_elapsed_weekly":    "bucket_weekly",
+        "momentum_min_elapsed_milestone": "milestone",
+    }
+    for field, bucket_key in _elapsed_map.items():
+        v = getattr(patch, field)
+        if v is not None:
+            config.MOMENTUM_MIN_ELAPSED_SECONDS[bucket_key] = int(v)
+            updated[field] = int(v)
+            log.info("Config updated via API", key=f"MOMENTUM_MIN_ELAPSED_SECONDS[{bucket_key}]", value=int(v))
     # Per-coin delta stop-loss overrides — written directly into the dict
     _delta_sl_coin_map = {
         "momentum_delta_sl_pct_btc":  "BTC",
@@ -959,6 +1030,8 @@ def patch_config(patch: ConfigPatch) -> dict:
             attr_changes["MOMENTUM_DELTA_SL_PCT_BY_COIN"] = dict(config.MOMENTUM_DELTA_SL_PCT_BY_COIN)
         if any(f in updated for f in _min_delta_coin_map):
             attr_changes["MOMENTUM_MIN_DELTA_PCT_BY_COIN"] = dict(config.MOMENTUM_MIN_DELTA_PCT_BY_COIN)
+        if any(f in updated for f in _elapsed_map):
+            attr_changes["MOMENTUM_MIN_ELAPSED_SECONDS"] = dict(config.MOMENTUM_MIN_ELAPSED_SECONDS)
         _save_overrides(attr_changes)
     return {
         "updated": updated,

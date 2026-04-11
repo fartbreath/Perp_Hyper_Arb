@@ -519,6 +519,27 @@ export interface ConfigData {
   momentum_near_expiry_time_stop_secs?: number;
   momentum_min_delta_pct?: number;
   monitor_interval?: number;
+  // Phase B — resolution oracle near expiry
+  momentum_use_resolution_oracle_near_expiry?: boolean;
+  // Phase C — per-type elapsed-time guard
+  momentum_min_elapsed_5m?: number;
+  momentum_min_elapsed_15m?: number;
+  momentum_min_elapsed_1h?: number;
+  momentum_min_elapsed_4h?: number;
+  momentum_min_elapsed_daily?: number;
+  momentum_min_elapsed_weekly?: number;
+  momentum_min_elapsed_milestone?: number;
+  // Phase D — hedge
+  momentum_hedge_enabled?: boolean;
+  momentum_hedge_price?: number;
+  // Phase E — empirical win-rate gate
+  momentum_win_rate_gate_enabled?: boolean;
+  momentum_win_rate_gate_min_factor?: number;
+  momentum_win_rate_gate_min_samples?: number;
+  // Kelly extensions
+  momentum_kelly_intra_sigma_enabled?: boolean;
+  momentum_kelly_persistence_enabled?: boolean;
+  momentum_kelly_persistence_z_boost_max?: number;
   // Range markets sub-strategy
   momentum_range_enabled?: boolean;
   momentum_range_price_band_low?: number;

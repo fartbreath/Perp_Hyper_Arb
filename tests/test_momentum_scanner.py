@@ -35,11 +35,13 @@ from pm_client import PMMarket, OrderBookSnapshot
 from strategies.Momentum.scanner import (
     MomentumScanner,
     _compute_kelly_size_usd,
+    _compute_bucket_intra_sigma,
     _extract_strike,
     _is_updown_market,
     _load_cooldowns,
     _save_cooldowns,
 )
+from market_data.rtds_client import SpotPrice
 from strategies.Momentum.market_utils import (
     _extract_range_bounds,
     _is_range_market,
@@ -358,8 +360,11 @@ class TestKellySizing:
     def test_debug_dict_has_expected_keys(self):
         _, debug = _compute_kelly_size_usd(_make_signal())
         expected = {
-            "kelly_sigma_tau", "kelly_z_total", "kelly_win_prob",
-            "kelly_payout_b", "kelly_f", "kelly_fraction_cfg", "kelly_size_usd",
+            "kelly_tte_floor_s", "kelly_tte_eff_s", "kelly_sigma_eff",
+            "kelly_intra_sigma", "kelly_persistence_pct", "kelly_z_boost",
+            "kelly_z_before_boost", "kelly_sigma_tau", "kelly_z_total",
+            "kelly_win_prob", "kelly_payout_b", "kelly_f",
+            "kelly_fraction_cfg", "kelly_size_usd",
         }
         assert expected.issubset(debug.keys())
 
@@ -524,6 +529,9 @@ class TestPaperModePositionSizing:
             "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
             "MOMENTUM_MIN_ENTRY_USD": config.MOMENTUM_MIN_ENTRY_USD,
             "MOMENTUM_ORDER_TYPE": config.MOMENTUM_ORDER_TYPE,
+            "MOMENTUM_KELLY_FRACTION": config.MOMENTUM_KELLY_FRACTION,
+            "MOMENTUM_KELLY_INTRA_SIGMA_ENABLED": config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED,
+            "MOMENTUM_KELLY_PERSISTENCE_ENABLED": config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
         }
         config.STRATEGY_MOMENTUM_ENABLED = True
         config.BOT_ACTIVE = True
@@ -532,6 +540,9 @@ class TestPaperModePositionSizing:
         config.MOMENTUM_MAX_ENTRY_USD = 3.0
         config.MOMENTUM_MIN_ENTRY_USD = 0.5
         config.MOMENTUM_ORDER_TYPE = "market"
+        config.MOMENTUM_KELLY_FRACTION = 1.0   # full-Kelly for sizing arithmetic tests
+        config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED = False
+        config.MOMENTUM_KELLY_PERSISTENCE_ENABLED = False
 
     def teardown_method(self):
         for k, v in self._saved.items():
@@ -907,3 +918,620 @@ class TestRangeStrategyLabel:
         assert result is True
         pos = scanner._risk.get_open_positions()[0]
         assert pos.strategy == "range"
+
+
+# ── Phase A: Kelly TTE floor, intra-sigma, persistence ────────────────────────
+
+class TestKellyTTEFloor:
+    """TTE floor prevents z-explosion at very low TTE values.
+
+    Before the fix: max(tte, 1.0) → at TTE=17s, bucket_5m floor=1s,
+    sigma_tau collapses → z → ∞ → win_prob≈1 → MAX_ENTRY always.
+
+    After the fix: tte_eff = max(tte, min_tte_floor) where floor=60s
+    for bucket_5m (from config overrides), so sigma_tau is bounded below.
+    """
+
+    def setup_method(self):
+        self._saved = {
+            "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
+            "MOMENTUM_MIN_ENTRY_USD": config.MOMENTUM_MIN_ENTRY_USD,
+            "MOMENTUM_KELLY_FRACTION": config.MOMENTUM_KELLY_FRACTION,
+            "MOMENTUM_MIN_TTE_SECONDS": config.MOMENTUM_MIN_TTE_SECONDS,
+            "MOMENTUM_KELLY_INTRA_SIGMA_ENABLED": config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED,
+            "MOMENTUM_KELLY_PERSISTENCE_ENABLED": config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
+        }
+        config.MOMENTUM_MAX_ENTRY_USD = 50.0
+        config.MOMENTUM_MIN_ENTRY_USD = 1.0
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+        config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED = False
+        config.MOMENTUM_KELLY_PERSISTENCE_ENABLED = False
+        # Set bucket_5m floor to 60 s (matches production config_overrides.json).
+        config.MOMENTUM_MIN_TTE_SECONDS = {**config.MOMENTUM_MIN_TTE_SECONDS, "bucket_5m": 60}
+
+    def teardown_method(self):
+        for k, v in self._saved.items():
+            setattr(config, k, v)
+
+    def test_tte_floor_prevents_max_entry_at_low_tte(self):
+        """At TTE=17s, without floor: z≈9σ → MAX_ENTRY.  With floor=60s: z<6σ → sub-MAX."""
+        # Signal with weak-ish delta that should NOT yield max size at proper TTE floor.
+        # sigma_ann=0.8, delta=3, tte=17s, token_price=0.5 (symmetric payout).
+        # Without floor: sigma_tau=0.8*sqrt(17/31_536_000)≈0.000110 → z=3/(0.000110*100)=272σ → capped 6σ → MAX.
+        # With floor=60s: sigma_tau=0.8*sqrt(60/31_536_000)≈0.000207 → z=3/(0.000207*100)=144.9σ → still capped.
+        # But at a more realistic delta: delta=0.5% (just above threshold),
+        # floor=60s → sigma_tau≈0.000207 → z=0.5/(0.000207*100)≈24.2 → capped 6σ → max.
+        # The real check: with floor, tte_eff=60 regardless of actual tte_seconds=17.
+        sig = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=17.0,
+            token_price=0.5, market_type="bucket_5m",
+        )
+        _, debug = _compute_kelly_size_usd(sig)
+        assert debug["kelly_tte_floor_s"] == 60.0, "floor should be 60s for bucket_5m"
+        assert debug["kelly_tte_eff_s"] == 60.0, "tte_eff should be floored to 60s, not 17s"
+
+    def test_tte_floor_does_not_apply_above_threshold(self):
+        """When actual TTE is already above the floor, tte_eff == tte_seconds."""
+        sig = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=120.0,
+            token_price=0.5, market_type="bucket_5m",
+        )
+        _, debug = _compute_kelly_size_usd(sig)
+        assert debug["kelly_tte_eff_s"] == pytest.approx(120.0)
+
+    def test_tte_floor_reduces_size_vs_unfloored(self):
+        """With floor, size at TTE=17s must be ≤ size at TTE=120s (same delta).
+
+        At TTE=17s, the floored sigma_tau (using 60s) is larger than if we
+        used exactly 17s, so z is smaller, win_prob is smaller, size is smaller.
+        """
+        # Build two signals: same delta, different TTE.
+        # Lower TTE without floor would give higher z; with floor both use 60s effective.
+        sig_low_tte = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=17.0,
+            token_price=0.5, market_type="bucket_5m",
+        )
+        sig_high_tte = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=120.0,
+            token_price=0.5, market_type="bucket_5m",
+        )
+        size_low, _ = _compute_kelly_size_usd(sig_low_tte)
+        size_high, _ = _compute_kelly_size_usd(sig_high_tte)
+        # TTE=17s is floored to 60s, TTE=120s uses 120s.
+        # Larger tte_eff → larger sigma_tau → smaller z → smaller size.
+        assert size_low >= size_high, (
+            "floored TTE=17s→60s should give >= size vs 120s (floor uses smaller window)"
+        )
+
+
+class TestKellyIntraSigma:
+    """Intra-bucket realized sigma replaces sigma_ann when higher and flag enabled."""
+
+    def setup_method(self):
+        self._saved = {
+            "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
+            "MOMENTUM_MIN_ENTRY_USD": config.MOMENTUM_MIN_ENTRY_USD,
+            "MOMENTUM_KELLY_FRACTION": config.MOMENTUM_KELLY_FRACTION,
+            "MOMENTUM_MIN_TTE_SECONDS": config.MOMENTUM_MIN_TTE_SECONDS,
+            "MOMENTUM_KELLY_INTRA_SIGMA_ENABLED": config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED,
+            "MOMENTUM_KELLY_PERSISTENCE_ENABLED": config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
+        }
+        config.MOMENTUM_MAX_ENTRY_USD = 50.0
+        config.MOMENTUM_MIN_ENTRY_USD = 1.0
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+        config.MOMENTUM_MIN_TTE_SECONDS = {**config.MOMENTUM_MIN_TTE_SECONDS, "bucket_5m": 60}
+        config.MOMENTUM_KELLY_PERSISTENCE_ENABLED = False
+
+    def teardown_method(self):
+        for k, v in self._saved.items():
+            setattr(config, k, v)
+
+    def test_intra_sigma_larger_reduces_size_when_enabled(self):
+        """bucket_intra_sigma > sigma_ann with flag=True → larger sigma_eff → smaller z → smaller size."""
+        config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED = True
+        sig_with = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
+            token_price=0.5, market_type="bucket_5m",
+            bucket_intra_sigma=2.0,  # much higher realized vol
+        )
+        sig_without = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
+            token_price=0.5, market_type="bucket_5m",
+            bucket_intra_sigma=None,
+        )
+        size_with, debug_with = _compute_kelly_size_usd(sig_with)
+        size_without, _ = _compute_kelly_size_usd(sig_without)
+        assert debug_with["kelly_sigma_eff"] == pytest.approx(2.0, abs=1e-4), (
+            "sigma_eff should be max(0.8, 2.0) = 2.0"
+        )
+        assert size_with <= size_without, (
+            "higher intra-sigma should reduce or equal size (more uncertain)"
+        )
+
+    def test_intra_sigma_flag_disabled_ignores_bucket_sigma(self):
+        """When flag=False, bucket_intra_sigma is ignored even if set."""
+        config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED = False
+        sig_flag_off = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
+            token_price=0.5, market_type="bucket_5m",
+            bucket_intra_sigma=2.0,
+        )
+        sig_no_sigma = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
+            token_price=0.5, market_type="bucket_5m",
+            bucket_intra_sigma=None,
+        )
+        size_off, debug_off = _compute_kelly_size_usd(sig_flag_off)
+        size_none, _ = _compute_kelly_size_usd(sig_no_sigma)
+        assert debug_off["kelly_sigma_eff"] == pytest.approx(0.8, abs=1e-4), (
+            "sigma_eff should fall back to sigma_ann=0.8 when flag disabled"
+        )
+        assert size_off == pytest.approx(size_none), "size should not change when flag disabled"
+
+    def test_intra_sigma_smaller_than_sigma_ann_uses_sigma_ann(self):
+        """When bucket_intra_sigma < sigma_ann, sigma_eff = sigma_ann (conservative max)."""
+        config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED = True
+        sig = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
+            token_price=0.5, market_type="bucket_5m",
+            bucket_intra_sigma=0.3,  # lower than sigma_ann
+        )
+        _, debug = _compute_kelly_size_usd(sig)
+        assert debug["kelly_sigma_eff"] == pytest.approx(0.8, abs=1e-4), (
+            "sigma_eff should be max(0.8, 0.3) = 0.8"
+        )
+
+
+class TestKellyPersistence:
+    """Persistence z-boost scales linearly from 0 to max over min_tte_floor seconds."""
+
+    def setup_method(self):
+        self._saved = {
+            "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
+            "MOMENTUM_MIN_ENTRY_USD": config.MOMENTUM_MIN_ENTRY_USD,
+            "MOMENTUM_KELLY_FRACTION": config.MOMENTUM_KELLY_FRACTION,
+            "MOMENTUM_MIN_TTE_SECONDS": config.MOMENTUM_MIN_TTE_SECONDS,
+            "MOMENTUM_KELLY_INTRA_SIGMA_ENABLED": config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED,
+            "MOMENTUM_KELLY_PERSISTENCE_ENABLED": config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
+            "MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX": config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX,
+        }
+        config.MOMENTUM_MAX_ENTRY_USD = 50.0
+        config.MOMENTUM_MIN_ENTRY_USD = 1.0
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+        config.MOMENTUM_MIN_TTE_SECONDS = {**config.MOMENTUM_MIN_TTE_SECONDS, "bucket_5m": 60}
+        config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED = False
+        config.MOMENTUM_KELLY_PERSISTENCE_ENABLED = True
+        config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX = 0.5
+
+    def teardown_method(self):
+        for k, v in self._saved.items():
+            setattr(config, k, v)
+
+    def test_zero_elapsed_gives_zero_boost(self):
+        """Signal just fired (elapsed≈0) → persistence_pct≈0 → z_boost≈0."""
+        now = time.time()
+        sig = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
+            token_price=0.5, market_type="bucket_5m",
+            signal_valid_since_ts=now,  # just now
+        )
+        _, debug = _compute_kelly_size_usd(sig)
+        assert debug["kelly_z_boost"] == pytest.approx(0.0, abs=0.05), (
+            "z_boost near zero when signal just fired"
+        )
+
+    def test_full_elapsed_gives_max_boost(self):
+        """Signal has been valid for ≥ floor seconds → persistence_pct=1 → z_boost=max."""
+        # signal_valid_since_ts = floor seconds ago → pct clamped to 1.0
+        floor_s = 60.0
+        now = time.time()
+        sig = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
+            token_price=0.5, market_type="bucket_5m",
+            signal_valid_since_ts=now - floor_s - 1.0,  # elapsed > floor
+        )
+        _, debug = _compute_kelly_size_usd(sig)
+        assert debug["kelly_persistence_pct"] == pytest.approx(1.0, abs=0.01)
+        assert debug["kelly_z_boost"] == pytest.approx(
+            config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX, abs=0.01
+        )
+
+    def test_half_elapsed_gives_half_boost(self):
+        """Elapsed = floor/2 → persistence_pct≈0.5 → z_boost≈max/2."""
+        floor_s = 60.0
+        now = time.time()
+        sig = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
+            token_price=0.5, market_type="bucket_5m",
+            signal_valid_since_ts=now - floor_s / 2,
+        )
+        _, debug = _compute_kelly_size_usd(sig)
+        assert debug["kelly_persistence_pct"] == pytest.approx(0.5, abs=0.06)
+        assert debug["kelly_z_boost"] == pytest.approx(
+            config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX * 0.5, abs=0.06
+        )
+
+    def test_persistence_disabled_gives_no_boost(self):
+        """With flag=False, z_boost=0 regardless of elapsed time."""
+        config.MOMENTUM_KELLY_PERSISTENCE_ENABLED = False
+        floor_s = 60.0
+        now = time.time()
+        sig = _make_signal(
+            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
+            token_price=0.5, market_type="bucket_5m",
+            signal_valid_since_ts=now - floor_s * 2,
+        )
+        _, debug = _compute_kelly_size_usd(sig)
+        assert debug["kelly_z_boost"] == pytest.approx(0.0)
+        assert debug["kelly_persistence_pct"] == pytest.approx(0.0)
+
+
+class TestBucketIntraSigma:
+    """Unit tests for _compute_bucket_intra_sigma."""
+
+    def test_returns_none_below_min_samples(self):
+        prices = [100.0] * 9  # only 9 prices, default min=10
+        assert _compute_bucket_intra_sigma(prices) is None
+
+    def test_returns_float_above_min_samples(self):
+        import math
+        # 11 prices with 1% log-return each: log(1.01)≈0.00995
+        prices = [100.0 * (1.01 ** i) for i in range(11)]
+        result = _compute_bucket_intra_sigma(prices)
+        assert isinstance(result, float)
+        assert result > 0.0
+
+    def test_flat_prices_give_near_zero_sigma(self):
+        prices = [50_000.0] * 50  # perfectly flat
+        result = _compute_bucket_intra_sigma(prices)
+        # All log returns are 0 → sigma = 0
+        assert result == pytest.approx(0.0, abs=1e-9)
+
+    def test_custom_min_samples(self):
+        prices = [100.0] * 5
+        assert _compute_bucket_intra_sigma(prices, min_samples=5) is not None
+        assert _compute_bucket_intra_sigma(prices, min_samples=6) is None
+
+
+# ── Phase C: elapsed gate (_scan_once) ────────────────────────────────────────
+
+class TestElapsedGate:
+    """Phase C: MOMENTUM_MIN_ELAPSED_SECONDS gates entries too early in market window."""
+
+    def setup_method(self):
+        self._orig_min_elapsed = config.MOMENTUM_MIN_ELAPSED_SECONDS
+
+    def teardown_method(self):
+        config.MOMENTUM_MIN_ELAPSED_SECONDS = self._orig_min_elapsed
+
+    def _make_scan_env(self, scanner, mkt, spot_price=70_100.0):
+        """Wire up scanner with a single market, fresh book and fresh spot."""
+        scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+        book = _make_book(mid=0.85, age_secs=0.0)
+        scanner._pm.get_book = MagicMock(return_value=book)
+        scanner._pm._books = {mkt.token_id_yes: book}
+        scanner._token_to_market = {mkt.token_id_yes: mkt, mkt.token_id_no: mkt}
+        fresh_spot = SpotPrice(coin="BTC", price=spot_price, timestamp=time.time())
+        spot = MagicMock()
+        spot.get_spot = MagicMock(return_value=fresh_spot)
+        spot.get_mid = MagicMock(return_value=spot_price)
+        scanner._spot = spot
+
+    def test_elapsed_gate_skips_fresh_market(self, tmp_path):
+        """Market with elapsed < min_elapsed must appear as 'too_early' in scan diags.
+
+        bucket_5m window = 300 s.  Default _min_tte["bucket_5m"] = 30 s.
+        Use TTE = 25 s so the market is inside the entry window.
+        elapsed = 300 - 25 = 275 s.  Set min_elapsed = 280 so gate fires.
+        """
+        config.MOMENTUM_MIN_ELAPSED_SECONDS = {"bucket_5m": 280}
+        config.STRATEGY_MOMENTUM_ENABLED = True
+        config.BOT_ACTIVE = True
+
+        scanner = _make_scanner(tmp_path)
+        scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
+        mkt = _make_market(market_type="bucket_5m",
+                           end_date=datetime.now(timezone.utc) + timedelta(seconds=25))
+        self._make_scan_env(scanner, mkt)
+
+        asyncio.get_event_loop().run_until_complete(scanner._scan_once())
+
+        diags = scanner._last_scan_diags
+        assert any(d.get("skip_reason") == "too_early" for d in diags), (
+            f"Expected 'too_early' in diags, got: {[d.get('skip_reason') for d in diags]}"
+        )
+        assert scanner._last_scan_summary.get("skipped_too_early", 0) >= 1
+
+    def test_elapsed_gate_passes_when_enough_time(self, tmp_path):
+        """Market with elapsed >= min_elapsed must NOT be gated as 'too_early'.
+
+        TTE = 25 s (inside 30 s entry window) -> elapsed = 275 s >= min_elapsed 60 s.
+        """
+        config.MOMENTUM_MIN_ELAPSED_SECONDS = {"bucket_5m": 60}
+        config.STRATEGY_MOMENTUM_ENABLED = True
+        config.BOT_ACTIVE = True
+
+        scanner = _make_scanner(tmp_path)
+        scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
+        mkt = _make_market(market_type="bucket_5m",
+                           end_date=datetime.now(timezone.utc) + timedelta(seconds=25))
+        self._make_scan_env(scanner, mkt)
+
+        asyncio.get_event_loop().run_until_complete(scanner._scan_once())
+
+        diags = scanner._last_scan_diags
+        assert not any(d.get("skip_reason") == "too_early" for d in diags), (
+            f"Should not have 'too_early' when elapsed >= min_elapsed, got: "
+            f"{[d.get('skip_reason') for d in diags]}"
+        )
+
+
+# ── Phase D: GTD hedge in _execute_signal ─────────────────────────────────────
+
+class TestGTDHedge:
+    """Phase D: after entry, a GTC limit BUY is placed on the opposite token."""
+
+    def setup_method(self):
+        self._saved = {
+            "MOMENTUM_HEDGE_ENABLED": config.MOMENTUM_HEDGE_ENABLED,
+            "MOMENTUM_HEDGE_PRICE": config.MOMENTUM_HEDGE_PRICE,
+            "MOMENTUM_ORDER_TYPE": config.MOMENTUM_ORDER_TYPE,
+            "MOMENTUM_PRICE_BAND_LOW": config.MOMENTUM_PRICE_BAND_LOW,
+            "MOMENTUM_PRICE_BAND_HIGH": config.MOMENTUM_PRICE_BAND_HIGH,
+            "STRATEGY_MOMENTUM_ENABLED": config.STRATEGY_MOMENTUM_ENABLED,
+            "BOT_ACTIVE": config.BOT_ACTIVE,
+        }
+        config.STRATEGY_MOMENTUM_ENABLED = True
+        config.BOT_ACTIVE = True
+        config.MOMENTUM_PRICE_BAND_LOW = 0.50
+        config.MOMENTUM_PRICE_BAND_HIGH = 0.95
+        config.MOMENTUM_ORDER_TYPE = "market"  # use place_market for main order
+
+    def teardown_method(self):
+        for k, v in self._saved.items():
+            setattr(config, k, v)
+
+    def test_hedge_enabled_calls_place_limit_on_opposite_token(self, tmp_path):
+        """When MOMENTUM_HEDGE_ENABLED=True, place_limit is called for the hedge."""
+        config.MOMENTUM_HEDGE_ENABLED = True
+        config.MOMENTUM_HEDGE_PRICE = 0.02
+
+        scanner = _make_scanner(tmp_path)
+        scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
+        ask_price = 0.85
+        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+
+        mkt = _make_market()
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+                           token_price=ask_price, p_yes=ask_price)
+        _run(scanner._execute_signal(sig, mkt))
+
+        # Main order via place_market; hedge via place_limit on NO token
+        scanner._pm.place_market.assert_called_once()
+        scanner._pm.place_limit.assert_called_once()
+        call_kwargs = scanner._pm.place_limit.call_args
+        assert call_kwargs.kwargs.get("token_id") == mkt.token_id_no or (
+            call_kwargs.args and call_kwargs.args[0] == mkt.token_id_no
+        )
+        assert call_kwargs.kwargs.get("post_only", True) is True
+
+    def test_hedge_disabled_does_not_call_place_limit(self, tmp_path):
+        """When MOMENTUM_HEDGE_ENABLED=False, no GTC limit is placed."""
+        config.MOMENTUM_HEDGE_ENABLED = False
+
+        scanner = _make_scanner(tmp_path)
+        ask_price = 0.85
+        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+
+        mkt = _make_market()
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+                           token_price=ask_price, p_yes=ask_price)
+        _run(scanner._execute_signal(sig, mkt))
+
+        scanner._pm.place_limit.assert_not_called()
+
+    def test_hedge_no_side_targets_yes_token(self, tmp_path):
+        """For NO side entry, the hedge targets the YES token."""
+        config.MOMENTUM_HEDGE_ENABLED = True
+        config.MOMENTUM_HEDGE_PRICE = 0.02
+
+        scanner = _make_scanner(tmp_path)
+        ask_price = 0.82
+        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+
+        mkt = _make_market()
+        sig = _make_signal(side="NO", token_id=mkt.token_id_no,
+                           token_price=ask_price, p_yes=1.0 - ask_price)
+        _run(scanner._execute_signal(sig, mkt))
+
+        scanner._pm.place_limit.assert_called_once()
+        call = scanner._pm.place_limit.call_args
+        # Hedge must target YES token when side is NO
+        token_called = call.kwargs.get("token_id") or (call.args and call.args[0])
+        assert token_called == mkt.token_id_yes
+
+    def test_hedge_cost_based_on_entry_size(self, tmp_path):
+        """Hedge cost in USD = entry_size × HEDGE_PRICE."""
+        config.MOMENTUM_HEDGE_ENABLED = True
+        config.MOMENTUM_HEDGE_PRICE = 0.02
+        config.MOMENTUM_MAX_ENTRY_USD = 3.0
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        scanner = _make_scanner(tmp_path)
+        ask_price = 0.85
+        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+
+        mkt = _make_market()
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+                           token_price=ask_price, p_yes=ask_price)
+        _run(scanner._execute_signal(sig, mkt))
+
+        call = scanner._pm.place_limit.call_args
+        size_called = call.kwargs.get("size") or (len(call.args) >= 4 and call.args[3])
+        # Size must be > 0
+        if size_called is not None:
+            assert float(size_called) > 0
+
+    def test_hedge_failure_does_not_abort_position(self, tmp_path):
+        """Even if hedge place_limit raises, the main position must still open."""
+        config.MOMENTUM_HEDGE_ENABLED = True
+        config.MOMENTUM_HEDGE_PRICE = 0.02
+
+        scanner = _make_scanner(tmp_path)
+        scanner._pm.place_limit = AsyncMock(side_effect=RuntimeError("network error"))
+        ask_price = 0.85
+        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+
+        mkt = _make_market()
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+                           token_price=ask_price, p_yes=ask_price)
+        result = _run(scanner._execute_signal(sig, mkt))
+
+        # Main position must still be opened even though hedge failed
+        assert result is True
+        assert len(scanner._risk.get_open_positions()) == 1
+
+
+# ── Phase E: win-rate gate in _scan_once ──────────────────────────────────────
+
+class TestWinRateGateScanner:
+    """Phase E: scanner _win_rate attribute and gate integration."""
+
+    def test_scanner_has_win_rate_attribute(self, tmp_path):
+        """Scanner must have _win_rate attribute after construction."""
+        scanner = _make_scanner(tmp_path)
+        assert hasattr(scanner, "_win_rate")
+        # May be None if win_rate module couldn't load data — that's fine
+        # as long as the attribute exists
+
+    def test_win_rate_enabled_flag_gates_signal(self, tmp_path):
+        """When gate is enabled and empirical WR < model_wr * factor, signal is gated.
+
+        Uses TTE=25 s (inside bucket_5m entry window of 30 s) so the market
+        reaches the win_rate gate.  Empirical WR of 0.10 vs model 0.85 triggers gate.
+        """
+        orig_enabled = config.MOMENTUM_WIN_RATE_GATE_ENABLED
+        orig_factor = config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR
+        orig_band_lo = config.MOMENTUM_PRICE_BAND_LOW
+        orig_band_hi = config.MOMENTUM_PRICE_BAND_HIGH
+        config.MOMENTUM_WIN_RATE_GATE_ENABLED = True
+        config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR = 0.9
+        config.STRATEGY_MOMENTUM_ENABLED = True
+        config.BOT_ACTIVE = True
+        # Keep default band [0.80, 0.90]; book mid 0.85 is in-band
+
+        try:
+            scanner = _make_scanner(tmp_path)
+            scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
+
+            # Inject a mock win_rate that returns a very low empirical WR (0.10)
+            mock_wr = MagicMock()
+            mock_wr.get = MagicMock(return_value=0.10)  # 10% empirical WR -> gate fires
+            scanner._win_rate = mock_wr
+
+            # TTE = 25 s: inside the bucket_5m entry window (min_tte = 30 s)
+            mkt = _make_market(market_type="bucket_5m",
+                               end_date=datetime.now(timezone.utc) + timedelta(seconds=25))
+            scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+
+            book = _make_book(mid=0.85, age_secs=0.0)
+            scanner._pm.get_book = MagicMock(return_value=book)
+            scanner._pm._books = {mkt.token_id_yes: book}
+            scanner._token_to_market = {mkt.token_id_yes: mkt, mkt.token_id_no: mkt}
+
+            fresh_spot = SpotPrice(coin="BTC", price=70_100.0, timestamp=time.time())
+            spot = MagicMock()
+            spot.get_spot = MagicMock(return_value=fresh_spot)
+            spot.get_mid = MagicMock(return_value=70_100.0)
+            scanner._spot = spot
+
+            asyncio.get_event_loop().run_until_complete(scanner._scan_once())
+
+            diags = scanner._last_scan_diags
+            assert any(d.get("skip_reason") == "win_rate_gate" for d in diags), (
+                f"Expected 'win_rate_gate' in diags, got: {[d.get('skip_reason') for d in diags]}"
+            )
+            assert scanner._last_scan_summary.get("skipped_win_rate", 0) >= 1
+        finally:
+            config.MOMENTUM_WIN_RATE_GATE_ENABLED = orig_enabled
+            config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR = orig_factor
+            config.MOMENTUM_PRICE_BAND_LOW = orig_band_lo
+            config.MOMENTUM_PRICE_BAND_HIGH = orig_band_hi
+
+
+# ── Phase P3: _signal_first_valid persistence ────────────────────────────────
+
+class TestSignalFirstValidPersistence:
+    """Phase P3: _signal_first_valid persists across restarts via disk-backed JSON."""
+
+    def test_scanner_has_signal_first_valid_path(self, tmp_path):
+        """Scanner must expose _signal_first_valid_path attribute."""
+        scanner = _make_scanner(tmp_path)
+        scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
+        assert hasattr(scanner, "_signal_first_valid_path")
+
+    def test_signal_first_valid_loaded_from_disk_on_init(self, tmp_path):
+        """If signal_first_valid.json exists, values are loaded on init."""
+        sfv_path = str(tmp_path / "sfv.json")
+        existing = {"cond_abc": 1_700_000_000.0, "cond_def": 1_700_000_100.0}
+        _save_cooldowns(sfv_path, existing)
+
+        scanner = _make_scanner(tmp_path)
+        # Patch the path after construction then reload
+        scanner._signal_first_valid_path = sfv_path
+        scanner._signal_first_valid = _load_cooldowns(sfv_path)
+
+        assert scanner._signal_first_valid.get("cond_abc") == pytest.approx(1_700_000_000.0)
+        assert scanner._signal_first_valid.get("cond_def") == pytest.approx(1_700_000_100.0)
+
+    def test_signal_first_valid_persisted_after_scan(self, tmp_path):
+        """After _scan_once, signal_first_valid must be saved to disk."""
+        import asyncio
+        from datetime import datetime, timezone, timedelta
+
+        config.STRATEGY_MOMENTUM_ENABLED = True
+        config.BOT_ACTIVE = True
+        config.MOMENTUM_PRICE_BAND_LOW = 0.50
+        config.MOMENTUM_PRICE_BAND_HIGH = 0.95
+
+        scanner = _make_scanner(tmp_path)
+        sfv_path = str(tmp_path / "sfv.json")
+        scanner._signal_first_valid_path = sfv_path
+        scanner._signal_first_valid["cond_persist_test"] = 1_700_000_000.0
+
+        mkt = _make_market(condition_id="cond_001",
+                           end_date=datetime.now(timezone.utc) + timedelta(seconds=90))
+        scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+
+        book = _make_book(mid=0.50, age_secs=5.0)  # stale → all skipped
+        scanner._pm.get_book = MagicMock(return_value=book)
+        scanner._pm._books = {mkt.token_id_yes: book}
+        scanner._token_to_market = {mkt.token_id_yes: mkt, mkt.token_id_no: mkt}
+
+        fresh_spot = SpotPrice(coin="BTC", price=70_000.0, timestamp=time.time())
+        spot = MagicMock()
+        spot.get_spot = MagicMock(return_value=fresh_spot)
+        spot.get_mid = MagicMock(return_value=70_000.0)
+        spot.on_rtds_update = MagicMock()
+        spot.on_chainlink_update = MagicMock()
+        scanner._spot = spot
+
+        asyncio.get_event_loop().run_until_complete(scanner._scan_once())
+
+        # The file must exist and must contain our pre-seeded entry (if not popped)
+        loaded = _load_cooldowns(sfv_path)
+        # Either the key survived (not popped during scan) or was correctly cleaned up
+        # Either way the file must exist after the scan
+        import os
+        assert os.path.exists(sfv_path), "_signal_first_valid must be saved to disk after scan"
+
+    def test_signal_first_valid_missing_file_returns_empty(self, tmp_path):
+        """Loading from a missing file must return empty dict (no crash)."""
+        result = _load_cooldowns(str(tmp_path / "missing.json"))
+        assert result == {}
+

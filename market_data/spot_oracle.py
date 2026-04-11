@@ -107,6 +107,25 @@ class SpotOracle:
             return time.time() - snap.timestamp if snap is not None else float("inf")
         return self._rtds.get_spot_age(underlying)
 
+    def get_mid_resolution_oracle(
+        self, underlying: str, market_type: str
+    ) -> Optional[float]:
+        """AggregatorV3-only price for near-expiry resolution matching.
+
+        Polymarket's resolution contract calls latestRoundData() on the on-chain
+        Polygon AggregatorV3 at expiry.  Near-expiry, the on-chain AggregatorV3
+        price is a better predictor of the settlement outcome than the RTDS relay
+        (which leads AggregatorV3 by up to ~15 s and can differ at a round boundary).
+
+        Returns the ChainlinkWSClient price only (no RTDS relay, no Streams relay)
+        for Chainlink market types on non-HYPE coins.  Falls back to standard
+        get_mid() for HYPE (no Polygon AggregatorV3) and non-Chainlink types.
+        """
+        if market_type in CHAINLINK_MARKET_TYPES and underlying != "HYPE":
+            snap = self._cl.get_spot(underlying)
+            return snap.price if snap is not None else None
+        return self.get_mid(underlying, market_type)
+
     # ── Chainlink dual-feed arbiter (all coins) ───────────────────────────────
 
     def _get_chainlink_spot(self, coin: str) -> Optional[SpotPrice]:

@@ -92,8 +92,10 @@ def _mock_cl(price_map: dict[str, float] | None = None) -> MagicMock:
     cl = MagicMock(spec=ChainlinkWSClient)
     pm = price_map or {}
     cl.get_mid.side_effect = lambda coin: pm.get(coin)
+    # Use timestamp=0.0 (epoch) so RTDS relay always wins in freshest-wins arbitration.
+    # This simulates an HTTP-seeded snapshot that is stale vs. a live RTDS relay.
     cl.get_spot.side_effect = lambda coin: (
-        SpotPrice(coin=coin, price=pm[coin]) if coin in pm else None
+        SpotPrice(coin=coin, price=pm[coin], timestamp=0.0) if coin in pm else None
     )
     cl.get_spot_age.side_effect = lambda coin: 5.0 if coin in pm else float("inf")
     cl.on_price_update = MagicMock()
@@ -296,8 +298,9 @@ class TestSpotOracleRouting:
         assert age < 1.0
 
     def test_no_data_returns_none(self):
-        """If RTDS chainlink has no price for a coin, get_mid must return None."""
+        """If neither RTDS relay nor CL WS has a price, get_mid must return None."""
         self.rtds.get_chainlink_spot.side_effect = lambda coin: None
+        self.cl.get_spot.side_effect = lambda coin: None
         result = self.oracle.get_mid("BTC", "bucket_5m")
         assert result is None
 

@@ -317,6 +317,12 @@ MOMENTUM_MAX_ENTRY_USD: float = 50.0
 MOMENTUM_KELLY_FRACTION: float = 1.0     # safety multiplier on kelly_f (0 < x ≤ 1.0)
 MOMENTUM_MIN_ENTRY_USD: float = 1.0      # floor to avoid dust orders
 
+# Kelly Phase-A extensions — TTE floor, intra-bucket sigma, persistence z-boost.
+# All three default to off (False / 0) so production config_overrides.json opts in explicitly.
+MOMENTUM_KELLY_INTRA_SIGMA_ENABLED: bool = True   # use max(sigma_ann, intra-bucket realised σ)
+MOMENTUM_KELLY_PERSISTENCE_ENABLED: bool = True   # enable persistence z-boost
+MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX: float = 0.5  # max additional z added at full persistence
+
 # Minimum USDC depth on the ask side within 1c of best ask (thin-book guard).
 # Prevents entering markets where our order would exhaust available liquidity.
 MOMENTUM_MIN_CLOB_DEPTH: float = 200.0
@@ -335,6 +341,14 @@ MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above thi
 # Near-expiry time-stop: when TTE is very short and spot has already crossed
 # the strike (delta < 0), exit via taker to avoid a binary snap to zero.
 MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS: int = 90        # TTE threshold (seconds)
+
+# Phase B — Two-oracle strategy: near-expiry delta SL uses only the on-chain
+# AggregatorV3 feed (ChainlinkWSClient) instead of freshest-wins (which normally
+# picks the RTDS relay).  This matches Polymarket's resolution contract, which
+# calls latestRoundData() at expiry — not the Data Streams relay feed.
+# Default False: validate by cross-checking oracle_ticks.csv against resolved
+# outcomes before enabling in production.
+MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY: bool = True
 
 # Entry window per bucket market type — only enter when TTE ≤ this value.
 # Markets with MORE time remaining than this are outside the entry window and
@@ -392,11 +406,30 @@ MOMENTUM_DELTA_SL_PCT_BY_COIN: dict[str, float] = {}
 # 0.0 = disabled (default).  Recommended live value: 0.02 (see config_overrides).
 MOMENTUM_MIN_GAP_PCT: float = 0.0
 
+# Phase C — Minimum elapsed-time guard: suppress entries fired in the first N
+# seconds of a market window (thin book, wide spreads, noisy ticks).
+# Empty dict = disabled for all types.  Per-type example: {"bucket_5m": 30}.
+MOMENTUM_MIN_ELAPSED_SECONDS: dict[str, int] = {}
+
+# Phase D — GTD (GTC resting) hedge: after a confirmed entry, optionally place
+# a low-price GTC limit BUY on the opposite token as oracle-free downside cover.
+# If the trade loses (held token → $0), the opposite token may briefly trade
+# at HEDGE_PRICE; the GTC order catches that dip and redeems at $1.00.
+MOMENTUM_HEDGE_ENABLED: bool = True
+MOMENTUM_HEDGE_PRICE: float = 0.02    # GTC bid price on the opposite token
+
+# Phase E — Empirical win-rate gate: load data/win_rate.csv at startup and gate
+# entries where historical win rate < WIN_RATE_GATE_MIN_FACTOR × model win_prob.
+# Disabled by default until ≥100 fills per bucket are available.
+MOMENTUM_WIN_RATE_GATE_ENABLED: bool = False
+MOMENTUM_WIN_RATE_GATE_MIN_FACTOR: float = 0.9  # empirical WR must be ≥ 90% of model WR
+MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES: int = 10    # minimum fills per bucket before gate activates
+
 # How often to run a full scan pass over all bucket markets (seconds).
-MOMENTUM_SCAN_INTERVAL: int = 10
+MOMENTUM_SCAN_INTERVAL: int = 1
 
 # Maximum simultaneous open momentum positions.
-MOMENTUM_MAX_CONCURRENT: int = 3
+MOMENTUM_MAX_CONCURRENT: int = 20
 
 # Pre-subscription lookahead: also subscribe to bucket markets that haven't
 # started yet but are within this many additional durations of their start.

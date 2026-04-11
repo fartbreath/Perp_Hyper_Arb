@@ -1909,6 +1909,166 @@ export default function Settings() {
             </Advanced>
           </div>
 
+          {/* ── Phase B/C/D/E + Kelly Extensions ─────────────── */}
+          <div className="card">
+            <h3>Momentum — Advanced Phases</h3>
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Optional enhancements to the momentum scanner. All are disabled by default.
+            </p>
+
+            <SectionHead title="Phase B — Resolution Oracle" />
+            <Toggle
+              label="Use Resolution Oracle Near Expiry"
+              description="In the final seconds before expiry, switch to PM's resolution oracle price instead of the RTDS spot feed. Reduces adverse timing noise when the oracle drifts from spot."
+              value={data.momentum_use_resolution_oracle_near_expiry ?? false}
+              onChange={(v) => apply({ momentum_use_resolution_oracle_near_expiry: v })}
+            />
+
+            <SectionHead title="Phase C — Entry Cooldown per Market Type" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Suppress entries in the first N seconds of a market window (thin book, wide spreads, noisy ticks).
+              0 = no cooldown for that type.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0" }}>
+              <NumberInput
+                label="5-Minute"
+                description="bucket_5m elapsed cooldown (s)."
+                value={data.momentum_min_elapsed_5m ?? 0}
+                step={5}
+                unit="s"
+                onSubmit={(v) => apply({ momentum_min_elapsed_5m: v })}
+              />
+              <NumberInput
+                label="15-Minute"
+                description="bucket_15m elapsed cooldown (s)."
+                value={data.momentum_min_elapsed_15m ?? 0}
+                step={5}
+                unit="s"
+                onSubmit={(v) => apply({ momentum_min_elapsed_15m: v })}
+              />
+              <NumberInput
+                label="1-Hour"
+                description="bucket_1h elapsed cooldown (s)."
+                value={data.momentum_min_elapsed_1h ?? 0}
+                step={15}
+                unit="s"
+                onSubmit={(v) => apply({ momentum_min_elapsed_1h: v })}
+              />
+              <NumberInput
+                label="4-Hour"
+                description="bucket_4h elapsed cooldown (s)."
+                value={data.momentum_min_elapsed_4h ?? 0}
+                step={30}
+                unit="s"
+                onSubmit={(v) => apply({ momentum_min_elapsed_4h: v })}
+              />
+              <NumberInput
+                label="Daily"
+                description="bucket_daily elapsed cooldown (s)."
+                value={data.momentum_min_elapsed_daily ?? 0}
+                step={60}
+                unit="s"
+                onSubmit={(v) => apply({ momentum_min_elapsed_daily: v })}
+              />
+              <NumberInput
+                label="Weekly"
+                description="bucket_weekly elapsed cooldown (s)."
+                value={data.momentum_min_elapsed_weekly ?? 0}
+                step={300}
+                unit="s"
+                onSubmit={(v) => apply({ momentum_min_elapsed_weekly: v })}
+              />
+            </div>
+            {GAP}
+            <NumberInput
+              label="Milestone"
+              description="milestone market elapsed cooldown (s)."
+              value={data.momentum_min_elapsed_milestone ?? 0}
+              step={60}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_min_elapsed_milestone: v })}
+            />
+
+            <SectionHead title="Phase D — Downside Hedge" />
+            <Toggle
+              label="Hedge Enabled"
+              description="After a confirmed entry, place a low-price GTC limit BUY on the opposite token as oracle-free downside cover. If the held token goes to $0, this resting bid may catch a panic dip."
+              value={data.momentum_hedge_enabled ?? false}
+              onChange={(v) => apply({ momentum_hedge_enabled: v })}
+            />
+            {(data.momentum_hedge_enabled ?? false) && (
+              <>
+                {GAP}
+                <FloatInput
+                  label="Hedge Bid Price"
+                  description="GTC bid price placed on the opposite token (e.g. 0.02 = bid $0.02). Only fills if it trades at a panic price."
+                  value={data.momentum_hedge_price ?? 0.02}
+                  step={0.005}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_hedge_price: v })}
+                />
+              </>
+            )}
+
+            <SectionHead title="Phase E — Empirical Win-Rate Gate" />
+            <Toggle
+              label="Win-Rate Gate Enabled"
+              description="Gate entries where the historical (empirical) win rate for the bucket type is significantly below the model's predicted win probability. Requires ≥ Min Samples fills to activate."
+              value={data.momentum_win_rate_gate_enabled ?? false}
+              onChange={(v) => apply({ momentum_win_rate_gate_enabled: v })}
+            />
+            {(data.momentum_win_rate_gate_enabled ?? false) && (
+              <>
+                {GAP}
+                <FloatInput
+                  label="Min Factor"
+                  description="Empirical win rate must be ≥ this fraction of the model win probability. 0.9 = allow up to 10% shortfall."
+                  value={data.momentum_win_rate_gate_min_factor ?? 0.9}
+                  step={0.05}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_win_rate_gate_min_factor: v })}
+                />
+                {GAP}
+                <NumberInput
+                  label="Min Samples"
+                  description="Minimum historical fills required per bucket before the gate activates. Below this, the gate stays open (optimistic prior)."
+                  value={data.momentum_win_rate_gate_min_samples ?? 10}
+                  step={5}
+                  unit="fills"
+                  onSubmit={(v) => apply({ momentum_win_rate_gate_min_samples: v })}
+                />
+              </>
+            )}
+
+            <SectionHead title="Kelly Extensions" />
+            <Toggle
+              label="Intra-Sigma Boost"
+              description="Use max(σ_ann, intra-bucket realised σ) when computing the Kelly-scaled entry size. Adapts position sizing upward during high-volatility periods."
+              value={data.momentum_kelly_intra_sigma_enabled ?? false}
+              onChange={(v) => apply({ momentum_kelly_intra_sigma_enabled: v })}
+            />
+            {GAP}
+            <Toggle
+              label="Persistence Z-Boost"
+              description="Boost the effective z-score when consecutive signals fire in the same direction (trend persistence). Sizes up into confirmed momentum runs."
+              value={data.momentum_kelly_persistence_enabled ?? false}
+              onChange={(v) => apply({ momentum_kelly_persistence_enabled: v })}
+            />
+            {(data.momentum_kelly_persistence_enabled ?? false) && (
+              <>
+                {GAP}
+                <FloatInput
+                  label="Max Z-Boost"
+                  description="Maximum additional z (σ) added at full persistence. 0.5 = up to +0.5σ boost at peak run length."
+                  value={data.momentum_kelly_persistence_z_boost_max ?? 0.5}
+                  step={0.1}
+                  unit="σ"
+                  onSubmit={(v) => apply({ momentum_kelly_persistence_z_boost_max: v })}
+                />
+              </>
+            )}
+          </div>
+
           {/* ── Range markets sub-strategy ───────────────────── */}
           <div className="card">
             <h3>Range Markets</h3>

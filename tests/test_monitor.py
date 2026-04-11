@@ -548,6 +548,7 @@ def _make_monitor(spot_client=None):
     # get_token_balance is awaited in _exit_position when PAPER_TRADING=False.
     # Return None so the code falls back to pos.size (safe in tests).
     pm.get_token_balance = AsyncMock(return_value=None)
+    pm.fetch_market_resolution = AsyncMock(return_value=None)
     risk = RiskEngine()
     # Tests call _check_position once and expect SL to fire immediately.
     config.MOMENTUM_DELTA_SL_MIN_TICKS = 1

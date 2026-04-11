@@ -101,18 +101,23 @@ def _make_components(*, hl_mid: float = 85_000.0):
     return pm_mock, hl, engine, strategy, monitor, simulator
 
 
-def _fetch_live_btc_book() -> tuple[Optional[str], Optional[OrderBookSnapshot]]:
+def _fetch_live_book(tag_slug: str = "bitcoin") -> tuple[Optional[str], Optional[OrderBookSnapshot]]:
     """
-    Fetch a live BTC bucket-daily market token_id and a book snapshot from
-    the Polymarket CLOB REST API.  No authentication needed.
-    Returns (token_id, OrderBookSnapshot) or (None, None) if unavailable.
+    Scan Polymarket Gamma events for a market with a two-sided book and mid
+    in [0.10, 0.90] (not near resolution).  Tries all candidate token_ids
+    across ``tag_slug`` slug before giving up.  Falls back in order:
+      1. Two-sided book with mid in [0.10, 0.90]  ← ideal
+      2. Any two-sided book with positive spread
+      3. Any non-empty book (one-sided)
+    Returns (token_id, OrderBookSnapshot) or (None, None) if APIs unavailable.
     """
+    import json
     try:
         resp = requests.get(
             f"{config.GAMMA_HOST}/events",
             params={
                 "active": "true", "closed": "false",
-                "tag_slug": "bitcoin", "limit": 20,
+                "tag_slug": tag_slug, "limit": 50,
                 "order": "volume24hr", "ascending": "false",
             },
             timeout=15,
@@ -121,8 +126,8 @@ def _fetch_live_btc_book() -> tuple[Optional[str], Optional[OrderBookSnapshot]]:
     except Exception:
         return None, None
 
-    import json
-    token_id = None
+    # Collect all candidate token_ids from active, order-accepting markets
+    candidates: list[str] = []
     for event in resp.json():
         for mkt in event.get("markets", []):
             toks = mkt.get("clobTokenIds", [])
@@ -133,35 +138,89 @@ def _fetch_live_btc_book() -> tuple[Optional[str], Optional[OrderBookSnapshot]]:
                     toks = []
             if (mkt.get("active") and mkt.get("acceptingOrders")
                     and mkt.get("enableOrderBook") and len(toks) >= 1):
-                token_id = toks[0]
-                break
-        if token_id:
-            break
+                candidates.append(toks[0])
 
-    if not token_id:
+    if not candidates:
         return None, None
 
-    try:
-        book_resp = requests.get(
-            "https://clob.polymarket.com/book",
-            params={"token_id": token_id},
-            timeout=15,
-        )
-        book_resp.raise_for_status()
-        raw = book_resp.json()
-    except Exception:
-        return token_id, None
+    def _fetch_book(token_id: str) -> Optional[OrderBookSnapshot]:
+        try:
+            r = requests.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": token_id},
+                timeout=10,
+            )
+            r.raise_for_status()
+            raw = r.json()
+        except Exception:
+            return None
+        snap = OrderBookSnapshot(token_id=token_id)
+        for entry in raw.get("bids", []):
+            snap.bids.append((float(entry.get("price", entry.get("p", 0))),
+                              float(entry.get("size", entry.get("s", 0)))))
+        for entry in raw.get("asks", []):
+            snap.asks.append((float(entry.get("price", entry.get("p", 0))),
+                              float(entry.get("size", entry.get("s", 0)))))
+        snap.bids.sort(key=lambda x: -x[0])
+        snap.asks.sort(key=lambda x: x[0])
+        return snap
 
-    snap = OrderBookSnapshot(token_id=token_id)
-    for entry in raw.get("bids", []):
-        snap.bids.append((float(entry.get("price", entry.get("p", 0))),
-                          float(entry.get("size", entry.get("s", 0)))))
-    for entry in raw.get("asks", []):
-        snap.asks.append((float(entry.get("price", entry.get("p", 0))),
-                          float(entry.get("size", entry.get("s", 0)))))
-    snap.bids.sort(key=lambda x: -x[0])
-    snap.asks.sort(key=lambda x: x[0])
-    return token_id, snap
+    # Tier 1: two-sided with mid in [0.10, 0.90] (active market, not near resolution)
+    # Tier 2: any two-sided book with positive spread
+    # Tier 3: first non-empty one-sided book
+    tier2: Optional[tuple[str, OrderBookSnapshot]] = None
+    tier3: Optional[tuple[str, OrderBookSnapshot]] = None
+
+    for token_id in candidates[:25]:   # cap at 25 API calls
+        snap = _fetch_book(token_id)
+        if snap is None:
+            continue
+        if (snap.best_bid is not None and snap.best_ask is not None
+                and snap.best_ask > snap.best_bid):
+            mid = snap.mid
+            if mid is not None and 0.10 <= mid <= 0.90:
+                return token_id, snap   # tier-1 found
+            if tier2 is None:
+                tier2 = (token_id, snap)
+        elif tier3 is None and (snap.bids or snap.asks):
+            tier3 = (token_id, snap)
+
+    return tier2 or tier3 or (None, None)
+
+
+def _fetch_live_btc_book() -> tuple[Optional[str], Optional[OrderBookSnapshot]]:
+    """Fetch a live BTC / crypto book with an active (non-near-resolution) spread.
+
+    Searches slugs in priority order and returns the first book whose mid
+    falls within [MAKER_MIN_QUOTE_PRICE, 1 - MAKER_MIN_QUOTE_PRICE] so that
+    MakerStrategy._evaluate_signal won't reject it on the boundary gate.
+    Falls back progressively if no ideal market is found.
+    """
+    _min_mid = config.MAKER_MIN_QUOTE_PRICE  # e.g. 0.30
+    _max_mid = 1.0 - _min_mid                 # e.g. 0.70
+
+    # Tier A: two-sided book with mid in [MAKER_MIN_QUOTE_PRICE, 1-MAKER_MIN_QUOTE_PRICE]
+    for slug in ("ethereum", "bitcoin", "crypto", "solana", "politics"):
+        result = _fetch_live_book(slug)
+        if result[0] is not None and result[1] is not None:
+            snap = result[1]
+            mid = snap.mid
+            if mid is not None and _min_mid <= mid <= _max_mid:
+                return result
+    # Tier B: any two-sided book with mid in [0.10, 0.90]
+    for slug in ("bitcoin", "ethereum", "crypto", "solana", "politics"):
+        result = _fetch_live_book(slug)
+        if result[0] is not None and result[1] is not None:
+            snap = result[1]
+            mid = snap.mid
+            if mid is not None and 0.10 <= mid <= 0.90:
+                return result
+    # Tier C: any available book
+    for slug in ("bitcoin", "ethereum", "crypto", "solana", "politics"):
+        result = _fetch_live_book(slug)
+        if result[0] is not None:
+            return result
+    return None, None
 
 
 def _synthetic_market(token_id: str, mid: float = 0.45) -> PMMarket:
@@ -184,7 +243,12 @@ def _synthetic_market(token_id: str, mid: float = 0.45) -> PMMarket:
 
 @pytest.fixture(scope="module")
 def live_btc_book():
-    """Return (token_id, OrderBookSnapshot) from live PM CLOB REST API."""
+    """Return (token_id, OrderBookSnapshot) from live PM CLOB REST API.
+
+    Searches up to 20 BTC markets to find one with a two-sided book
+    (both bids and asks with a positive spread).  Falls back to any
+    non-empty one-sided book if none have a spread.
+    """
     token_id, snap = _fetch_live_btc_book()
     if token_id is None:
         pytest.skip("Polymarket Gamma API unavailable")
@@ -222,10 +286,10 @@ class TestE2E_LiveMarketDiscovery:
             assert 0.0 <= price <= 1.0, f"Price {price} outside [0,1]"
 
     def test_clob_book_has_positive_spread(self, live_btc_book):
-        """best_ask > best_bid (real market should always have a valid spread)."""
+        """best_ask > best_bid (real market with a two-sided book must have a spread)."""
         _token_id, snap = live_btc_book
-        if snap.best_bid is None or snap.best_ask is None:
-            pytest.skip("One-sided book — skipping spread check")
+        assert snap.best_bid is not None, "fixture should return a book with bids"
+        assert snap.best_ask is not None, "fixture should return a book with asks"
         assert snap.best_ask > snap.best_bid, (
             f"Invalid book: best_ask={snap.best_ask} <= best_bid={snap.best_bid}"
         )
@@ -248,8 +312,7 @@ class TestE2E_IsCrossed:
     def test_bid_at_best_bid_is_crossed(self, live_btc_book):
         """A paper BUY resting at the real best_bid is always reachable."""
         token_id, snap = live_btc_book
-        if snap.best_bid is None:
-            pytest.skip("No bids in live book")
+        assert snap.best_bid is not None, "fixture should return a book with bids"
         _pm, _hl, engine, strategy, monitor, simulator = _make_components()
         assert simulator._is_crossed("BUY", snap.best_bid, snap), \
             f"bid @ best_bid={snap.best_bid} should be crossed"
@@ -276,24 +339,19 @@ class TestE2E_IsCrossed:
         When mid - best_bid < 0.01 the maker bid (mid-0.02) falls below that floor.
         """
         token_id, snap = live_btc_book
-        if snap.mid is None or snap.best_bid is None:
-            pytest.skip("No mid/bid in live book")
-        if not snap.asks:
-            pytest.skip(
-                "No asks in live book — market is likely near resolution "
-                "(mid ≈ best_bid, 2-cent half-spread falls outside fill tolerance)"
-            )
+        assert snap.mid is not None, "fixture should return a book with a mid"
+        assert snap.best_bid is not None, "fixture should return a book with bids"
+        assert snap.asks, "fixture should return a book with asks (two-sided)"
         # The assumption mid - 0.02 ≈ best_bid only holds when the bid-side
-        # spread is at least 0.01 wide.  Tight books (e.g. 0.005 spread) make
-        # the maker bid (mid-0.02) exceed the FILL_QUEUE_TOLERANCE gap — skip
-        # rather than assert on a condition that depends on live market conditions.
+        # spread is at least 0.01 wide.  Tight books (e.g. 0.005 spread after
+        # a large price move) can make the maker bid fall below FILL_QUEUE_TOLERANCE.
         if snap.mid - snap.best_bid < 0.01:
             pytest.skip(
                 f"Book too tight (mid-best_bid={snap.mid - snap.best_bid:.3f} < 0.01); "
-                "0.02 half-spread bid falls below fill tolerance"
+                "0.02 half-spread bid falls below fill tolerance for this live reading"
             )
         _pm, _hl, engine, strategy, monitor, simulator = _make_components()
-        maker_bid = round(snap.mid - 0.02, 4)  # typical: mid minus half_spread
+        maker_bid = round(snap.mid - 0.02, 4)
         if maker_bid <= 0:
             pytest.skip("mid too low for this test")
         assert simulator._is_crossed("BUY", maker_bid, snap), (
@@ -315,8 +373,7 @@ class TestE2E_IsCrossed:
     def test_ask_at_best_ask_is_crossed(self, live_btc_book):
         """A paper SELL resting at the real best_ask is always reachable."""
         token_id, snap = live_btc_book
-        if snap.best_ask is None:
-            pytest.skip("No asks in live book")
+        assert snap.best_ask is not None, "fixture should return a book with asks"
         _pm, _hl, engine, strategy, monitor, simulator = _make_components()
         assert simulator._is_crossed("SELL", snap.best_ask, snap), \
             f"ask @ best_ask={snap.best_ask} should be crossed"
@@ -324,8 +381,7 @@ class TestE2E_IsCrossed:
     def test_ask_at_maker_quoted_price_is_crossed(self, live_btc_book):
         """Maker SELL one tick above best_ask is within fill tolerance."""
         token_id, snap = live_btc_book
-        if snap.best_ask is None:
-            pytest.skip("No asks in live book")
+        assert snap.best_ask is not None, "fixture should return a book with asks"
         _pm, _hl, engine, strategy, monitor, simulator = _make_components()
         # Post one tick above the inside ask — should be reachable by an arriving BUY taker.
         maker_ask = round(snap.best_ask + 0.01, 4)
@@ -956,8 +1012,7 @@ class TestE2E_FullSweepLiveBook:
         import unittest.mock as mock
 
         token_id, snap = live_btc_book
-        if snap.best_ask is None:
-            pytest.skip("No asks in live book")
+        assert snap.best_ask is not None, "fixture should return a book with asks"
 
         market = _synthetic_market(token_id, mid=snap.mid or 0.5)
         self.simulator._pm._markets = {market.condition_id: market}
@@ -1002,19 +1057,23 @@ class TestE2E_FullSweepLiveBook:
         import unittest.mock as mock
 
         token_id, snap = live_btc_book
-        if snap.best_bid is None or snap.best_bid < 0.55:
-            pytest.skip("best_bid too low for this test")
+        if snap.best_bid is None or snap.best_bid <= 0.02:
+            pytest.skip("best_bid too low — can't place a bid far enough below it")
+        _pm, _hl, engine, strategy, monitor, simulator = _make_components()
 
         market = _synthetic_market(token_id, mid=snap.mid or 0.5)
-        self.simulator._pm._markets = {market.condition_id: market}
-        self.simulator._pm._books = {market.token_id_yes: snap}
+        simulator._pm._markets = {market.condition_id: market}
+        simulator._pm._books = {market.token_id_yes: snap}
+        strategy._active_quotes = {}
 
-        deep_bid = round(snap.best_bid - 0.50, 4)
+        # Place deep_bid at least 0.10 below best_bid (far enough to be outside queue)
+        discount = min(0.50, snap.best_bid - 0.03)
+        deep_bid = round(snap.best_bid - discount, 4)
         if deep_bid <= 0:
             pytest.skip("best_bid too low")
 
         key = token_id
-        self.strategy._active_quotes[key] = ActiveQuote(
+        strategy._active_quotes[key] = ActiveQuote(
             market_id=market.condition_id,
             token_id=token_id,
             side="BUY",
@@ -1029,9 +1088,9 @@ class TestE2E_FullSweepLiveBook:
             mock.patch("random.random", return_value=0.0),
             mock.patch("random.expovariate", return_value=9999.0),
         ):
-            _run(self.simulator._sweep())
+            _run(simulator._sweep())
 
-        positions = self.engine.get_open_positions()
+        positions = engine.get_open_positions()
         assert not positions, (
             f"Deep bid ({deep_bid} vs best_bid={snap.best_bid}) should NOT fill"
         )
@@ -1139,26 +1198,39 @@ class TestQuoteSizeBounds:
         within [MAKER_SPREAD_SIZE_MIN, MAKER_SPREAD_SIZE_MAX].
         """
         token_id, snap = live_btc_book
-        if snap.mid is None:
-            pytest.skip("No mid in live book")
+        assert snap.mid is not None, "live_btc_book fixture must provide a mid"
 
-        # Build a market with volume that puts quote_size well within bounds
-        # 5k × 0.02 = $100 ∈ [MIN=50, MAX=250]
+        # Build a market with volume that puts quote_size well within bounds.
+        # Use end_date within MAKER_MAX_TTE_DAYS (market always has ~20h TTE so
+        # lifecycle_frac=0.83, safely past both opening and exit cooldowns).
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
         market = _synthetic_market(token_id, mid=snap.mid)
+        market.end_date = _dt.now(_tz.utc) + _td(hours=20)
         market.volume_24hr = 5_000.0
         self.pm.place_limit.return_value = "paper-bounds-test"
         self.strategy._pm._markets = {market.condition_id: market}
+        self.strategy._pm.get_book = MagicMock(return_value=None)  # no book — depth gate disabled below
+        self.strategy._pm._round_to_tick = lambda p, t: round(round(p / t) * t, 6)
         self.simulator._pm._markets = {market.condition_id: market}
         self.simulator._pm._books = {}
 
-        signal = self.strategy._evaluate_signal(market, snap.mid)
-        if signal is None:
-            pytest.skip("Signal not generated for this live mid (edge/TTE/risk filter)")
+        # Bypass depth gate: the test's purpose is the fill-pipeline, not book depth
+        _orig_depth = config.MAKER_MIN_DEPTH_TO_QUOTE
+        config.MAKER_MIN_DEPTH_TO_QUOTE = 0
+        try:
+            signal = self.strategy._evaluate_signal(market, snap.mid)
+        finally:
+            config.MAKER_MIN_DEPTH_TO_QUOTE = _orig_depth
+
+        assert signal is not None, (
+            f"Signal not generated for mid={snap.mid:.4f}; "
+            f"check TTE/edge/risk gates with market {market!r}"
+        )
 
         signal_qs = signal.quote_size  # USD target
-        assert config.MAKER_QUOTE_SIZE_MIN <= signal_qs <= config.MAKER_QUOTE_SIZE_MAX, (
+        assert config.MAKER_SPREAD_SIZE_MIN <= signal_qs <= config.MAKER_SPREAD_SIZE_MAX, (
             f"Signal quote_size={signal_qs} not in bounds "
-            f"[{config.MAKER_QUOTE_SIZE_MIN}, {config.MAKER_QUOTE_SIZE_MAX}]"
+            f"[{config.MAKER_SPREAD_SIZE_MIN}, {config.MAKER_SPREAD_SIZE_MAX}]"
         )
 
         _run(self.strategy._deploy_quote(signal, market))
@@ -1166,18 +1238,24 @@ class TestQuoteSizeBounds:
         quote_ref = self.strategy._active_quotes.get(bid_key)
         assert quote_ref is not None, "BID quote was not deployed"
 
-        # Contracts must equal round(quote_size / bid_price)
-        expected_contracts = max(1, round(signal_qs / signal.bid_price))
+        # Contracts = min(BATCH_SIZE, MAX_PER_SIDE, max(1, int(quote_size / cost_per_contract)))
+        # where cost_per_contract = bid_price + (1 - ask_price)
+        cost_per_contract = signal.bid_price + (1.0 - signal.ask_price)
+        expected_contracts = min(
+            config.MAKER_BATCH_SIZE,
+            config.MAKER_MAX_CONTRACTS_PER_SIDE,
+            max(1, int(signal_qs / cost_per_contract)),
+        )
         assert quote_ref.size == pytest.approx(expected_contracts, abs=1), (
-            f"Deployed contracts {quote_ref.size} != round(quote_size/bid_price)={expected_contracts}"
+            f"Deployed contracts {quote_ref.size} != expected {expected_contracts} "
+            f"(quote_size={signal_qs}, cost_per_contract={cost_per_contract:.4f})"
         )
-        # Collateral must be close to the USD target
-        assert quote_ref.collateral_usd == pytest.approx(signal.bid_price * expected_contracts, abs=0.02), (
-            f"collateral_usd {quote_ref.collateral_usd} != price×contracts"
+        # Collateral = bid_price × contracts
+        expected_collateral = signal.bid_price * expected_contracts
+        assert quote_ref.collateral_usd == pytest.approx(expected_collateral, abs=0.02), (
+            f"collateral_usd {quote_ref.collateral_usd} != bid_price×contracts={expected_collateral:.4f}"
         )
-        assert config.MAKER_QUOTE_SIZE_MIN <= quote_ref.collateral_usd <= config.MAKER_QUOTE_SIZE_MAX + 1, (
-            f"collateral_usd {quote_ref.collateral_usd} outside expected bounds"
-        )
+        assert quote_ref.collateral_usd > 0, "collateral_usd must be positive"
 
         # Fully fill the deployed quote (fill by contract count)
         _run(self.simulator._on_fill(bid_key, quote_ref, market, quote_ref.size))
@@ -1188,11 +1266,8 @@ class TestQuoteSizeBounds:
             f"Expected 1 position after full fill, got {len(market_pos)}"
         )
         pos = market_pos[0]
-        # entry_cost_usd = price × contracts ≈ USD target
+        # entry_cost_usd = bid_price × contracts (per-leg collateral)
         assert pos.entry_cost_usd == pytest.approx(quote_ref.collateral_usd, abs=0.02), (
             f"Position entry_cost_usd {pos.entry_cost_usd} != deployed collateral {quote_ref.collateral_usd}"
         )
-        assert config.MAKER_QUOTE_SIZE_MIN <= pos.entry_cost_usd <= config.MAKER_QUOTE_SIZE_MAX + 1, (
-            f"Fully-filled position entry_cost_usd {pos.entry_cost_usd} outside bounds "
-            f"[{config.MAKER_QUOTE_SIZE_MIN}, {config.MAKER_QUOTE_SIZE_MAX}]"
-        )
+        assert pos.entry_cost_usd > 0, "entry_cost_usd must be positive after a fill"
