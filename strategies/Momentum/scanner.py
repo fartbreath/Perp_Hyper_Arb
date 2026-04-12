@@ -489,14 +489,13 @@ class MomentumScanner(BaseStrategy):
             if _is_updown_market(market.title):
                 _mid_pre = market.condition_id
                 if _mid_pre not in self._market_open_spot_confirmed:
-                    # Fetch the canonical "Price To Beat" from the Gamma events API.
-                    # This is the exact Chainlink snapshot at window-open time — the
-                    # same value Polymarket's settlement contract reads.
-                    # Until the API confirms the value, no strike is recorded and the
-                    # market is skipped (no_strike). We never trade against a guessed
-                    # or stale oracle price.
+                    # Try gamma first — it's the authoritative source for 4h+ markets
+                    # (priceToBeat appears within seconds of window open for those).
+                    # For 5m/15m markets gamma only sets priceToBeat AFTER the window
+                    # closes (too late to trade), so they fall through to the spot path.
                     _ptb = await self._pm.fetch_price_to_beat(market.market_slug)
                     if _ptb is not None:
+                        # Gamma confirmed — use and persist.
                         self._market_open_spot[_mid_pre] = _ptb
                         self._market_open_spot_confirmed.add(_mid_pre)
                         _save_open_spots(self._open_spot_path, {
@@ -510,6 +509,22 @@ class MomentumScanner(BaseStrategy):
                             open_spot=round(_ptb, 4),
                             source="gamma_ptb",
                         )
+                    elif _mid_pre not in self._market_open_spot:
+                        # Gamma hasn't set priceToBeat yet (typical for 5m/15m during
+                        # active window).  Record the current oracle price ONCE and
+                        # freeze it.  The bot runs continuously so this first-detection
+                        # price is within seconds of the actual window open.  NOT
+                        # persisted — gamma override still takes effect if it arrives.
+                        _open_snap = self._spot.get_spot(market.underlying, market.market_type)
+                        if _open_snap is not None and _open_snap.mid is not None:
+                            self._market_open_spot[_mid_pre] = _open_snap.mid
+                            log.debug(
+                                "MomentumScanner: recorded spot fallback for Up/Down strike",
+                                market=market.title[:60],
+                                market_id=_mid_pre[:16],
+                                open_spot=round(_open_snap.mid, 4),
+                                source="spot_first_detection",
+                            )
                 # Surface the recorded strike in diag at every scan state,
                 # even for out-of-band / not-yet-in-band rows.
                 if _mid_pre in self._market_open_spot:
