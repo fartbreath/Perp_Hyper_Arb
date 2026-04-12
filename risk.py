@@ -233,7 +233,16 @@ class RiskEngine:
                 return 0
             try:
                 with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-                    rows = list(csv.DictReader(f))
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+                # Guard against headerless CSVs: if the first row's keys don't
+                # include "timestamp" the CSV was written without a header row
+                # (DictReader misused the first data row as fieldnames).
+                # Re-read with explicit fieldnames from TRADES_HEADER.
+                if rows and "timestamp" not in rows[0]:
+                    log.warning("patch_trade_outcome: headerless trades.csv — re-reading with explicit fieldnames")
+                    with TRADES_CSV.open(newline="", encoding="utf-8") as f:
+                        rows = list(csv.DictReader(f, fieldnames=TRADES_HEADER))
             except Exception as exc:
                 log.error("patch_trade_outcome: read failed", exc=str(exc))
                 return 0

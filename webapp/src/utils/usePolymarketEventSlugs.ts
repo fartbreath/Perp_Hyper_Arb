@@ -20,7 +20,7 @@ export function usePolymarketEventSlugs() {
         for (const ev of events) {
           for (const m of ev.markets ?? []) {
             // Use the event-level slug — Polymarket's canonical URL is /event/{event-slug}
-            const slug: string = ev.slug || m.slug;
+            const slug: string = ev.slug || m.slug || "";
             if (slug && m.conditionId) map[m.conditionId] = slug;
           }
         }

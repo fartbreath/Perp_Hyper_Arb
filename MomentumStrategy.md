@@ -468,6 +468,8 @@ Before entering, check all open positions across ALL strategies:
 | Deribit IV cached from high-vol period | Cache TTL 5 min; stale vol widens threshold | Conservative; may miss some trades |
 | Vol regime spikes 3x (black swan) | z-score scales threshold with vol | Naturally filters out noisy markets |
 | Low-vol coin passes z-gate with tiny gap | `MOMENTUM_MIN_DELTA_PCT` absolute floor (independent of bucket) | Blocks trades where a single tick would cross strike; see [Absolute Floor Principle](#absolute-floor-principle) |
+| NO/DOWN position immediately stop-lossed after entry (dip market) | Dip-market delta direction fix: if `entry_spot > strike` swap sign of delta formula in `should_exit()` and `_write_momentum_tick()` | Reach-market NO wins when spot < strike; dip-market NO wins when spot > strike — formula now inferred from `pos.spot_price` recorded at entry |
+| Kelly `f* < 0` (negative expected value) | Kelly negative-EV guard: `_compute_kelly_size_usd` returns 0 when `raw_kelly_f < 0` | `MOMENTUM_MIN_ENTRY_USD` floor is not applied; signal skipped; `kelly_f_raw` logged for audit |
 
 ---
 
@@ -622,9 +624,9 @@ MomentumScanner._on_signal cb ────→ GET /momentum/signals
 - [x] Pyth outage detection (>50% stale-price warning)
 - [x] `/momentum/diagnostics` API endpoint backed by `_last_scan_diags`
 - [x] WS subscription refresh every 5 minutes (new bucket markets picked up automatically)
-- [ ] Unit tests for `vol_fetcher.py` (mock Deribit + HL)
-- [ ] Unit tests for `scanner.py` stale signal guards and Up/Down market handling
-- [ ] Unit tests for `monitor.py` momentum exits (side-specific stop-loss)
+- [x] Unit tests for `vol_fetcher.py` (mock Deribit + HL)
+- [x] Unit tests for `scanner.py` stale signal guards and Up/Down market handling
+- [x] Unit tests for `monitor.py` momentum exits (side-specific stop-loss)
 
 ### Pre-launch (required before going live)
 
@@ -635,7 +637,7 @@ MomentumScanner._on_signal cb ────→ GET /momentum/signals
 
 ### v2 (deferred)
 
-- [ ] Kelly sizing based on edge and bankroll
+- [x] ~~Kelly sizing based on edge and bankroll~~ → shipped; see [Kelly Sizing](#kelly-sizing) section
 - [ ] Regime detection: if Deribit IV > 2x trailing average → raise z-score automatically
 - [ ] Telegram alerts on momentum fills
 - [x] ~~Per-bucket-type z-score overrides (5m markets may need higher gate)~~ → shipped via `MOMENTUM_VOL_Z_SCORE_BY_TYPE`
@@ -705,6 +707,52 @@ for calibrating `MOMENTUM_VOL_Z_SCORE` and `MOMENTUM_MIN_TTE_SECONDS` from real 
 If more than 50% of all bucket markets are skipped for stale Pyth price in a single scan pass,
 the scanner logs a `WARNING: possible Pyth WS outage`. This distinguishes a genuine feed outage
 from isolated stale-price misses and alerts operators to investigate quickly.
+
+### Dip-Market NO Delta Direction Fix
+
+Binary bucket markets come in two flavours for the NO token:
+
+| Flavour | Example title | NO wins when |
+|---------|--------------|--------------|
+| Reach market | "Will ETH reach $2,500 by 3 PM?" | `spot < strike` at expiry |
+| Dip market | "Will ETH dip to $2,200 by 3 PM?" | `spot > strike` at expiry |
+
+`should_exit()` originally used `(strike − spot) / strike × 100` for all NO/DOWN positions
+(correct for reach markets). For dip markets this formula is negative whenever the position is
+winning (spot above strike), which triggered the stop-loss immediately after entry.
+
+**Fix:** `monitor.py` now inspects `pos.spot_price` (recorded at fill time). If
+`pos.spot_price > pos.strike`, the position is treated as a dip-market NO and the delta formula
+is flipped: `(spot − strike) / strike × 100`. The fix is applied in both `should_exit()` and
+`_write_momentum_tick()` (so `momentum_ticks.csv` also records the correct signed value).
+
+Backward-compatible: `pos.spot_price` defaults to `0.0`; for any saved position loaded with
+no spot price, `0.0 ≤ strike` so the reach-market formula is preserved.
+
+### Kelly Sizing
+
+The bot sizes each momentum entry using fractional Kelly:
+
+```
+f* = (p × b − (1 − p)) / b      # b = net payout per dollar (1/token_price − 1)
+size_usd = (f* × FRACTIONAL_KELLY × bankroll × kelly_multiplier)
+           clamped to [MOMENTUM_MIN_ENTRY_USD, MOMENTUM_MAX_ENTRY_USD]
+```
+
+Key tuning knobs (all in `config.py`):
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `MOMENTUM_KELLY_FRACTION` | `0.25` | Fractional Kelly (full Kelly is too aggressive for prediction markets) |
+| `MOMENTUM_KELLY_MIN_TTE_SECONDS` | `30` | Floor TTE for Kelly math — prevents sigma_tau collapse near expiry inflating `win_prob` to ~1.0 and sizing every entry at MAX |
+| `MOMENTUM_KELLY_MULTIPLIER_BY_TYPE` | `{5m:0.45, 15m:0.70, 1h:0.90, 4h+:1.00}` | Per-bucket structural dampener applied after fractional Kelly. Short buckets are noisy; dampening reduces over-sizing near expiry |
+| `MOMENTUM_KELLY_PERSISTENCE_ENABLED` | `True` | If True, a signal in-band continuously for ≥ 1 min-TTE window receives a z-score bonus (up to `MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX = 0.5`) — rewards sustained momentum vs. single-tick noise |
+
+**Negative-EV guard:** When `f* < 0` (payout too small to overcome the loss probability),
+`_compute_kelly_size_usd` returns `0.0` and `_execute_signal` skips the entry completely.
+`MOMENTUM_MIN_ENTRY_USD` does **not** override a negative-EV signal. The raw Kelly fraction
+(`kelly_f_raw`) is recorded in both the fills CSV debug dict and structured logs to make
+negative-EV skips auditable.
 
 ---
 

@@ -105,8 +105,8 @@ if emp_wr is not None and emp_wr < signal.win_prob * 0.9:
 ---
 
 ## P2 — Regression analysis: validate Kelly debug constants empirically
-**What:** After 50+ fills with new Kelly debug fields (`kelly_intra_sigma`, `kelly_persistence_pct`, `kelly_z_boost`, `kelly_tte_eff_s`), run a regression analysis.
-**Why:** The persistence z-boost max (0.5σ) and the `max()` sigma selector are empirical constants. Need to validate that higher `persistence_pct` correlates with wins and higher `intra_sigma` correlates with losses before relying on them for sizing.
+**What:** After 50+ fills with new Kelly debug fields (`kelly_persistence_pct`, `kelly_z_boost`, `kelly_tte_eff_s`), run a regression analysis.
+**Why:** The persistence z-boost max (0.5σ) is an empirical constant. Need to validate that higher `persistence_pct` correlates with wins before relying on it for sizing.
 **Effort:** M (human: ~1 day / CC: ~1 hour) — requires ~50 trades of data first.
 **Depends on:** Kelly TTE floor + path history PR being live for long enough to accumulate fills.
 

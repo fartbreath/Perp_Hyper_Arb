@@ -150,10 +150,14 @@ def _write_momentum_tick(
     try:
         _ensure_momentum_ticks_csv()
         entry_delta: Optional[float] = None
-        if pos.spot_price > 0 and pos.strike > 0:
+        if pos.strike > 0:
             if pos.side in ("YES", "BUY_YES", "UP"):
                 entry_delta = round((pos.spot_price - pos.strike) / pos.strike * 100, 6)
+            elif pos.spot_price > pos.strike:
+                # Dip-market NO/DOWN: winning direction is spot > strike.
+                entry_delta = round((pos.spot_price - pos.strike) / pos.strike * 100, 6)
             else:
+                # Reach-market NO/DOWN: winning direction is spot < strike.
                 entry_delta = round((pos.strike - pos.spot_price) / pos.strike * 100, 6)
         tok_drop = (
             round((pos.entry_price - current_token_price) / pos.entry_price * 100, 4)
@@ -363,8 +367,17 @@ def should_exit(
             if pos.side in ("YES", "BUY_YES", "UP"):
                 # Long YES/UP: profit when spot > strike.  Delta positive when in-the-money.
                 current_delta_pct = (current_spot - pos.strike) / pos.strike * 100
+            elif pos.spot_price > pos.strike:
+                # Long NO/DOWN on a "dip" market (e.g. "Will ETH dip to $X?"):
+                # NO wins when spot STAYS ABOVE the strike.
+                # Entry spot was above strike → winning delta = (spot - strike) / strike.
+                # pos.spot_price defaults to 0.0 so this branch only activates for live
+                # dip-market positions where the scanner stored the actual entry spot.
+                current_delta_pct = (current_spot - pos.strike) / pos.strike * 100
             else:
-                # Long NO/DOWN: profit when spot < strike.  Delta positive when in-the-money.
+                # Long NO/DOWN on a "reach" market (e.g. "Will ETH reach $X?"):
+                # NO wins when spot STAYS BELOW the strike.
+                # Entry spot was at or below strike → winning delta = (strike - spot) / strike.
                 current_delta_pct = (pos.strike - current_spot) / pos.strike * 100
             # PROTECTIVE BUFFER: fire when delta drops below +SL_PCT, i.e. while
             # still in-the-money but within SL_PCT% of the strike.  With
@@ -1076,83 +1089,35 @@ class PositionMonitor:
             #     _redeem_ready_positions() acts as a final safety-net in live
             #     mode — it re-closes with the correct payout from the Data API.
 
-            exit_mid: Optional[float] = None
-
-            # L1 — PM CLOB market resolution
+            # PM CLOB settlement API is the sole source of truth for resolved
+            # markets.  Once a market has expired there is no ambiguity: PM
+            # returns the settled YES-token price (0.0 or 1.0).  We do NOT fall
+            # back to oracle estimates or stale CLOB book mids — both can be
+            # wrong at the settlement instant and would produce incorrect P&L.
+            # If the PM API hasn't propagated the result yet, skip this cycle;
+            # _redeem_ready_positions() is the final safety-net that processes
+            # the position once redeemable=True or curPrice settles.
             _pm_yes_price = await self._pm.fetch_market_resolution(pos.market_id)
-            if _pm_yes_price is not None:
-                # _pm_yes_price is the settled YES/UP token price (0.0 or 1.0).
-                # Convert to price-of-held-token space so the existing snap and
-                # WIN/LOSS logic in _exit_position works correctly.
-                if pos.side in ("YES", "BUY_YES", "UP"):
-                    exit_mid = _pm_yes_price
-                else:
-                    exit_mid = 1.0 - _pm_yes_price
-                log.info(
-                    "Monitor: RESOLVED — PM CLOB settlement confirms outcome",
+            if _pm_yes_price is None:
+                log.debug(
+                    "Monitor: RESOLVED market — PM API not settled yet, will retry",
                     market_id=pos.market_id,
-                    pm_yes_price=_pm_yes_price,
-                    side=pos.side,
-                    exit_mid=exit_mid,
                 )
+                return
 
-            # L2 — oracle spot vs. strike (momentum positions; fills the gap
-            # before the CLOB market object is marked closed=True)
-            if (
-                exit_mid is None
-                and pos.strategy == "momentum"
-                and pos.strike > 0
-                and self._spot is not None
-                and pos.underlying
-            ):
-                # Phase B: always use AggregatorV3-only feed for L2 resolution
-                # matching (post-expiry path) when flag is enabled.
-                if config.MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY:
-                    _res_spot = self._spot.get_mid_resolution_oracle(
-                        pos.underlying, pos.market_type
-                    )
-                else:
-                    _res_spot = self._spot.get_mid(pos.underlying, pos.market_type)
-                if _res_spot is not None and _res_spot > 0:
-                    if pos.side in ("YES", "BUY_YES", "UP"):
-                        exit_mid = 1.0 if _res_spot > pos.strike else 0.0
-                    else:
-                        exit_mid = 1.0 if _res_spot < pos.strike else 0.0
-                    log.info(
-                        "Monitor: RESOLVED momentum — oracle vs. strike (PM API not yet closed)",
-                        market_id=pos.market_id,
-                        spot=round(_res_spot, 4),
-                        strike=round(pos.strike, 4),
-                        side=pos.side,
-                        oracle_exit_mid=exit_mid,
-                    )
-
-            # L3 — CLOB book mid
-            book = self._pm._books.get(market.token_id_yes)
-            if exit_mid is None:
-                if pos.side in ("YES", "BUY_YES", "UP"):
-                    exit_mid = (
-                        book.mid
-                        if book is not None and book.mid is not None
-                        else pos.entry_price
-                    )
-                else:
-                    book_no_res = self._pm._books.get(market.token_id_no)
-                    if book_no_res is not None and book_no_res.mid is not None:
-                        exit_mid = book_no_res.mid
-                    else:
-                        log.warning(
-                            "Monitor: NO/DOWN book gone at resolution — using entry_price (zero P&L)",
-                            market_id=pos.market_id,
-                        )
-                        exit_mid = pos.entry_price
+            # Convert settled YES-token price to held-token space.
+            if pos.side in ("YES", "BUY_YES", "UP"):
+                exit_mid = _pm_yes_price
+            else:
+                exit_mid = 1.0 - _pm_yes_price
 
             unrealised = compute_unrealised_pnl(pos, exit_mid)
             log.info(
-                "Monitor: resolved market — closing position",
+                "Monitor: RESOLVED — PM CLOB settlement confirms outcome",
                 market_id=pos.market_id,
-                exit_mid=round(exit_mid, 4),
-                book_available=book is not None and book.mid is not None,
+                pm_yes_price=_pm_yes_price,
+                side=pos.side,
+                exit_mid=exit_mid,
             )
             await self._exit_position(pos, market, exit_mid, ExitReason.RESOLVED, unrealised)
             return

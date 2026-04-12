@@ -317,14 +317,12 @@ function MomentumRow({
   closeState,
   onClose,
   marketUrl,
-  stopLoss,
   takeProfit,
 }: {
   pos: Position;
   closeState: string | undefined;
   onClose: (id: string) => void;
   marketUrl: string | null;
-  stopLoss: number;
   takeProfit: number;
 }) {
   const tokenEntry = pos.token_entry_price ?? (pos.side === "NO" ? 1 - pos.entry_price : pos.entry_price);
@@ -334,9 +332,9 @@ function MomentumRow({
     (tokenCurrent != null ? (tokenCurrent - tokenEntry) * pos.contracts : null);
   const contracts = pos.contracts ?? pos.size_usd;
 
-  // Stop/TP proximity bar — 0 = at stop, 100 = at TP
-  const proximityPct = tokenCurrent != null
-    ? Math.max(0, Math.min(100, ((tokenCurrent - stopLoss) / (takeProfit - stopLoss)) * 100))
+  // Entry-to-TP proximity bar — 0 = at entry, 100 = at take-profit
+  const proximityPct = tokenCurrent != null && takeProfit > tokenEntry
+    ? Math.max(0, Math.min(100, ((tokenCurrent - tokenEntry) / (takeProfit - tokenEntry)) * 100))
     : null;
   const proxColor = proximityPct == null ? "#64748b"
     : proximityPct < 15 ? "#ef4444"
@@ -371,7 +369,7 @@ function MomentumRow({
       </td>
       {/* Stop / TP proximity */}
       <td title={tokenCurrent != null
-          ? `Stop: ${(stopLoss * 100).toFixed(0)}¢  |  Current: ${(tokenCurrent * 100).toFixed(1)}¢  |  TP: ${(takeProfit * 100).toFixed(0)}¢`
+          ? `Entry: ${(tokenEntry * 100).toFixed(1)}¢  |  Current: ${(tokenCurrent * 100).toFixed(1)}¢  |  TP: ${(takeProfit * 100).toFixed(0)}¢`
           : "Price unavailable"}
           style={{ minWidth: 80 }}>
         {proximityPct != null ? (
@@ -430,7 +428,6 @@ export default function Positions() {
   const [orderPending, setOrderPending] = useState<string | null>(null);
   const openOrders = (signalsData?.signals ?? []).filter((s) => s.is_deployed);
 
-  const stopLoss = cfg?.momentum_stop_loss ?? 0.55;
   const takeProfit = cfg?.momentum_take_profit ?? 0.96;
 
   const handleClose = async (marketId: string) => {
@@ -681,7 +678,7 @@ export default function Positions() {
               <th>Side</th>
               <th title="Entry token price (side-adjusted)" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Entry</th>
               <th title="Current live token price" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Current</th>
-              <th title="Stop/TP proximity — 0% = at stop, 100% = at take-profit" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Stop … TP</th>
+              <th title="Progress from entry toward take-profit (0% = at entry, 100% = at TP)" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Entry … TP</th>
               <th title="USDC capital deployed at entry" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Deployed</th>
               <th title="Unrealised P&L at current price">Unrealised P&L</th>
               <th>Opened</th>
@@ -700,7 +697,6 @@ export default function Positions() {
                   closeState={closeState[pos.condition_id]}
                   onClose={handleClose}
                   marketUrl={marketUrl}
-                  stopLoss={stopLoss}
                   takeProfit={takeProfit}
                 />
               );
@@ -723,7 +719,7 @@ export default function Positions() {
                 <th>Side</th>
                 <th>Entry</th>
                 <th>Current</th>
-                <th>Stop … TP</th>
+                <th>Entry … TP</th>
                 <th>Deployed</th>
                 <th>Unrealised P&amp;L</th>
                 <th>Opened</th>
@@ -742,7 +738,6 @@ export default function Positions() {
                     closeState={closeState[pos.condition_id]}
                     onClose={handleClose}
                     marketUrl={marketUrl}
-                    stopLoss={stopLoss}
                     takeProfit={takeProfit}
                   />
                 );

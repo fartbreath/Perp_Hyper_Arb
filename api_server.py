@@ -523,12 +523,13 @@ _MUTABLE_CONFIG = {
     # Phase D — hedge
     "momentum_hedge_enabled":          ("MOMENTUM_HEDGE_ENABLED",           bool),
     "momentum_hedge_price":            ("MOMENTUM_HEDGE_PRICE",             float),
+    "momentum_hedge_coverage_pct":     ("MOMENTUM_HEDGE_COVERAGE_PCT",      float),
     # Phase E — empirical win-rate gate
     "momentum_win_rate_gate_enabled":  ("MOMENTUM_WIN_RATE_GATE_ENABLED",   bool),
     "momentum_win_rate_gate_min_factor": ("MOMENTUM_WIN_RATE_GATE_MIN_FACTOR", float),
     "momentum_win_rate_gate_min_samples": ("MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES", int),
     # Kelly extensions
-    "momentum_kelly_intra_sigma_enabled":    ("MOMENTUM_KELLY_INTRA_SIGMA_ENABLED",    bool),
+    "momentum_kelly_min_tte_seconds":         ("MOMENTUM_KELLY_MIN_TTE_SECONDS",         int),
     "momentum_kelly_persistence_enabled":    ("MOMENTUM_KELLY_PERSISTENCE_ENABLED",    bool),
     "momentum_kelly_persistence_z_boost_max": ("MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX", float),
     # Range markets (sub-strategy of Momentum)
@@ -707,14 +708,28 @@ class ConfigPatch(BaseModel):
     # Phase D — hedge
     momentum_hedge_enabled: bool | None = None
     momentum_hedge_price: float | None = None
+    momentum_hedge_coverage_pct: float | None = None
+    momentum_hedge_price_5m: float | None = None
+    momentum_hedge_price_15m: float | None = None
+    momentum_hedge_price_1h: float | None = None
+    momentum_hedge_price_4h: float | None = None
+    momentum_hedge_price_daily: float | None = None
+    momentum_hedge_price_weekly: float | None = None
+    momentum_hedge_price_milestone: float | None = None
     # Phase E — empirical win-rate gate
     momentum_win_rate_gate_enabled: bool | None = None
     momentum_win_rate_gate_min_factor: float | None = None
     momentum_win_rate_gate_min_samples: int | None = None
     # Kelly extensions
-    momentum_kelly_intra_sigma_enabled: bool | None = None
+    momentum_kelly_min_tte_seconds: int | None = None
     momentum_kelly_persistence_enabled: bool | None = None
     momentum_kelly_persistence_z_boost_max: float | None = None
+    momentum_kelly_multiplier_5m: float | None = None
+    momentum_kelly_multiplier_15m: float | None = None
+    momentum_kelly_multiplier_1h: float | None = None
+    momentum_kelly_multiplier_4h: float | None = None
+    momentum_kelly_multiplier_daily: float | None = None
+    momentum_kelly_multiplier_weekly: float | None = None
     # Range markets sub-strategy
     momentum_range_enabled: bool | None = None
     momentum_range_price_band_low: float | None = None
@@ -893,14 +908,28 @@ def get_config() -> dict:
         # Phase D — hedge
         "momentum_hedge_enabled":         config.MOMENTUM_HEDGE_ENABLED,
         "momentum_hedge_price":           config.MOMENTUM_HEDGE_PRICE,
+        "momentum_hedge_coverage_pct":    config.MOMENTUM_HEDGE_COVERAGE_PCT,
+        "momentum_hedge_price_5m":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_5m",    config.MOMENTUM_HEDGE_PRICE),
+        "momentum_hedge_price_15m":       config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_15m",   config.MOMENTUM_HEDGE_PRICE),
+        "momentum_hedge_price_1h":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_1h",    config.MOMENTUM_HEDGE_PRICE),
+        "momentum_hedge_price_4h":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_4h",    config.MOMENTUM_HEDGE_PRICE),
+        "momentum_hedge_price_daily":     config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_daily",  config.MOMENTUM_HEDGE_PRICE),
+        "momentum_hedge_price_weekly":    config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_weekly", config.MOMENTUM_HEDGE_PRICE),
+        "momentum_hedge_price_milestone": config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("milestone",     config.MOMENTUM_HEDGE_PRICE),
         # Phase E — empirical win-rate gate
         "momentum_win_rate_gate_enabled":     config.MOMENTUM_WIN_RATE_GATE_ENABLED,
         "momentum_win_rate_gate_min_factor":  config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR,
         "momentum_win_rate_gate_min_samples": config.MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES,
         # Kelly extensions
-        "momentum_kelly_intra_sigma_enabled":    config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED,
+        "momentum_kelly_min_tte_seconds":         config.MOMENTUM_KELLY_MIN_TTE_SECONDS,
         "momentum_kelly_persistence_enabled":    config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
         "momentum_kelly_persistence_z_boost_max": config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX,
+        "momentum_kelly_multiplier_5m":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_5m",    1.0),
+        "momentum_kelly_multiplier_15m":          config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_15m",   1.0),
+        "momentum_kelly_multiplier_1h":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_1h",    1.0),
+        "momentum_kelly_multiplier_4h":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_4h",    1.0),
+        "momentum_kelly_multiplier_daily":        config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_daily", 1.0),
+        "momentum_kelly_multiplier_weekly":       config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_weekly",1.0),
         # Range markets sub-strategy
         "momentum_range_enabled":              config.MOMENTUM_RANGE_ENABLED,
         "momentum_range_price_band_low":       config.MOMENTUM_RANGE_PRICE_BAND_LOW,
@@ -978,6 +1007,36 @@ def patch_config(patch: ConfigPatch) -> dict:
             config.MOMENTUM_MIN_ELAPSED_SECONDS[bucket_key] = int(v)
             updated[field] = int(v)
             log.info("Config updated via API", key=f"MOMENTUM_MIN_ELAPSED_SECONDS[{bucket_key}]", value=int(v))
+    # Per-bucket Kelly multiplier overrides — written directly into the dict
+    _kelly_mult_map = {
+        "momentum_kelly_multiplier_5m":      "bucket_5m",
+        "momentum_kelly_multiplier_15m":     "bucket_15m",
+        "momentum_kelly_multiplier_1h":      "bucket_1h",
+        "momentum_kelly_multiplier_4h":      "bucket_4h",
+        "momentum_kelly_multiplier_daily":   "bucket_daily",
+        "momentum_kelly_multiplier_weekly":  "bucket_weekly",
+    }
+    for field, bucket_key in _kelly_mult_map.items():
+        v = getattr(patch, field)
+        if v is not None:
+            config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE[bucket_key] = float(v)
+            updated[field] = float(v)
+            log.info("Config updated via API", key=f"MOMENTUM_KELLY_MULTIPLIER_BY_TYPE[{bucket_key}]", value=float(v))
+    # Phase D — per-bucket hedge price overrides
+    _hedge_price_map = {        "momentum_hedge_price_5m":       "bucket_5m",
+        "momentum_hedge_price_15m":      "bucket_15m",
+        "momentum_hedge_price_1h":       "bucket_1h",
+        "momentum_hedge_price_4h":       "bucket_4h",
+        "momentum_hedge_price_daily":    "bucket_daily",
+        "momentum_hedge_price_weekly":   "bucket_weekly",
+        "momentum_hedge_price_milestone":"milestone",
+    }
+    for field, bucket_key in _hedge_price_map.items():
+        v = getattr(patch, field)
+        if v is not None:
+            config.MOMENTUM_HEDGE_PRICE_BY_TYPE[bucket_key] = float(v)
+            updated[field] = float(v)
+            log.info("Config updated via API", key=f"MOMENTUM_HEDGE_PRICE_BY_TYPE[{bucket_key}]", value=float(v))
     # Per-coin delta stop-loss overrides — written directly into the dict
     _delta_sl_coin_map = {
         "momentum_delta_sl_pct_btc":  "BTC",
@@ -1032,6 +1091,8 @@ def patch_config(patch: ConfigPatch) -> dict:
             attr_changes["MOMENTUM_MIN_DELTA_PCT_BY_COIN"] = dict(config.MOMENTUM_MIN_DELTA_PCT_BY_COIN)
         if any(f in updated for f in _elapsed_map):
             attr_changes["MOMENTUM_MIN_ELAPSED_SECONDS"] = dict(config.MOMENTUM_MIN_ELAPSED_SECONDS)
+        if any(f in updated for f in _hedge_price_map):
+            attr_changes["MOMENTUM_HEDGE_PRICE_BY_TYPE"] = dict(config.MOMENTUM_HEDGE_PRICE_BY_TYPE)
         _save_overrides(attr_changes)
     return {
         "updated": updated,

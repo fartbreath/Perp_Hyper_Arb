@@ -10,7 +10,7 @@ A semi-automated crypto trading bot that runs three complementary strategies: ma
 
 **Strategy 2 — Mispricing Scanner:** Scans Polymarket milestone markets against matching Kalshi markets. When both venues list the same crypto event (e.g. "Will BTC close above $90k on March 31?"), any price divergence above the fee hurdle is a candidate trade. Deribit N(d₂) can optionally be used as a second-layer confirmation signal. Spot price for Black-Scholes is sourced from **Polymarket RTDS**.
 
-**Strategy 3 — Momentum Scanner:** Runs a price-confirmation taker strategy that enters high-probability contracts when Polymarket token prices and spot movement jointly confirm momentum. It supports volatility-aware thresholds, per-market cooldowns, stop-loss / take-profit exits, a near-expiry protective exit, and an optional range-market sub-strategy for "Will BTC be between $X and $Y?" markets.
+**Strategy 3 — Momentum Scanner:** Runs a price-confirmation taker strategy that enters high-probability contracts when Polymarket token prices and spot movement jointly confirm momentum. It supports volatility-aware thresholds, per-market cooldowns, fractional Kelly position sizing (with per-bucket dampeners and a negative-EV guard), stop-loss / take-profit exits with correct directional delta for both reach-market and dip-market NO positions, a near-expiry protective exit, and an optional range-market sub-strategy for "Will BTC be between $X and $Y?" markets.
 
 All strategies start in **paper trading mode** (no real funds). Switching to live is a single config change.
 
@@ -202,6 +202,13 @@ Key parameters:
 ---
 
 ## Recent Changes
+
+### 2026-04-12 — Dip-market delta fix, Kelly negative-EV guard, per-bucket multiplier
+
+- **Dip-market NO delta direction fix** (`monitor.py`): `should_exit()` and `_write_momentum_tick()` now infer the winning direction for NO/DOWN positions from `pos.spot_price` recorded at entry. If `entry_spot > strike` (the "Will ETH dip to $X?" flavour), the delta formula is `(spot − strike) / strike × 100` rather than the inverted reach-market version. This fixes instant false stop-losses that fired in the same second as entry for any dip-market NO.
+- **Kelly negative-EV guard** (`scanner.py`): `_compute_kelly_size_usd` now returns `0.0` when `raw_kelly_f < 0`. The `_execute_signal` entry path skips the order entirely. `MOMENTUM_MIN_ENTRY_USD` does not override negative-EV signals. A `kelly_f_raw` field added to debug CSV/logs for auditability.
+- **Per-bucket Kelly multiplier** (`MOMENTUM_KELLY_MULTIPLIER_BY_TYPE`): structural dampener applied after fractional Kelly — `{5m: 0.45, 15m: 0.70, 1h: 0.90, 4h+: 1.00}`. Reduces over-sizing in noisy short-bucket markets.
+- **Kelly TTE floor** (`MOMENTUM_KELLY_MIN_TTE_SECONDS = 30`): Kelly uses `max(tte, 30)` as effective TTE, preventing sigma_tau collapse near expiry from inflating `win_prob` to ~1.0 on every near-expiry signal.
 
 ### 2026-05 — Per-coin config + delta SL hysteresis
 

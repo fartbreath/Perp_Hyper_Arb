@@ -2,6 +2,59 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-12] - Bug fixes: dip-market delta inversion, negative-EV Kelly override, per-bucket multiplier test isolation
+
+### Fix — Dip-market NO/DOWN delta stop-loss inversion (`monitor.py`)
+
+**Problem:** `should_exit()` always computed the NO/DOWN winning delta as
+`(strike − spot) / strike × 100`, which is correct for *reach* markets ("Will ETH reach $3k?")
+but inverted for *dip* markets ("Will ETH dip to $2,200?"). For a dip-market NO, the position
+wins when `spot > strike`. With `spot = $2,223` and `strike = $2,200` the formula returned
+`−1.065%`, which is always below the `+0.04%` stop-loss threshold — firing an instant false
+stop-loss at open regardless of spot movement.
+
+Root cause confirmed by examining a live trade: `entry_delta = −1.065`, `tok_drop_pct = 2.46%`
+(bid/ask spread artefact), `hold_seconds = 0.1` — the position was killed in the same second
+it was opened, with spot completely unchanged.
+
+**Fix:** For NO/DOWN positions, infer the winning direction from `pos.spot_price` recorded at
+entry. If `pos.spot_price > pos.strike` (dip market: entry spot was above strike) the correct
+delta formula is `(current_spot − strike) / strike × 100`. Otherwise the legacy reach-market
+formula `(strike − current_spot) / strike × 100` applies. `pos.spot_price` defaults to `0.0`,
+so all existing reach-market positions, saved positions, and tests are unaffected.
+
+The same directional fix was applied to `_write_momentum_tick()` so `momentum_ticks.csv`
+records the correct signed `entry_delta` for auditing.
+
+### Fix — Kelly MIN_ENTRY floor overrides negative-EV signals (`scanner.py`)
+
+**Problem:** When raw Kelly fraction `f* = (p×b − (1−p)) / b < 0` (the model says the bet has
+negative expected value), the `MOMENTUM_MIN_ENTRY_USD` floor was forcing a `$1` minimum entry
+anyway. This occurred for deeply in-the-money tokens (price ≥ 0.95¢) where `payout_b` is so
+small that `win_prob` cannot overcome the hurdle: e.g. `token = 0.955`, `payout_b = 0.0471`,
+`win_prob = 0.919` → `f* = (0.919×0.047 − 0.081)/0.047 = −0.80`.
+
+**Fix:** `_compute_kelly_size_usd` now returns `size_usd = 0.0` when `raw_kelly_f < 0`. The
+`_execute_signal` entry path checks `size_usd == 0.0` and skips with an INFO log rather than
+placing the order. `MOMENTUM_MIN_ENTRY_USD` only applies when Kelly says "bet small" (raw ≥ 0).
+A new `kelly_f_raw` field is added to the fills CSV debug dict to make negative-EV decisions
+auditable without re-running the math.
+
+### Fix — TestPaperModePositionSizing missing multiplier reset (`tests/test_momentum_scanner.py`)
+
+`TestPaperModePositionSizing.setup_method` was missing `MOMENTUM_KELLY_MULTIPLIER_BY_TYPE = {}`
+in its saved/restored config state. When the per-bucket multiplier feature was added in the
+previous session, the `bucket_5m` multiplier of `0.45` silently reduced the test's expected
+`MAX_ENTRY_USD = $3.0` position to `$1.35`, causing four assertions to fail with
+`assert 1.35 == 3.0`. Fixed by neutralising the per-bucket multiplier dict in setup, mirroring
+the existing pattern in `TestKellySizing`.
+
+The old `test_negative_ev_signal_returns_min` test (which asserted that a negative-EV signal
+returns `MIN_ENTRY_USD`) was renamed `test_negative_ev_signal_returns_zero` and updated to
+assert `size == 0.0`.
+
+---
+
 ## [2026-04-11] - Phase B/B2/C/D/E + Kelly extensions: near-expiry oracle, hedging, win-rate gate
 
 ### Phase B — Two-oracle near-expiry strategy (`monitor.py`, `spot_oracle.py`, `config.py`)

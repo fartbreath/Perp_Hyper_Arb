@@ -317,11 +317,51 @@ MOMENTUM_MAX_ENTRY_USD: float = 50.0
 MOMENTUM_KELLY_FRACTION: float = 1.0     # safety multiplier on kelly_f (0 < x ≤ 1.0)
 MOMENTUM_MIN_ENTRY_USD: float = 1.0      # floor to avoid dust orders
 
-# Kelly Phase-A extensions — TTE floor, intra-bucket sigma, persistence z-boost.
-# All three default to off (False / 0) so production config_overrides.json opts in explicitly.
-MOMENTUM_KELLY_INTRA_SIGMA_ENABLED: bool = True   # use max(sigma_ann, intra-bucket realised σ)
-MOMENTUM_KELLY_PERSISTENCE_ENABLED: bool = True   # enable persistence z-boost
-MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX: float = 0.5  # max additional z added at full persistence
+# Kelly-specific minimum effective TTE.  Prevents sigma_tau from collapsing at
+# very small TTEs (e.g. 3s, 5s), which inflates z → 6σ hard cap → win_prob ≈ 1.0
+# → MAX_ENTRY on every signal regardless of actual edge.
+#
+# This is NOT the entry-gate ceiling (MOMENTUM_MIN_TTE_SECONDS): we still enter
+# markets at any TTE within the gate.  This floor only affects how confident Kelly
+# is — a signal fired with 3s left is sized as if MOMENTUM_KELLY_MIN_TTE_SECONDS
+# seconds remain, preventing overbetting while keeping the correct direction.
+#
+# Rule of thumb: ~50% of the entry-gate window (bucket_5m gate=60s → floor=30s).
+MOMENTUM_KELLY_MIN_TTE_SECONDS: int = 30
+
+# Per-bucket Kelly multiplier — applied after the fractional-Kelly fraction to
+# further dampen position sizes on short-duration buckets where the TTE floor
+# alone does not fully prevent over-sizing.
+#
+# Why this is needed:
+#   Even with MOMENTUM_KELLY_MIN_TTE_SECONDS=30, most 5m signals fire in the
+#   last 10–25 seconds.  sigma_tau at 30s effective TTE is still very small,
+#   so observed_z is large → high win_prob → Kelly still wants full MAX_ENTRY.
+#   The multiplier applies a structural cap that the vol model cannot compute
+#   on its own because it has no knowledge of the bucket's typical noise regime.
+#
+# Calibration:
+#   bucket_5m  0.45 — strong dampening; 5m markets are noisy & near-expiry
+#   bucket_15m 0.70 — moderate dampening
+#   bucket_1h+ 1.00 — no dampening; longer TTEs have reliable vol estimates
+#   Unlisted bucket types default to 1.0 (no dampening).
+MOMENTUM_KELLY_MULTIPLIER_BY_TYPE: dict[str, float] = {
+    "bucket_5m":    0.45,
+    "bucket_15m":   0.70,
+    "bucket_1h":    0.90,
+    "bucket_4h":    1.00,
+    "bucket_daily": 1.00,
+    "bucket_weekly": 1.00,
+}
+
+# Kelly Phase-A extension — persistence z-boost.
+
+# PERSISTENCE: rewards signals that have remained continuously valid (above
+# threshold) for a sustained period.  A z-boost ramps linearly from 0 up to
+# PERSISTENCE_Z_BOOST_MAX as the signal ages, so a signal that has been strong
+# for the full min-TTE window gets slightly more sizing than a brand-new trigger.
+MOMENTUM_KELLY_PERSISTENCE_ENABLED: bool = True
+MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX: float = 0.5  # max additional z at full persistence window
 
 # Minimum USDC depth on the ask side within 1c of best ask (thin-book guard).
 # Prevents entering markets where our order would exhaust available liquidity.
@@ -416,7 +456,20 @@ MOMENTUM_MIN_ELAPSED_SECONDS: dict[str, int] = {}
 # If the trade loses (held token → $0), the opposite token may briefly trade
 # at HEDGE_PRICE; the GTC order catches that dip and redeems at $1.00.
 MOMENTUM_HEDGE_ENABLED: bool = True
-MOMENTUM_HEDGE_PRICE: float = 0.02    # GTC bid price on the opposite token
+MOMENTUM_HEDGE_PRICE: float = 0.03    # GTC bid price fallback (when no per-bucket override)
+# Per-bucket hedge bid prices — shorter windows carry higher mismatch risk, so
+# the resting bid needs to be a bit higher to get filled during a panic dip.
+MOMENTUM_HEDGE_PRICE_BY_TYPE: dict[str, float] = {
+    "bucket_5m":  0.04,
+    "bucket_15m": 0.035,
+    "bucket_1h":  0.025,
+    "bucket_4h":  0.02,
+    "bucket_daily":   0.015,
+    "bucket_weekly":  0.01,
+    "milestone":      0.01,
+}
+# Hedge size as fraction of main position (0.40 = cover 40% of entry cost).
+MOMENTUM_HEDGE_COVERAGE_PCT: float = 0.40
 
 # Phase E — Empirical win-rate gate: load data/win_rate.csv at startup and gate
 # entries where historical win rate < WIN_RATE_GATE_MIN_FACTOR × model win_prob.

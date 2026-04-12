@@ -111,6 +111,7 @@ MOMENTUM_FILLS_HEADER = [
     "kelly_payout_b",     # (1-token_price)/token_price — dollars won per dollar risked
     "kelly_f",            # raw full-Kelly fraction before scaling
     "kelly_fraction_cfg", # MOMENTUM_KELLY_FRACTION config value used
+    "kelly_multiplier",   # per-bucket Kelly multiplier (MOMENTUM_KELLY_MULTIPLIER_BY_TYPE)
     "kelly_size_usd",     # intended position size in USD (=size_usd before fill)
 ]
 
@@ -188,13 +189,6 @@ class MomentumScanner(BaseStrategy):
         )
         self._signal_first_valid: dict[str, float] = _load_cooldowns(
             self._signal_first_valid_path
-        )
-        # Rolling intra-bucket spot history per underlying coin.
-        # Populated by _on_spot_update_entry on every RTDS / Chainlink tick.
-        # Used by _compute_bucket_intra_sigma to estimate realised vol within the bucket.
-        # maxlen = 300 s worth of ~1 Hz ticks — enough for any bucket type.
-        self._spot_mid_history: dict[str, collections.deque] = collections.defaultdict(
-            lambda: collections.deque(maxlen=300)
         )
         # Open-spot cache for "Up or Down" directional markets.
         # key: condition_id  value: RTDS spot price at the moment the window opened.
@@ -968,9 +962,6 @@ class MomentumScanner(BaseStrategy):
             if _fv_key not in self._signal_first_valid:
                 self._signal_first_valid[_fv_key] = now_ts
             signal.signal_valid_since_ts = self._signal_first_valid[_fv_key]
-            # bucket_intra_sigma: realised annualised vol from recent ticks (may be None).
-            _mid_hist = list(self._spot_mid_history.get(market.underlying, []))
-            signal.bucket_intra_sigma = _compute_bucket_intra_sigma(_mid_hist)
             # ── Kelly sizing preview for diagnostics ─────────────────────
             # Compute Kelly fields now so the webapp diagnostics row for this
             # signal shows the full sizing breakdown, not just whether it fired.
@@ -1169,9 +1160,6 @@ class MomentumScanner(BaseStrategy):
         """
         if not config.STRATEGY_MOMENTUM_ENABLED or not config.BOT_ACTIVE:
             return
-        # Record every tick for intra-bucket realised vol computation.
-        if price > 0:
-            self._spot_mid_history[coin].append(price)
         for mkt in self._token_to_market.values():
             if mkt.underlying == coin:
                 self._scan_event.set()
@@ -1245,6 +1233,19 @@ class MomentumScanner(BaseStrategy):
         # ── Fractional Kelly sizing ────────────────────────────────────────────
         _range_max_entry = config.MOMENTUM_RANGE_MAX_ENTRY_USD if _is_range_market(signal.market_title) else None
         size_usd, _kelly_debug = _compute_kelly_size_usd(signal, max_entry_usd=_range_max_entry)
+
+        # Skip when raw Kelly fraction is negative (EV < 0).  The MIN_ENTRY floor
+        # must not override a model that explicitly says "don't bet here".
+        if size_usd == 0.0:
+            log.info(
+                "Momentum: skipping entry — negative Kelly (raw_f=%s, payout_b=%s, win_prob=%s)",
+                _kelly_debug.get("kelly_f_raw"),
+                _kelly_debug.get("kelly_payout_b"),
+                _kelly_debug.get("kelly_win_prob"),
+                market=signal.market_title[:60],
+                side=signal.side,
+            )
+            return False
 
         # ── Place order ───────────────────────────────────────────────────────
         order_id: Optional[str] = None
@@ -1395,45 +1396,51 @@ class MomentumScanner(BaseStrategy):
         )
         self._risk.open_position(pos)
 
-        # ── Phase D: GTD hedge ────────────────────────────────────────────────
-        # Place a GTC maker limit BUY on the opposite token at HEDGE_PRICE.
-        # If the held token loses (→ $0), the opposite token resolves at $1.00.
-        # A resting bid at $0.02 may fill in the secondary market before expiry.
-        # Cost ≈ entry_size × HEDGE_PRICE ≈ 2–3 % of entry_cost_usd.
+        # ── Phase D: Optional GTD hedge ──────────────────────────────────────
+        # Place a post-only GTC limit BUY on the opposite token at a low price.
+        # If the held token loses (→ $0), the opposite token may briefly trade
+        # below our bid; the resting order catches that dip and redeems at $1.
+        # Bid price is per-bucket (shorter buckets → higher bid to get filled).
         if config.MOMENTUM_HEDGE_ENABLED:
-            _opp_token = (
-                market.token_id_no
-                if signal.side in ("YES", "UP")
-                else market.token_id_yes
+            opp_token = (
+                market.token_id_no if signal.side in ("YES", "UP") else market.token_id_yes
             )
-            _hedge_cost_usd = round(entry_size * config.MOMENTUM_HEDGE_PRICE, 4)
+            hedge_price = config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get(
+                market.market_type, config.MOMENTUM_HEDGE_PRICE
+            )
+            hedge_size_usd = round(
+                max(config.MOMENTUM_MIN_ENTRY_USD, entry_size * config.MOMENTUM_HEDGE_COVERAGE_PCT), 4
+            )
             try:
-                _hedge_id = await self._pm.place_limit(
-                    token_id=_opp_token,
+                hedge_id = await self._pm.place_limit(
+                    token_id=opp_token,
                     side="BUY",
-                    price=config.MOMENTUM_HEDGE_PRICE,
-                    size=_hedge_cost_usd,
+                    price=hedge_price,
+                    size=hedge_size_usd,
                     market=market,
                     post_only=True,
                 )
             except Exception as _hex:
-                _hedge_id = None
+                hedge_id = None
                 log.warning("Momentum: GTD hedge error", exc=str(_hex))
-            if _hedge_id:
+            if hedge_id:
                 log.info(
                     "Momentum: GTD hedge placed",
-                    hedge_order_id=_hedge_id[:20],
-                    opp_token=_opp_token[:16],
-                    hedge_price=config.MOMENTUM_HEDGE_PRICE,
-                    hedge_cost_usd=_hedge_cost_usd,
+                    market=signal.market_title[:50],
+                    main_side=signal.side,
+                    hedge_side="DOWN" if signal.side in ("YES", "UP") else "UP",
+                    hedge_price=hedge_price,
+                    hedge_size_usd=hedge_size_usd,
+                    hedge_id=hedge_id[:20],
                 )
 
         # ── Write momentum fills CSV for execution-quality analysis ──────────
         try:
             _ensure_momentum_fills_csv()
             _obs_z = signal.delta_pct / (
-                signal.sigma_ann * math.sqrt(max(signal.tte_seconds, 1.0) / 31_536_000) * 100
-                + 1e-9
+                signal.sigma_ann * math.sqrt(
+                    max(signal.tte_seconds, float(config.MOMENTUM_KELLY_MIN_TTE_SECONDS)) / 31_536_000
+                ) * 100 + 1e-9
             )
             _slippage_pct = (
                 round((entry_price - signal.token_price) / signal.token_price * 100, 4)
@@ -1466,6 +1473,7 @@ class MomentumScanner(BaseStrategy):
                 "kelly_payout_b":     _kelly_debug["kelly_payout_b"],
                 "kelly_f":            _kelly_debug["kelly_f"],
                 "kelly_fraction_cfg": _kelly_debug["kelly_fraction_cfg"],
+                "kelly_multiplier":   _kelly_debug["kelly_multiplier"],
                 "kelly_size_usd":     _kelly_debug["kelly_size_usd"],
             }
             with MOMENTUM_FILLS_CSV.open("a", newline="") as _f:
@@ -1492,6 +1500,7 @@ class MomentumScanner(BaseStrategy):
             kelly_payout_b=_kelly_debug["kelly_payout_b"],
             kelly_f=_kelly_debug["kelly_f"],
             kelly_fraction_cfg=_kelly_debug["kelly_fraction_cfg"],
+            kelly_multiplier=_kelly_debug["kelly_multiplier"],
             kelly_size_usd=_kelly_debug["kelly_size_usd"],
         )
         return True
@@ -1539,45 +1548,6 @@ def _save_cooldowns(path: str, cache: dict[str, float]) -> None:
         pass  # non-critical — cooldown continues in-memory; only loses persistence on restart
 
 
-def _compute_bucket_intra_sigma(
-    mid_prices: list[float],
-    *,
-    min_samples: int = 10,
-) -> float | None:
-    """Compute intra-bucket realised annualised volatility from a list of mid prices.
-
-    Uses log-return standard deviation scaled to 1-year.  Assumes the prices were
-    sampled at 1-second intervals (consistent with RTDS / Chainlink tick rate).
-
-    Returns None if fewer than `min_samples` prices are available so callers can
-    fall back to the Deribit/HL sigma_ann without masking a data gap.
-
-    Args:
-        mid_prices: Ordered list of recent spot mid prices (oldest first).
-        min_samples: Minimum number of prices required (default 10).
-
-    Returns:
-        Annualised σ as a float, or None if insufficient data.
-    """
-    if len(mid_prices) < min_samples:
-        return None
-    import math as _math
-    log_returns = [
-        _math.log(mid_prices[i] / mid_prices[i - 1])
-        for i in range(1, len(mid_prices))
-        if mid_prices[i - 1] > 0 and mid_prices[i] > 0
-    ]
-    if len(log_returns) < min_samples - 1:
-        return None
-    n = len(log_returns)
-    mean = sum(log_returns) / n
-    variance = sum((r - mean) ** 2 for r in log_returns) / max(n - 1, 1)
-    sigma_per_second = variance ** 0.5
-    # Annualise: √(seconds_per_year) = √31_536_000 ≈ 5615.7
-    sigma_ann = sigma_per_second * (31_536_000 ** 0.5)
-    return sigma_ann
-
-
 def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | None = None) -> tuple[float, dict]:
     """Compute position size in USD using fractional Kelly Criterion.
 
@@ -1623,30 +1593,25 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     config lives on the signal's threshold_pct and vol_z_score fields and is
     used for signal_score analytics (position meta) — not for sizing.
     """
-    # σ_τ = σ_ann × √(TTE_seconds / one_year_seconds)
-    # Floor at 1 s so TTE → 0 near expiry doesn't collapse sigma_tau to 0
-    # and send observed_z_total to +∞ (which would always return MAX_ENTRY).
-    # TTE floor — prevent sigma_tau collapsing near expiry and sending z → ∞,
-    # which would always return MAX_ENTRY regardless of signal strength.
-    # Use the same bucket-aware floor that gates entry (MOMENTUM_MIN_TTE_SECONDS).
-    _min_tte_floor = float(
+    # Kelly minimum effective TTE — prevents sigma_tau from collapsing at very
+    # small TTEs (e.g. 3s or 5s), which would inflate z → 6σ hard cap →
+    # win_prob ≈ 1.0 → MAX_ENTRY regardless of actual edge strength.
+    # MOMENTUM_KELLY_MIN_TTE_SECONDS (default 30s) is the floor; signals fired
+    # with less time remaining are sized as if this many seconds remain.
+    # Do NOT use MOMENTUM_MIN_TTE_SECONDS (the entry-gate CEILING) here.
+    _kelly_min_tte = float(config.MOMENTUM_KELLY_MIN_TTE_SECONDS)
+    tte_eff = max(signal.tte_seconds, _kelly_min_tte)
+
+    # Persistence scaling still uses the entry-gate window as its reference —
+    # "has the signal been valid for a full entry window?" is the right question.
+    _persistence_window = float(
         config.MOMENTUM_MIN_TTE_SECONDS.get(
             signal.market_type,
             config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT,
         )
     )
-    tte_eff = max(signal.tte_seconds, _min_tte_floor)
 
-    # Effective annualised sigma — fall back to intra-bucket realized vol when:
-    #   (a) the feature flag is on, and
-    #   (b) we have enough ticks to compute it (not None), and
-    #   (c) it implies a wider distribution (i.e. is larger than sigma_ann).
-    # Taking max() is conservative: it admits the higher uncertainty estimate,
-    # which lowers z → lowers win_prob → smaller Kelly size (anti-overfit).
-    if config.MOMENTUM_KELLY_INTRA_SIGMA_ENABLED and signal.bucket_intra_sigma is not None:
-        sigma_eff = max(signal.sigma_ann, signal.bucket_intra_sigma)
-    else:
-        sigma_eff = signal.sigma_ann
+    sigma_eff = signal.sigma_ann
 
     sigma_tau = sigma_eff * math.sqrt(tte_eff / 31_536_000)
 
@@ -1657,15 +1622,19 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
 
     # Persistence z-boost — reward signals that have been continuously valid
     # for at least one full min-TTE window, up to MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX.
-    # Scales linearly from 0 (just fired) to max (held ≥ _min_tte_floor seconds).
+    # Scales linearly from 0 (just fired) to max (held ≥ _persistence_window seconds).
     _z_boost = 0.0
     _persistence_pct = 0.0
     if config.MOMENTUM_KELLY_PERSISTENCE_ENABLED and signal.signal_valid_since_ts > 0:
         _elapsed = time.time() - signal.signal_valid_since_ts
-        _persistence_pct = min(1.0, _elapsed / max(_min_tte_floor, 1.0))
+        _persistence_pct = min(1.0, _elapsed / max(_persistence_window, 1.0))
         _z_boost = config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX * _persistence_pct
 
-    # Cap at 6σ to prevent erf() overflow on very strong signals
+    # Cap at 6σ to prevent erf() overflow on very strong signals.
+    # Near expiry, sigma_tau → 0 so z_raw can be very large — this is correct
+    # behaviour: a clear spot displacement with only seconds remaining IS high
+    # confidence.  The 6σ cap just prevents float overflow; it does not dampen
+    # the signal.  Higher z → higher win_prob → bigger Kelly bet, as intended.
     observed_z_total = min(observed_z_raw + _z_boost, 6.0)
 
     # Model win probability: P(underlying finishes on the winning side)
@@ -1679,25 +1648,38 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
 
     # Full Kelly fraction: the fraction of bankroll a perfect model would bet.
     lose_prob = 1.0 - win_prob
-    kelly_f = max(0.0, (win_prob * payout_b - lose_prob) / payout_b)
+    raw_kelly_f = (win_prob * payout_b - lose_prob) / payout_b
+    kelly_f = max(0.0, raw_kelly_f)
 
     # Fractional Kelly: multiply by KELLY_FRACTION safety factor.
     # KELLY_FRACTION=1.0 → deploy kelly_f × MAX_ENTRY (full-Kelly relative to max).
     # KELLY_FRACTION=0.5 → deploy 0.5 × kelly_f × MAX_ENTRY (half-Kelly).
     # KELLY_FRACTION=0.25 → quarter-Kelly.
     _fraction_cfg = max(0.0, min(1.0, config.MOMENTUM_KELLY_FRACTION))
-    fraction_of_max = min(1.0, kelly_f * _fraction_cfg)
-    _max_entry = max_entry_usd if max_entry_usd is not None else config.MOMENTUM_MAX_ENTRY_USD
-    size_usd = max(
-        config.MOMENTUM_MIN_ENTRY_USD,
-        round(fraction_of_max * _max_entry, 2),
+
+    # Per-bucket multiplier: dampens over-sizing on short-TTE buckets where
+    # sigma_tau is small even after the TTE floor and win_prob stays near 1.
+    kelly_multiplier = config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get(
+        signal.market_type, 1.0
     )
+    kelly_multiplier = max(0.0, min(1.0, kelly_multiplier))
+
+    fraction_of_max = min(1.0, kelly_f * _fraction_cfg * kelly_multiplier)
+    _max_entry = max_entry_usd if max_entry_usd is not None else config.MOMENTUM_MAX_ENTRY_USD
+    if raw_kelly_f < 0:
+        # Negative raw Kelly means EV < 0 — the model says don't bet.
+        # The MIN_ENTRY floor must NOT override this: entering a negative-EV
+        # trade at minimum size is still a losing trade.
+        size_usd = 0.0
+    else:
+        size_usd = max(
+            config.MOMENTUM_MIN_ENTRY_USD,
+            round(fraction_of_max * _max_entry, 2),
+        )
 
     debug: dict = {
-        "kelly_tte_floor_s":  _min_tte_floor,
         "kelly_tte_eff_s":    round(tte_eff, 1),
         "kelly_sigma_eff":    round(sigma_eff, 6),
-        "kelly_intra_sigma":  round(signal.bucket_intra_sigma, 6) if signal.bucket_intra_sigma is not None else None,
         "kelly_persistence_pct": round(_persistence_pct, 3),
         "kelly_z_boost":      round(_z_boost, 4),
         "kelly_z_before_boost": round(observed_z_raw, 4),
@@ -1705,8 +1687,10 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
         "kelly_z_total":      round(observed_z_total, 4),
         "kelly_win_prob":     round(win_prob, 4),
         "kelly_payout_b":     round(payout_b, 4),
+        "kelly_f_raw":        round(raw_kelly_f, 4),  # pre-clip; negative = no EV
         "kelly_f":            round(kelly_f, 4),
         "kelly_fraction_cfg": _fraction_cfg,
+        "kelly_multiplier":   round(kelly_multiplier, 4),
         "kelly_size_usd":     size_usd,
     }
     return size_usd, debug

@@ -44,7 +44,6 @@ class MomentumSignal:
     score: float = 0.0      # reserved for future scoring / filtering
 
     # ── Path history (Kelly TTE floor / persistence — Phase A) ────────────
-    bucket_intra_sigma: Optional[float] = None       # intra-bucket realized σ_ann; None if < min samples
     signal_valid_since_ts: float = field(default_factory=time.time)  # Unix ts when signal first cleared all gates
 
     @property

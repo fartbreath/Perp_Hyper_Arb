@@ -2000,12 +2000,84 @@ export default function Settings() {
               <>
                 {GAP}
                 <FloatInput
-                  label="Hedge Bid Price"
-                  description="GTC bid price placed on the opposite token (e.g. 0.02 = bid $0.02). Only fills if it trades at a panic price."
-                  value={data.momentum_hedge_price ?? 0.02}
+                  label="Coverage %"
+                  description="Hedge size as % of main position (e.g. 40 = 40% coverage). Sized as entry_size × coverage_pct."
+                  value={(data.momentum_hedge_coverage_pct ?? 0.40) * 100}
+                  step={5}
+                  unit="%"
+                  onSubmit={(v) => apply({ momentum_hedge_coverage_pct: v / 100 })}
+                />
+                {GAP}
+                <FloatInput
+                  label="Default Bid Price"
+                  description="Fallback GTC bid price on the opposite token when no per-bucket override applies (e.g. 0.03)."
+                  value={data.momentum_hedge_price ?? 0.03}
                   step={0.005}
                   unit=""
                   onSubmit={(v) => apply({ momentum_hedge_price: v })}
+                />
+                {GAP}
+                <FloatInput
+                  label="5m Bucket Price"
+                  description="Hedge bid price for 5-minute bucket markets (highest mismatch risk → higher bid)."
+                  value={data.momentum_hedge_price_5m ?? 0.04}
+                  step={0.005}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_hedge_price_5m: v })}
+                />
+                {GAP}
+                <FloatInput
+                  label="15m Bucket Price"
+                  description="Hedge bid price for 15-minute bucket markets."
+                  value={data.momentum_hedge_price_15m ?? 0.035}
+                  step={0.005}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_hedge_price_15m: v })}
+                />
+                {GAP}
+                <FloatInput
+                  label="1h Bucket Price"
+                  description="Hedge bid price for 1-hour bucket markets."
+                  value={data.momentum_hedge_price_1h ?? 0.025}
+                  step={0.005}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_hedge_price_1h: v })}
+                />
+                {GAP}
+                <FloatInput
+                  label="4h Bucket Price"
+                  description="Hedge bid price for 4-hour bucket markets (lowest mismatch risk → lower bid)."
+                  value={data.momentum_hedge_price_4h ?? 0.02}
+                  step={0.005}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_hedge_price_4h: v })}
+                />
+                {GAP}
+                <FloatInput
+                  label="Daily Bucket Price"
+                  description="Hedge bid price for daily bucket markets."
+                  value={data.momentum_hedge_price_daily ?? 0.015}
+                  step={0.005}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_hedge_price_daily: v })}
+                />
+                {GAP}
+                <FloatInput
+                  label="Weekly Bucket Price"
+                  description="Hedge bid price for weekly bucket markets."
+                  value={data.momentum_hedge_price_weekly ?? 0.01}
+                  step={0.005}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_hedge_price_weekly: v })}
+                />
+                {GAP}
+                <FloatInput
+                  label="Milestone Price"
+                  description="Hedge bid price for milestone markets."
+                  value={data.momentum_hedge_price_milestone ?? 0.01}
+                  step={0.005}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_hedge_price_milestone: v })}
                 />
               </>
             )}
@@ -2041,11 +2113,13 @@ export default function Settings() {
             )}
 
             <SectionHead title="Kelly Extensions" />
-            <Toggle
-              label="Intra-Sigma Boost"
-              description="Use max(σ_ann, intra-bucket realised σ) when computing the Kelly-scaled entry size. Adapts position sizing upward during high-volatility periods."
-              value={data.momentum_kelly_intra_sigma_enabled ?? false}
-              onChange={(v) => apply({ momentum_kelly_intra_sigma_enabled: v })}
+            <NumberInput
+              label="Min Effective TTE"
+              description="Kelly-specific TTE floor (seconds). Prevents sigma_tau collapsing at near-expiry (e.g. 3s), which would inflate z → 6σ → MAX bet regardless of edge. Signals with less TTE remaining are sized as if this many seconds remain. Rule of thumb: ~50% of the bucket's entry-gate window."
+              value={data.momentum_kelly_min_tte_seconds ?? 30}
+              step={5}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_kelly_min_tte_seconds: v })}
             />
             {GAP}
             <Toggle
@@ -2067,6 +2141,36 @@ export default function Settings() {
                 />
               </>
             )}
+
+            <SectionHead title="Kelly Per-Bucket Multipliers" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Applied after the fractional-Kelly fraction to cap sizing on short-duration
+              buckets. Even with a TTE floor, sigma_tau is small near expiry, so win_prob
+              stays high and Kelly wants full MAX_ENTRY. These multipliers enforce a
+              structural cap the vol model cannot compute on its own.
+            </p>
+            {([
+              ["5m",    "bucket_5m",    "momentum_kelly_multiplier_5m",    0.45] as const,
+              ["15m",   "bucket_15m",   "momentum_kelly_multiplier_15m",   0.70] as const,
+              ["1h",    "bucket_1h",    "momentum_kelly_multiplier_1h",    0.90] as const,
+              ["4h",    "bucket_4h",    "momentum_kelly_multiplier_4h",    1.00] as const,
+              ["Daily", "bucket_daily", "momentum_kelly_multiplier_daily",  1.00] as const,
+              ["Weekly","bucket_weekly","momentum_kelly_multiplier_weekly", 1.00] as const,
+            ] as const).map(([label, , field, def]) => (
+              <div key={field}>
+                {GAP}
+                <FloatInput
+                  label={`${label} Multiplier`}
+                  description={`Kelly size multiplier for ${label} bucket markets. 1.0 = no dampening; 0.45 = size at most 45% of raw Kelly.`}
+                  value={(data[field as keyof typeof data] as number | undefined) ?? def}
+                  step={0.05}
+                  min={0}
+                  max={1}
+                  unit="×"
+                  onSubmit={(v) => apply({ [field]: v })}
+                />
+              </div>
+            ))}
           </div>
 
           {/* ── Range markets sub-strategy ───────────────────── */}

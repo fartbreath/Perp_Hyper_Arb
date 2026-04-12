@@ -24,6 +24,19 @@ def _isolate_trades_csv(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_open_positions(tmp_path):
+    """Patch risk.OPEN_POSITIONS_JSON to a per-test temp file.
+
+    Prevents test token IDs (tid_yes_001, tok_yes, etc.) from being written
+    into the live data/open_positions.json during pytest runs.
+    """
+    original = risk.OPEN_POSITIONS_JSON
+    risk.OPEN_POSITIONS_JSON = tmp_path / "open_positions.json"
+    yield
+    risk.OPEN_POSITIONS_JSON = original
+
+
+@pytest.fixture(autouse=True)
 def _reset_score_thresholds():
     """Reset signal score thresholds to 0 for every test.
 

@@ -478,7 +478,6 @@ export interface ConfigData {
   momentum_min_clob_depth?: number;
   momentum_order_type?: string;
   momentum_delta_stop_loss_pct?: number;
-  momentum_stop_loss?: number;
   momentum_take_profit?: number;
   momentum_min_tte_5m?: number;
   momentum_min_tte_15m?: number;
@@ -532,14 +531,28 @@ export interface ConfigData {
   // Phase D — hedge
   momentum_hedge_enabled?: boolean;
   momentum_hedge_price?: number;
+  momentum_hedge_coverage_pct?: number;
+  momentum_hedge_price_5m?: number;
+  momentum_hedge_price_15m?: number;
+  momentum_hedge_price_1h?: number;
+  momentum_hedge_price_4h?: number;
+  momentum_hedge_price_daily?: number;
+  momentum_hedge_price_weekly?: number;
+  momentum_hedge_price_milestone?: number;
   // Phase E — empirical win-rate gate
   momentum_win_rate_gate_enabled?: boolean;
   momentum_win_rate_gate_min_factor?: number;
   momentum_win_rate_gate_min_samples?: number;
   // Kelly extensions
-  momentum_kelly_intra_sigma_enabled?: boolean;
+  momentum_kelly_min_tte_seconds?: number;
   momentum_kelly_persistence_enabled?: boolean;
   momentum_kelly_persistence_z_boost_max?: number;
+  momentum_kelly_multiplier_5m?: number;
+  momentum_kelly_multiplier_15m?: number;
+  momentum_kelly_multiplier_1h?: number;
+  momentum_kelly_multiplier_4h?: number;
+  momentum_kelly_multiplier_daily?: number;
+  momentum_kelly_multiplier_weekly?: number;
   // Range markets sub-strategy
   momentum_range_enabled?: boolean;
   momentum_range_price_band_low?: number;

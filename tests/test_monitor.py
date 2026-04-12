@@ -676,12 +676,13 @@ class TestCheckPosition:
 
     def test_resolved_spread_both_legs_snap_consistently(self):
         """
-        Regression: at resolution each leg must exit using its own CLOB book mid
-        (YES book for YES positions, NO book for NO positions).
+        Regression: at resolution the PM CLOB settlement API is the sole source
+        of truth.  Both legs exit using fetch_market_resolution() — no CLOB book
+        or oracle fallback.
 
         A spread bought at YES=0.49 + NO=0.48 (total cost 0.97/ct) should yield
-        positive combined P&L when YES snaps to 0 and NO snaps to 1 (or vice
-        versa), capturing the spread ≈ 0.03/ct × 20 = ~$0.60.
+        positive combined P&L when PM settles YES=0 (NO wins), capturing the
+        spread ≈ 0.03/ct × 20 = ~$0.60.
         """
         config.PROFIT_TARGET_PCT = 0.60
         config.STOP_LOSS_USD = 999.0  # disable stop-loss
@@ -689,16 +690,12 @@ class TestCheckPosition:
         config.MIN_HOLD_SECONDS = 0
 
         monitor, pm, risk = _make_monitor()
+        # PM API: YES settled at 0.0 (YES loses, NO wins)
+        pm.fetch_market_resolution = AsyncMock(return_value=0.0)
 
         past = datetime.now(timezone.utc) - timedelta(seconds=10)
         mkt = self._make_market(end_date=past)  # already resolved
         pm._markets["mkt_001"] = mkt
-
-        # YES mid=0.49 → round(0.49)=0 → YES loses
-        pm._books["tok_yes"] = self._make_book(mid=0.49, bid=0.48, ask=0.50)
-        # NO mid=0.51  → round(0.51)=1 → NO wins
-        # Must provide an independent NO book; never derive from YES book.
-        pm._books["tok_no"]  = self._make_book(mid=0.51, bid=0.50, ask=0.52)
 
         # YES leg: entry 0.490
         yes_pos = _make_position(side="YES", entry_price=0.490, size=20.0,
@@ -721,26 +718,9 @@ class TestCheckPosition:
         assert yes_closed.is_closed, "YES leg should be closed on resolution"
         assert no_closed.is_closed,  "NO leg should be closed on resolution"
 
-        # YES: exit at round(0.49)=0 → pnl=(0-0.49)*20=-9.8
-        # NO:  exit at round(0.51)=1 → pnl=(1-0.48)*20=+10.4
+        # YES: pm_yes=0.0 → exit_mid=0.0 → pnl=(0-0.49)*20=-9.8
+        # NO:  pm_yes=0.0 → exit_mid=1-0.0=1.0 → pnl=(1.0-0.48)*20=+10.4
         # Combined ≈ +0.6 (spread capture)
-        combined_pnl = yes_closed.realized_pnl + no_closed.realized_pnl
-        assert combined_pnl > 0.0, (
-            f"Spread should capture positive P&L on resolution, "
-            f"got YES={yes_closed.realized_pnl:.4f} NO={no_closed.realized_pnl:.4f}"
-        )
-
-        _run(monitor._check_position(yes_pos))
-        _run(monitor._check_position(no_pos))
-
-        yes_closed = risk._positions["mkt_001:YES"]
-        no_closed  = risk._positions["mkt_001:NO"]
-
-        assert yes_closed.is_closed, "YES leg should be closed on resolution"
-        assert no_closed.is_closed,  "NO leg should be closed on resolution"
-
-        # Combined P&L must be positive: YES entry 0.490 + NO entry 0.480 = 0.970/ct.
-        # At resolution one side pays 1.0: spread capture = 1.0 - 0.970 = 0.030/ct × 20 = $0.60
         combined_pnl = yes_closed.realized_pnl + no_closed.realized_pnl
         assert combined_pnl > 0.0, (
             f"Spread should capture positive P&L on resolution, "
@@ -875,16 +855,20 @@ class TestYesNoBookIndependence:
 
     # ── resolution exit ───────────────────────────────────────────────────────
 
-    def test_resolution_exit_no_uses_no_book_mid(self):
-        """At resolution, NO position should exit at the actual NO CLOB mid."""
+    def test_resolution_exit_no_uses_pm_api(self):
+        """At resolution, NO position exits using the PM CLOB settlement API only.
+        pm_yes_price=0.0 means YES lost → NO won → exit_mid=1.0."""
         now = datetime.now(timezone.utc)
         end_date = now - timedelta(seconds=5)  # already past expiry
 
         monitor, pm, risk, _ = _make_monitor_with_market(
-            yes_mid=0.01,                          # YES snapped near 0
-            no_mid=0.99, no_bid=0.99, no_ask=1.0,  # NO should win
+            yes_mid=0.01,  # book data present but ignored in RESOLVED path
+            no_mid=0.99,
             end_date=end_date,
         )
+        # PM API confirms YES settled at 0 → NO wins
+        pm.fetch_market_resolution = AsyncMock(return_value=0.0)
+
         no_pos = _make_position(side="NO", entry_price=0.82, size=100.0, strategy="momentum",
                                 seconds_ago=120, now=now)
         risk.open_position(no_pos)
@@ -893,30 +877,30 @@ class TestYesNoBookIndependence:
 
         closed = risk._positions["mkt_001:NO"]
         assert closed.is_closed
-        # Exit must be at NO book mid (0.99), not at 1 − YES_mid (1 − 0.01 = 0.99 coincidentally)
-        # Use a different pairing to make the test meaningful:
-        # YES_mid=0.01 → derived=0.99; actual NO_mid=0.99 — same here.
-        # Test that realized_pnl is positive (correct), not zero (entry_price fallback).
+        # exit_mid = 1.0 - 0.0 = 1.0 → pnl = (1.0 - 0.82) * 100 = +18
         assert closed.realized_pnl > 0.0, (
-            f"P&L should be positive (NO gained value from 0.82 to 0.99), got {closed.realized_pnl}"
+            f"P&L should be positive (NO won: exit_mid=1.0), got {closed.realized_pnl}"
         )
 
-    def test_resolution_exit_no_book_missing_uses_entry_price(self):
-        """At resolution, when NO book is gone, exit at entry_price (no YES derivation).
+    def test_resolution_pm_api_loss_no_book_missing(self):
+        """At resolution, PM API is sole source of truth regardless of whether CLOB books
+        are present.  When NO book is absent the position still closes correctly.
 
-        entry_price=0.20 is used so that:
-          - New code: exit_mid=0.20 → round(0.20)=0.0 → pnl=(0-0.20)*100≈-20  (NO loses)
-          - Old code: exit_mid=1.0-round(YES_mid=0.01)=1.0 → pnl=(1-0.20)*100=+80 (NO wins)
-        This verifies the derivation path is no longer taken.
+        pm_yes_price=1.0 → YES won → NO lost → exit_mid=0.0 → pnl=(0-0.20)*100=-20.
+        Old CLOB-book fallback would have derived exit_mid=entry_price or 1-YES_mid=0.99,
+        both of which gave wrong P&L.
         """
         now = datetime.now(timezone.utc)
         end_date = now - timedelta(seconds=5)
 
         monitor, pm, risk, _ = _make_monitor_with_market(
-            yes_mid=0.01,   # YES snaps to 0 — old code would derive NO exit=1.0
-            no_mid=None,    # NO book absent
+            yes_mid=0.01,   # book data present but irrelevant — PM API is authoritative
+            no_mid=None,    # NO book absent — must not affect outcome
             end_date=end_date,
         )
+        # YES won → NO lost
+        pm.fetch_market_resolution = AsyncMock(return_value=1.0)
+
         no_pos = _make_position(side="NO", entry_price=0.20, size=100.0, strategy="momentum",
                                 seconds_ago=120, now=now)
         risk.open_position(no_pos)
@@ -924,10 +908,33 @@ class TestYesNoBookIndependence:
         _run(monitor._check_position(no_pos))
 
         closed = risk._positions["mkt_001:NO"]
-        assert closed.is_closed, "Resolved position must always be closed"
-        # Old derivation: 1.0-round(0.01)=1.0 → pnl ≈ +80.  New: entry_price=0.20 → pnl ≈ -20.
+        assert closed.is_closed, "Resolved position must always be closed when PM API returns a result"
+        # exit_mid = 1.0 - 1.0 = 0.0 → pnl = (0.0 - 0.20) * 100 = -20
         assert closed.realized_pnl == pytest.approx(-20.0, abs=0.5), (
-            f"exit must use entry_price=0.20 (pnl≈-20), not derived 1.0 (pnl≈+80), got {closed.realized_pnl:.4f}"
+            f"exit must use PM settlement (exit_mid=0.0, pnl≈-20), got {closed.realized_pnl:.4f}"
+        )
+
+    def test_resolution_pm_api_not_settled_yet_skips(self):
+        """When fetch_market_resolution returns None (PM API hasn't propagated yet),
+        the position must NOT be closed — wait for the next poll cycle."""
+        now = datetime.now(timezone.utc)
+        end_date = now - timedelta(seconds=5)
+
+        monitor, pm, risk, _ = _make_monitor_with_market(
+            yes_mid=0.99,  # looks like a winner but PM API not settled
+            end_date=end_date,
+        )
+        # PM API not ready yet
+        pm.fetch_market_resolution = AsyncMock(return_value=None)
+
+        pos = _make_position(side="YES", entry_price=0.80, size=100.0, strategy="momentum",
+                             seconds_ago=10, now=now)
+        risk.open_position(pos)
+
+        _run(monitor._check_position(pos))
+
+        assert not risk._positions["mkt_001:YES"].is_closed, (
+            "Position must not be closed while PM API has not yet confirmed settlement"
         )
 
     # ── pre-expiry taker exit ─────────────────────────────────────────────────
