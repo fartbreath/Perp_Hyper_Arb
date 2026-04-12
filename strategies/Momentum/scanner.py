@@ -510,16 +510,20 @@ class MomentumScanner(BaseStrategy):
                         )
                     else:
                         # Gamma hasn't populated priceToBeat yet (market too new).
-                        # Use current spot for display/delta this scan only — don't save.
-                        _open_snap = self._spot.get_spot(market.underlying, market.market_type)
-                        if _open_snap is not None and _open_snap.mid is not None:
-                            self._market_open_spot[_mid_pre] = _open_snap.mid
-                            log.debug(
-                                "MomentumScanner: using spot fallback for Up/Down strike (will retry gamma)",
-                                market=market.title[:60],
-                                market_id=_mid_pre[:16],
-                                open_spot=round(_open_snap.mid, 4),
-                            )
+                        # Only set the spot fallback on the FIRST scan for this market
+                        # (no existing entry).  Subsequent scans keep retrying gamma
+                        # but leave the cached value untouched so the strike stays
+                        # stable and doesn't chase the current moving price.
+                        if _mid_pre not in self._market_open_spot:
+                            _open_snap = self._spot.get_spot(market.underlying, market.market_type)
+                            if _open_snap is not None and _open_snap.mid is not None:
+                                self._market_open_spot[_mid_pre] = _open_snap.mid
+                                log.debug(
+                                    "MomentumScanner: using spot fallback for Up/Down strike (will retry gamma)",
+                                    market=market.title[:60],
+                                    market_id=_mid_pre[:16],
+                                    open_spot=round(_open_snap.mid, 4),
+                                )
                 # Surface the recorded strike in diag at every scan state,
                 # even for out-of-band / not-yet-in-band rows.
                 if _mid_pre in self._market_open_spot:
