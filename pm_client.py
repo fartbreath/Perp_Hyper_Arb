@@ -1526,6 +1526,44 @@ class PMClient:
             )
         return None
 
+    async def fetch_price_to_beat(self, event_slug: str) -> Optional[float]:
+        """Fetch the canonical opening strike for an Up/Down market from the Gamma API.
+
+        Queries GET /events/slug/{event_slug} and returns
+        ``eventMetadata.priceToBeat`` — the exact oracle price at the start of
+        the time window, as used by Polymarket's settlement contract.
+
+        Returns None if the slug is blank, the market hasn't opened yet (metadata
+        absent), or the network request fails.
+        """
+        if not event_slug:
+            return None
+        url = f"{config.GAMMA_HOST}/events/slug/{event_slug}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not isinstance(data, dict):
+                        return None
+                    meta = data.get("eventMetadata")
+                    if not isinstance(meta, dict):
+                        return None
+                    ptb = meta.get("priceToBeat")
+                    if ptb is not None:
+                        return float(ptb)
+        except Exception as exc:
+            log.debug(
+                "fetch_price_to_beat failed",
+                slug=event_slug,
+                exc=str(exc),
+            )
+        return None
+
     # ── Accessors ──────────────────────────────────────────────────────────────
 
     def get_markets(self) -> dict[str, PMMarket]:
