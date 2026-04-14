@@ -290,6 +290,7 @@ class PMMarket:
     discovered_at: float = field(default_factory=time.time)
     volume_24hr: float = 0.0
     market_slug: str = ""  # Gamma API event slug → used for https://polymarket.com/event/{slug}
+    event_start_time: str = ""  # ISO window-open time e.g. "2026-04-12T14:20:00Z" (for priceToBeat lookup)
 
     @property
     def is_fee_free(self) -> bool:
@@ -802,6 +803,7 @@ class PMClient:
             max_incentive_spread=float(raw.get("maxIncentiveSpread", 0.04)),
             volume_24hr=float(raw.get("volume24hr", 0.0) or 0.0),
             market_slug=event_slug or raw.get("slug", ""),  # prefer event slug — canonical Polymarket URL
+            event_start_time=raw.get("eventStartTime", "") or "",  # window-open ISO timestamp for priceToBeat lookup
         )
 
     # ── Market pruning ──────────────────────────────────────────────────────────
@@ -1514,7 +1516,20 @@ class PMClient:
                     tokens = data.get("tokens") or []
                     if not tokens:
                         return None
-                    # tokens[0] is the YES/Up token; price is 0 or 1 after settlement.
+                    # Find the YES/Up token by its outcome label — more robust than
+                    # relying on ordering, which can vary across markets.
+                    for tok in tokens:
+                        if str(tok.get("outcome", "")).lower() in ("yes", "up"):
+                            yes_price = tok.get("price")
+                            if yes_price is not None:
+                                return float(yes_price)
+                    # Outcome label absent — fall back to winner flag or first token.
+                    for tok in tokens:
+                        if tok.get("winner") is True:
+                            # This token won; determine if it's the YES/UP side.
+                            is_yes = str(tok.get("outcome", "")).lower() not in ("no", "down")
+                            return 1.0 if is_yes else 0.0
+                    # Last resort: assume tokens[0] is YES/Up.
                     yes_price = tokens[0].get("price")
                     if yes_price is not None:
                         return float(yes_price)
@@ -1560,6 +1575,72 @@ class PMClient:
             log.debug(
                 "fetch_price_to_beat failed",
                 slug=event_slug,
+                exc=str(exc),
+            )
+        return None
+
+    async def fetch_crypto_price_ptb(
+        self,
+        symbol: str,
+        event_start_time: str,
+        end_date: "Optional[datetime]",
+    ) -> Optional[float]:
+        """Fetch the opening strike for an Up/Down market via the Polymarket
+        crypto-price API (``polymarket.com/api/crypto/crypto-price``).
+
+        This endpoint is populated immediately when the window opens and works
+        for ALL recurring market types — 5m, 15m, 4h, daily, weekly.
+
+        Parameters
+        ----------
+        symbol:
+            Uppercase coin ticker, e.g. ``"BTC"``, ``"ETH"``, ``"SOL"``.
+        event_start_time:
+            ISO timestamp of the window open, e.g. ``"2026-04-12T14:20:00Z"``.
+            Comes from ``PMMarket.event_start_time``.
+        end_date:
+            Window close datetime (``PMMarket.end_date``).
+
+        Returns
+        -------
+        float or None
+            ``openPrice`` reported by the API, or ``None`` on any failure.
+        """
+        if not symbol or not event_start_time or end_date is None:
+            return None
+        end_str = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        params = {
+            "symbol": symbol.upper(),
+            "eventStartTime": event_start_time,
+            "variant": "fifteen",
+            "endDate": end_str,
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://polymarket.com/",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://polymarket.com/api/crypto/crypto-price",
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not isinstance(data, dict):
+                        return None
+                    ptb = data.get("openPrice")
+                    if ptb is not None:
+                        return float(ptb)
+        except Exception as exc:
+            log.debug(
+                "fetch_crypto_price_ptb failed",
+                symbol=symbol,
+                event_start_time=event_start_time,
                 exc=str(exc),
             )
         return None

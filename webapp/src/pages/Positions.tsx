@@ -392,6 +392,19 @@ function MomentumRow({
       <td style={{ fontFamily: "monospace", fontWeight: 700, color: pnlColor(unrealizedPnl) }}>
         {pnlStr(unrealizedPnl)}
       </td>
+      {/* GTD Hedge */}
+      <td style={{ fontFamily: "monospace", fontSize: "0.75rem" }}>
+        {pos.hedge_order_id ? (
+          <span
+            title={`Resting bid on opposite token\nOrder: ${pos.hedge_order_id}\nToken: ${pos.hedge_token_id ?? "—"}\nSize: $${Number(pos.hedge_size_usd ?? 0).toFixed(2)}`}
+            style={{ color: "#a78bfa", cursor: "help" }}
+          >
+            {(Number(pos.hedge_price ?? 0) * 100).toFixed(1)}¢ · ${Number(pos.hedge_size_usd ?? 0).toFixed(2)}
+          </span>
+        ) : (
+          <span style={{ color: "#374151" }}>—</span>
+        )}
+      </td>
       {/* Opened */}
       <td className="muted">{timeSince(pos.opened_at)}</td>
       {/* Ends */}
@@ -681,6 +694,7 @@ export default function Positions() {
               <th title="Progress from entry toward take-profit (0% = at entry, 100% = at TP)" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Entry … TP</th>
               <th title="USDC capital deployed at entry" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>Deployed</th>
               <th title="Unrealised P&L at current price">Unrealised P&L</th>
+              <th title="Resting GTD limit bid on opposite token (momentum hedge)" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>GTD Hedge</th>
               <th>Opened</th>
               <th>Ends</th>
               <th>Action</th>
@@ -722,6 +736,7 @@ export default function Positions() {
                 <th>Entry … TP</th>
                 <th>Deployed</th>
                 <th>Unrealised P&amp;L</th>
+                <th title="Resting GTD limit bid on opposite token (momentum hedge)" style={{ cursor: "help", borderBottom: "1px dashed #6b7280" }}>GTD Hedge</th>
                 <th>Opened</th>
                 <th>Ends</th>
                 <th>Action</th>

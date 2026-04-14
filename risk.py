@@ -25,6 +25,7 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 TRADES_CSV = DATA_DIR / "trades.csv"
 OPEN_POSITIONS_JSON = DATA_DIR / "open_positions.json"
+PAPER_HEDGE_FILLS_JSON = DATA_DIR / "paper_hedge_fills.json"
 TRADES_HEADER = [
     "timestamp", "entry_timestamp", "market_id", "market_title", "market_type", "underlying", "side", "size", "price",
     "fees_paid", "rebates_earned", "hl_hedge_size", "hl_entry_price",
@@ -41,6 +42,13 @@ TRADES_HEADER = [
     "signal_source",    # "kalshi_confirmed" | "kalshi_only" | "nd2_only"
     "signal_score",     # quality score 0–100 at signal time
     "resolved_outcome", # WIN | LOSS | "" (empty = early exit / paper / unknown)
+    # GTD hedge fields (momentum strategy only; empty for maker/mispricing)
+    "hedge_order_id",       # PM CLOB order ID of the resting opposite-token bid
+    "hedge_token_id",       # CLOB token_id of the opposite (hedged) token
+    "hedge_price",          # limit price the hedge bid was placed at
+    "hedge_size_usd",       # USD size of the hedge order
+    "hedge_status",         # "filled_won" | "filled_lost" | "unfilled" | "" (main rows)
+    "spot_resolve_price",   # oracle spot at market resolution (hedge rows only; 0.0 otherwise)
 ]
 
 
@@ -116,6 +124,31 @@ class Position:
     # Updated when a reprice fires a new order so logs can follow order lifecycle.
     order_id: str = ""
 
+    # GTD hedge fields (populated when momentum hedge is placed)
+    hedge_order_id: str = ""
+    hedge_token_id: str = ""
+    hedge_price: float = 0.0
+    hedge_size_usd: float = 0.0
+
+    # Active TP resting limit order (Item 1): PM CLOB order ID of a pre-armed SELL
+    # at the take-profit price.  Cancelled automatically on any non-TP exit.
+    tp_order_id: str = ""
+
+    # Probability-based SL threshold (Item 7): CLOB token price below which the
+    # prob-based SL fires.  Set to entry_price * (1 - MOMENTUM_PROB_SL_PCT) when
+    # the position is opened.  0.0 = disabled (non-momentum positions).
+    prob_sl_threshold: float = 0.0
+
+    # Range market bounds (populated for strategy="range" positions only).
+    # range_lo / range_hi are the actual lower and upper price boundaries from the
+    # market title (e.g. "between $72,000 and $74,000").  Both default to 0.0 for
+    # non-range positions.  The SL in should_exit() uses these to determine whether
+    # the spot has moved outside the range rather than relying on pos.strike alone
+    # (pos.strike stores the range midpoint, so spot between [lo, strike) would
+    # falsely look like a negative delta without the full range bounds).
+    range_lo: float = 0.0
+    range_hi: float = 0.0
+
     # Spread pair tracking: when this position is one leg of a calendar spread,
     # both legs share the same spread_id (uuid4().hex).  None for single-leg positions.
     spread_id: Optional[str] = None
@@ -151,6 +184,10 @@ class RiskEngine:
         self._token_strategy: dict[str, str] = self._load_token_strategy()
         # Lock protecting CSV file writes (used by _write_csv_row in thread pool).
         self._csv_write_lock = threading.Lock()
+        # Paper-mode GTD hedge fills simulated by FillSimulator._sweep_hedges().
+        # keyed by hedge_token_id; value = {"fill_price": float, "fill_size": float, "ts": str}
+        # Persisted to PAPER_HEDGE_FILLS_JSON so fills survive bot restarts.
+        self._paper_hedge_fills: dict[str, dict] = self._load_paper_hedge_fills()
         self._ensure_csv()
 
     # ── CSV ────────────────────────────────────────────────────────────────────
@@ -546,6 +583,172 @@ class RiskEngine:
                 self._token_strategy[position.token_id] = position.strategy
                 self._save_token_strategy()
 
+    def update_gtd_hedge(
+        self,
+        market_id: str,
+        side: str,
+        hedge_order_id: str,
+        hedge_token_id: str,
+        hedge_price: float,
+        hedge_size_usd: float,
+    ) -> None:
+        """Store GTD hedge details on the position after momentum hedge is placed."""
+        with self._lock:
+            pos = self._positions.get(self._pos_key(market_id, side))
+            if pos is None:
+                log.warning("update_gtd_hedge: unknown position", market_id=market_id, side=side)
+                return
+            pos.hedge_order_id = hedge_order_id
+            pos.hedge_token_id = hedge_token_id
+            pos.hedge_price = hedge_price
+            pos.hedge_size_usd = hedge_size_usd
+
+    def get_position_by_hedge_token(self, hedge_token_id: str) -> Optional[Position]:
+        """Return the position whose GTD hedge_token_id matches, or None."""
+        with self._lock:
+            for pos in self._positions.values():
+                if pos.hedge_token_id == hedge_token_id:
+                    return pos
+        return None
+
+    def record_paper_hedge_fill_sim(
+        self, hedge_token_id: str, fill_price: float, fill_size: float
+    ) -> None:
+        """Record a paper-mode GTD hedge fill simulated by FillSimulator._sweep_hedges().
+
+        Called when the live CLOB shows the opposite token touching the hedge bid.
+        The actual settled outcome (filled_won/filled_lost) is determined later at
+        market resolution in monitor._exit_position(), where the main position's
+        exit_price tells us which side won.
+        """
+        with self._lock:
+            self._paper_hedge_fills[hedge_token_id] = {
+                "fill_price": fill_price,
+                "fill_size": fill_size,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save_paper_hedge_fills()
+
+    def get_paper_hedge_fill(self, hedge_token_id: str) -> Optional[dict]:
+        """Return simulated fill info for hedge_token_id, or None if not yet filled."""
+        with self._lock:
+            return self._paper_hedge_fills.get(hedge_token_id)
+
+    def _load_paper_hedge_fills(self) -> dict[str, dict]:
+        """Load persisted paper-mode hedge fills from disk."""
+        if PAPER_HEDGE_FILLS_JSON.exists():
+            try:
+                return json.loads(PAPER_HEDGE_FILLS_JSON.read_text())
+            except Exception:
+                pass
+        return {}
+
+    def _save_paper_hedge_fills(self) -> None:
+        """Write paper-mode hedge fills to disk. Must be called under self._lock."""
+        try:
+            PAPER_HEDGE_FILLS_JSON.write_text(json.dumps(self._paper_hedge_fills))
+        except Exception as exc:
+            log.warning("Failed to persist paper hedge fills", exc=str(exc))
+
+    def has_hedge_fill(self, market_id: str) -> bool:
+        """Return True if a momentum_hedge row for market_id already exists in trades.csv."""
+        try:
+            if not TRADES_CSV.exists():
+                return False
+            with TRADES_CSV.open(newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f, fieldnames=TRADES_HEADER)
+                next(reader, None)  # skip header row
+                for row in reader:
+                    if (row.get("market_id") == market_id
+                            and row.get("strategy") == "momentum_hedge"):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def record_hedge_fill(
+        self,
+        parent_market_id: str,
+        parent_market_title: str,
+        hedge_token_id: str,
+        fill_price: float,
+        fill_size: float,
+        settled_price: float,
+        *,
+        hedge_status: str = "filled_won",
+        spot_resolve_price: float = 0.0,
+    ) -> None:
+        """Record a GTD hedge outcome in trades.csv.
+
+        Called by _redeem_ready_positions() when the auto-redeem loop detects
+        that a token_id belongs to a known momentum GTD hedge, or when a RESOLVED
+        exit confirms the hedge was never filled.
+
+        Args:
+            parent_market_id:    condition_id of the main momentum trade.
+            parent_market_title: human label for the market.
+            hedge_token_id:      PM CLOB token_id of the hedged (opposite) token.
+            fill_price:          price at which the hedge BUY filled (pos.hedge_price).
+            fill_size:           number of contracts (0.0 for unfilled hedge).
+            settled_price:       1.0 if hedge token won, 0.0 if lost (ignored for unfilled).
+            hedge_status:        "filled_won" | "filled_lost" | "unfilled".
+            spot_resolve_price:  oracle spot at market resolution time.
+        """
+        pnl = round((settled_price - fill_price) * fill_size, 6)
+        _csv_row: dict = {}
+        with self._lock:
+            self._realized_pnl += pnl
+            _csv_row = {
+                "timestamp":        datetime.now(timezone.utc).isoformat(),
+                "entry_timestamp":  "",
+                "market_id":        parent_market_id,
+                "market_title":     (parent_market_title or "")[:60],
+                "market_type":      "momentum_hedge",
+                "underlying":       "",
+                "side":             "hedge",
+                "size":             round(fill_size, 6),
+                "price":            round(fill_price, 4),
+                "fees_paid":        0.0,
+                "rebates_earned":   0.0,
+                "hl_hedge_size":    0.0,
+                "hl_entry_price":   0.0,
+                "strategy":         "momentum_hedge",
+                "spread_id":        "",
+                "pnl":              pnl,
+                "entry_deviation":  0.0,
+                "implied_prob":     0.0,
+                "deribit_iv":       0.0,
+                "tte_years":        0.0,
+                "spot_price":       0.0,
+                "exit_spot_price":  settled_price,
+                "strike":           0.0,
+                "kalshi_price":     0.0,
+                "signal_source":      "gtd_hedge",
+                "signal_score":       0.0,
+                "resolved_outcome":   "WIN" if settled_price >= 0.5 else "LOSS",
+                "hedge_order_id":     "",
+                "hedge_token_id":     hedge_token_id,
+                "hedge_price":        round(fill_price, 4),
+                "hedge_size_usd":     round(fill_size * fill_price, 6),
+                "hedge_status":       hedge_status,
+                "spot_resolve_price": round(spot_resolve_price, 4),
+            }
+            log.info(
+                "GTD hedge fill recorded",
+                parent_market_id=parent_market_id[:20],
+                hedge_token_id=hedge_token_id[:20],
+                fill_price=fill_price,
+                fill_size=round(fill_size, 4),
+                settled_price=settled_price,
+                pnl=pnl,
+            )
+            # Clean up persisted paper-mode fill entry now that the outcome is
+            # written to trades.csv — prevents stale entries after restart.
+            if hedge_token_id in self._paper_hedge_fills:
+                del self._paper_hedge_fills[hedge_token_id]
+                self._save_paper_hedge_fills()
+        self._append_csv(_csv_row)
+
     def update_hedge(
         self,
         market_id: str,
@@ -684,6 +887,12 @@ class RiskEngine:
                 "signal_source": pos.signal_source,
                 "signal_score": pos.signal_score,
                 "resolved_outcome": resolved_outcome,
+                "hedge_order_id": pos.hedge_order_id,
+                "hedge_token_id": pos.hedge_token_id,
+                "hedge_price": pos.hedge_price,
+                "hedge_size_usd": pos.hedge_size_usd,
+                "hedge_status": "",
+                "spot_resolve_price": 0.0,
             }
             _closed_pos = pos
             log.info(

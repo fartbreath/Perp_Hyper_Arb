@@ -133,17 +133,23 @@ class LiveFillHandler:
         """Restore live state from a previous session.
 
         Flow:
-          1. Fetch current resting (LIVE) orders from the CLOB API.
-          2. For orders belonging to known markets: re-register them as
+          1. Restore open token positions from the PM Data API first — this
+             populates the risk engine so hedge orders can be classified in step 2.
+          2. Fetch current resting (LIVE) orders from the CLOB API.
+          3. For orders belonging to known markets: re-register them as
              ActiveQuote entries so the bot continues to manage them.
-          3. Cancel any orders for unknown/expired markets (can't manage them).
-          4. Restore open token positions into the risk engine.
+             GTD hedge orders (BUY on the opposite token of a restored momentum
+             position) are reconnected to their parent position instead.
+          4. Cancel any orders for unknown/expired markets (can't manage them).
 
         This avoids the blast-cancel-and-repost cycle that causes unnecessary
         API churn and potentially misses fills in flight at restart.
         """
         if config.PAPER_TRADING:
             return
+
+        log.info("Live startup: loading existing positions from PM Data API…")
+        await self._restore_positions()
 
         log.info("Live startup: restoring open orders from previous session…")
         unknown_order_ids = await self._restore_open_orders()
@@ -158,9 +164,6 @@ class LiveFillHandler:
                     await self._pm.cancel_order(oid)
                 except Exception as exc:
                     log.warning("startup_restore: cancel failed", order_id=oid[:20], exc=str(exc))
-
-        log.info("Live startup: loading existing positions from PM Data API…")
-        await self._restore_positions()
     # ── Open-order restore ───────────────────────────────────────────────
 
     async def _restore_open_orders(self) -> list[str]:
@@ -217,6 +220,46 @@ class LiveFillHandler:
             key = market.token_id_yes if is_yes else f"{market.token_id_yes}_ask"
 
             collateral = price * remaining
+
+            # ── GTD hedge detection ─────────────────────────────────────────────
+            # A GTD hedge is a low-price BUY on the opposite token of an open
+            # momentum position.  Re-attach it to the position instead of
+            # registering it as a maker ActiveQuote (which would mismanage it).
+            if order.get("side", "").upper() == "BUY":
+                positions = self._risk.get_positions()
+                parent_pos = next(
+                    (
+                        p for p in positions.values()
+                        if p.market_id == market.condition_id
+                        and not p.is_closed
+                        and p.strategy == "momentum"
+                        and p.token_id
+                        and p.token_id != token_id   # opposite token
+                        and not p.hedge_order_id     # not already reconnected
+                    ),
+                    None,
+                )
+                if parent_pos is not None:
+                    hedge_size_usd = round(remaining * price, 6)
+                    self._risk.update_gtd_hedge(
+                        parent_pos.market_id,
+                        parent_pos.side,
+                        order_id,
+                        token_id,
+                        price,
+                        hedge_size_usd,
+                    )
+                    self._pm._pinned_tokens.add(token_id)
+                    restored += 1
+                    log.info(
+                        "startup_restore: GTD hedge reconnected to momentum position",
+                        market=market.title[:60],
+                        hedge_token=token_id[:24],
+                        order_id=order_id[:20],
+                        price=price,
+                    )
+                    continue
+            # ───────────────────────────────────────────────────────────────────
 
             aq = ActiveQuote(
                 market_id=market.condition_id,

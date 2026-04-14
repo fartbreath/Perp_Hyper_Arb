@@ -1712,6 +1712,15 @@ export default function Settings() {
               unit="s"
               onSubmit={(v) => apply({ momentum_near_expiry_time_stop_secs: v })}
             />
+            {GAP}
+            <NumberInput
+              label="Resolved Force-Close Timeout (s)"
+              description="Seconds past end_date before using oracle (spot vs. strike) to force-close a stuck resolved position. PM can take 1–10 min for bucket_5m. Critical in paper mode where auto-redeem is disabled. Default: 300."
+              value={data.momentum_resolved_force_close_sec ?? 300}
+              step={30}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_resolved_force_close_sec: v })}
+            />
           </div>
 
           <div className="card">
@@ -2000,18 +2009,18 @@ export default function Settings() {
               <>
                 {GAP}
                 <FloatInput
-                  label="Coverage %"
-                  description="Hedge size as % of main position (e.g. 40 = 40% coverage). Sized as entry_size × coverage_pct."
-                  value={(data.momentum_hedge_coverage_pct ?? 0.40) * 100}
-                  step={5}
+                  label="Contracts %"
+                  description="Hedge size as % of main entry contracts (e.g. 100 = same count). Actual USDC cost = contracts × bid price (e.g. 25ct × $0.02 = $0.50)."
+                  value={(data.momentum_hedge_contracts_pct ?? 1.0) * 100}
+                  step={10}
                   unit="%"
-                  onSubmit={(v) => apply({ momentum_hedge_coverage_pct: v / 100 })}
+                  onSubmit={(v) => apply({ momentum_hedge_contracts_pct: v / 100 })}
                 />
                 {GAP}
                 <FloatInput
                   label="Default Bid Price"
-                  description="Fallback GTC bid price on the opposite token when no per-bucket override applies (e.g. 0.03)."
-                  value={data.momentum_hedge_price ?? 0.03}
+                  description="Fallback GTC bid price on the opposite token when no per-bucket override applies (e.g. 0.02)."
+                  value={data.momentum_hedge_price ?? 0.02}
                   step={0.005}
                   unit=""
                   onSubmit={(v) => apply({ momentum_hedge_price: v })}
@@ -2020,7 +2029,7 @@ export default function Settings() {
                 <FloatInput
                   label="5m Bucket Price"
                   description="Hedge bid price for 5-minute bucket markets (highest mismatch risk → higher bid)."
-                  value={data.momentum_hedge_price_5m ?? 0.04}
+                  value={data.momentum_hedge_price_5m ?? 0.02}
                   step={0.005}
                   unit=""
                   onSubmit={(v) => apply({ momentum_hedge_price_5m: v })}
@@ -2029,7 +2038,7 @@ export default function Settings() {
                 <FloatInput
                   label="15m Bucket Price"
                   description="Hedge bid price for 15-minute bucket markets."
-                  value={data.momentum_hedge_price_15m ?? 0.035}
+                  value={data.momentum_hedge_price_15m ?? 0.02}
                   step={0.005}
                   unit=""
                   onSubmit={(v) => apply({ momentum_hedge_price_15m: v })}
@@ -2038,7 +2047,7 @@ export default function Settings() {
                 <FloatInput
                   label="1h Bucket Price"
                   description="Hedge bid price for 1-hour bucket markets."
-                  value={data.momentum_hedge_price_1h ?? 0.025}
+                  value={data.momentum_hedge_price_1h ?? 0.015}
                   step={0.005}
                   unit=""
                   onSubmit={(v) => apply({ momentum_hedge_price_1h: v })}
@@ -2047,7 +2056,7 @@ export default function Settings() {
                 <FloatInput
                   label="4h Bucket Price"
                   description="Hedge bid price for 4-hour bucket markets (lowest mismatch risk → lower bid)."
-                  value={data.momentum_hedge_price_4h ?? 0.02}
+                  value={data.momentum_hedge_price_4h ?? 0.01}
                   step={0.005}
                   unit=""
                   onSubmit={(v) => apply({ momentum_hedge_price_4h: v })}
@@ -2056,7 +2065,7 @@ export default function Settings() {
                 <FloatInput
                   label="Daily Bucket Price"
                   description="Hedge bid price for daily bucket markets."
-                  value={data.momentum_hedge_price_daily ?? 0.015}
+                  value={data.momentum_hedge_price_daily ?? 0.01}
                   step={0.005}
                   unit=""
                   onSubmit={(v) => apply({ momentum_hedge_price_daily: v })}

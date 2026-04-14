@@ -9,6 +9,7 @@ import Settings from "./pages/Settings";
 import Logs from "./pages/Logs";
 import Positions from "./pages/Positions";
 import Fills from "./pages/Fills";
+import Events from "./pages/Events";
 import "./App.css";
 
 const NAV_LINKS = [
@@ -20,6 +21,7 @@ const NAV_LINKS = [
   { to: "/risk", label: "Risk" },
   { to: "/markets", label: "Markets" },
   { to: "/fills", label: "Fills" },
+  { to: "/events", label: "Events" },
   { to: "/logs", label: "Logs" },
   { to: "/settings", label: "⚙️ Settings" },
 ];
@@ -54,6 +56,7 @@ export default function App() {
           <Route path="/markets" element={<Markets />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/fills" element={<Fills />} />
+          <Route path="/events" element={<Events />} />
           <Route path="/logs" element={<Logs />} />
         </Routes>
       </main>

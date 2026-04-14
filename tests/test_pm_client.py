@@ -478,10 +478,12 @@ class TestAutoRedeemDedup:
         pm._clob.get_collateral_address = MagicMock(return_value="0xUSDC")
         risk = MagicMock()
         risk.get_positions = MagicMock(return_value={})
+        risk.get_position_by_hedge_token = MagicMock(return_value=None)  # not a hedge token
         mon = PositionMonitor.__new__(PositionMonitor)
         mon._pm = pm
         mon._risk = risk
         mon._redeemed_tokens = set()
+        mon._spot = None  # no spot oracle needed for dedup test
         return mon
 
     def test_auto_redeem_dedup(self):

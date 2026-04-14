@@ -74,6 +74,7 @@ from market_data.pm_client import PMClient, _MARKET_TYPE_DURATION_SECS
 from market_data.rtds_client import RTDSClient
 from market_data.spot_oracle import SpotOracle
 from ctf_utils import _redeem_ctf_via_safe
+from strategies.Momentum.event_log import emit as _emit_event
 
 log = get_bot_logger(__name__)
 
@@ -395,7 +396,7 @@ def should_exit(
             ):
                 return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
 
-        # Token-price exits (take-profit) require the held token's CLOB mid.
+        # Token-price exits (take-profit + prob-based SL) require the held token's CLOB mid.
         if pos.side in ("YES", "BUY_YES", "UP"):
             # Use actual YES/UP CLOB mid; fall back to current_price.
             token_price = current_token_price if current_token_price is not None else current_price
@@ -408,6 +409,30 @@ def should_exit(
             token_price = current_token_price
         # Recompute unrealised against the actual held-token price.
         unrealised = compute_unrealised_pnl(pos, token_price)
+
+        # Probability-based SL (Item 7): fires when the CLOB token price has
+        # dropped more than MOMENTUM_PROB_SL_PCT below the entry price.
+        # This is a secondary failsafe complementing the oracle-delta SL.
+        # Uses the same MOMENTUM_DELTA_SL_MIN_TICKS hysteresis to avoid single
+        # CLOB-noise triggers.
+        # Near-expiry guard: in the final MOMENTUM_PROB_SL_MIN_TTE_SECS seconds the
+        # CLOB book drains — best_bid collapses to the tick floor while best_ask
+        # stays near 1.0, pushing mid to ~0.50 regardless of oracle state.  Firing
+        # the prob-SL on this artificial mid collapse exits winning positions at the
+        # book floor (0.01).  The oracle-delta SL is the correct protection near
+        # expiry; suppress prob-SL below the TTE guard.
+        _prob_sl_tte_ok = (
+            tte_seconds is None
+            or config.MOMENTUM_PROB_SL_MIN_TTE_SECS <= 0
+            or tte_seconds >= config.MOMENTUM_PROB_SL_MIN_TTE_SECS
+        )
+        if (
+            _prob_sl_tte_ok
+            and config.MOMENTUM_PROB_SL_ENABLED
+            and pos.prob_sl_threshold > 0.0
+            and token_price < pos.prob_sl_threshold
+        ):
+            return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
 
         # Take-profit: still CLOB-based (converging to 1.0 at resolution).
         if token_price >= config.MOMENTUM_TAKE_PROFIT:
@@ -423,6 +448,50 @@ def should_exit(
             return True, ExitReason.PROFIT_TARGET, unrealised
         if unrealised <= -config.STOP_LOSS_USD:
             return True, ExitReason.STOP_LOSS, unrealised
+        return False, "", unrealised
+
+    # ── Range exits — oracle delta SL only ───────────────────────────────────
+    # Range positions (strategy="range") use a delta SL based on whether the oracle
+    # spot has moved OUTSIDE the range boundaries.  pos.range_lo / pos.range_hi
+    # store the actual title-parsed boundaries (set by the scanner); pos.strike holds
+    # the midpoint as a fallback.
+    # No take-profit or prob-SL: the scanner already confirmed a positive delta at
+    # entry, and range markets converge correctly on their own near resolution.
+    if pos.strategy == "range":
+        if current_spot is not None:
+            _sl = delta_sl_pct if delta_sl_pct is not None else config.MOMENTUM_DELTA_STOP_LOSS_PCT
+            if pos.range_lo > 0 and pos.range_hi > 0:
+                # Compute delta as distance-from-nearest-boundary (positive = in winning zone).
+                if pos.side in ("YES", "BUY_YES", "UP"):
+                    # YES wins when spot is INSIDE [range_lo, range_hi].
+                    if pos.range_lo <= current_spot <= pos.range_hi:
+                        mid = pos.strike if pos.strike > 0 else (pos.range_lo + pos.range_hi) / 2
+                        current_delta_pct = min(
+                            current_spot - pos.range_lo,
+                            pos.range_hi - current_spot,
+                        ) / mid * 100
+                    else:
+                        # Spot is outside the range — position losing.
+                        current_delta_pct = -1.0  # definitely below _sl threshold
+                else:
+                    # NO wins when spot is OUTSIDE [range_lo, range_hi].
+                    mid = pos.strike if pos.strike > 0 else (pos.range_lo + pos.range_hi) / 2
+                    if current_spot > pos.range_hi:
+                        current_delta_pct = (current_spot - pos.range_hi) / mid * 100
+                    elif current_spot < pos.range_lo:
+                        current_delta_pct = (pos.range_lo - current_spot) / mid * 100
+                    else:
+                        current_delta_pct = -1.0  # spot inside range → NO is losing
+            elif pos.strike > 0:
+                # Fallback when range bounds not stored: standard (spot-strike)/strike.
+                if pos.side in ("YES", "BUY_YES", "UP"):
+                    current_delta_pct = (current_spot - pos.strike) / pos.strike * 100
+                else:
+                    current_delta_pct = (pos.strike - current_spot) / pos.strike * 100
+            else:
+                current_delta_pct = None
+            if current_delta_pct is not None and current_delta_pct < _sl:
+                return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
         return False, "", unrealised
 
     # ── Any other strategy label: no triggers (hold to RESOLVED) ─────────────
@@ -802,9 +871,42 @@ class PositionMonitor:
 
             payout = round(size * cur_price, 4)
 
+            # ── GTD hedge token intercept ─────────────────────────────────────────
+            # When a wallet token belongs to a momentum GTD hedge (a resting BUY on
+            # the OPPOSITE side), the normal close-position logic must NOT fire:
+            # applying the hedge token's settlement price to the main position would
+            # record an incorrect WIN/LOSS on the main trade.  Check first.
+            _hedge_parent = self._risk.get_position_by_hedge_token(token_id)
+
             # Genuine loser — nothing to redeem on-chain
             if payout == 0:
                 self._redeemed_tokens.add(token_id)
+                # GTD hedge token that lost: dismiss with a dedicated log line and
+                # skip the main-position close entirely.
+                if _hedge_parent is not None:
+                    # Hedge token was in wallet and resolved to 0 (main WON, hedge LOST).
+                    # Record the outcome so the webapp can show "Expired - LOST".
+                    _spot_hl = (
+                        self._spot.get_mid(_hedge_parent.underlying, _hedge_parent.market_type)
+                        if self._spot is not None and _hedge_parent.underlying else 0.0
+                    )
+                    self._risk.record_hedge_fill(
+                        parent_market_id=_hedge_parent.market_id,
+                        parent_market_title=_hedge_parent.market_title,
+                        hedge_token_id=token_id,
+                        fill_price=_hedge_parent.hedge_price,
+                        fill_size=size,
+                        settled_price=0.0,
+                        hedge_status="filled_lost",
+                        spot_resolve_price=_spot_hl,
+                    )
+                    log.info(
+                        "Auto-redeem: GTD hedge token lost (payout=0) — outcome recorded",
+                        token_id=token_id[:20],
+                        parent_market_id=_hedge_parent.market_id[:20],
+                        spot_resolve_price=round(_spot_hl, 2),
+                    )
+                    continue
                 log.info(
                     "Auto-redeem: lost position dismissed (payout=0)",
                     token_id=token_id[:20],
@@ -867,38 +969,78 @@ class PositionMonitor:
             # Close any still-open position AND force-correct any already-closed
             # record that was written with the wrong outcome (e.g., RESOLVED fast-path
             # used stale oracle and recorded LOSS when market actually paid out).
-            markets_snap = self._pm.get_markets()
-            for mkt in markets_snap.values():
-                if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
-                    # cur_price=1.0 for a settled winner
-                    # YES token=1  → YES won  → resolved_yes_price=1.0
-                    # NO  token=1  → NO  won  → resolved_yes_price=0.0
-                    is_yes_token = (mkt.token_id_yes == token_id)
-                    pm_resolved_yes = 1.0 if is_yes_token else 0.0
-                    for rp in list(self._risk.get_positions().values()):
-                        if rp.market_id == mkt.condition_id and not rp.is_closed:
-                            self._risk.close_position(
-                                mkt.condition_id, exit_price=cur_price, side=rp.side,
-                                resolved_outcome="WIN",
+            #
+            # Exception: GTD hedge tokens share the same condition_id as the main
+            # position (they are on the opposite token of the same market).  If we
+            # ran the normal close-position loop the hedge token's settlement price
+            # (1.0) would be applied to the main trade, recording a phantom WIN.
+            # Instead, record the hedge fill's own P&L and let on-chain redemption
+            # proceed without touching the main position's accounting.
+            if _hedge_parent is not None:
+                _spot_hw = (
+                    self._spot.get_mid(_hedge_parent.underlying, _hedge_parent.market_type)
+                    if self._spot is not None and _hedge_parent.underlying else 0.0
+                )
+                self._risk.record_hedge_fill(
+                    parent_market_id=_hedge_parent.market_id,
+                    parent_market_title=_hedge_parent.market_title,
+                    hedge_token_id=token_id,
+                    fill_price=_hedge_parent.hedge_price,
+                    fill_size=size,
+                    settled_price=settled_price,
+                    hedge_status="filled_won",
+                    spot_resolve_price=_spot_hw,
+                )
+                log.info(
+                    "Auto-redeem: GTD hedge token won — fill P&L recorded, redeeming on-chain",
+                    token_id=token_id[:20],
+                    parent_market_id=_hedge_parent.market_id[:20],
+                    fill_price=_hedge_parent.hedge_price,
+                    fill_size=round(size, 4),
+                    payout_usd=payout,
+                )
+                _emit_event(
+                    "HEDGE_FILL",
+                    market_id=_hedge_parent.market_id,
+                    market_title=_hedge_parent.market_title[:80],
+                    hedge_token_id=token_id,
+                    fill_price=_hedge_parent.hedge_price,
+                    fill_size=round(size, 4),
+                    payout_usd=round(payout, 4),
+                )
+            else:
+                markets_snap = self._pm.get_markets()
+                for mkt in markets_snap.values():
+                    if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
+                        # cur_price=1.0 for a settled winner
+                        # YES token=1  → YES won  → resolved_yes_price=1.0
+                        # NO  token=1  → NO  won  → resolved_yes_price=0.0
+                        is_yes_token = (mkt.token_id_yes == token_id)
+                        pm_resolved_yes = 1.0 if is_yes_token else 0.0
+                        for rp in list(self._risk.get_positions().values()):
+                            if rp.market_id == mkt.condition_id and not rp.is_closed:
+                                self._risk.close_position(
+                                    mkt.condition_id, exit_price=cur_price, side=rp.side,
+                                    resolved_outcome="WIN",
+                                )
+                        # Correct any already-closed record with wrong outcome
+                        try:
+                            patched = self._risk.patch_trade_outcome(
+                                mkt.condition_id, pm_resolved_yes, force=True
                             )
-                    # Correct any already-closed record with wrong outcome
-                    try:
-                        patched = self._risk.patch_trade_outcome(
-                            mkt.condition_id, pm_resolved_yes, force=True
-                        )
-                        if patched:
-                            log.info(
-                                "Auto-redeem: corrected trades.csv via PM payout>0",
-                                condition_id=mkt.condition_id[:20],
-                                payout_usd=payout,
-                                patched=patched,
+                            if patched:
+                                log.info(
+                                    "Auto-redeem: corrected trades.csv via PM payout>0",
+                                    condition_id=mkt.condition_id[:20],
+                                    payout_usd=payout,
+                                    patched=patched,
+                                )
+                        except Exception as exc:
+                            log.warning(
+                                "Auto-redeem: patch_trade_outcome failed",
+                                exc=str(exc), condition_id=condition_id[:20],
                             )
-                    except Exception as exc:
-                        log.warning(
-                            "Auto-redeem: patch_trade_outcome failed",
-                            exc=str(exc), condition_id=condition_id[:20],
-                        )
-                    break
+                        break
 
             # Mark BEFORE the async call so a crash doesn't cause a double-submit.
             self._redeemed_tokens.add(token_id)
@@ -1089,21 +1231,66 @@ class PositionMonitor:
             #     _redeem_ready_positions() acts as a final safety-net in live
             #     mode — it re-closes with the correct payout from the Data API.
 
-            # PM CLOB settlement API is the sole source of truth for resolved
-            # markets.  Once a market has expired there is no ambiguity: PM
-            # returns the settled YES-token price (0.0 or 1.0).  We do NOT fall
-            # back to oracle estimates or stale CLOB book mids — both can be
-            # wrong at the settlement instant and would produce incorrect P&L.
-            # If the PM API hasn't propagated the result yet, skip this cycle;
-            # _redeem_ready_positions() is the final safety-net that processes
-            # the position once redeemable=True or curPrice settles.
+            # L1: PM CLOB settlement API — authoritative once closed=True.
+            # We prefer PM's own answer over any oracle estimate.
+            # In live mode _auto_redeem_loop() acts as a final safety-net and
+            # will force-correct any mis-price via PM wallet payout data.
+            # In paper mode _auto_redeem_loop() is disabled, so we fall back to
+            # the resolution oracle after MOMENTUM_RESOLVED_FORCE_CLOSE_SEC.
             _pm_yes_price = await self._pm.fetch_market_resolution(pos.market_id)
             if _pm_yes_price is None:
-                log.debug(
-                    "Monitor: RESOLVED market — PM API not settled yet, will retry",
-                    market_id=pos.market_id,
-                )
-                return
+                # PM API hasn't confirmed settlement yet.
+                # Check how long we've been waiting past end_date.
+                _secs_past_end = (now - market.end_date).total_seconds()
+                if _secs_past_end < config.MOMENTUM_RESOLVED_FORCE_CLOSE_SEC:
+                    log.debug(
+                        "Monitor: RESOLVED market — PM API not settled yet, will retry",
+                        market_id=pos.market_id,
+                        secs_past_end=round(_secs_past_end, 0),
+                        timeout=config.MOMENTUM_RESOLVED_FORCE_CLOSE_SEC,
+                    )
+                    return
+
+                # ── L2 oracle fallback ────────────────────────────────────────
+                # Timeout reached.  Use the resolution oracle (Chainlink /
+                # RTDS) to determine the outcome from spot vs. strike.
+                # This is the same oracle PM's settlement contract reads.
+                # In live mode this is a best-effort estimate; _auto_redeem_loop
+                # will patch the P&L once the real payout is known.
+                _fallback_spot: Optional[float] = None
+                if self._spot is not None and pos.underlying and pos.strike > 0:
+                    _fallback_spot = self._spot.get_mid_resolution_oracle(
+                        pos.underlying, pos.market_type
+                    ) or self._spot.get_mid(pos.underlying, pos.market_type)
+
+                if _fallback_spot is not None and pos.strike > 0:
+                    # UP/YES wins when spot > strike; DOWN/NO wins when spot < strike.
+                    _oracle_yes = 1.0 if _fallback_spot > pos.strike else 0.0
+                    _pm_yes_price = _oracle_yes
+                    log.warning(
+                        "Monitor: RESOLVED — PM API timeout, closing via oracle fallback",
+                        market_id=pos.market_id,
+                        side=pos.side,
+                        secs_past_end=round(_secs_past_end, 0),
+                        spot=round(_fallback_spot, 2),
+                        strike=round(pos.strike, 2),
+                        oracle_yes=_oracle_yes,
+                        paper=config.PAPER_TRADING,
+                    )
+                else:
+                    # No oracle data — close neutral at entry price to avoid phantom P&L.
+                    log.warning(
+                        "Monitor: RESOLVED — no oracle data after timeout,"
+                        " closing at entry price",
+                        market_id=pos.market_id,
+                        side=pos.side,
+                        secs_past_end=round(_secs_past_end, 0),
+                    )
+                    _pm_yes_price = (
+                        pos.entry_price
+                        if pos.side in ("YES", "BUY_YES", "UP")
+                        else 1.0 - pos.entry_price
+                    )
 
             # Convert settled YES-token price to held-token space.
             if pos.side in ("YES", "BUY_YES", "UP"):
@@ -1113,7 +1300,7 @@ class PositionMonitor:
 
             unrealised = compute_unrealised_pnl(pos, exit_mid)
             log.info(
-                "Monitor: RESOLVED — PM CLOB settlement confirms outcome",
+                "Monitor: RESOLVED — closing position",
                 market_id=pos.market_id,
                 pm_yes_price=_pm_yes_price,
                 side=pos.side,
@@ -1241,9 +1428,9 @@ class PositionMonitor:
                 self._delta_sl_ticks.pop(pos.market_id, None)
 
         # Write every intra-hold price check to momentum_ticks.csv for momentum
-        # positions. Kept out of bot.log to avoid noise; the dedicated CSV is
-        # easy to filter and analyse for calibrating exit stop thresholds.
-        if pos.strategy == "momentum":
+        # and range positions. Kept out of bot.log to avoid noise; the dedicated
+        # CSV is easy to filter and analyse for calibrating exit stop thresholds.
+        if pos.strategy in ("momentum", "range"):
             _tick_delta: Optional[float] = None
             if current_spot is not None and pos.strike > 0:
                 if pos.side in ("YES", "BUY_YES", "UP"):
@@ -1423,6 +1610,13 @@ class PositionMonitor:
                         "EXIT_ORDER_FAILED — manual intervention required",
                         market_id=pos.market_id, side=pos.side, reason=reason,
                     )
+                    _emit_event(
+                        "SELL_FAILED",
+                        market_id=pos.market_id,
+                        side=pos.side,
+                        reason=reason,
+                        exit_price=round(exit_price, 6),
+                    )
                     self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
                     return
             else:
@@ -1454,6 +1648,13 @@ class PositionMonitor:
                     log.error(
                         "EXIT_ORDER_FAILED — manual intervention required",
                         market_id=pos.market_id, side=pos.side, reason=reason,
+                    )
+                    _emit_event(
+                        "SELL_FAILED",
+                        market_id=pos.market_id,
+                        side=pos.side,
+                        reason=reason,
+                        exit_price=round(exit_price, 6),
                     )
                     self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
                     return
@@ -1510,6 +1711,99 @@ class PositionMonitor:
             exit_spot_price=_exit_spot,
         )
 
+        # For RESOLVED exits: if the position had a hedge order that was never
+        # filled (token never appeared in the wallet), write an "unfilled" record.
+        # has_hedge_fill() returns True if a momentum_hedge row already exists
+        # (i.e., the auto-redeem loop or a prior RESOLVED exit already wrote one).
+        if reason == ExitReason.RESOLVED and closed and closed.hedge_order_id and closed.hedge_token_id:
+            if not self._risk.has_hedge_fill(closed.market_id):
+                # In paper mode the fill_simulator may have simulated a hedge fill.
+                # If so, use that fill data and apply the correct outcome based on
+                # which side won: main WON → hedge (opposite) LOST; main LOST → WON.
+                _paper_fill = self._risk.get_paper_hedge_fill(closed.hedge_token_id)
+                if _paper_fill is not None:
+                    _main_won = (closed.exit_price or 0.0) >= 0.99
+                    _h_status = "filled_lost" if _main_won else "filled_won"
+                    _h_settled = 0.0 if _main_won else 1.0
+                    self._risk.record_hedge_fill(
+                        parent_market_id=closed.market_id,
+                        parent_market_title=closed.market_title,
+                        hedge_token_id=closed.hedge_token_id,
+                        fill_price=_paper_fill["fill_price"],
+                        fill_size=_paper_fill["fill_size"],
+                        settled_price=_h_settled,
+                        hedge_status=_h_status,
+                        spot_resolve_price=_exit_spot,
+                    )
+                    log.info(
+                        "GTD hedge — paper-simulated fill recorded on RESOLVED exit",
+                        market_id=closed.market_id[:20],
+                        hedge_token_id=closed.hedge_token_id[:20],
+                        hedge_status=_h_status,
+                        fill_price=_paper_fill["fill_price"],
+                        fill_size=round(_paper_fill["fill_size"], 4),
+                        spot_resolve_price=round(_exit_spot, 2),
+                    )
+                else:
+                    self._risk.record_hedge_fill(
+                        parent_market_id=closed.market_id,
+                        parent_market_title=closed.market_title,
+                        hedge_token_id=closed.hedge_token_id,
+                        fill_price=closed.hedge_price,
+                        fill_size=0.0,
+                        settled_price=0.0,
+                        hedge_status="unfilled",
+                        spot_resolve_price=_exit_spot,
+                    )
+                    log.info(
+                        "GTD hedge — unfilled record written on RESOLVED exit",
+                        market_id=closed.market_id[:20],
+                        hedge_token_id=closed.hedge_token_id[:20],
+                        spot_resolve_price=round(_exit_spot, 2),
+                    )
+
+        # Cancel any resting GTD hedge order — but ONLY when the main position
+        # reached take-profit (we won; insurance is no longer needed).
+        # On loss exits (stop-loss, near-expiry, time-stop) the hedge is kept alive:
+        # it is now the primary recovery leg and may still redeem at $1 if the
+        # opposite token dips to our resting bid before market resolution.
+        # RESOLVED exits are excluded regardless (PM auto-expires all open orders).
+        _hedge_cancel_on_win = {ExitReason.PROFIT_TARGET, ExitReason.MOMENTUM_TAKE_PROFIT}
+        if closed and closed.hedge_order_id and reason in _hedge_cancel_on_win:
+            asyncio.create_task(self._pm.cancel_order(closed.hedge_order_id))
+            log.info(
+                "GTD hedge order cancel submitted on take-profit close",
+                hedge_order_id=closed.hedge_order_id[:20],
+                reason=reason,
+            )
+            _emit_event(
+                "HEDGE_CANCEL",
+                market_id=pos.market_id,
+                market_title=pos.market_title[:80],
+                hedge_order_id=closed.hedge_order_id,
+                reason=str(reason),
+            )
+        elif closed and closed.hedge_order_id and reason not in (
+            ExitReason.RESOLVED, *_hedge_cancel_on_win
+        ):
+            # Loss exit — hedge stays alive as recovery leg
+            log.info(
+                "GTD hedge kept alive after loss exit — recovery leg remains in CLOB",
+                hedge_order_id=closed.hedge_order_id[:20],
+                reason=reason,
+            )
+
+        # Cancel the resting TP SELL order (Item 1) on any exit that isn't the
+        # TP itself.  On a TP exit the order may already be filled; cancel is
+        # a no-op if so.  On RESOLVED, PM auto-expires all open orders.
+        if closed and closed.tp_order_id and reason != ExitReason.RESOLVED:
+            asyncio.create_task(self._pm.cancel_order(closed.tp_order_id))
+            log.info(
+                "TP resting order cancel submitted on position close",
+                tp_order_id=closed.tp_order_id[:20],
+                reason=reason,
+            )
+
         # Release the exit guard so the slot can be reused if the same market
         # re-opens (e.g. after a restart or a new bucket round).
         self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
@@ -1523,6 +1817,18 @@ class PositionMonitor:
                 hold_seconds=round(
                     (datetime.now(timezone.utc) - pos.opened_at).total_seconds(), 1
                 ),
+            )
+            _emit_event(
+                "SELL_CLOSE",
+                market_id=pos.market_id,
+                market_title=pos.market_title[:80],
+                underlying=pos.underlying,
+                market_type=pos.market_type,
+                side=pos.side,
+                entry_price=round(pos.entry_price, 6),
+                exit_price=round(exit_price, 6),
+                realized_pnl=round(closed.realized_pnl, 4),
+                reason=reason,
             )
             self._initial_deviations.pop(pos.market_id, None)
             if self._on_close_callback is not None:

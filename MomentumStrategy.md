@@ -812,3 +812,150 @@ negative-EV skips auditable.
 >
 > **SKIP.** Even though 84c looks attractive, the high-vol regime correctly raises the bar.
 > Dynamic vol protects against entries during chaotic market conditions.
+
+---
+
+## Improvement Set — Items 1, 2, 4, 5, 6, 7
+
+These six improvements were implemented together and are documented here.
+
+---
+
+### Item 1 — Active TP Resting Limit Order
+
+**Motivation:** Previously the monitor polled the CLOB price for take-profit. A resting SELL limit pre-armed at the TP price allows the Polymarket CLOB to fill the exit immediately when the market reaches the target, rather than waiting for the next monitor poll cycle.
+
+**Behaviour:**
+1. After entry fill is confirmed, a SELL limit order is placed at `MOMENTUM_TAKE_PROFIT` for the full position size.
+2. The order ID is stored in `pos.tp_order_id`.
+3. If the position closes for any other reason (SL, near-expiry, RESOLVED), the TP resting order is cancelled via `pm.cancel_order(pos.tp_order_id)`.
+
+**Config:**
+| Parameter | Default | Description |
+|---|---|---|
+| `MOMENTUM_TP_RESTING_ENABLED` | `True` | Enable/disable resting TP order |
+| `MOMENTUM_TP_RETRY_MAX` | `3` | Max retry attempts if TP order placement fails |
+| `MOMENTUM_TP_RETRY_STEP` | `0.005` | Price step down per TP placement retry |
+
+**Event:** `SELL_SUBMIT` emitted when TP order is placed with `order_id`, `tp_price`, and `size`.
+
+---
+
+### Item 2 — Order Cancel-and-Retry Loop
+
+**Motivation:** In live mode, limit entries can remain unfilled for many seconds. Waiting indefinitely wastes time and locks up the `MAX_CONCURRENT` slot. A cancel-and-retry loop re-submits at a higher price (tighter to the ask) up to `MOMENTUM_MAX_RETRIES` times.
+
+**Behaviour (live mode only, paper mode bypasses):**
+1. Place BUY limit/market at `current_ask`.
+2. Wait `MOMENTUM_ORDER_CANCEL_SEC` seconds for a WS fill event or REST confirmation.
+3. On timeout: REST-check the order first (handles race conditions where fill arrived after our check); if genuinely unfilled → cancel and retry at `+MOMENTUM_BUY_RETRY_STEP`.
+4. After `MOMENTUM_MAX_RETRIES` exhausted, emit `BUY_FAILED` and return False (position not opened).
+5. Hard slippage cap: `token_price × (1 + MOMENTUM_SLIPPAGE_CAP)` — never retry above this.
+
+**Config:**
+| Parameter | Default | Description |
+|---|---|---|
+| `MOMENTUM_ORDER_CANCEL_SEC` | `8.0` | Seconds before cancelling an unfilled entry |
+| `MOMENTUM_SLIPPAGE_CAP` | `0.05` | Maximum allowed ask-slippage (5%) |
+| `MOMENTUM_MAX_RETRIES` | `2` | Retry attempts after first timeout |
+| `MOMENTUM_BUY_RETRY_STEP` | `0.01` | Ask price increment per retry |
+
+**Events:** `BUY_SUBMIT` (each attempt), `BUY_CANCEL_TIMEOUT` (timeout), `BUY_FILL` (success), `BUY_FAILED` (all retries exhausted).
+
+---
+
+### Item 4 — VWAP Deviation + Momentum RoC Filter
+
+**Motivation:** The PTB-bot and VWAP-bot both use VWAP deviation and rate-of-change as secondary confirmation — they help avoid entries when price is stale/mean-reverting and confirm that positive momentum is still active.
+
+**Behaviour:**
+1. Price ticks are recorded in a per-token `_price_history` deque (up to 600 ticks) whenever `MOMENTUM_MIN_VWAP_DEV_PCT > 0` or `MOMENTUM_MIN_ROC_PCT > 0`.
+2. At scan time, `_check_vwap_roc()` computes:
+   - **VWAP** = Σ(price × vol_proxy) / Σ(vol_proxy) over `MOMENTUM_VWAP_WINDOW_SEC`
+   - **VWAP deviation** = (last_price − VWAP) / VWAP × 100%
+   - **RoC** = (last_price − oldest_price) / oldest_price × 100% over `MOMENTUM_ROC_WINDOW_SEC`
+3. Signal is skipped if deviation < `MOMENTUM_MIN_VWAP_DEV_PCT` **or** RoC < `MOMENTUM_MIN_ROC_PCT`.
+4. Insufficient history (< 3 ticks) passes permissively.
+
+**Volume proxy:** Since Polymarket WS does not expose per-trade volumes, `ask_size` at the best ask is used as a proxy. This is the same approach used in the VWAP-bot reference.
+
+**Default values (0.0 = disabled/permissive):** Both thresholds default to 0 so the filter has no impact until the operator tunes them from live data.
+
+**Config:**
+| Parameter | Default | Description |
+|---|---|---|
+| `MOMENTUM_VWAP_WINDOW_SEC` | `30` | Rolling window for VWAP computation (seconds) |
+| `MOMENTUM_ROC_WINDOW_SEC` | `60` | Rolling window for RoC computation (seconds) |
+| `MOMENTUM_MIN_VWAP_DEV_PCT` | `0.0` | Minimum VWAP deviation required (0 = disabled) |
+| `MOMENTUM_MIN_ROC_PCT` | `0.0` | Minimum RoC required (0 = disabled) |
+
+**Diagnostics:** `skipped_vwap` counter added to scan summary; debug dict includes `vwap`, `vwap_dev_pct`, `vwap_samples`, `roc_pct`.
+
+---
+
+### Item 5 — Tightened Chainlink Silence Watchdog
+
+**Motivation:** The previous 120-second silence timeout is too long — a Chainlink feed pause of 30+ seconds is already unsafe for oracle-delta SL accuracy.
+
+**Behaviour:** `_WS_SILENCE_TIMEOUT_S` in `chainlink_ws_client.py` now reads `config.CHAINLINK_SILENCE_WATCHDOG_SECS` (default 30 s) instead of the hardcoded 120 s. If no AnswerUpdated event is received within this window, the WS client triggers reconnection.
+
+**Config:**
+| Parameter | Default | Description |
+|---|---|---|
+| `CHAINLINK_SILENCE_WATCHDOG_SECS` | `30` | Seconds of silence before WS reconnect |
+
+---
+
+### Item 6 — Event-Typed Entry/Exit Journal
+
+**Motivation:** Unstructured log scraping makes trade lifecycle analysis difficult. A structured JSONL event log provides first-class support for PnL accounting, retry analysis, and (in future) streaming dashboards.
+
+**File:** `data/momentum_events.jsonl` — one JSON record per line.
+
+**Schema (schema_version=1):**
+```json
+{
+  "schema_version": 1,
+  "ts": "<ISO UTC>",
+  "event": "<EVENT_TYPE>",
+  "market_id": "...",
+  ...event-specific fields...
+}
+```
+
+**Event types:**
+| Event | Emitted by | Description |
+|---|---|---|
+| `SESSION_START` | `scanner.start()` | Once per bot startup |
+| `BUY_SUBMIT` | `_execute_signal` | Each entry order submission |
+| `BUY_CANCEL_TIMEOUT` | `_execute_signal` | Unfilled entry cancelled after timeout |
+| `BUY_FILL` | `_execute_signal` | Entry fill confirmed (WS or REST) |
+| `BUY_FAILED` | `_execute_signal` | All retries exhausted, no position opened |
+| `SELL_SUBMIT` | `_execute_signal` | TP resting SELL limit pre-armed |
+| `SELL_CLOSE` | `monitor._exit_position` | Position successfully closed |
+| `SELL_FAILED` | `monitor._exit_position` | Exit order placement failed |
+
+**API:** `GET /momentum/events?n=200` returns the last N events newest-first.
+
+**Module:** `strategies/Momentum/event_log.py` exports `emit(**kwargs)` and `read_recent(n)`.
+
+---
+
+### Item 7 — Probability-Based Stop-Loss
+
+**Motivation:** The oracle-delta SL only fires when the spot price diverges from the strike. For short-duration markets (5m, 15m), the CLOB token price itself may collapse well before the spot delta crosses the threshold. A secondary SL based on token price captures this.
+
+**Behaviour:**
+1. At entry, `pos.prob_sl_threshold` is set to `entry_price × (1 − MOMENTUM_PROB_SL_PCT)`.
+2. In `should_exit()`, if `token_price < pos.prob_sl_threshold` and `MOMENTUM_PROB_SL_ENABLED`, exit with `ExitReason.MOMENTUM_STOP_LOSS`.
+3. The check fires on the actual held-token CLOB price (same as TP check), so it applies to both YES and NO positions correctly.
+4. Setting `prob_sl_threshold = 0.0` disables the check for a position (e.g., when `MOMENTUM_PROB_SL_ENABLED = False` at entry time).
+
+**Config:**
+| Parameter | Default | Description |
+|---|---|---|
+| `MOMENTUM_PROB_SL_ENABLED` | `True` | Enable probability-based CLOB SL |
+| `MOMENTUM_PROB_SL_PCT` | `0.15` | Drop from entry price that triggers SL (15%) |
+
+**Interaction with delta SL:** Both the oracle-delta SL and the prob-SL are independent failsafes. Either can fire first. The prob-SL is faster for bucket markets where spot doesn't move much but CLOB prices collapse.
+

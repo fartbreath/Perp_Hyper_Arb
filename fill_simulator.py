@@ -190,12 +190,75 @@ class FillSimulator:
     async def _loop(self) -> None:
         while self._running:
             await asyncio.sleep(config.FILL_CHECK_INTERVAL)
-            if not config.STRATEGY_MAKER_ENABLED:
-                continue
             try:
-                await self._sweep()
+                if config.STRATEGY_MAKER_ENABLED:
+                    await self._sweep()
+                if config.MOMENTUM_HEDGE_ENABLED:
+                    await self._sweep_hedges()
             except Exception as exc:
                 log.error("FillSimulator sweep error", exc=str(exc))
+
+    async def _sweep_hedges(self) -> None:
+        """Check all paper-mode GTD hedge bids against the live CLOB.
+
+        For every open momentum position that has a paper hedge order (order_id
+        starts with "paper-"), fetch the live book for the opposite (hedge) token
+        and see if a real seller is offering at or below our resting bid.  If so,
+        simulate a fill using PAPER_HEDGE_FILL_PROB (single Bernoulli draw per
+        sweep — the hedge is a deep-discount resting order, not a maker quote, so
+        queue-position randomness is not modelled here).
+
+        The actual WIN/LOSS outcome is only known at market resolution; we store the
+        simulated fill in risk._paper_hedge_fills so _exit_position() can apply the
+        right status when writing the trades.csv momentum_hedge row.
+        """
+        positions = self._risk.get_positions()
+        for pos in positions.values():
+            if pos.is_closed:
+                continue
+            if not pos.hedge_token_id or not pos.hedge_order_id:
+                continue
+            if not pos.hedge_order_id.startswith("paper-"):
+                continue   # live mode — real CLOB handles this
+            if self._risk.get_paper_hedge_fill(pos.hedge_token_id) is not None:
+                continue   # already simulated as filled this session
+
+            # Fetch the live CLOB book for the opposite (hedge) token.
+            book = self._pm._books.get(pos.hedge_token_id)
+            if book is None or book.best_ask is None:
+                continue
+
+            # Touch check: does the market have a seller at or below our bid?
+            if book.best_ask > pos.hedge_price:
+                continue   # no seller at our price yet
+
+            # Seller exists at our price — simulate fill with PAPER_HEDGE_FILL_PROB.
+            if random.random() > config.PAPER_HEDGE_FILL_PROB:
+                continue   # missed this sweep; will retry next tick
+
+            # Determine fill size: hedge_size_usd / hedge_price = contracts ordered.
+            fill_size = round(
+                pos.hedge_size_usd / pos.hedge_price if pos.hedge_price > 0 else 0.0, 6
+            )
+            if fill_size <= 0:
+                continue
+
+            fill_price = pos.hedge_price  # resting bid — we fill at our own price
+
+            self._risk.record_paper_hedge_fill_sim(
+                hedge_token_id=pos.hedge_token_id,
+                fill_price=fill_price,
+                fill_size=fill_size,
+            )
+            log.info(
+                "[PAPER HEDGE FILL] GTD hedge simulated — waiting for resolution",
+                market=pos.market_title[:60],
+                market_id=pos.market_id[:20],
+                hedge_token_id=pos.hedge_token_id[:20],
+                hedge_price=fill_price,
+                fill_size=round(fill_size, 4),
+                book_ask=round(book.best_ask, 4),
+            )
 
     async def _sweep(self) -> None:
         """

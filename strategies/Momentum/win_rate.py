@@ -107,6 +107,10 @@ class WinRateTable:
         try:
             with _FILLS_CSV.open("r", newline="") as f:
                 for row in csv.DictReader(f):
+                    # Skip GTD hedge placement rows — they are not signal-quality fills.
+                    if row.get("row_type", "entry") == "hedge":
+                        continue
+
                     mkt_id = row.get("market_id", "").strip()
                     outcome = outcomes.get(mkt_id)
                     if outcome is None:

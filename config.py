@@ -377,6 +377,16 @@ MOMENTUM_ORDER_TYPE: str = "limit"
 MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.01  # protective buffer: exit when delta (in-the-money %) drops BELOW this threshold (fires before strike is crossed)
 MOMENTUM_DELTA_SL_MIN_TICKS: int = 2        # hysteresis: delta SL only fires after this many consecutive below-threshold ticks (prevents single-tick noise from triggering exit)
 MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
+# How long to wait for PM API to confirm settlement before falling back to the
+# resolution oracle.  PM can take 1–10 min to flip closed=True on the CLOB API
+# for short-duration (5m/15m) bucket markets.  After this many seconds past
+# end_date, _check_position_exit() closes the position using the oracle spot vs
+# strike comparison — which is authoritative for bucket markets.  In live mode
+# _auto_redeem_loop() remains the final safety-net and will correct any
+# oracle-estimation error once PM confirms the real payout.
+# In paper-trading mode _auto_redeem_loop() is disabled, so this timeout IS the
+# final fallback.
+MOMENTUM_RESOLVED_FORCE_CLOSE_SEC: int = 300  # seconds past end_date before oracle fallback
 
 # Near-expiry time-stop: when TTE is very short and spot has already crossed
 # the strike (delta < 0), exit via taker to avoid a binary snap to zero.
@@ -456,20 +466,31 @@ MOMENTUM_MIN_ELAPSED_SECONDS: dict[str, int] = {}
 # If the trade loses (held token → $0), the opposite token may briefly trade
 # at HEDGE_PRICE; the GTC order catches that dip and redeems at $1.00.
 MOMENTUM_HEDGE_ENABLED: bool = True
-MOMENTUM_HEDGE_PRICE: float = 0.03    # GTC bid price fallback (when no per-bucket override)
+MOMENTUM_HEDGE_PRICE: float = 0.02    # GTC bid price fallback (when no per-bucket override)
 # Per-bucket hedge bid prices — shorter windows carry higher mismatch risk, so
 # the resting bid needs to be a bit higher to get filled during a panic dip.
+# These are intentionally deep OTM bids: the opposite token must fall from
+# its ~10-30% implied prob all the way to these prices before filling.
 MOMENTUM_HEDGE_PRICE_BY_TYPE: dict[str, float] = {
-    "bucket_5m":  0.04,
-    "bucket_15m": 0.035,
-    "bucket_1h":  0.025,
-    "bucket_4h":  0.02,
-    "bucket_daily":   0.015,
+    "bucket_5m":  0.02,
+    "bucket_15m": 0.02,
+    "bucket_1h":  0.015,
+    "bucket_4h":  0.01,
+    "bucket_daily":   0.01,
     "bucket_weekly":  0.01,
     "milestone":      0.01,
 }
-# Hedge size as fraction of main position (0.40 = cover 40% of entry cost).
-MOMENTUM_HEDGE_COVERAGE_PCT: float = 0.40
+# Hedge size as fraction of main entry contracts (1.0 = same contract count as main position).
+# Actual USDC cost = hedge_contracts × hedge_price (e.g. 25ct × $0.02 = $0.50).
+MOMENTUM_HEDGE_CONTRACTS_PCT: float = 1.0
+
+# Paper-mode GTD hedge fill simulation.
+# When PAPER_TRADING=True the fill_simulator also checks resting hedge bids against
+# the live CLOB on every sweep.  If the opposite token's best_ask ≤ hedge_price,
+# the hedge is considered "at touch" and fills with this probability.
+# Mirrors the maker's taker-arrival model but without queue-position randomness
+# (a resting BUY at the touch fills quickly in real CLOBs).
+PAPER_HEDGE_FILL_PROB: float = 0.60   # probability of fill per sweep when ask <= bid
 
 # Phase E — Empirical win-rate gate: load data/win_rate.csv at startup and gate
 # entries where historical win rate < WIN_RATE_GATE_MIN_FACTOR × model win_prob.
@@ -539,6 +560,62 @@ MIN_STRIKE_DISTANCE_PCT: float = 0.08  # fraction of spot, e.g. 0.08 = 8%
 # price filter alone blocks the bad signals; short cooldown just deduplicates.
 MISPRICING_MARKET_COOLDOWN_SECONDS: int = 300   # 5 minutes — mispricing strategy
 MOMENTUM_MARKET_COOLDOWN_SECONDS: int = 60  # 30 minutes — momentum strategy
+
+# ── Momentum: order cancel-and-retry (Item 2) ─────────────────────────────────
+# After MOMENTUM_ORDER_CANCEL_SEC seconds without a fill, the unfilled limit
+# order is cancelled and re-submitted at a higher price (chasing the market).
+# Price steps up by MOMENTUM_BUY_RETRY_STEP each attempt, capped at
+# entry_price * (1 + MOMENTUM_SLIPPAGE_CAP) or 0.995, whichever is lower.
+MOMENTUM_ORDER_CANCEL_SEC: float = 8.0    # seconds to wait before cancelling unfilled entry
+MOMENTUM_SLIPPAGE_CAP: float = 0.05       # max allowable slippage from initial signal price (5%)
+MOMENTUM_MAX_RETRIES: int = 2             # max cancel-and-retry attempts per entry signal
+MOMENTUM_BUY_RETRY_STEP: float = 0.01    # price step per retry (chase the market)
+
+# ── Momentum: active TP resting limit order (Item 1) ─────────────────────────
+# When MOMENTUM_TP_RESTING_ENABLED is True, a SELL limit order is pre-armed at
+# MOMENTUM_TAKE_PROFIT immediately after the entry fill.  The order sits in the
+# CLOB and fills automatically when the token converges to certainty, removing
+# the monitor-latency round-trip for take-profit exits.
+# Up to MOMENTUM_TP_RETRY_MAX placement attempts; price steps up by
+# MOMENTUM_TP_RETRY_STEP each attempt (in case the initial price is crossed).
+MOMENTUM_TP_RESTING_ENABLED: bool = True  # pre-arm SELL at TP level after entry fill
+MOMENTUM_TP_RETRY_MAX: int = 3            # max placement attempts for the resting TP SELL
+MOMENTUM_TP_RETRY_STEP: float = 0.005     # price step per TP placement retry
+
+# ── Momentum: VWAP deviation + momentum RoC secondary filter (Item 4) ────────
+# VWAP is computed over a MOMENTUM_VWAP_WINDOW_SEC rolling window from PM CLOB
+# mid-price ticks, weighted by ask size as a volume proxy.
+# Momentum RoC is the percentage price change over MOMENTUM_ROC_WINDOW_SEC.
+# Both thresholds default to 0.0 (permissive / filter disabled) so they can be
+# tuned from live data without blocking signals on first deployment.
+MOMENTUM_VWAP_WINDOW_SEC: int = 30        # rolling window for VWAP computation (seconds)
+MOMENTUM_ROC_WINDOW_SEC: int = 60         # rolling window for momentum RoC (seconds)
+MOMENTUM_MIN_VWAP_DEV_PCT: float = 0.0   # min VWAP deviation % required (0 = disabled)
+MOMENTUM_MIN_ROC_PCT: float = 0.0         # min momentum RoC % required  (0 = disabled)
+
+# ── Momentum: probability-based stop-loss (Item 7) ────────────────────────────
+# Complement to the oracle-delta SL.  Fires when the held token's CLOB price
+# drops more than MOMENTUM_PROB_SL_PCT below the entry price, indicating the
+# market has significantly repriced against the position regardless of the
+# current oracle delta.  Both SL conditions are independent — the position
+# exits on whichever fires first.
+# Note: the canonical SL is the oracle-delta SL; CLOB-price SL is a secondary
+# failsafe.  Keep MOMENTUM_PROB_SL_PCT large enough (≥0.10) to avoid false
+# triggers from normal CLOB bid-ask noise.
+MOMENTUM_PROB_SL_ENABLED: bool = True     # enable CLOB-price-based SL as complement
+MOMENTUM_PROB_SL_PCT: float = 0.25        # SL fires when token drops 25% below entry
+# Near-expiry guard: disable prob-based SL when TTE is below this value (seconds).
+# In the final minutes before resolution, CLOB books drain — the best_bid collapses
+# to the tick floor (0.01) while the best_ask remains near 1.0, making the mid an
+# unreliable price signal.  The oracle-delta SL remains active and is the correct
+# primary stop near expiry.  Set to 0 to disable the guard.
+MOMENTUM_PROB_SL_MIN_TTE_SECS: int = 300  # suppress prob-SL in final 5 minutes
+
+# ── Chainlink watchdog (Item 5) ──────────────────────────────────────────────
+# Seconds of silence on an established WebSocket connection before forcing a
+# reconnect.  Reduced from 120 s to 30 s so a zombie TCP connection is detected
+# within one 5m-bucket expiry window rather than two.
+CHAINLINK_SILENCE_WATCHDOG_SECS: int = 30
 
 # ── Kalshi signal confirmation layer ──────────────────────────────────────
 # When KALSHI_ENABLED=True, the scanner fetches matching Kalshi market prices

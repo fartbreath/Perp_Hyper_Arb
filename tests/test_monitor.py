@@ -1691,3 +1691,515 @@ class TestSpotOracleEventPath:
             "Delta SL must fire for NO position even when both YES and NO books are empty"
         )
         pm.place_market.assert_called_once()
+
+
+# ── GTD Hedge: cancel on close + redeem token intercept ──────────────────────
+
+class TestGtdHedgeCancelOnClose:
+    """GTD hedge cancel_order behaviour on position close.
+
+    New rule: cancel hedge ONLY on take-profit (we won — insurance unneeded).
+    On stop-loss/near-expiry exits keep the hedge alive — it is the recovery leg.
+    On RESOLVED exits PM auto-expires orders; never send explicit cancel.
+
+    Covers the cancel logic in _exit_position:
+        _hedge_cancel_on_win = {ExitReason.PROFIT_TARGET, ExitReason.MOMENTUM_TAKE_PROFIT}
+        if closed and closed.hedge_order_id and reason in _hedge_cancel_on_win:
+            asyncio.create_task(self._pm.cancel_order(closed.hedge_order_id))
+    """
+
+    def _make_market(self, market_id="mkt_001", end_date=None):
+        mkt = MagicMock()
+        mkt.condition_id = market_id
+        mkt.token_id_yes = "tok_yes"
+        mkt.token_id_no  = "tok_no"
+        mkt.fees_enabled = False
+        mkt.end_date     = end_date
+        mkt.title        = "Will BTC exceed $100k?"
+        return mkt
+
+    def _make_book(self, mid):
+        book = MagicMock()
+        book.mid = mid
+        book.best_bid = mid
+        book.best_ask = mid
+        return book
+
+    def _open_with_hedge(self, risk):
+        """Open a YES mispricing position and attach a GTD hedge order."""
+        pos = _make_position(
+            strategy="mispricing", side="YES", entry_price=0.50,
+            size=100.0, seconds_ago=120,
+        )
+        risk.open_position(pos)
+        risk.update_gtd_hedge(
+            market_id="mkt_001",
+            side="YES",
+            hedge_order_id="gtd_order_hedge_001",
+            hedge_token_id="tok_no_hedge",
+            hedge_price=0.04,
+            hedge_size_usd=5.0,
+        )
+        return pos
+
+    def test_no_cancel_on_stop_loss(self):
+        """SL exit → hedge kept alive (recovery leg); cancel_order must NOT be called."""
+        config.STOP_LOSS_USD = 20.0
+        config.PROFIT_TARGET_PCT = 0.99  # effectively disabled
+        config.EXIT_DAYS_BEFORE_RESOLUTION = 0
+        config.MIN_HOLD_SECONDS = 60
+
+        monitor, pm, risk = _make_monitor()
+        pm.cancel_order = AsyncMock(return_value=True)
+        pm._markets["mkt_001"] = self._make_market()
+        pm._books["tok_yes"] = self._make_book(mid=0.25)  # pnl=(0.25-0.50)*100=-$25 → SL
+
+        pos = self._open_with_hedge(risk)
+        monitor.record_entry_deviation("mkt_001", 0.10)
+        _run(monitor._check_position(pos))
+
+        assert risk._positions["mkt_001:YES"].is_closed, "Position should be closed by SL"
+        pm.cancel_order.assert_not_called()  # hedge stays alive as recovery leg
+
+    def test_cancel_on_profit_target(self):
+        """Profit target exit → we won; cancel_order called to tear down hedge."""
+        config.PROFIT_TARGET_PCT = 0.60
+        config.STOP_LOSS_USD = 999.0  # disabled
+        config.EXIT_DAYS_BEFORE_RESOLUTION = 0
+        config.MIN_HOLD_SECONDS = 60
+
+        monitor, pm, risk = _make_monitor()
+        pm.cancel_order = AsyncMock(return_value=True)
+        pm._markets["mkt_001"] = self._make_market()
+        # entry=0.40, mid=0.55 → pnl=$15; deviation=0.20, target=$12 → TP fires
+        pm._books["tok_yes"] = self._make_book(mid=0.55)
+
+        pos = _make_position(
+            strategy="mispricing", side="YES", entry_price=0.40,
+            size=100.0, seconds_ago=120,
+        )
+        risk.open_position(pos)
+        risk.update_gtd_hedge(
+            market_id="mkt_001", side="YES",
+            hedge_order_id="gtd_order_hedge_001",
+            hedge_token_id="tok_no_hedge",
+            hedge_price=0.04, hedge_size_usd=5.0,
+        )
+        monitor.record_entry_deviation("mkt_001", 0.20)  # target = 0.20*0.60*100 = $12
+        _run(monitor._check_position(pos))
+
+        assert risk._positions["mkt_001:YES"].is_closed, "Position should be closed by TP"
+        pm.cancel_order.assert_called_once_with("gtd_order_hedge_001")
+
+    def test_no_cancel_on_resolved_exit(self):
+        """RESOLVED exit: cancel_order must NOT be called (PM auto-expires orders)."""
+        config.EXIT_DAYS_BEFORE_RESOLUTION = 0
+        config.MIN_HOLD_SECONDS = 0
+        config.STOP_LOSS_USD = 999.0
+        config.PROFIT_TARGET_PCT = 0.99
+
+        monitor, pm, risk = _make_monitor()
+        pm.cancel_order = AsyncMock(return_value=True)
+        past = datetime.now(timezone.utc) - timedelta(hours=1)
+        pm._markets["mkt_001"] = self._make_market(end_date=past)
+        pm._books["tok_yes"] = self._make_book(mid=0.50)
+        pm.fetch_market_resolution = AsyncMock(return_value=0.0)  # YES settles to 0
+
+        pos = self._open_with_hedge(risk)
+        _run(monitor._check_position(pos))
+
+        assert risk._positions["mkt_001:YES"].is_closed, "Position should close via RESOLVED"
+        pm.cancel_order.assert_not_called()
+
+    def test_no_cancel_if_no_hedge_order_id(self):
+        """Position without hedge_order_id: cancel_order is never called."""
+        config.STOP_LOSS_USD = 20.0
+        config.PROFIT_TARGET_PCT = 0.99
+        config.EXIT_DAYS_BEFORE_RESOLUTION = 0
+        config.MIN_HOLD_SECONDS = 60
+
+        monitor, pm, risk = _make_monitor()
+        pm.cancel_order = AsyncMock(return_value=True)
+        pm._markets["mkt_001"] = self._make_market()
+        pm._books["tok_yes"] = self._make_book(mid=0.25)
+
+        # Open WITHOUT attaching a hedge
+        pos = _make_position(
+            strategy="mispricing", side="YES", entry_price=0.50,
+            size=100.0, seconds_ago=120,
+        )
+        risk.open_position(pos)
+        monitor.record_entry_deviation("mkt_001", 0.10)
+        _run(monitor._check_position(pos))
+
+        assert risk._positions["mkt_001:YES"].is_closed
+        pm.cancel_order.assert_not_called()
+
+
+class TestGtdHedgeRedeemIntercept:
+    """_redeem_ready_positions routes hedge tokens without corrupting the main position.
+
+    Covers:
+    - Hedge token winner (payout>0): record_hedge_fill called; main position stays open
+    - Hedge token loser (payout=0): dismissed silently; main position stays open
+    - Normal (non-hedge) token winner: existing close_position flow unchanged
+    """
+
+    def setup_method(self):
+        import risk as risk_module
+        from pathlib import Path
+        import tempfile
+        self._risk_module = risk_module
+        self._orig_csv = risk_module.TRADES_CSV
+        self._tmp = tempfile.mkdtemp()
+        risk_module.TRADES_CSV = Path(self._tmp) / "trades.csv"
+
+    def teardown_method(self):
+        self._risk_module.TRADES_CSV = self._orig_csv
+
+    def _make_pm(self, token_id, redeemable, cur_price, condition_id="mkt_001",
+                 title="BTC > 100k", size=10.0):
+        pm = MagicMock()
+        pm._markets = {}
+        pm._books = {}
+        pm.place_limit  = AsyncMock(return_value="paper_order_001")
+        pm.place_market = AsyncMock(return_value="paper_mkt_001")
+        pm.on_price_change = MagicMock()
+        pm.get_token_balance = AsyncMock(return_value=None)
+        pm.fetch_market_resolution = AsyncMock(return_value=None)
+        pm.get_live_positions = AsyncMock(return_value=[{
+            "asset": token_id,
+            "redeemable": redeemable,
+            "size": size,
+            "curPrice": cur_price,
+            "conditionId": condition_id,
+            "title": title,
+        }])
+        pm.get_markets = MagicMock(return_value={})
+        return pm
+
+    def _open_main_pos_with_hedge(self, risk, hedge_token_id, market_id="mkt_001"):
+        """Open a momentum YES position and attach a GTD hedge pointing at hedge_token_id."""
+        pos = _make_position(
+            strategy="momentum", side="YES", entry_price=0.85,
+            size=100.0, seconds_ago=120, market_id=market_id,
+        )
+        risk.open_position(pos)
+        risk.update_gtd_hedge(
+            market_id=market_id,
+            side="YES",
+            hedge_order_id="gtd_order_999",
+            hedge_token_id=hedge_token_id,
+            hedge_price=0.04,
+            hedge_size_usd=5.0,
+        )
+        return pos
+
+    def test_winner_calls_record_hedge_fill(self):
+        """Hedge token settles at 1.0 → record_hedge_fill called; main position stays open."""
+        hedge_token_id = "tok_hedge_no_001"
+        pm = self._make_pm(token_id=hedge_token_id, redeemable=True, cur_price=1.0)
+        risk = RiskEngine()
+        config.MOMENTUM_DELTA_SL_MIN_TICKS = 1
+        monitor = PositionMonitor(pm=pm, risk=risk, interval=30)
+        self._open_main_pos_with_hedge(risk, hedge_token_id)
+        before_pnl = risk.realized_pnl
+
+        with patch("monitor._redeem_ctf_via_safe", AsyncMock(return_value="0xhash")):
+            _run(monitor._redeem_ready_positions())
+
+        # Main position must still be open — hedge token's settlement must not close it
+        assert not risk._positions["mkt_001:YES"].is_closed, (
+            "Main position must stay open after hedge winner is processed"
+        )
+        # realized_pnl must have increased: (1.0 - 0.04) * 10 = 9.6
+        assert risk.realized_pnl > before_pnl, "Hedge fill should add to realized P&L"
+
+    def test_loser_dismissed_without_closing_main_position(self):
+        """Hedge token settles at 0.0 → outcome recorded as filled_lost; main position stays open."""
+        hedge_token_id = "tok_hedge_no_002"
+        pm = self._make_pm(token_id=hedge_token_id, redeemable=True, cur_price=0.0)
+        risk = RiskEngine()
+        config.MOMENTUM_DELTA_SL_MIN_TICKS = 1
+        monitor = PositionMonitor(pm=pm, risk=risk, interval=30)
+        self._open_main_pos_with_hedge(risk, hedge_token_id)
+        hedge_pos = risk._positions["mkt_001:YES"]
+        expected_pnl_delta = -(hedge_pos.hedge_price * 10.0)  # fill_size=10 (default size param)
+
+        _run(monitor._redeem_ready_positions())
+
+        assert not risk._positions["mkt_001:YES"].is_closed, (
+            "Main position must not be closed by a losing hedge token"
+        )
+        # New behaviour: filled_lost records (settled_price - fill_price) * fill_size = cost of hedge
+        assert abs(risk.realized_pnl - expected_pnl_delta) < 1e-6, (
+            f"filled_lost should record hedge cost; expected {expected_pnl_delta}, got {risk.realized_pnl}"
+        )
+
+    def test_non_hedge_token_normal_close_flow(self):
+        """Regular (non-hedge) token settles at 1.0 → normal close_position path runs."""
+        regular_token_id = "tok_yes_regular"
+        pm = self._make_pm(
+            token_id=regular_token_id, redeemable=True, cur_price=1.0,
+            condition_id="mkt_002", title="ETH > 3k",
+        )
+        # Provide a market so the normal winner path can find the token and close positions
+        mkt = MagicMock()
+        mkt.condition_id = "mkt_002"
+        mkt.token_id_yes = regular_token_id
+        mkt.token_id_no  = "tok_no_regular"
+        pm.get_markets = MagicMock(return_value={"mkt_002": mkt})
+
+        risk = RiskEngine()
+        config.MOMENTUM_DELTA_SL_MIN_TICKS = 1
+        monitor = PositionMonitor(pm=pm, risk=risk, interval=30)
+
+        pos = _make_position(
+            strategy="mispricing", side="YES", entry_price=0.40,
+            size=10.0, seconds_ago=120, market_id="mkt_002",
+        )
+        risk.open_position(pos)
+
+        with patch("monitor._redeem_ctf_via_safe", AsyncMock(return_value="0xhash")):
+            _run(monitor._redeem_ready_positions())
+
+        assert risk._positions["mkt_002:YES"].is_closed, (
+            "Normal (non-hedge) winner token must trigger close_position"
+        )
+
+# ── Item 7: Probability-based SL in should_exit ───────────────────────────────
+
+
+class TestProbSlShouldExit:
+
+    NOW = datetime(2099, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _momentum_pos(self, entry_price=0.85, prob_sl_threshold=0.0):
+        pos = _make_position(
+            entry_price=entry_price, size=50.0, seconds_ago=120,
+            strategy="momentum", side="YES", strike=100_000.0,
+        )
+        pos.prob_sl_threshold = prob_sl_threshold
+        return pos
+
+    def test_prob_sl_fires_when_price_below_threshold(self):
+        config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0  # disable oracle SL
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 60
+
+        pos = self._momentum_pos(entry_price=0.85, prob_sl_threshold=0.80)
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.75,
+            current_token_price=0.75,
+            current_spot=100_000.0,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert exit_flag is True
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_prob_sl_does_not_fire_at_threshold(self):
+        config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 60
+
+        pos = self._momentum_pos(entry_price=0.85, prob_sl_threshold=0.80)
+        # Exactly at threshold -- strict < means no trigger
+        exit_flag, _, _ = should_exit(
+            pos=pos,
+            current_price=0.80,
+            current_token_price=0.80,
+            current_spot=100_000.0,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert not exit_flag
+
+    def test_prob_sl_does_not_fire_when_disabled(self):
+        config.MOMENTUM_PROB_SL_ENABLED = False
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 60
+
+        pos = self._momentum_pos(entry_price=0.85, prob_sl_threshold=0.80)
+        exit_flag, _, _ = should_exit(
+            pos=pos,
+            current_price=0.60,  # well below threshold
+            current_token_price=0.60,
+            current_spot=100_000.0,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert not exit_flag
+
+    def test_prob_sl_does_not_fire_when_threshold_zero(self):
+        config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 60
+
+        pos = self._momentum_pos(entry_price=0.85, prob_sl_threshold=0.0)
+        exit_flag, _, _ = should_exit(
+            pos=pos,
+            current_price=0.10,  # extremely low but threshold is 0 (not set)
+            current_token_price=0.10,
+            current_spot=100_000.0,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert not exit_flag
+
+    def test_prob_sl_above_threshold_no_exit(self):
+        config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 60
+
+        pos = self._momentum_pos(entry_price=0.85, prob_sl_threshold=0.70)
+        exit_flag, _, _ = should_exit(
+            pos=pos,
+            current_price=0.88,
+            current_token_price=0.88,
+            current_spot=100_000.0,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(minutes=10),
+            now=self.NOW,
+        )
+        assert not exit_flag
+
+    def test_prob_sl_suppressed_near_expiry(self):
+        """Bug fix: prob-SL must not fire when TTE < MOMENTUM_PROB_SL_MIN_TTE_SECS.
+        Near expiry the CLOB book drains, pushing mid to ~0.50 even on winning
+        positions — the oracle-delta SL is the correct protection in this window."""
+        config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_PROB_SL_MIN_TTE_SECS = 300
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0  # disable oracle SL for isolation
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 0
+
+        pos = self._momentum_pos(entry_price=0.96, prob_sl_threshold=0.816)
+        # Token price collapsed to 0.49 (drained book: bid=0.01, ask=0.97, mid=0.49)
+        # but we are only 250 s from expiry — guard must suppress the prob-SL.
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.49,
+            current_token_price=0.49,
+            current_spot=100_100.0,   # spot still above strike → winning position
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=250),
+            tte_seconds=250.0,        # below the 300-second guard
+            now=self.NOW,
+        )
+        assert exit_flag is False, "prob-SL must be suppressed when TTE < guard"
+
+    def test_prob_sl_fires_when_tte_above_guard(self):
+        """Prob-SL must still fire normally when TTE >= MOMENTUM_PROB_SL_MIN_TTE_SECS."""
+        config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_PROB_SL_MIN_TTE_SECS = 300
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 0
+
+        pos = self._momentum_pos(entry_price=0.85, prob_sl_threshold=0.80)
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.70,
+            current_token_price=0.70,
+            current_spot=100_000.0,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=600),
+            tte_seconds=600.0,        # above the 300-second guard
+            now=self.NOW,
+        )
+        assert exit_flag is True
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+
+class TestRangeStrategyExits:
+    """Range positions (strategy='range') must use delta-based SL.
+    Previously they hit the 'unknown' catch-all and were held to resolved."""
+
+    NOW = datetime(2099, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _range_pos(self, entry_price=0.84, spot_at_entry=72400.0, strike=73000.0,
+                   range_lo=72000.0, range_hi=74000.0):
+        pos = _make_position(
+            entry_price=entry_price, size=20.0, seconds_ago=120,
+            strategy="range", side="YES", strike=strike,
+        )
+        pos.spot_price = spot_at_entry
+        pos.range_lo = range_lo
+        pos.range_hi = range_hi
+        return pos
+
+    def test_range_delta_sl_fires_when_spot_below_strike(self):
+        """Range YES: when spot drops below the range midpoint-strike, SL fires."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.04
+        config.MIN_HOLD_SECONDS = 0
+
+        pos = self._range_pos(entry_price=0.84, spot_at_entry=72400.0, strike=73000.0)
+        # Spot drops far below range midpoint → delta strongly negative
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.50,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(hours=2),
+            now=self.NOW,
+            current_spot=71000.0,   # 72K-74K range; spot at 71K → outside and below
+        )
+        assert exit_flag is True
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_range_no_exit_when_spot_inside_range(self):
+        """Range YES: spot inside the range → delta positive → no SL."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.04
+        config.MIN_HOLD_SECONDS = 0
+
+        pos = self._range_pos(entry_price=0.84, spot_at_entry=72400.0, strike=73000.0)
+        exit_flag, _, _ = should_exit(
+            pos=pos,
+            current_price=0.84,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(hours=2),
+            now=self.NOW,
+            current_spot=72800.0,   # still inside 72K-74K range
+        )
+        assert exit_flag is False
+
+    def test_range_no_exit_without_spot_data(self):
+        """Range: if oracle spot unavailable, no SL (never fire on stale/missing data)."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.04
+        config.MIN_HOLD_SECONDS = 0
+
+        pos = self._range_pos()
+        exit_flag, _, _ = should_exit(
+            pos=pos,
+            current_price=0.50,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(hours=2),
+            now=self.NOW,
+            current_spot=None,  # oracle unavailable
+        )
+        assert exit_flag is False
+
+    def test_range_global_resolved_still_fires(self):
+        """RESOLVED is a global exit that must fire for range positions too."""
+        config.MIN_HOLD_SECONDS = 0
+        pos = self._range_pos()
+        past_end = self.NOW - timedelta(seconds=10)
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.84,
+            initial_deviation=0.0,
+            market_end_date=past_end,
+            now=self.NOW,
+        )
+        assert exit_flag is True
+        assert reason == ExitReason.RESOLVED

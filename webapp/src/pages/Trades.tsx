@@ -77,8 +77,9 @@ interface MarketGroup {
   market_type: string;
   underlying: string;
   strategy: string;
-  legs: Trade[];              // individual rows
-  totalSize: number;          // USDC deployed across all legs
+  legs: Trade[];              // individual rows (strategy !== "momentum_hedge")
+  hedgeTrades: Trade[];       // GTD hedge fill rows (strategy === "momentum_hedge")
+  totalSize: number;          // USDC deployed across main legs only
   totalGross: number;
   totalFees: number;
   totalRebates: number;
@@ -98,20 +99,54 @@ function aggregateToMarkets(trades: Trade[], typeFilter: string): MarketGroup[] 
   }
 
   const groups: MarketGroup[] = [];
-  for (const [mid, legs] of map) {
-    const first = legs[0];
+  for (const [mid, allRows] of map) {
+    // Separate GTD hedge fill rows from main position legs
+    const legs        = allRows.filter(t => t.strategy !== "momentum_hedge");
+    const hedgeTrades = allRows.filter(t => t.strategy === "momentum_hedge");
+    // Use first main leg for market metadata; fall back to first row if only hedges exist
+    const first = legs[0] ?? allRows[0];
     const mtype = first.market_type ?? "";
     if (typeFilter && mtype !== typeFilter) continue;
 
-    // USDC cost basis per leg: price × size (entry_price is the actual token price for both YES and NO)
+    // USDC cost basis: main position legs only (entry_price is the actual token price)
     const totalSize = legs.reduce((acc, t) => {
       return acc + (isHl(t) ? Number(t.size) * Number(t.price) : Number(t.price) * Number(t.size));
     }, 0);
 
-    const totalGross    = legs.reduce((a, t) => a + gross(t), 0);
-    const totalFees     = legs.reduce((a, t) => a + Number(t.fees_paid), 0);
-    const totalRebates  = legs.reduce((a, t) => a + Number(t.rebates_earned), 0);
-    const totalPnl      = legs.reduce((a, t) => a + Number(t.pnl), 0);
+    const totalGross   = legs.reduce((a, t) => a + gross(t), 0);
+    // Fees and rebates across all rows including hedge fills
+    const totalFees    = [...legs, ...hedgeTrades].reduce((a, t) => a + Number(t.fees_paid), 0);
+    const totalRebates = [...legs, ...hedgeTrades].reduce((a, t) => a + Number(t.rebates_earned), 0);
+    // Include hedge PnL so market-level total correctly reflects realized outcome
+    let totalPnl       = [...legs, ...hedgeTrades].reduce((a, t) => a + Number(t.pnl), 0);
+
+    // Hedge cost accounting: only deduct hedge_size_usd when there is credible evidence
+    // the hedge order was filled AND lost (i.e., main WON → hedge was on the losing token
+    // which may have briefly touched the 2¢ resting bid near expiry via book drain).
+    // When main LOST, the hedge was on the WINNING token (going to $1, not $0.02) —
+    // a GTC limit BUY at 2¢ on a token trading 37¢→100¢ is structurally impossible to
+    // fill, so cost = $0.  GTC limit orders debit USDC only on fill, not on placement;
+    // unfilled orders are returned at market close.
+    const hedgeLeg = legs.find(t => t.hedge_order_id);
+    if (hedgeLeg && hedgeTrades.length === 0) {
+      const ctLabel = closeType(legs);
+      // TP exit: hedge was actively cancelled, no cost lost.
+      let exitHedgeTp: number | null = null;
+      for (const t of legs) { const ex = impliedExitToken(t); if (ex !== null) { exitHedgeTp = ex; break; } }
+      const isTpExit = ctLabel === "PRE-EXPIRY" && exitHedgeTp !== null && exitHedgeTp > 0.95;
+      if (!isTpExit) {
+        // Deduct only when main WON (hedge was on losing token — can briefly touch 2¢
+        // via book drain).  Main WON = exit token > 0.95 OR resolved_outcome="WIN".
+        const mainWon = legs.some(t => {
+          const ex = impliedExitToken(t);
+          const roWin = (t.resolved_outcome ?? "").toUpperCase() === "WIN";
+          return roWin || (ex !== null && ex > 0.95);
+        });
+        if (mainWon) {
+          totalPnl -= Number(hedgeLeg.hedge_size_usd ?? 0);
+        }
+      }
+    }
 
     const scores = legs.map((t) => Number(t.signal_score)).filter((s) => !isNaN(s) && s > 0);
     const avgScore = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
@@ -125,6 +160,7 @@ function aggregateToMarkets(trades: Trade[], typeFilter: string): MarketGroup[] 
       underlying: first.underlying ?? "—",
       strategy: first.strategy ?? "—",
       legs,
+      hedgeTrades,
       totalSize,
       totalGross,
       totalFees,
@@ -264,9 +300,234 @@ function SummaryBar({ groups }: { groups: MarketGroup[] }) {
   );
 }
 
+// ── Hedge sub-section (shown inside expanded LegDetail) ────────────────────────
+
+function HedgeSection({
+  legs, hedgeTrades, closeTypeLabel,
+}: {
+  legs: Trade[];
+  hedgeTrades: Trade[];
+  closeTypeLabel: string;
+}) {
+  const hedgeLeg = legs.find(t => t.hedge_order_id);
+  if (!hedgeLeg) return null;
+
+  const entryPriceCents = Number(hedgeLeg.hedge_price ?? 0) * 100;
+  const sizeUsd         = Number(hedgeLeg.hedge_size_usd ?? 0);
+
+  // momentum_hedge row — written when the hedge outcome is recorded by the backend.
+  // The hedge_status field is the canonical source of truth (set by PM API callbacks).
+  // Fall back to legacy frontend heuristics for records predating hedge_status.
+  const fillRow     = hedgeTrades[0];
+  const hedgeStatus = fillRow?.hedge_status ?? "";  // from trades.csv (backend source of truth)
+
+  let status: string;
+  let statusBg: string;
+  let statusFg: string;
+  let exitStr: string;
+  let pnlDisplay: string;
+  let pnlFg: string;
+  let spotResolveDisplay: string = "—";
+
+  // ── Backend-authoritative path (hedge_status populated by PM API callbacks) ───
+  if (hedgeStatus === "filled_won") {
+    // Hedge order filled AND hedge token won (main LOST) → payout redeemed
+    status    = "Expired - WON";
+    statusBg  = "#14532d";
+    statusFg  = "#4ade80";
+    exitStr   = "1.000";
+    const p   = Number(fillRow.pnl);
+    pnlDisplay = fmtSigned(p, 2);
+    pnlFg      = pnlColor(p);
+    const srp = Number(fillRow?.spot_resolve_price ?? 0);
+    spotResolveDisplay = srp > 0 ? `$${srp.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—";
+
+  } else if (hedgeStatus === "filled_lost") {
+    // Hedge order filled but hedge token lost (main WON) → cost = fill_price × size
+    status    = "Expired - LOST";
+    statusBg  = "#450a0a";
+    statusFg  = "#f87171";
+    exitStr   = "0.000";
+    const loss = -sizeUsd;
+    pnlDisplay = fmtSigned(loss, 2);
+    pnlFg      = pnlColor(loss);
+    const srp = Number(fillRow?.spot_resolve_price ?? 0);
+    spotResolveDisplay = srp > 0 ? `$${srp.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—";
+
+  } else if (hedgeStatus === "unfilled") {
+    // Order was never filled (token never in wallet) → cost = $0
+    status    = "Expired - Unfilled";
+    statusBg  = "#1c1917";
+    statusFg  = "#6b7280";
+    exitStr   = "—";
+    pnlDisplay = "$0.00";
+    pnlFg      = "#6b7280";
+    const srp = Number(fillRow?.spot_resolve_price ?? 0);
+    spotResolveDisplay = srp > 0 ? `$${srp.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—";
+
+  } else if (fillRow) {
+    // Legacy: momentum_hedge row exists but no hedge_status field (old records)
+    // Treat as "Filled" — hedge was redeemed with payout > 0
+    status    = "Filled";
+    statusBg  = "#14532d";
+    statusFg  = "#4ade80";
+    exitStr   = "1.000";
+    const p   = Number(fillRow.pnl);
+    pnlDisplay = fmtSigned(p, 2);
+    pnlFg      = pnlColor(p);
+
+  } else {
+    // ── Legacy heuristic path (no hedge_status, no fill row) ────────────────
+    let exitTokenPrice: number | null = null;
+    for (const t of legs) {
+      const ex = impliedExitToken(t);
+      if (ex !== null) { exitTokenPrice = ex; break; }
+    }
+    const isTpExit = closeTypeLabel === "PRE-EXPIRY" && exitTokenPrice !== null && exitTokenPrice > 0.95;
+    const isLossEarlyExit = closeTypeLabel.startsWith("TAKER") ||
+                            (closeTypeLabel === "PRE-EXPIRY" && exitTokenPrice !== null && exitTokenPrice < 0.05);
+
+    if (isTpExit) {
+      status    = "Cancelled";
+      statusBg  = "#431407";
+      statusFg  = "#fb923c";
+      exitStr   = "—";
+      pnlDisplay = "—";
+      pnlFg      = "#94a3b8";
+    } else if (isLossEarlyExit) {
+      const marketResolved = legs.some(t => !!(t.resolved_outcome ?? "").trim());
+      if (marketResolved) {
+        const mainLost = legs.some(t => (t.resolved_outcome ?? "").toUpperCase() === "LOSS");
+        if (mainLost) {
+          status    = "Expired - Unfilled";
+          statusBg  = "#1c1917";
+          statusFg  = "#6b7280";
+          exitStr   = "—";
+          pnlDisplay = "$0.00";
+          pnlFg      = "#6b7280";
+        } else {
+          status    = "Expired - LOST";
+          statusBg  = "#450a0a";
+          statusFg  = "#f87171";
+          exitStr   = "0.000";
+          const loss = -sizeUsd;
+          pnlDisplay = fmtSigned(loss, 2);
+          pnlFg      = pnlColor(loss);
+        }
+      } else {
+        status    = "Recovery";
+        statusBg  = "#1e3a5f";
+        statusFg  = "#60a5fa";
+        exitStr   = "—";
+        pnlDisplay = "—";
+        pnlFg      = "#94a3b8";
+      }
+    } else {
+      const anyResolved = legs.some(t => {
+        const ex = impliedExitToken(t);
+        return ex !== null && (ex < 0.05 || ex > 0.95);
+      });
+      if (anyResolved) {
+        const mainWonResolved = legs.some(t => {
+          const ex = impliedExitToken(t);
+          const roWin = (t.resolved_outcome ?? "").toUpperCase() === "WIN";
+          return roWin || (ex !== null && ex > 0.95);
+        });
+        if (mainWonResolved) {
+          status    = "Expired - LOST";
+          statusBg  = "#450a0a";
+          statusFg  = "#f87171";
+          exitStr   = "0.000";
+          const loss = -sizeUsd;
+          pnlDisplay = fmtSigned(loss, 2);
+          pnlFg      = pnlColor(loss);
+        } else {
+          status    = "Expired - Unfilled";
+          statusBg  = "#1c1917";
+          statusFg  = "#6b7280";
+          exitStr   = "—";
+          pnlDisplay = "$0.00";
+          pnlFg      = "#6b7280";
+        }
+      } else {
+        status    = "Placed";
+        statusBg  = "#2e1065";
+        statusFg  = "#c4b5fd";
+        exitStr   = "—";
+        pnlDisplay = "—";
+        pnlFg      = "#94a3b8";
+      }
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 10, borderTop: "1px dashed #334155", paddingTop: 8 }}>
+      <div style={{
+        color: "#a78bfa", fontSize: "0.72em", fontWeight: 700,
+        textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5,
+      }}>
+        GTD Hedge
+      </div>
+      <table style={{ width: "100%", fontSize: "0.8em", borderCollapse: "collapse" }}>
+        <thead>
+          <tr style={{ color: "#94a3b8", borderBottom: "1px solid #1e293b" }}>
+            <th style={{ textAlign: "left",  padding: "2px 8px" }}>Time</th>
+            <th style={{ textAlign: "left",  padding: "2px 8px" }}>Status</th>
+            <th style={{ textAlign: "right", padding: "2px 8px" }}>Entry (¢)</th>
+            <th style={{ textAlign: "right", padding: "2px 8px" }}>Size ($)</th>
+            <th style={{ textAlign: "right", padding: "2px 8px" }}>Exit</th>
+            <th style={{ textAlign: "right", padding: "2px 8px" }}>Spot Resolve</th>
+            <th style={{ textAlign: "right", padding: "2px 8px" }}>Net P&L</th>
+            <th style={{ textAlign: "right", padding: "2px 8px", color: "#374151" }}>Order</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style={{ padding: "3px 8px", color: "#64748b" }}>{fmtTs(hedgeLeg.timestamp)}</td>
+            <td style={{ padding: "3px 8px" }}>
+              <span style={{
+                background: statusBg, color: statusFg, fontWeight: 700,
+                fontSize: "0.85em", padding: "2px 7px", borderRadius: 4,
+              }}>
+                {status}
+              </span>
+            </td>
+            <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#a78bfa" }}>
+              {entryPriceCents.toFixed(1)}¢
+            </td>
+            <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace" }}>
+              ${sizeUsd.toFixed(2)}
+            </td>
+            <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#94a3b8" }}>
+              {exitStr}
+            </td>
+            <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#94a3b8" }}>
+              {spotResolveDisplay}
+            </td>
+            <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: pnlFg }}>
+              {pnlDisplay}
+            </td>
+            <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#374151", fontSize: "0.75em" }}
+                title={`Token: ${hedgeLeg.hedge_token_id ?? "—"}`}>
+              {hedgeLeg.hedge_order_id?.slice(0, 10)}…
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // ── Expanded leg detail ───────────────────────────────────────────────────────
 
-function LegDetail({ legs, outcomes }: { legs: Trade[]; outcomes: Record<string, { resolved_yes_price: number }> | null }) {
+function LegDetail({
+  legs, hedgeTrades, closeTypeLabel, outcomes,
+}: {
+  legs: Trade[];
+  hedgeTrades: Trade[];
+  closeTypeLabel: string;
+  outcomes: Record<string, { resolved_yes_price: number }> | null;
+}) {
   return (
     <tr>
       <td colSpan={14} style={{ padding: "6px 16px 10px 32px", background: "rgba(0,0,0,0.25)" }}>
@@ -373,6 +634,7 @@ function LegDetail({ legs, outcomes }: { legs: Trade[]; outcomes: Record<string,
             })}
           </tbody>
         </table>
+        <HedgeSection legs={legs} hedgeTrades={hedgeTrades} closeTypeLabel={closeTypeLabel} />
       </td>
     </tr>
   );
@@ -523,7 +785,7 @@ export default function Trades() {
                     </tr>
 
                     {/* expandable leg detail */}
-                    {isOpen && <LegDetail legs={g.legs} outcomes={outcomes} />}
+                    {isOpen && <LegDetail legs={g.legs} hedgeTrades={g.hedgeTrades} closeTypeLabel={g.closeTypeLabel} outcomes={outcomes} />}
                   </Fragment>
                 );
               })}

@@ -2422,7 +2422,7 @@ class TestGTDHedge:
 
             "MOMENTUM_HEDGE_PRICE_BY_TYPE": dict(config.MOMENTUM_HEDGE_PRICE_BY_TYPE),
 
-            "MOMENTUM_HEDGE_COVERAGE_PCT": config.MOMENTUM_HEDGE_COVERAGE_PCT,
+            "MOMENTUM_HEDGE_CONTRACTS_PCT": config.MOMENTUM_HEDGE_CONTRACTS_PCT,
 
             "MOMENTUM_ORDER_TYPE": config.MOMENTUM_ORDER_TYPE,
 
@@ -2433,6 +2433,8 @@ class TestGTDHedge:
             "STRATEGY_MOMENTUM_ENABLED": config.STRATEGY_MOMENTUM_ENABLED,
 
             "BOT_ACTIVE": config.BOT_ACTIVE,
+
+            "MOMENTUM_TP_RESTING_ENABLED": config.MOMENTUM_TP_RESTING_ENABLED,
 
         }
 
@@ -2445,6 +2447,8 @@ class TestGTDHedge:
         config.MOMENTUM_PRICE_BAND_HIGH = 0.95
 
         config.MOMENTUM_ORDER_TYPE = "market"  # use place_market for main order
+
+        config.MOMENTUM_TP_RESTING_ENABLED = False  # isolate hedge-only place_limit calls
 
 
 
@@ -2590,13 +2594,13 @@ class TestGTDHedge:
 
     def test_hedge_cost_based_on_entry_size(self, tmp_path):
 
-        """Hedge size in USD = entry_size × HEDGE_COVERAGE_PCT (not HEDGE_PRICE)."""
+        """Hedge size in contracts = entry_size × HEDGE_CONTRACTS_PCT."""
 
         config.MOMENTUM_HEDGE_ENABLED = True
 
         config.MOMENTUM_HEDGE_PRICE = 0.04
 
-        config.MOMENTUM_HEDGE_COVERAGE_PCT = 0.40
+        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
 
         config.MOMENTUM_MAX_ENTRY_USD = 3.0
 
@@ -2954,3 +2958,150 @@ class TestSignalFirstValidPersistence:
 
 
 
+
+# ── Item 4: VWAP/RoC secondary filter ────────────────────────────────────────
+
+
+class TestCheckVwapRoc:
+
+    def _build_history(self, prices, base_ts=1000.0, step=1.0):
+        return [(base_ts + i * step, p, 100.0) for i, p in enumerate(prices)]
+
+    def test_no_data_passes_permissively(self):
+        from strategies.Momentum.scanner import _check_vwap_roc
+        ok, debug = _check_vwap_roc([], now_ts=1000.0, min_dev_pct=1.0,
+                                    vwap_window_sec=30, roc_min_pct=1.0, roc_window_sec=60)
+        assert ok is True
+        assert debug.get("vwap_filter") == "no_data"
+
+    def test_insufficient_data_passes_permissively(self):
+        from strategies.Momentum.scanner import _check_vwap_roc
+        history = self._build_history([0.60, 0.61], base_ts=1000.0)
+        ok, _ = _check_vwap_roc(history, now_ts=1010.0, min_dev_pct=1.0,
+                                 vwap_window_sec=30, roc_min_pct=1.0, roc_window_sec=60)
+        assert ok is True
+
+    def test_zero_thresholds_always_pass(self):
+        from strategies.Momentum.scanner import _check_vwap_roc
+        history = self._build_history([0.50] * 35, base_ts=1000.0)
+        ok, _ = _check_vwap_roc(history, now_ts=1034.0, min_dev_pct=0.0,
+                                 vwap_window_sec=30, roc_min_pct=0.0, roc_window_sec=60)
+        assert ok is True
+
+    def test_upward_momentum_passes(self):
+        from strategies.Momentum.scanner import _check_vwap_roc
+        prices = [round(0.60 + i * (0.05 / 34), 4) for i in range(35)]
+        history = self._build_history(prices, base_ts=1000.0)
+        ok, debug = _check_vwap_roc(history, now_ts=1034.0, min_dev_pct=1.0,
+                                    vwap_window_sec=30, roc_min_pct=0.5, roc_window_sec=30)
+        assert ok is True
+        assert debug["vwap_dev_pct"] > 0
+
+    def test_flat_prices_fail_positive_dev_threshold(self):
+        import pytest
+        from strategies.Momentum.scanner import _check_vwap_roc
+        history = self._build_history([0.60] * 35, base_ts=1000.0)
+        ok, debug = _check_vwap_roc(history, now_ts=1034.0, min_dev_pct=1.0,
+                                    vwap_window_sec=30, roc_min_pct=0.0, roc_window_sec=60)
+        assert ok is False
+        assert debug["vwap_dev_pct"] == pytest.approx(0.0, abs=0.01)
+
+    def test_negative_roc_fails_positive_threshold(self):
+        from strategies.Momentum.scanner import _check_vwap_roc
+        prices = [round(0.70 - i * (0.10 / 34), 4) for i in range(35)]
+        history = self._build_history(prices, base_ts=1000.0)
+        ok, debug = _check_vwap_roc(history, now_ts=1034.0, min_dev_pct=0.0,
+                                    vwap_window_sec=30, roc_min_pct=1.0, roc_window_sec=30)
+        assert ok is False
+        assert debug.get("roc_pct", 0) < 0
+
+    def test_debug_dict_has_expected_keys(self):
+        from strategies.Momentum.scanner import _check_vwap_roc
+        history = self._build_history([0.80] * 10, base_ts=1000.0)
+        _, debug = _check_vwap_roc(history, now_ts=1009.0, min_dev_pct=0.0,
+                                   vwap_window_sec=30, roc_min_pct=0.0, roc_window_sec=60)
+        assert "vwap" in debug
+        assert "vwap_dev_pct" in debug
+        assert "vwap_samples" in debug
+
+
+# ── Item 6: event_log.emit / read_recent ─────────────────────────────────────
+
+
+class TestEventLog:
+
+    def test_emit_creates_file_and_valid_json(self, tmp_path):
+        import json as _json
+        from strategies.Momentum import event_log as el
+        orig = el.MOMENTUM_EVENTS_PATH
+        el.MOMENTUM_EVENTS_PATH = tmp_path / "events.jsonl"
+        try:
+            el.emit("TEST_EVENT", market_id="mkt_001", side="YES", order_price=0.85)
+            lines = el.MOMENTUM_EVENTS_PATH.read_text().splitlines()
+            assert len(lines) == 1
+            row = _json.loads(lines[0])
+            assert row["event"] == "TEST_EVENT"
+            assert row["market_id"] == "mkt_001"
+            assert row["schema_version"] == 1
+            assert "ts" in row
+        finally:
+            el.MOMENTUM_EVENTS_PATH = orig
+
+    def test_emit_multiple_events_appends(self, tmp_path):
+        from strategies.Momentum import event_log as el
+        orig = el.MOMENTUM_EVENTS_PATH
+        el.MOMENTUM_EVENTS_PATH = tmp_path / "events.jsonl"
+        try:
+            el.emit("SESSION_START", bot_version="momentum")
+            el.emit("BUY_SUBMIT", market_id="m1", side="YES")
+            el.emit("BUY_FILL", market_id="m1", fill_price=0.85)
+            lines = el.MOMENTUM_EVENTS_PATH.read_text().splitlines()
+            assert len(lines) == 3
+        finally:
+            el.MOMENTUM_EVENTS_PATH = orig
+
+    def test_read_recent_returns_newest_first(self, tmp_path):
+        from strategies.Momentum import event_log as el
+        orig = el.MOMENTUM_EVENTS_PATH
+        el.MOMENTUM_EVENTS_PATH = tmp_path / "events.jsonl"
+        try:
+            el.emit("EVENT_A", seq=1)
+            el.emit("EVENT_B", seq=2)
+            el.emit("EVENT_C", seq=3)
+            records = el.read_recent(10)
+            assert records[0]["event"] == "EVENT_C"
+            assert records[-1]["event"] == "EVENT_A"
+        finally:
+            el.MOMENTUM_EVENTS_PATH = orig
+
+    def test_read_recent_respects_n_limit(self, tmp_path):
+        from strategies.Momentum import event_log as el
+        orig = el.MOMENTUM_EVENTS_PATH
+        el.MOMENTUM_EVENTS_PATH = tmp_path / "events.jsonl"
+        try:
+            for i in range(10):
+                el.emit("PING", seq=i)
+            records = el.read_recent(3)
+            assert len(records) == 3
+        finally:
+            el.MOMENTUM_EVENTS_PATH = orig
+
+    def test_read_recent_missing_file_returns_empty(self, tmp_path):
+        from strategies.Momentum import event_log as el
+        orig = el.MOMENTUM_EVENTS_PATH
+        el.MOMENTUM_EVENTS_PATH = tmp_path / "nonexistent.jsonl"
+        try:
+            records = el.read_recent(10)
+            assert records == []
+        finally:
+            el.MOMENTUM_EVENTS_PATH = orig
+
+    def test_emit_never_raises_on_bad_path(self):
+        from pathlib import Path
+        from strategies.Momentum import event_log as el
+        orig = el.MOMENTUM_EVENTS_PATH
+        el.MOMENTUM_EVENTS_PATH = Path("/nonexistent_root_xyz/events.jsonl")
+        try:
+            el.emit("CRASH_TEST")  # must not raise
+        finally:
+            el.MOMENTUM_EVENTS_PATH = orig

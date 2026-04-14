@@ -523,7 +523,7 @@ _MUTABLE_CONFIG = {
     # Phase D — hedge
     "momentum_hedge_enabled":          ("MOMENTUM_HEDGE_ENABLED",           bool),
     "momentum_hedge_price":            ("MOMENTUM_HEDGE_PRICE",             float),
-    "momentum_hedge_coverage_pct":     ("MOMENTUM_HEDGE_COVERAGE_PCT",      float),
+    "momentum_hedge_contracts_pct":    ("MOMENTUM_HEDGE_CONTRACTS_PCT",     float),
     # Phase E — empirical win-rate gate
     "momentum_win_rate_gate_enabled":  ("MOMENTUM_WIN_RATE_GATE_ENABLED",   bool),
     "momentum_win_rate_gate_min_factor": ("MOMENTUM_WIN_RATE_GATE_MIN_FACTOR", float),
@@ -539,6 +539,27 @@ _MUTABLE_CONFIG = {
     "momentum_range_max_entry_usd":        ("MOMENTUM_RANGE_MAX_ENTRY_USD",        float),
     "momentum_range_vol_z_score":          ("MOMENTUM_RANGE_VOL_Z_SCORE",          float),
     "momentum_range_min_tte_seconds":      ("MOMENTUM_RANGE_MIN_TTE_SECONDS",      int),
+    # Item 2: Order cancel-and-retry
+    "momentum_order_cancel_sec":           ("MOMENTUM_ORDER_CANCEL_SEC",            float),
+    "momentum_slippage_cap":               ("MOMENTUM_SLIPPAGE_CAP",                float),
+    "momentum_max_retries":                ("MOMENTUM_MAX_RETRIES",                 int),
+    "momentum_buy_retry_step":             ("MOMENTUM_BUY_RETRY_STEP",              float),
+    # Item 1: Active TP resting limit order
+    "momentum_tp_resting_enabled":         ("MOMENTUM_TP_RESTING_ENABLED",          bool),
+    "momentum_tp_retry_max":               ("MOMENTUM_TP_RETRY_MAX",               int),
+    "momentum_tp_retry_step":              ("MOMENTUM_TP_RETRY_STEP",              float),
+    # Item 4: VWAP/RoC secondary filter
+    "momentum_vwap_window_sec":            ("MOMENTUM_VWAP_WINDOW_SEC",             int),
+    "momentum_roc_window_sec":             ("MOMENTUM_ROC_WINDOW_SEC",              int),
+    "momentum_min_vwap_dev_pct":           ("MOMENTUM_MIN_VWAP_DEV_PCT",            float),
+    "momentum_min_roc_pct":                ("MOMENTUM_MIN_ROC_PCT",                 float),
+    # Item 7: Probability-based SL
+    "momentum_prob_sl_enabled":            ("MOMENTUM_PROB_SL_ENABLED",             bool),
+    "momentum_prob_sl_pct":                ("MOMENTUM_PROB_SL_PCT",                 float),
+    # Item 5: Chainlink watchdog
+    "chainlink_silence_watchdog_secs":     ("CHAINLINK_SILENCE_WATCHDOG_SECS",      int),
+    # RESOLVED fast-path fallback timeout
+    "momentum_resolved_force_close_sec":   ("MOMENTUM_RESOLVED_FORCE_CLOSE_SEC",    int),
 }
 
 
@@ -708,7 +729,7 @@ class ConfigPatch(BaseModel):
     # Phase D — hedge
     momentum_hedge_enabled: bool | None = None
     momentum_hedge_price: float | None = None
-    momentum_hedge_coverage_pct: float | None = None
+    momentum_hedge_contracts_pct: float | None = None
     momentum_hedge_price_5m: float | None = None
     momentum_hedge_price_15m: float | None = None
     momentum_hedge_price_1h: float | None = None
@@ -737,6 +758,27 @@ class ConfigPatch(BaseModel):
     momentum_range_max_entry_usd: float | None = None
     momentum_range_vol_z_score: float | None = None
     momentum_range_min_tte_seconds: int | None = None
+    # Item 2: Order cancel-and-retry
+    momentum_order_cancel_sec: float | None = None
+    momentum_slippage_cap: float | None = None
+    momentum_max_retries: int | None = None
+    momentum_buy_retry_step: float | None = None
+    # Item 1: Active TP resting limit order
+    momentum_tp_resting_enabled: bool | None = None
+    momentum_tp_retry_max: int | None = None
+    momentum_tp_retry_step: float | None = None
+    # Item 4: VWAP/RoC secondary filter
+    momentum_vwap_window_sec: int | None = None
+    momentum_roc_window_sec: int | None = None
+    momentum_min_vwap_dev_pct: float | None = None
+    momentum_min_roc_pct: float | None = None
+    # Item 7: Probability-based SL
+    momentum_prob_sl_enabled: bool | None = None
+    momentum_prob_sl_pct: float | None = None
+    # Item 5: Chainlink watchdog
+    chainlink_silence_watchdog_secs: int | None = None
+    # RESOLVED fast-path fallback timeout
+    momentum_resolved_force_close_sec: int | None = None
 
 
 @app.get("/config")
@@ -908,7 +950,7 @@ def get_config() -> dict:
         # Phase D — hedge
         "momentum_hedge_enabled":         config.MOMENTUM_HEDGE_ENABLED,
         "momentum_hedge_price":           config.MOMENTUM_HEDGE_PRICE,
-        "momentum_hedge_coverage_pct":    config.MOMENTUM_HEDGE_COVERAGE_PCT,
+        "momentum_hedge_contracts_pct":   config.MOMENTUM_HEDGE_CONTRACTS_PCT,
         "momentum_hedge_price_5m":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_5m",    config.MOMENTUM_HEDGE_PRICE),
         "momentum_hedge_price_15m":       config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_15m",   config.MOMENTUM_HEDGE_PRICE),
         "momentum_hedge_price_1h":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_1h",    config.MOMENTUM_HEDGE_PRICE),
@@ -937,6 +979,27 @@ def get_config() -> dict:
         "momentum_range_max_entry_usd":        config.MOMENTUM_RANGE_MAX_ENTRY_USD,
         "momentum_range_vol_z_score":          config.MOMENTUM_RANGE_VOL_Z_SCORE,
         "momentum_range_min_tte_seconds":      config.MOMENTUM_RANGE_MIN_TTE_SECONDS,
+        # Item 2: Order cancel-and-retry
+        "momentum_order_cancel_sec":           config.MOMENTUM_ORDER_CANCEL_SEC,
+        "momentum_slippage_cap":               config.MOMENTUM_SLIPPAGE_CAP,
+        "momentum_max_retries":                config.MOMENTUM_MAX_RETRIES,
+        "momentum_buy_retry_step":             config.MOMENTUM_BUY_RETRY_STEP,
+        # Item 1: Active TP resting limit order
+        "momentum_tp_resting_enabled":         config.MOMENTUM_TP_RESTING_ENABLED,
+        "momentum_tp_retry_max":               config.MOMENTUM_TP_RETRY_MAX,
+        "momentum_tp_retry_step":              config.MOMENTUM_TP_RETRY_STEP,
+        # Item 4: VWAP/RoC secondary filter
+        "momentum_vwap_window_sec":            config.MOMENTUM_VWAP_WINDOW_SEC,
+        "momentum_roc_window_sec":             config.MOMENTUM_ROC_WINDOW_SEC,
+        "momentum_min_vwap_dev_pct":           config.MOMENTUM_MIN_VWAP_DEV_PCT,
+        "momentum_min_roc_pct":                config.MOMENTUM_MIN_ROC_PCT,
+        # Item 7: Probability-based SL
+        "momentum_prob_sl_enabled":            config.MOMENTUM_PROB_SL_ENABLED,
+        "momentum_prob_sl_pct":                config.MOMENTUM_PROB_SL_PCT,
+        # Item 5: Chainlink watchdog
+        "chainlink_silence_watchdog_secs":     config.CHAINLINK_SILENCE_WATCHDOG_SECS,
+        # RESOLVED fast-path fallback timeout
+        "momentum_resolved_force_close_sec":   config.MOMENTUM_RESOLVED_FORCE_CLOSE_SEC,
         "timestamp":            time.time(),
     }
 
@@ -2387,6 +2450,19 @@ async def momentum_scan_summary() -> dict:
         "summary": d.get("summary", {}),
         "timestamp": time.time(),
     }
+
+
+@app.get("/momentum/events")
+async def get_momentum_events(n: int = 200) -> dict:
+    """Return the last *n* events from data/momentum_events.jsonl (newest first).
+
+    Events are written by the scanner and monitor whenever key trading
+    lifecycle milestones occur (SESSION_START, BUY_SUBMIT, BUY_FILL,
+    BUY_CANCEL_TIMEOUT, BUY_FAILED, SELL_SUBMIT, SELL_CLOSE, SELL_FAILED).
+    """
+    from strategies.Momentum.event_log import read_recent
+    events = read_recent(n)
+    return {"events": events, "count": len(events)}
 
 
 # ── Proxy ────────────────────────────────────────────────────────────────────

@@ -451,6 +451,11 @@ async def state_sync_loop(
                     # Legacy field — null for all new positions
                     "spread_id": pos.spread_id,
                     "strike": pos.strike if pos.strike else None,
+                    # GTD hedge (momentum strategy only)
+                    "hedge_order_id": pos.hedge_order_id or None,
+                    "hedge_token_id": pos.hedge_token_id or None,
+                    "hedge_price": pos.hedge_price if pos.hedge_price else None,
+                    "hedge_size_usd": pos.hedge_size_usd if pos.hedge_size_usd else None,
                     # Closed-position visibility (present only when recently closed)
                     "is_closed": pos.is_closed,
                     "closed_at": pos.closed_at.isoformat() if pos.closed_at else None,

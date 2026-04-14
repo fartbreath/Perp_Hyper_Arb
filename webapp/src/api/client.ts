@@ -150,6 +150,11 @@ export interface Position {
   // Legacy field — null for all new positions
   spread_id?: string | null;
   strike?: number | null;
+  // GTD hedge (momentum strategy only; null for maker/mispricing)
+  hedge_order_id?: string | null;
+  hedge_token_id?: string | null;
+  hedge_price?: number | null;
+  hedge_size_usd?: number | null;
 }
 
 export interface Trade {
@@ -173,6 +178,14 @@ export interface Trade {
   resolved_outcome?: string; // "WIN" | "LOSS" | "" — set on RESOLVED exits; empty for taker/stop
   spread_id?: string;        // legacy field; null for all new positions
   strike?: string;           // recorded strike price (window-open spot for Up/Down, parsed from title otherwise)
+  // GTD hedge (momentum strategy only; empty for maker/mispricing)
+  hedge_order_id?: string;
+  hedge_token_id?: string;
+  hedge_price?: string;
+  hedge_size_usd?: string;
+  // Hedge outcome — written when market resolves (PM API is source of truth)
+  hedge_status?: string;        // "filled_won" | "filled_lost" | "unfilled" | ""
+  spot_resolve_price?: string;  // oracle spot at market resolution (hedge rows); "0" otherwise
 }
 
 export interface PnlData {
@@ -531,7 +544,7 @@ export interface ConfigData {
   // Phase D — hedge
   momentum_hedge_enabled?: boolean;
   momentum_hedge_price?: number;
-  momentum_hedge_coverage_pct?: number;
+  momentum_hedge_contracts_pct?: number;
   momentum_hedge_price_5m?: number;
   momentum_hedge_price_15m?: number;
   momentum_hedge_price_1h?: number;
@@ -560,6 +573,8 @@ export interface ConfigData {
   momentum_range_max_entry_usd?: number;
   momentum_range_vol_z_score?: number;
   momentum_range_min_tte_seconds?: number;
+  // RESOLVED fallback timeout
+  momentum_resolved_force_close_sec?: number;
 }
 
 export interface InventoryData {
@@ -771,6 +786,35 @@ export interface MomentumDiagnosticsResponse {
 
 export const useMomentumDiagnostics = () =>
   usePolling<MomentumDiagnosticsResponse>("/momentum/diagnostics", 15_000);
+
+export interface MomentumEvent {
+  schema_version: number;
+  ts: string;
+  event: string;
+  market_id?: string;
+  market_title?: string;
+  underlying?: string;
+  market_type?: string;
+  side?: string;
+  order_price?: number;
+  fill_price?: number;
+  fill_size?: number;
+  fill_from_ws?: boolean;
+  size_usd?: number;
+  retry?: number;
+  order_id?: string;
+  timeout_s?: number;
+  reason?: string;
+  retries?: number;
+  tp_price?: number;
+  exit_reason?: string;
+  bot_version?: string;
+  paper?: boolean;
+  [key: string]: unknown;
+}
+
+export const useMomentumEvents = (n = 200) =>
+  usePolling<{ events: MomentumEvent[]; count: number }>(`/momentum/events?n=${n}`, 10_000);
 export const useFills = (
   limit = 100,
   offset = 0,

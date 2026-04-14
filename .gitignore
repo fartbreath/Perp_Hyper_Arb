@@ -42,6 +42,7 @@ data/
 
 # Analysis / one-off research helpers
 scripts/
+Reports/
 
 # Gstack
 .gstack/

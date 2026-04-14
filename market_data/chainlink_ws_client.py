@@ -19,7 +19,7 @@ Architecture:
     update cache, fire callbacks.
   • On reconnect: reseed via latestRoundData() to catch any rounds missed during
     the downtime window.
-  • 120 s silence on an established connection → force reconnect (zombie TCP guard).
+  • CHAINLINK_SILENCE_WATCHDOG_SECS (default 30 s) silence → force reconnect (zombie TCP guard).
   • Exponential backoff on disconnect (1 s → 60 s cap).
 
 Requires a WebSocket-capable Polygon JSON-RPC endpoint.
@@ -84,7 +84,8 @@ _DECIMALS = 8
 _HTTP_TIMEOUT_S = 5.0
 
 # Seconds of WS silence before forcing a reconnect (zombie TCP guard).
-_WS_SILENCE_TIMEOUT_S = 120.0
+# Reads from config.CHAINLINK_SILENCE_WATCHDOG_SECS (default 30 s).
+_WS_SILENCE_TIMEOUT_S = float(config.CHAINLINK_SILENCE_WATCHDOG_SECS)
 
 # Polygon Mainnet Chainlink proxy addresses — used only for HTTP latestRoundData() seed.
 # Must match exactly what Polymarket settlement contracts read at expiry.

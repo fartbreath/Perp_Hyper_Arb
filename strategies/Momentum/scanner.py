@@ -81,6 +81,7 @@ from strategies.Momentum.market_utils import (
 )
 from strategies.Momentum.signal import MomentumSignal
 from strategies.Momentum.vol_fetcher import VolFetcher
+from strategies.Momentum.event_log import emit as _emit_event
 
 log = get_bot_logger(__name__)
 
@@ -113,6 +114,7 @@ MOMENTUM_FILLS_HEADER = [
     "kelly_fraction_cfg", # MOMENTUM_KELLY_FRACTION config value used
     "kelly_multiplier",   # per-bucket Kelly multiplier (MOMENTUM_KELLY_MULTIPLIER_BY_TYPE)
     "kelly_size_usd",     # intended position size in USD (=size_usd before fill)
+    "row_type",           # "entry" | "hedge" — distinguishes main fills from GTD hedge placements
 ]
 
 
@@ -225,6 +227,12 @@ class MomentumScanner(BaseStrategy):
             self._win_rate = _WRT()
         except Exception:
             pass  # no fills/trades data yet — Phase E gate skipped until available
+        # Item 4: VWAP/RoC secondary filter — per-token price history.
+        # key: token_id  value: deque of (timestamp, mid, ask_size_proxy) tuples
+        # Populated on every WS price tick regardless of whether the token is in-band;
+        # this ensures sufficient history is available when a signal first fires.
+        # maxlen=600 is ~10 minutes of 1-tick/second data.
+        self._price_history: dict[str, collections.deque] = {}
 
     # ── BaseStrategy interface ────────────────────────────────────────────────
 
@@ -236,6 +244,7 @@ class MomentumScanner(BaseStrategy):
             band=(config.MOMENTUM_PRICE_BAND_LOW, config.MOMENTUM_PRICE_BAND_HIGH),
             z=config.MOMENTUM_VOL_Z_SCORE,
         )
+        _emit_event("SESSION_START", bot_version="momentum", paper=config.PAPER_TRADING)
         # Subscribe bucket markets for book updates immediately so the first scan
         # has book data.  The loop also refreshes every 5 minutes.
         await self._refresh_subscriptions()
@@ -418,6 +427,7 @@ class MomentumScanner(BaseStrategy):
         skipped_cooldown = 0
         skipped_cap = 0
         skipped_win_rate = 0     # Phase E: empirical win-rate gate
+        skipped_vwap = 0         # Item 4: VWAP/RoC secondary filter
         skipped_beyond_horizon = 0
         skipped_not_started = 0
 
@@ -488,10 +498,14 @@ class MomentumScanner(BaseStrategy):
             if _is_updown_market(market.title):
                 _mid_pre = market.condition_id
                 if _mid_pre not in self._market_open_spot_confirmed:
-                    # Gamma's eventMetadata.priceToBeat is the authoritative strike for
-                    # all Up/Down markets (5m, 15m, 4h, daily, weekly).  It is set
-                    # immediately when the window opens.  Retry every scan until confirmed.
-                    _ptb = await self._pm.fetch_price_to_beat(market.market_slug)
+                    # polymarket.com/api/crypto/crypto-price returns openPrice immediately
+                    # when the window opens for ALL Up/Down market types (5m, 15m, 4h, daily).
+                    # Retry every scan until confirmed.
+                    _ptb = await self._pm.fetch_crypto_price_ptb(
+                        market.underlying,
+                        market.event_start_time,
+                        market.end_date,
+                    )
                     if _ptb is not None:
                         self._market_open_spot[_mid_pre] = _ptb
                         self._market_open_spot_confirmed.add(_mid_pre)
@@ -504,7 +518,7 @@ class MomentumScanner(BaseStrategy):
                             market=market.title[:60],
                             market_id=_mid_pre[:16],
                             open_spot=round(_ptb, 4),
-                            source="gamma_ptb",
+                            source="crypto_price_api",
                         )
                 # Surface the recorded strike in diag at every scan state,
                 # even for out-of-band / not-yet-in-band rows.
@@ -999,6 +1013,28 @@ class MomentumScanner(BaseStrategy):
                     scan_diags.append(_d)
                     continue
 
+            # ── Gate: VWAP deviation + momentum RoC (Item 4) ─────────────────
+            # Secondary filter using CLOB price history.  Both thresholds default
+            # to 0.0 (permissive / gate disabled) and can be tuned from live data.
+            # Falls through permissively when there is insufficient price history.
+            if config.MOMENTUM_MIN_VWAP_DEV_PCT > 0 or config.MOMENTUM_MIN_ROC_PCT > 0:
+                _hist = self._price_history.get(token_id)
+                _vwap_ok, _vwap_debug = _check_vwap_roc(
+                    _hist or [],
+                    now_ts,
+                    config.MOMENTUM_MIN_VWAP_DEV_PCT,
+                    config.MOMENTUM_VWAP_WINDOW_SEC,
+                    config.MOMENTUM_MIN_ROC_PCT,
+                    config.MOMENTUM_ROC_WINDOW_SEC,
+                )
+                _d.update(_vwap_debug)
+                if not _vwap_ok:
+                    skipped_vwap += 1
+                    self._signal_first_valid.pop(market.condition_id, None)
+                    _d["skip_reason"] = "vwap_roc_filter"
+                    scan_diags.append(_d)
+                    continue
+
             _d["skip_reason"] = "signal_fired"
             scan_diags.append(_d)
             log.info(
@@ -1056,6 +1092,7 @@ class MomentumScanner(BaseStrategy):
             skipped_cooldown=skipped_cooldown,
             skipped_cap=skipped_cap,
             skipped_win_rate=skipped_win_rate,
+            skipped_vwap=skipped_vwap,
         )
         # Persist diags for /momentum/diagnostics — no vol re-calls needed.
         self._last_scan_diags = scan_diags
@@ -1077,6 +1114,7 @@ class MomentumScanner(BaseStrategy):
             "skipped_cooldown":        skipped_cooldown,
             "skipped_cap":             skipped_cap,
             "skipped_win_rate":        skipped_win_rate,
+            "skipped_vwap":            skipped_vwap,
         }
         self._last_scan_ts = now_ts
 
@@ -1129,6 +1167,13 @@ class MomentumScanner(BaseStrategy):
         Both YES/UP and NO/DOWN token IDs are in _token_to_market so either token firing
         triggers an early wakeup — important when only the DOWN/NO side is in-band.
         """
+        # Item 4: Record price tick for VWAP/RoC filter (always, not just in-band).
+        if config.MOMENTUM_MIN_VWAP_DEV_PCT > 0 or config.MOMENTUM_MIN_ROC_PCT > 0:
+            _book = self._pm.get_book(token_id)
+            _ask_sz = _book.asks[0][1] if _book and _book.asks else 1.0
+            if token_id not in self._price_history:
+                self._price_history[token_id] = collections.deque(maxlen=600)
+            self._price_history[token_id].append((time.time(), mid, _ask_sz))
         if not config.STRATEGY_MOMENTUM_ENABLED or not config.BOT_ACTIVE:
             return
         market = self._token_to_market.get(token_id)
@@ -1258,58 +1303,111 @@ class MomentumScanner(BaseStrategy):
             )
             return False
 
-        # ── Place order ───────────────────────────────────────────────────────
+        # ── Order placement with cancel-and-retry (Item 2) ──────────────────
+        # In live mode: wait MOMENTUM_ORDER_CANCEL_SEC for a fill WS event;
+        # on timeout cancel the unfilled order and retry at a higher price.
+        # Repeats up to MOMENTUM_MAX_RETRIES times before giving up.  Paper
+        # mode: single attempt (no real order to cancel).
         order_id: Optional[str] = None
-        order_price = current_ask  # intent price sent to CLOB (not the actual fill)
-
-        if config.MOMENTUM_ORDER_TYPE == "market":
-            order_id = await self._pm.place_market(
-                token_id=signal.token_id,
-                side="BUY",
-                price=order_price,
-                size=size_usd,
-            )
-        else:
-            # Taker limit: ask + 0.5c to cross the spread and ensure fill
-            order_price = round(min(current_ask + 0.005, 0.99), 3)
-            order_id = await self._pm.place_limit(
-                token_id=signal.token_id,
-                side="BUY",
-                price=order_price,
-                size=size_usd,
-                market=market,
-                post_only=False,
-            )
-
-        if not order_id:
-            log.warning(
-                "Momentum: order placement failed",
-                market=signal.market_title[:60],
-                side=signal.side,
-                size_usd=size_usd,
-            )
-            return False
-
-        # ── Record execution from PM source of truth ──────────────────────────
-        # YES and NO are independent CLOBs.  entry_price is the actual token fill
-        # price for both sides — no YES-space conversion.
-        #   YES token: entry_price = fill_price (e.g. 0.83 if buying YES at 0.83)
-        #   NO  token: entry_price = fill_price (e.g. 0.83 if buying NO  at 0.83)
-        # P&L = (exit_price - entry_price) × size  — same formula for both sides.
-        #
-        # Fill detection strategy (fastest first):
-        #   1. Register a one-shot Future before awaiting anything else.  If the
-        #      MATCHED WS event arrives (typical path), extract price/size_matched
-        #      directly — zero REST round-trips, ~0 ms latency.
-        #   2. If the WS event has no usable price/size fields, fall back to a
-        #      single REST call WITHOUT the 1-second sleep (we know it filled).
-        #   3. Timeout (5 s) → single REST fallback, then give up gracefully.
+        order_price = current_ask          # initial intent price
         actual_fill: Optional[tuple[float, float]] = None
-        if not self._pm._paper_mode:
+
+        _max_retries = config.MOMENTUM_MAX_RETRIES if not self._pm._paper_mode else 0
+        # Slippage cap: never chase above signal_price + SLIPPAGE_CAP, nor 0.995.
+        _slippage_cap = min(
+            round(signal.token_price * (1.0 + config.MOMENTUM_SLIPPAGE_CAP), 3), 0.995
+        )
+
+        for _retry in range(_max_retries + 1):
+            if _retry > 0:
+                order_price = round(
+                    min(order_price + config.MOMENTUM_BUY_RETRY_STEP, _slippage_cap), 3
+                )
+                if order_price > _slippage_cap:
+                    log.info(
+                        "Momentum: slippage cap reached — aborting cancel-retry",
+                        market=signal.market_title[:50],
+                        retries=_retry,
+                        cap=_slippage_cap,
+                    )
+                    _emit_event(
+                        "BUY_FAILED",
+                        market_id=signal.market_id,
+                        market_title=signal.market_title[:80],
+                        side=signal.side,
+                        reason="slippage_cap",
+                        retries=_retry,
+                    )
+                    return False
+
+            if config.MOMENTUM_ORDER_TYPE == "market":
+                _place_price = order_price
+                order_id = await self._pm.place_market(
+                    token_id=signal.token_id,
+                    side="BUY",
+                    price=_place_price,
+                    size=size_usd,
+                )
+            else:
+                # Taker limit: + 0.5c to cross the spread and ensure fill
+                _place_price = round(min(order_price + 0.005, 0.99), 3)
+                order_id = await self._pm.place_limit(
+                    token_id=signal.token_id,
+                    side="BUY",
+                    price=_place_price,
+                    size=size_usd,
+                    market=market,
+                    post_only=False,
+                )
+
+            if not order_id:
+                if _retry < _max_retries:
+                    log.warning(
+                        "Momentum: order placement rejected — retrying",
+                        market=signal.market_title[:50],
+                        attempt=_retry + 1,
+                    )
+                    continue
+                log.warning(
+                    "Momentum: order placement failed",
+                    market=signal.market_title[:60],
+                    side=signal.side,
+                    size_usd=size_usd,
+                )
+                _emit_event(
+                    "BUY_FAILED",
+                    market_id=signal.market_id,
+                    market_title=signal.market_title[:80],
+                    side=signal.side,
+                    reason="placement_failure",
+                )
+                return False
+
+            order_price = _place_price   # record actual placed price
+            _emit_event(
+                "BUY_SUBMIT",
+                market_id=signal.market_id,
+                market_title=signal.market_title[:80],
+                underlying=signal.underlying,
+                market_type=signal.market_type,
+                side=signal.side,
+                order_price=round(_place_price, 6),
+                size_usd=size_usd,
+                retry=_retry,
+                order_id=order_id,
+            )
+
+            # Paper mode: no fill tracking needed; break immediately.
+            if self._pm._paper_mode:
+                break
+
+            # ── Wait for fill; cancel-and-retry on timeout ─────────────────
             _fill_future: asyncio.Future = asyncio.get_running_loop().create_future()
             self._pm.register_fill_future(order_id, _fill_future)
             try:
-                fill_event = await asyncio.wait_for(_fill_future, timeout=5.0)
+                fill_event = await asyncio.wait_for(
+                    _fill_future, timeout=config.MOMENTUM_ORDER_CANCEL_SEC
+                )
                 ws_price = float(fill_event.get("price") or 0)
                 ws_size  = float(fill_event.get("size_matched") or 0)
                 if ws_price > 0 and ws_size > 0:
@@ -1320,12 +1418,99 @@ class MomentumScanner(BaseStrategy):
                         ws_price=ws_price,
                         ws_size=ws_size,
                     )
+                    _emit_event(
+                        "BUY_FILL",
+                        market_id=signal.market_id,
+                        side=signal.side,
+                        fill_price=round(ws_price, 6),
+                        fill_size=round(ws_size, 6),
+                        fill_from_ws=True,
+                        retry=_retry,
+                        order_id=order_id,
+                    )
+                    break
                 else:
                     actual_fill = await self._pm.get_order_fill_rest(order_id)
+                    if actual_fill:
+                        _emit_event(
+                            "BUY_FILL",
+                            market_id=signal.market_id,
+                            side=signal.side,
+                            fill_price=round(actual_fill[0], 6),
+                            fill_size=round(actual_fill[1], 6),
+                            fill_from_ws=False,
+                            retry=_retry,
+                            order_id=order_id,
+                        )
+                        break
             except asyncio.TimeoutError:
-                log.debug("Momentum: fill WS timeout — REST fallback", order_id=order_id[:20])
-                actual_fill = await self._pm.get_order_fill_rest(order_id)
+                # REST-check before cancelling: order may have filled in the
+                # window between the asyncio timeout and this call.
+                rest_check = await self._pm.get_order_fill_rest(order_id)
+                if rest_check:
+                    actual_fill = rest_check
+                    _emit_event(
+                        "BUY_FILL",
+                        market_id=signal.market_id,
+                        side=signal.side,
+                        fill_price=round(rest_check[0], 6),
+                        fill_size=round(rest_check[1], 6),
+                        fill_from_ws=False,
+                        retry=_retry,
+                        order_id=order_id,
+                    )
+                    break
+                # Genuinely unfilled — cancel and optionally retry.
+                log.info(
+                    "Momentum: entry fill timeout — cancelling",
+                    market=signal.market_title[:50],
+                    order_id=order_id[:20],
+                    attempt=_retry + 1,
+                    timeout_s=config.MOMENTUM_ORDER_CANCEL_SEC,
+                )
+                _emit_event(
+                    "BUY_CANCEL_TIMEOUT",
+                    market_id=signal.market_id,
+                    market_title=signal.market_title[:80],
+                    side=signal.side,
+                    order_price=round(_place_price, 6),
+                    retry=_retry,
+                    timeout_s=config.MOMENTUM_ORDER_CANCEL_SEC,
+                    order_id=order_id,
+                )
+                await self._pm.cancel_order(order_id)
+                order_id = None
+                if _retry >= _max_retries:
+                    log.warning(
+                        "Momentum: all cancel-retry attempts exhausted",
+                        market=signal.market_title[:50],
+                        retries=_retry + 1,
+                    )
+                    _emit_event(
+                        "BUY_FAILED",
+                        market_id=signal.market_id,
+                        market_title=signal.market_title[:80],
+                        side=signal.side,
+                        reason="timeout_all_retries",
+                        retries=_retry + 1,
+                    )
+                    return False
+                continue
 
+        if order_id is None:
+            return False
+
+        # ── Determine fill price and size ─────────────────────────────────────
+        # Fill detection strategy:
+        #   1. WS MATCHED event → actual_fill set inside the retry loop above.
+        #   2. REST fallback → also set above on WS timeout.
+        #   3. Paper mode / REST unavailable → derive from order_price.
+
+        # ── Determine fill price and size ─────────────────────────────────────
+        # Fill detection strategy:
+        #   1. WS MATCHED event → actual_fill set inside the retry loop above.
+        #   2. REST fallback → also set above on WS timeout.
+        #   3. Paper mode / REST unavailable → derive from order_price.
         if actual_fill is not None:
             raw_fill_price, actual_size = actual_fill
 
@@ -1404,14 +1589,81 @@ class MomentumScanner(BaseStrategy):
             # observed_z that inflates near expiry.  Positive means delta exceeded
             # the z-score threshold; higher = stronger signal relative to annual vol.
             signal_score=round(_excess_z, 4),
+            # Item 7: probability-based SL threshold — CLOB price below which
+            # prob SL fires.  Computed as entry_price * (1 - PROB_SL_PCT).
+            prob_sl_threshold=(
+                round(entry_price * (1.0 - config.MOMENTUM_PROB_SL_PCT), 6)
+                if config.MOMENTUM_PROB_SL_ENABLED else 0.0
+            ),
         )
+        # For range positions, populate the actual boundary values so the monitor
+        # can compute a proper inside/outside-range delta for the SL check.
+        if pos.strategy == "range":
+            _rng = _extract_range_bounds(market.title)
+            if _rng is not None:
+                pos.range_lo, pos.range_hi = _rng
         self._risk.open_position(pos)
+
+        # ── Item 1: Pre-arm resting TP SELL order ─────────────────────────────
+        # Place a SELL limit at MOMENTUM_TAKE_PROFIT immediately after fill so
+        # the order sits in the CLOB and fills automatically when the token
+        # converges to certainty — removing monitor-latency from TP exits.
+        # Up to MOMENTUM_TP_RETRY_MAX placement attempts at increasing prices.
+        if config.MOMENTUM_TP_RESTING_ENABLED:
+            _tp_order_id: Optional[str] = None
+            for _tp_attempt in range(config.MOMENTUM_TP_RETRY_MAX):
+                _tp_price = round(
+                    min(config.MOMENTUM_TAKE_PROFIT + _tp_attempt * config.MOMENTUM_TP_RETRY_STEP, 0.999),
+                    4,
+                )
+                try:
+                    _tp_order_id = await self._pm.place_limit(
+                        token_id=signal.token_id,
+                        side="SELL",
+                        price=_tp_price,
+                        size=entry_size,
+                        market=market,
+                        post_only=False,
+                    )
+                except Exception as _tpe:
+                    _tp_order_id = None
+                    log.warning("Momentum: TP resting order error", exc=str(_tpe))
+                if _tp_order_id:
+                    break
+            if _tp_order_id:
+                pos.tp_order_id = _tp_order_id
+                log.info(
+                    "Momentum: TP resting SELL placed",
+                    market=signal.market_title[:50],
+                    tp_price=_tp_price,
+                    size=round(entry_size, 4),
+                    tp_order_id=_tp_order_id[:20],
+                )
+                _emit_event(
+                    "SELL_SUBMIT",
+                    market_id=signal.market_id,
+                    market_title=signal.market_title[:80],
+                    side=signal.side,
+                    tp_price=round(_tp_price, 4),
+                    size=round(entry_size, 6),
+                    tp_order_id=_tp_order_id,
+                )
+            else:
+                log.warning(
+                    "Momentum: TP resting order placement failed — will use monitor TP",
+                    market=signal.market_title[:50],
+                )
 
         # ── Phase D: Optional GTD hedge ──────────────────────────────────────
         # Place a post-only GTC limit BUY on the opposite token at a low price.
         # If the held token loses (→ $0), the opposite token may briefly trade
         # below our bid; the resting order catches that dip and redeems at $1.
         # Bid price is per-bucket (shorter buckets → higher bid to get filled).
+        _hedge_id: str | None      = None  # set below if placed; used in Phase E fill CSV
+        _hedge_price: float        = 0.0
+        _hedge_contracts: float    = 0.0
+        _hedge_size_usd: float     = 0.0
+        _hedge_side: str           = ""
         if config.MOMENTUM_HEDGE_ENABLED:
             opp_token = (
                 market.token_id_no if signal.side in ("YES", "UP") else market.token_id_yes
@@ -1419,18 +1671,24 @@ class MomentumScanner(BaseStrategy):
             hedge_price = config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get(
                 market.market_type, config.MOMENTUM_HEDGE_PRICE
             )
-            hedge_size_usd = round(
-                max(config.MOMENTUM_MIN_ENTRY_USD, entry_size * config.MOMENTUM_HEDGE_COVERAGE_PCT), 4
-            )
+            # Size hedge by contract count (same # of contracts as main position),
+            # not by USD notional.  Actual USDC cost = contracts × hedge_price.
+            hedge_contracts = round(entry_size * config.MOMENTUM_HEDGE_CONTRACTS_PCT, 6)
+            hedge_size_usd  = round(hedge_contracts * hedge_price, 6)
+            _hedge_price     = hedge_price
+            _hedge_contracts  = hedge_contracts
+            _hedge_size_usd   = hedge_size_usd
+            _hedge_side       = "DOWN" if signal.side in ("YES", "UP") else "UP"
             try:
                 hedge_id = await self._pm.place_limit(
                     token_id=opp_token,
                     side="BUY",
                     price=hedge_price,
-                    size=hedge_size_usd,
+                    size=hedge_contracts,
                     market=market,
                     post_only=True,
                 )
+                _hedge_id = hedge_id
             except Exception as _hex:
                 hedge_id = None
                 log.warning("Momentum: GTD hedge error", exc=str(_hex))
@@ -1439,10 +1697,28 @@ class MomentumScanner(BaseStrategy):
                     "Momentum: GTD hedge placed",
                     market=signal.market_title[:50],
                     main_side=signal.side,
+                    hedge_side=_hedge_side,
+                    hedge_price=hedge_price,
+                    hedge_contracts=round(hedge_contracts, 4),
+                    hedge_cost_usd=hedge_size_usd,
+                    hedge_id=hedge_id[:20],
+                )
+                _emit_event(
+                    "HEDGE_SUBMIT",
+                    market_id=signal.market_id,
+                    market_title=signal.market_title[:80],
+                    underlying=signal.underlying,
+                    market_type=signal.market_type,
+                    side=signal.side,
                     hedge_side="DOWN" if signal.side in ("YES", "UP") else "UP",
                     hedge_price=hedge_price,
-                    hedge_size_usd=hedge_size_usd,
-                    hedge_id=hedge_id[:20],
+                    hedge_contracts=round(hedge_contracts, 4),
+                    size_usd=hedge_size_usd,
+                    hedge_id=hedge_id,
+                )
+                self._risk.update_gtd_hedge(
+                    signal.market_id, signal.side,
+                    hedge_id, opp_token, hedge_price, hedge_size_usd,
                 )
 
         # ── Write momentum fills CSV for execution-quality analysis ──────────
@@ -1487,8 +1763,26 @@ class MomentumScanner(BaseStrategy):
                 "kelly_multiplier":   _kelly_debug["kelly_multiplier"],
                 "kelly_size_usd":     _kelly_debug["kelly_size_usd"],
             }
+            _fill_row["row_type"] = "entry"
             with MOMENTUM_FILLS_CSV.open("a", newline="") as _f:
-                csv.DictWriter(_f, fieldnames=MOMENTUM_FILLS_HEADER).writerow(_fill_row)
+                _writer = csv.DictWriter(_f, fieldnames=MOMENTUM_FILLS_HEADER, extrasaction="ignore")
+                _writer.writerow(_fill_row)
+                # Also record the GTD hedge placement so it appears alongside the entry.
+                if _hedge_id:
+                    _writer.writerow({
+                        "timestamp":    _fill_row["timestamp"],
+                        "market_id":    signal.market_id,
+                        "market_title": signal.market_title[:80],
+                        "underlying":   signal.underlying,
+                        "market_type":  signal.market_type,
+                        "side":         _hedge_side,
+                        "signal_price": _hedge_price,
+                        "order_price":  _hedge_price,
+                        "fill_price":   _hedge_price,
+                        "fill_size":    _hedge_contracts,
+                        "kelly_size_usd": _hedge_size_usd,
+                        "row_type":     "hedge",
+                    })
         except Exception as _ex:
             log.debug("momentum_fills.csv write error", exc=str(_ex))
 
@@ -1731,3 +2025,75 @@ def _signal_log_dict(s: MomentumSignal) -> dict:
         "sigma_ann":     round(s.sigma_ann, 3),
         "vol_source":    s.vol_source,
     }
+
+
+def _check_vwap_roc(
+    history: "collections.deque | list",
+    now_ts: float,
+    min_dev_pct: float,
+    vwap_window_sec: int,
+    roc_min_pct: float,
+    roc_window_sec: int,
+) -> tuple[bool, dict]:
+    """Compute VWAP deviation and momentum RoC from a CLOB mid-price history.
+
+    VWAP formula (from VWAP-bot PROJECT_LOGIC.md §4):
+        VWAP = Σ(price_i × vol_i) / Σ(vol_i)   over vwap_window_sec
+        deviation = (P_last − VWAP) / VWAP × 100%
+
+    RoC formula (from VWAP-bot §4):
+        RoC = (P_last − P_ago) / P_ago × 100%   over roc_window_sec
+
+    Args:
+        history:       deque of (timestamp, mid_price, ask_size_proxy) tuples
+        now_ts:        current unix timestamp
+        min_dev_pct:   minimum VWAP deviation required (0 = permissive)
+        vwap_window_sec: rolling window for VWAP computation
+        roc_min_pct:   minimum momentum RoC required (0 = permissive)
+        roc_window_sec: rolling window for RoC computation
+
+    Returns:
+        (passes, debug_dict)  where passes=True when the signal satisfies both
+        thresholds, or when there is insufficient history for a reliable estimate.
+    """
+    if not history:
+        return True, {"vwap_filter": "no_data"}
+
+    cutoff_vwap = now_ts - vwap_window_sec
+    vwap_samples = [(p, v) for t, p, v in history if t >= cutoff_vwap]
+
+    if len(vwap_samples) < 3:
+        # Too few ticks to compute a reliable VWAP — pass permissively.
+        return True, {"vwap_filter": "insufficient_data", "vwap_samples": len(vwap_samples)}
+
+    total_vol = sum(v for _, v in vwap_samples)
+    if total_vol <= 0:
+        return True, {"vwap_filter": "zero_vol"}
+
+    vwap = sum(p * v for p, v in vwap_samples) / total_vol
+    last_price = vwap_samples[-1][0]
+    dev = (last_price - vwap) / vwap * 100 if vwap > 0 else 0.0
+
+    # RoC over roc_window_sec
+    cutoff_roc = now_ts - roc_window_sec
+    roc_samples = [(t, p) for t, p, _ in history if t >= cutoff_roc]
+    roc: Optional[float] = None
+    roc_ok = True
+    if len(roc_samples) >= 2:
+        oldest_p = roc_samples[0][1]
+        if oldest_p > 0:
+            roc = (last_price - oldest_p) / oldest_p * 100
+            roc_ok = roc >= roc_min_pct
+    # If insufficient RoC history, pass permissively.
+
+    dev_ok = dev >= min_dev_pct
+    passes = dev_ok and roc_ok
+
+    debug: dict = {
+        "vwap": round(vwap, 4),
+        "vwap_dev_pct": round(dev, 4),
+        "vwap_samples": len(vwap_samples),
+    }
+    if roc is not None:
+        debug["roc_pct"] = round(roc, 4)
+    return passes, debug
