@@ -2,6 +2,77 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-16] - Bug fixes: range spot propagation, range tick delta, prob-SL oracle gate, WS fill detection, FAK fallback, hedge cancel regression
+
+### Fix — Range positions never received `current_spot` (`monitor.py`)
+
+**Problem:** `_check_position()` fetched `current_spot` only when `pos.strategy == "momentum"`,
+so range positions always had `current_spot = None`. This meant the delta stop-loss could never
+evaluate for range markets. Confirmed by audit: 82,935 BTC weekly-range ticks all had empty
+spot, so the position ran unprotected to expiry and lost $14.71.
+
+**Fix:** Changed guard to `pos.strategy in ("momentum", "range")` so both strategy types get
+spot data. Range positions already had `range_lo` / `range_hi` populated by the scanner; this
+change connects the spot feed so those bounds can actually be evaluated.
+
+### Fix — Range tick delta used momentum (strike-midpoint) formula (`monitor.py`)
+
+**Problem:** `_write_momentum_tick()` always computed delta as `(spot − strike) / strike × 100`
+regardless of strategy. For range positions the meaningful metric is distance to the nearest
+bound, not distance to the midpoint strike.
+
+**Fix:** When `pos.strategy == "range"` and `range_lo / range_hi` are populated, the tick delta
+is computed as `min(spot − range_lo, range_hi − spot) / mid × 100` (positive = inside range)
+for YES positions, and as distance above/below the range for NO positions (positive = outside
+range = winning direction). Momentum positions use the unchanged strike-midpoint formula.
+
+### Fix — Prob-SL could fire on CLOB book drain while solidly ITM (`monitor.py`)
+
+**Problem:** When a range/momentum market approaches expiry, liquidity drains from the CLOB
+book. The resulting price collapse could drop the token below `prob_sl_threshold` even when the
+oracle confirms the position is solidly in-the-money. Confirmed by audit: XRP daily fired
+prob-SL at 62% CLOB collapse while oracle delta was +27% ITM — a clear false positive.
+
+**Fix:** Added `_oracle_delta_pct` capture from the oracle block in `should_exit()`. A new
+`_prob_sl_oracle_ok` gate fires prob-SL only when:
+- oracle data is unavailable (prob-SL remains the sole guard), **or**
+- oracle delta is < 1.0% from strike (genuinely close — may legitimately be at threshold).
+
+When oracle delta > 1% the position is solidly ITM; a CLOB collapse is book drain, not a real
+directional move, and prob-SL is suppressed.
+
+### Fix — User WS fill detection missed FILLED status and nested event format (`pm_client.py`)
+
+**Problem:** The PM user WebSocket fill handler checked `msg.get("status") == "MATCHED"` with
+an exact case-sensitive match. PM's API also emits `"FILLED"` status and a nested
+`{"event_type": "order", "order": {...}}` format, both of which were silently ignored. Result:
+`fill_from_ws = 0/32` fills detected via WS — all fell back to REST polling.
+
+**Fix:** Broadened the check to handle `"MATCHED"` and `"FILLED"` case-insensitively, and added
+a nested-format handler. Added `log.debug` of all user WS messages to aid future diagnostics.
+
+### Fix — FAK exit retries exhausted with no fallback (`monitor.py`)
+
+**Problem:** `_exit_position()` retried a FAK market sell up to 3 times (0.2 s sleep), then
+logged `EXIT_ORDER_FAILED` and returned without placing any order — leaving the position open
+indefinitely if the book was momentarily empty near expiry.
+
+**Fix:** Increased retries to 5 (0.5 s sleep). After all FAK attempts fail, places a GTC limit
+at `max(sell_price × 0.5, 0.01)` as a floor-price safety net. Only logs `EXIT_ORDER_FAILED`
+and returns if the limit order also fails, requiring manual intervention.
+
+### Fix — Hedge cancel fired on all loss exits (pre-existing regression) (`monitor.py`)
+
+**Problem:** Working-tree code changed the GTD hedge cancel logic from "cancel only on win
+exits" to "cancel on everything except RESOLVED and deferred MOMENTUM_STOP_LOSS", breaking the
+intended behaviour of keeping the hedge alive on loss exits so it can partially recover.
+
+**Fix:** Restored the `elif reason in _hedge_cancel_on_win` guard (win-only cancel), where
+`_hedge_cancel_on_win = {ExitReason.PROFIT_TARGET, ExitReason.MOMENTUM_TAKE_PROFIT}`. Loss
+exits (STOP_LOSS, NEAR_EXPIRY, etc.) fall through without cancelling the hedge.
+
+---
+
 ## [2026-04-12] - Bug fixes: dip-market delta inversion, negative-EV Kelly override, per-bucket multiplier test isolation
 
 ### Fix — Dip-market NO/DOWN delta stop-loss inversion (`monitor.py`)

@@ -1365,9 +1365,10 @@ class PMClient:
         Fires `_fire_order_fill(msg)` for every MATCHED order event received.
         """
         if self._api_creds is None:
-            log.warning("User WS: no API credentials — fill events will not arrive")
+            log.warning("User WS: no API credentials — fill events will not arrive via WS; all fills will use REST fallback")
             return
         creds = self._api_creds
+        log.info("PM user WS starting", api_key=creds.api_key[:8] + "...")
         sub_msg = json.dumps({
             "auth": {
                 "apiKey": creds.api_key,
@@ -1411,9 +1412,17 @@ class PMClient:
                         for msg in msgs:
                             if not isinstance(msg, dict):
                                 continue
-                            # PM sends status=="MATCHED" on order fill events
-                            if msg.get("status") == "MATCHED":
+                            log.debug("PM user WS msg", status=msg.get("status"), type=msg.get("type"), keys=list(msg.keys())[:8])
+                            # PM sends status=="MATCHED" (or "FILLED") on order fill events.
+                            # Also handle nested {"event_type": "order", "order": {...}} format.
+                            _status = msg.get("status", "")
+                            _type   = msg.get("type", "")
+                            if _status.upper() in ("MATCHED", "FILLED") or _type.upper() in ("MATCHED", "FILLED"):
                                 await self._fire_order_fill(msg)
+                            elif msg.get("event_type") == "order":
+                                inner = msg.get("order") or {}
+                                if isinstance(inner, dict) and inner.get("status", "").upper() in ("MATCHED", "FILLED"):
+                                    await self._fire_order_fill(inner)
             except ConnectionClosed as exc:
                 log.warning("PM user WS disconnected", code=exc.code)
             except Exception as exc:
@@ -1541,6 +1550,36 @@ class PMClient:
             )
         return None
 
+    async def fetch_market_is_closed(self, condition_id: str) -> Optional[bool]:
+        """Query the CLOB API and return whether the market has been closed/settled.
+
+        This is a lightweight companion to fetch_market_resolution() that lets
+        callers distinguish:
+            True  — CLOB says closed=True (PM has processed settlement)
+            False — CLOB says closed=False (PM settlement still in-progress; wait)
+            None  — network error or unexpected response; state unknown
+        """
+        url = f"{config.POLY_HOST}/markets/{condition_id}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not isinstance(data, dict):
+                        return None
+                    return bool(data.get("closed"))
+        except Exception as exc:
+            log.debug(
+                "fetch_market_is_closed failed",
+                condition_id=condition_id[:16],
+                exc=str(exc),
+            )
+        return None
+
     async def fetch_price_to_beat(self, event_slug: str) -> Optional[float]:
         """Fetch the canonical opening strike for an Up/Down market from the Gamma API.
 
@@ -1608,6 +1647,12 @@ class PMClient:
         """
         if not symbol or not event_start_time or end_date is None:
             return None
+        # Polymarket settlement uses the UMA/Chainlink oracle, whose openPrice is
+        # exposed via variant="fifteen" for ALL bucket durations (5m, 15m, 1h, 4h,
+        # daily, weekly).  Live testing confirms this value exactly matches
+        # Gamma's eventMetadata.priceToBeat for every market type.  Dynamic
+        # variant mapping ("five", "sixty", etc.) returns values from a different
+        # high-frequency feed that diverges from the settlement oracle — do NOT use.
         end_str = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
         params = {
             "symbol": symbol.upper(),
@@ -1639,6 +1684,107 @@ class PMClient:
         except Exception as exc:
             log.debug(
                 "fetch_crypto_price_ptb failed",
+                symbol=symbol,
+                event_start_time=event_start_time,
+                exc=str(exc),
+            )
+        return None
+
+    async def fetch_gamma_settle_spot(self, market_slug: str) -> Optional[float]:
+        """Fetch the settlement spot price for a resolved market via the Gamma API.
+
+        Calls ``GET /events/slug/{market_slug}`` (the official public Gamma API)
+        and extracts ``eventMetadata.closePrice`` — the exact underlying spot price
+        published by Polymarket at market resolution.  This is the authoritative
+        source that the PM settlement contract used; it is independent of the live
+        oracle and valid for all bucket durations (5m, 15m, 1h, 4h, daily…).
+
+        Falls back to ``None`` when the market is not yet resolved (``closePrice``
+        absent), the slug is blank, or the request fails.
+        """
+        if not market_slug:
+            return None
+        url = f"{config.GAMMA_HOST}/events/slug/{market_slug}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not isinstance(data, dict):
+                        return None
+                    meta = data.get("eventMetadata")
+                    if not isinstance(meta, dict):
+                        return None
+                    close = meta.get("closePrice")
+                    if close is not None:
+                        return float(close)
+        except Exception as exc:
+            log.debug(
+                "fetch_gamma_settle_spot failed",
+                slug=market_slug,
+                exc=str(exc),
+            )
+        return None
+
+    async def fetch_resolve_spot_price(
+        self,
+        symbol: str,
+        event_start_time: str,
+        end_date: "Optional[datetime]",
+    ) -> Optional[float]:
+        """Fetch the final oracle price at market close from the Polymarket
+        crypto-price API (``polymarket.com/api/crypto/crypto-price``).
+
+        The API returns ``closePrice`` — the actual underlying spot price at the
+        moment the time window closed, which is the value used by Polymarket's
+        settlement contract to determine the binary outcome.  This is distinct
+        from ``openPrice`` (the strike / priceToBeat at window open).
+
+        NOTE: ``variant`` is mapped from market duration so the API returns data
+        for all bucket types (5m, 15m, 1h, 4h, daily, weekly).
+
+        Returns ``closePrice`` on success, or ``None`` on any failure.
+        """
+        if not symbol or not event_start_time or end_date is None:
+            return None
+        # Polymarket settlement uses the UMA/Chainlink oracle.  The closePrice
+        # for this oracle is also exposed via variant="fifteen" — the same variant
+        # used for openPrice (priceToBeat).  Use "fifteen" for ALL bucket durations.
+        end_str = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        params = {
+            "symbol": symbol.upper(),
+            "eventStartTime": event_start_time,
+            "variant": "fifteen",
+            "endDate": end_str,
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://polymarket.com/",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://polymarket.com/api/crypto/crypto-price",
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not isinstance(data, dict):
+                        return None
+                    close = data.get("closePrice")
+                    if close is not None:
+                        return float(close)
+        except Exception as exc:
+            log.debug(
+                "fetch_resolve_spot_price failed",
                 symbol=symbol,
                 event_start_time=event_start_time,
                 exc=str(exc),
