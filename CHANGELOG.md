@@ -2,7 +2,25 @@
 
 All notable changes to this repository are documented in this file.
 
-## [2026-04-16] - Bug fixes: range spot propagation, range tick delta, prob-SL oracle gate, WS fill detection, FAK fallback, hedge cancel regression
+## [2026-04-16] - Bug fixes: range spot propagation, range tick delta, prob-SL oracle gate, WS fill detection, FAK fallback, hedge cancel regression, auto-redeem stale curPrice
+
+### Fix — Auto-redeem used stale `curPrice` for WIN/LOSS determination (`monitor.py`)
+
+**Problem:** Both auto-redeem paths (`redeemable=False` externally-settled detection and
+`redeemable=True` on-chain submission) used `curPrice >= 0.99` from the PM wallet positions API
+to decide WIN vs LOSS. `curPrice` is a stale CLOB mid-price that can show ~1.0 for a *losing*
+token in the brief window right after settlement, before PM's oracle updates it. Confirmed on
+2026-04-16: SOL DOWN token curPrice showed ~1.0 immediately after resolution even though SOL
+ended UP (DOWN = LOSS). The bot closed the position as WIN (pnl=+$0.46), submitted an on-chain
+redemption expecting $2.76, but the contract correctly paid $0.
+
+**Fix:** Both paths now call `fetch_market_resolution(condition_id)` which reads the CLOB
+`winner` flag — the authoritative source of truth per the PM Gamma API. `curPrice` is no
+longer used for outcome determination anywhere in the auto-redeem flow. If CLOB isn't settled
+yet (returns `None`), the cycle is skipped and retried on the next poll. This also closes the
+same vulnerability in the externally-redeemed path.
+
+
 
 ### Fix — Range positions never received `current_spot` (`monitor.py`)
 

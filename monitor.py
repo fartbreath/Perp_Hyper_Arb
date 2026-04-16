@@ -1047,65 +1047,65 @@ class PositionMonitor:
             if not token_id or token_id in self._redeemed_tokens:
                 continue
             if not pos_data.get("redeemable", False):
-                # cur_price tells us whether the oracle has settled or is still pending.
-                # A settled token lands at 0 (loser) or 1 (winner); anything in between
-                # means the oracle has not published yet — nothing to do.
-                _ext_price = float(
-                    pos_data.get("curPrice") or pos_data.get("currentPrice")
-                    or pos_data.get("cur_price") or 0
+                # curPrice is stale mid-price — do NOT use it for WIN/LOSS.
+                # The CLOB winner flag is the authoritative source of truth.
+                _ext_condition_id: str = (
+                    pos_data.get("conditionId") or pos_data.get("condition_id") or ""
                 )
-                if not (_ext_price <= 0.01 or _ext_price >= 0.99):
-                    continue  # Oracle still pending — nothing to do yet
+                if not _ext_condition_id:
+                    continue
+                _ext_resolved_yes = await self._pm.fetch_market_resolution(_ext_condition_id)
+                if _ext_resolved_yes is None:
+                    continue  # CLOB not settled yet — nothing to do
 
                 # Settled but redeemable=False → already redeemed externally.
                 # Correct trades.csv (force=True is idempotent on correct records)
                 # and mark the token so we don't process it again this session.
-                _ext_condition_id: str = (
-                    pos_data.get("conditionId") or pos_data.get("condition_id") or ""
-                )
                 _ext_title = pos_data.get("title") or token_id[:20]
-                if _ext_condition_id:
-                    markets_snap = self._pm.get_markets()
-                    for mkt in markets_snap.values():
-                        if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
-                            is_yes_token = (mkt.token_id_yes == token_id)
-                            if _ext_price >= 0.99:
-                                # This token won (→1); YES won if this is the YES token
-                                pm_resolved_yes = 1.0 if is_yes_token else 0.0
-                                _outcome_str, _exit_p = "WIN", _ext_price
-                            else:
-                                # This token lost (→0)
-                                pm_resolved_yes = 0.0 if is_yes_token else 1.0
-                                _outcome_str, _exit_p = "LOSS", 0.0
-                            # Close any open (ghost) position
-                            for rp in list(self._risk.get_positions().values()):
-                                if rp.market_id == mkt.condition_id and not rp.is_closed:
-                                    self._risk.close_position(
-                                        mkt.condition_id, exit_price=_exit_p,
-                                        side=rp.side, resolved_outcome=_outcome_str,
-                                    )
-                            # Force-correct any already-closed record with wrong outcome
-                            try:
-                                patched = self._risk.patch_trade_outcome(
-                                    mkt.condition_id, pm_resolved_yes, force=True
+                markets_snap = self._pm.get_markets()
+                for mkt in markets_snap.values():
+                    if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
+                        is_yes_token = (mkt.token_id_yes == token_id)
+                        # pm_resolved_yes is always the YES-token price (1.0=YES won)
+                        pm_resolved_yes = _ext_resolved_yes
+                        if pm_resolved_yes >= 0.99:
+                            # YES won; this token won if it's the YES token
+                            _outcome_str = "WIN" if is_yes_token else "LOSS"
+                            _exit_p = 1.0 if is_yes_token else 0.0
+                        else:
+                            # NO won; this token won if it's the NO token
+                            _outcome_str = "LOSS" if is_yes_token else "WIN"
+                            _exit_p = 0.0 if is_yes_token else 1.0
+                        # Close any open (ghost) position
+                        for rp in list(self._risk.get_positions().values()):
+                            if rp.market_id == mkt.condition_id and not rp.is_closed:
+                                self._risk.close_position(
+                                    mkt.condition_id, exit_price=_exit_p,
+                                    side=rp.side, resolved_outcome=_outcome_str,
                                 )
-                                log.info(
-                                    "Auto-redeem: externally-redeemed token detected"
-                                    " — trades.csv corrected",
-                                    condition_id=mkt.condition_id[:20],
-                                    title=_ext_title[:60],
-                                    is_yes_token=is_yes_token,
-                                    pm_resolved_yes=pm_resolved_yes,
-                                    patched=patched,
-                                )
-                            except Exception as exc:
-                                log.warning(
-                                    "Auto-redeem: patch_trade_outcome failed"
-                                    " (external redemption)",
-                                    exc=str(exc),
-                                    condition_id=_ext_condition_id[:20],
-                                )
-                            break
+                        # Force-correct any already-closed record with wrong outcome
+                        try:
+                            patched = self._risk.patch_trade_outcome(
+                                mkt.condition_id, pm_resolved_yes, force=True
+                            )
+                            log.info(
+                                "Auto-redeem: externally-redeemed token detected"
+                                " — trades.csv corrected",
+                                condition_id=mkt.condition_id[:20],
+                                title=_ext_title[:60],
+                                is_yes_token=is_yes_token,
+                                pm_resolved_yes=pm_resolved_yes,
+                                outcome=_outcome_str,
+                                patched=patched,
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "Auto-redeem: patch_trade_outcome failed"
+                                " (external redemption)",
+                                exc=str(exc),
+                                condition_id=_ext_condition_id[:20],
+                            )
+                        break
                 # Do NOT add to _redeemed_tokens here.  The PM API sometimes
                 # returns redeemable=False for a brief window after oracle
                 # settlement before flipping to redeemable=True.  If we block the
@@ -1122,50 +1122,39 @@ class PositionMonitor:
             title = pos_data.get("title") or token_id[:20]
             condition_id: str = pos_data.get("conditionId") or pos_data.get("condition_id") or ""
 
-            # The PM positions API sets redeemable=True before curPrice updates
-            # from the stale CLOB mid-price to the final settlement value (0 or 1).
-            # A mid-range curPrice on a redeemable position is unreliable — using
-            # it as the payout would produce the wrong WIN/LOSS determination.
-            # Binary rule: >=0.99 → this token won (payout=size), <=0.01 → lost
-            # (payout=0).  For anything in between, fall back to the CLOB resolution
-            # API which is always authoritative once the condition is on-chain settled.
-            if cur_price >= 0.99:
-                settled_price = 1.0
-            elif cur_price <= 0.01:
-                settled_price = 0.0
-            else:
-                # Stale mid-price — ask the CLOB for the authoritative settlement.
-                if condition_id:
-                    resolved_yes = await self._pm.fetch_market_resolution(condition_id)
-                else:
-                    resolved_yes = None
-                if resolved_yes is None:
-                    log.debug(
-                        "Auto-redeem: redeemable but curPrice stale and CLOB"
-                        " not settled yet — will retry next cycle",
-                        token_id=token_id[:20],
-                        cur_price=round(cur_price, 4),
-                    )
-                    continue
-                # Determine settlement price for this specific token (YES or NO).
-                markets_snap = self._pm.get_markets()
-                settled_price = 0.0  # default: assume loser until proven otherwise
-                for _mkt in markets_snap.values():
-                    if _mkt.token_id_yes == token_id:
-                        settled_price = resolved_yes          # 1.0 if YES won
-                        break
-                    if _mkt.token_id_no == token_id:
-                        settled_price = 1.0 - resolved_yes    # 1.0 if NO won
-                        break
+            # curPrice from the positions API is stale mid-price and must NOT be
+            # used for WIN/LOSS determination — it can show ~1.0 for a losing token
+            # in the brief window right after settlement (as seen in prod on 2026-04-16).
+            # The CLOB winner flag via fetch_market_resolution() is the source of truth.
+            if not condition_id:
+                log.warning("Auto-redeem: no condition_id — will retry next cycle", token_id=token_id[:20])
+                continue
+            resolved_yes = await self._pm.fetch_market_resolution(condition_id)
+            if resolved_yes is None:
                 log.debug(
-                    "Auto-redeem: resolved stale curPrice via CLOB API",
+                    "Auto-redeem: CLOB not settled yet — will retry next cycle",
                     token_id=token_id[:20],
-                    old_cur_price=round(cur_price, 4),
-                    settled_price=settled_price,
+                    cur_price=round(cur_price, 4),
                 )
-                cur_price = settled_price
+                continue
+            # Determine settlement price for this specific token (YES or NO).
+            markets_snap = self._pm.get_markets()
+            settled_price = 0.0  # default: loser until CLOB confirms otherwise
+            for _mkt in markets_snap.values():
+                if _mkt.token_id_yes == token_id:
+                    settled_price = resolved_yes          # 1.0 if YES won
+                    break
+                if _mkt.token_id_no == token_id:
+                    settled_price = 1.0 - resolved_yes    # 1.0 if NO won
+                    break
+            log.debug(
+                "Auto-redeem: CLOB-resolved settlement price",
+                token_id=token_id[:20],
+                resolved_yes=resolved_yes,
+                settled_price=settled_price,
+            )
 
-            payout = round(size * cur_price, 4)
+            payout = round(size * settled_price, 4)
 
             # ── GTD hedge token intercept ─────────────────────────────────────────
             # When a wallet token belongs to a momentum GTD hedge (a resting BUY on
@@ -1246,10 +1235,6 @@ class PositionMonitor:
                             break
                 continue
 
-            if not condition_id:
-                log.warning("Auto-redeem: no condition_id — will retry next cycle", token_id=token_id[:20])
-                continue
-
             log.info(
                 "Auto-redeem: redeemable position found",
                 token_id=token_id[:20],
@@ -1304,16 +1289,16 @@ class PositionMonitor:
                 markets_snap = self._pm.get_markets()
                 for mkt in markets_snap.values():
                     if mkt.token_id_yes == token_id or mkt.token_id_no == token_id:
-                        # cur_price=1.0 for a settled winner
-                        # YES token=1  → YES won  → resolved_yes_price=1.0
-                        # NO  token=1  → NO  won  → resolved_yes_price=0.0
+                        # resolved_yes from CLOB is authoritative (see fetch above).
+                        # settled_price is 1.0 for this specific token (it won).
                         is_yes_token = (mkt.token_id_yes == token_id)
-                        pm_resolved_yes = 1.0 if is_yes_token else 0.0
+                        pm_resolved_yes = resolved_yes  # YES-price: 1.0=YES won, 0.0=NO won
+                        _win_str = "WIN" if settled_price >= 0.99 else "LOSS"
                         for rp in list(self._risk.get_positions().values()):
                             if rp.market_id == mkt.condition_id and not rp.is_closed:
                                 self._risk.close_position(
-                                    mkt.condition_id, exit_price=cur_price, side=rp.side,
-                                    resolved_outcome="WIN",
+                                    mkt.condition_id, exit_price=settled_price, side=rp.side,
+                                    resolved_outcome=_win_str,
                                 )
                         # Correct any already-closed record with wrong outcome
                         try:

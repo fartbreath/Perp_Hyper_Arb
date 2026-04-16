@@ -1899,6 +1899,12 @@ class TestGtdHedgeRedeemIntercept:
         """Hedge token settles at 1.0 → record_hedge_fill called; main position stays open."""
         hedge_token_id = "tok_hedge_no_001"
         pm = self._make_pm(token_id=hedge_token_id, redeemable=True, cur_price=1.0)
+        # CLOB: YES lost (resolved_yes=0.0) → NO/hedge token won (settled_price=1.0)
+        pm.fetch_market_resolution = AsyncMock(return_value=0.0)
+        mkt_h = MagicMock()
+        mkt_h.token_id_yes = "tok_yes_opposite_001"
+        mkt_h.token_id_no = hedge_token_id
+        pm.get_markets = MagicMock(return_value={"mkt_001": mkt_h})
         risk = RiskEngine()
         config.MOMENTUM_DELTA_SL_MIN_TICKS = 1
         monitor = PositionMonitor(pm=pm, risk=risk, interval=30)
@@ -1919,6 +1925,12 @@ class TestGtdHedgeRedeemIntercept:
         """Hedge token settles at 0.0 → outcome recorded as filled_lost; main position stays open."""
         hedge_token_id = "tok_hedge_no_002"
         pm = self._make_pm(token_id=hedge_token_id, redeemable=True, cur_price=0.0)
+        # CLOB: YES won (resolved_yes=1.0) → NO/hedge token lost (settled_price=0.0)
+        pm.fetch_market_resolution = AsyncMock(return_value=1.0)
+        mkt_h = MagicMock()
+        mkt_h.token_id_yes = "tok_yes_opposite_002"
+        mkt_h.token_id_no = hedge_token_id
+        pm.get_markets = MagicMock(return_value={"mkt_001": mkt_h})
         risk = RiskEngine()
         config.MOMENTUM_DELTA_SL_MIN_TICKS = 1
         monitor = PositionMonitor(pm=pm, risk=risk, interval=30)
@@ -1949,6 +1961,8 @@ class TestGtdHedgeRedeemIntercept:
         mkt.token_id_yes = regular_token_id
         mkt.token_id_no  = "tok_no_regular"
         pm.get_markets = MagicMock(return_value={"mkt_002": mkt})
+        # CLOB: YES won (resolved_yes=1.0) → YES token settled_price=1.0
+        pm.fetch_market_resolution = AsyncMock(return_value=1.0)
 
         risk = RiskEngine()
         config.MOMENTUM_DELTA_SL_MIN_TICKS = 1
@@ -1966,6 +1980,91 @@ class TestGtdHedgeRedeemIntercept:
         assert risk._positions["mkt_002:YES"].is_closed, (
             "Normal (non-hedge) winner token must trigger close_position"
         )
+
+
+class TestPendingResolutionHedgeBackfill:
+    """_record_pending_resolution_hedge writes independent hedge outcomes."""
+
+    def setup_method(self):
+        import risk as risk_module
+        import tempfile
+
+        self._risk_module = risk_module
+        self._orig_csv = risk_module.TRADES_CSV
+        self._tmp = tempfile.mkdtemp()
+        risk_module.TRADES_CSV = Path(self._tmp) / "trades.csv"
+
+    def teardown_method(self):
+        self._risk_module.TRADES_CSV = self._orig_csv
+
+    def _read_hedge_rows(self):
+        import csv
+
+        rows = []
+        with self._risk_module.TRADES_CSV.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("strategy") == "momentum_hedge":
+                    rows.append(row)
+        return rows
+
+    def _open_and_close_parent(self, risk: RiskEngine, *, side: str = "YES") -> None:
+        pos = _make_position(
+            strategy="momentum",
+            side=side,
+            entry_price=0.85,
+            size=100.0,
+            seconds_ago=120,
+            market_id="mkt_001",
+        )
+        risk.open_position(pos)
+        risk.update_gtd_hedge(
+            market_id="mkt_001",
+            side=side,
+            hedge_order_id="paper-hedge-001",
+            hedge_token_id="tok_no_hedge",
+            hedge_price=0.04,
+            hedge_size_usd=5.0,
+        )
+        risk.close_position(
+            market_id="mkt_001",
+            side=side,
+            exit_price=0.60,
+            resolved_outcome="",
+        )
+
+    def test_records_filled_won_from_paper_fill(self):
+        monitor, pm, risk = _make_monitor()
+        pm.get_markets = MagicMock(return_value={})
+        pm.fetch_resolve_spot_price = AsyncMock(return_value=None)
+
+        self._open_and_close_parent(risk, side="YES")
+        risk.record_paper_hedge_fill_sim(
+            hedge_token_id="tok_no_hedge",
+            fill_price=0.04,
+            fill_size=10.0,
+        )
+
+        # YES resolved to 0.0 -> main lost -> opposite hedge token won.
+        _run(monitor._record_pending_resolution_hedge("mkt_001", 0.0))
+
+        hedge_rows = self._read_hedge_rows()
+        assert len(hedge_rows) == 1
+        assert hedge_rows[0]["hedge_status"] == "filled_won"
+        assert float(hedge_rows[0]["size"]) == pytest.approx(10.0)
+        assert risk.get_paper_hedge_fill("tok_no_hedge") is None
+
+    def test_records_unfilled_without_paper_fill(self):
+        monitor, pm, risk = _make_monitor()
+        pm.get_markets = MagicMock(return_value={})
+        pm.fetch_resolve_spot_price = AsyncMock(return_value=None)
+
+        self._open_and_close_parent(risk, side="YES")
+        _run(monitor._record_pending_resolution_hedge("mkt_001", 1.0))
+
+        hedge_rows = self._read_hedge_rows()
+        assert len(hedge_rows) == 1
+        assert hedge_rows[0]["hedge_status"] == "unfilled"
+        assert float(hedge_rows[0]["size"]) == pytest.approx(0.0)
 
 # ── Item 7: Probability-based SL in should_exit ───────────────────────────────
 
