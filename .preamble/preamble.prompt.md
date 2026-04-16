@@ -146,12 +146,15 @@ per-row based on each record's `side` column.
    (`token → 0.999`). Do not use CLOB price drops alone as the primary SL signal —
    CLOB reprices forward and can collapse on book drain while the position is winning.
 
-4. **Kelly sizes grow near expiry** (sigma_tau → 0 → high win_prob → larger bet).
-   This is correct. Do not reduce Kelly at low TTE.
+4. **Oracle feeds must be event-driven WebSocket streams, not HTTP polling.**
+   Polling is not institutional grade — it introduces latency jitter, misses intra-candle
+   moves, and wastes rate-limit budget. All spot price feeds must push ticks via WS.
+   If a data source does not offer a WS feed, use the lowest-latency streaming alternative
+   available. Never introduce polling as a "simpler" solution — the edge at near-expiry
+   depends on reacting to oracle moves within milliseconds, not seconds.
+   Current routing:
+   - `bucket_5m`, `bucket_15m`, `bucket_4h` → Chainlink WS tick stream
+   - `bucket_1h`, `bucket_daily`, `bucket_weekly` → RTDS WS exchange-aggregated
 
-5. **Oracle routing by bucket:**
-   - `bucket_5m`, `bucket_15m`, `bucket_4h` → Chainlink HTTP polling
-   - `bucket_1h`, `bucket_daily`, `bucket_weekly` → RTDS exchange-aggregated
-
-6. **Settlement oracle is Chainlink**, not Hyperliquid spot, not Pyth, not PM UI price.
+5. **Settlement oracle is Chainlink**, not Hyperliquid spot, not Pyth, not PM UI price.
    Always use `fetch_market_resolution()` for final outcome, not any spot feed value.
