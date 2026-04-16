@@ -155,10 +155,13 @@ per-row based on each record's `side` column.
    All production oracle feeds go through the **Polymarket RTDS WebSocket** — two topics:
    - `crypto_prices_chainlink` (RTDS-relayed Chainlink prices) → 5m / 15m / 4h buckets
    - `crypto_prices` (RTDS exchange-aggregated) → 1h / daily / weekly buckets
-   The direct `ChainlinkWSClient` (eth_subscribe on public RPCs) was retired — public RPCs
+   The direct `ChainlinkWSClient` (eth_subscribe on public RPCs) was paused — public RPCs
    are unreliable for production. Use `RTDSClient.get_chainlink_spot()` for short buckets
    and `RTDSClient.get_mid()` / `get_spot()` for longer buckets. See `market_data/rtds_client.py`
    and `market_data/spot_oracle.py` for routing logic.
 
-5. **Settlement oracle is Chainlink**, not Hyperliquid spot, not Pyth, not PM UI price.
-   Always use `fetch_market_resolution()` for final outcome, not any spot feed value.
+5. **PM Gamma API is the source of truth for settlement.** Use `fetch_market_resolution()`
+   (which reads the CLOB `tokens[].winner` flag) for final outcome. Never infer settlement
+   from any spot feed, PM UI price, or `curPrice`. The underlying oracle that PM resolves
+   against is Chainlink — but the authoritative answer for the bot is always PM's own CLOB
+   winner flag, not any price comparison performed by the bot.
