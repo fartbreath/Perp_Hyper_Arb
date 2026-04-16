@@ -238,6 +238,9 @@ def _add_pending_resolution(
     end_date: Optional[datetime],
     *,
     force: bool = False,
+    underlying: str = "",
+    market_slug: str = "",
+    market_type: str = "",
 ) -> None:
     """Track a market for retroactive resolution verification.
 
@@ -247,6 +250,9 @@ def _add_pending_resolution(
         An outcome was already written (possibly from an oracle fallback that may
         have been wrong).  _check_pending_resolutions will re-verify against the
         CLOB API and call patch_trade_outcome(force=True) to correct if needed.
+        underlying/market_slug/market_type are stored so _check_pending_resolutions
+        can retroactively fetch the Chainlink settlement spot price once the Gamma
+        API has it (typically available a few minutes after market close).
     """
     if not condition_id:
         return
@@ -257,6 +263,13 @@ def _add_pending_resolution(
         if force and not existing.get("force"):
             existing["force"] = True
             existing["checked"] = False
+            # Also store market metadata for spot retry if not already present.
+            if underlying and not existing.get("underlying"):
+                existing["underlying"] = underlying
+            if market_slug and not existing.get("market_slug"):
+                existing["market_slug"] = market_slug
+            if market_type and not existing.get("market_type"):
+                existing["market_type"] = market_type
             _save_pending_resolutions(pending)
         return
     end_date_iso = end_date.isoformat() if end_date else ""
@@ -265,6 +278,9 @@ def _add_pending_resolution(
         "end_date_iso": end_date_iso,
         "checked": False,
         "force": force,
+        "underlying": underlying,
+        "market_slug": market_slug,
+        "market_type": market_type,
     })
     _save_pending_resolutions(pending)
 
@@ -952,6 +968,56 @@ class PositionMonitor:
                         cid=cid[:16],
                         exc=str(exc),
                     )
+                # For RESOLVED exits that recorded exit_spot_price=0.0 (because the
+                # Gamma API didn't have closePrice at the moment of resolution), retry
+                # now that the market has had time to settle.
+                if is_force:
+                    _underlying = entry.get("underlying", "")
+                    _mkt_slug   = entry.get("market_slug", "")
+                    _mkt_type   = entry.get("market_type", "")
+                    _end_date_obj: Optional[datetime] = None
+                    if end_date_iso:
+                        try:
+                            _end_date_obj = datetime.fromisoformat(end_date_iso)
+                            if _end_date_obj.tzinfo is None:
+                                _end_date_obj = _end_date_obj.replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            pass
+                    _settle_spot: Optional[float] = None
+                    # 1. Gamma events endpoint (authoritative)
+                    if _mkt_slug:
+                        try:
+                            _settle_spot = await self._pm.fetch_gamma_settle_spot(_mkt_slug)
+                        except Exception:
+                            pass
+                    # 2. PM crypto-price API fallback
+                    if _settle_spot is None and _underlying and _end_date_obj:
+                        _dur_s = _MARKET_TYPE_DURATION_SECS.get(_mkt_type, 0)
+                        _wstart = (
+                            (_end_date_obj - timedelta(seconds=_dur_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            if _dur_s else ""
+                        )
+                        if _wstart:
+                            try:
+                                _settle_spot = await self._pm.fetch_resolve_spot_price(
+                                    _underlying, _wstart, _end_date_obj,
+                                )
+                            except Exception:
+                                pass
+                    if _settle_spot and _settle_spot > 0:
+                        try:
+                            _sp = self._risk.patch_exit_spot_price(cid, _settle_spot)
+                            if _sp:
+                                log.info(
+                                    "patch_exit_spot_price: settlement spot back-filled",
+                                    condition_id=cid[:16],
+                                    spot=round(_settle_spot, 4),
+                                    records=_sp,
+                                )
+                        except Exception as exc:
+                            log.warning(
+                                "patch_exit_spot_price failed", cid=cid[:16], exc=str(exc)
+                            )
         if changed:
             _save_pending_resolutions(pending)
 
@@ -1023,9 +1089,15 @@ class PositionMonitor:
                     return round(_close, 4)
             except Exception:
                 pass
-        # 3. Live oracle mid (last resort)
-        if self._spot is not None and parent_pos.underlying:
-            return self._spot.get_mid(parent_pos.underlying, parent_pos.market_type) or 0.0
+        # 3. Do NOT fall back to live oracle mid — the live feed price at detection
+        # time will not match the Chainlink oracle settlement price. Return 0.0;
+        # _check_pending_resolutions will retry once Gamma has the closePrice
+        # (typically a few minutes after market close).
+        log.debug(
+            "_fetch_hedge_resolve_spot: Gamma API not ready — will retry via pending resolutions",
+            market_id=parent_pos.market_id[:20],
+            underlying=parent_pos.underlying,
+        )
         return 0.0
 
     async def _redeem_ready_positions(self) -> None:
@@ -1947,10 +2019,15 @@ class PositionMonitor:
             )
             _record_market_outcome(pos.market_id, _yes_token_price)
             # Track RESOLVED exits for retroactive CLOB verification (force=True).
-            # If the outcome was derived from an oracle fallback it may be wrong;
-            # _check_pending_resolutions will re-verify and call patch_trade_outcome
-            # to correct trades.csv.  No-ops on already-correct records.
-            _add_pending_resolution(pos.market_id, _market_end_date, force=True)
+            # Also store market metadata so _check_pending_resolutions can retry
+            # the Gamma settlement spot fetch once closePrice is available.
+            _mkt_slug = getattr(market, "market_slug", "")
+            _add_pending_resolution(
+                pos.market_id, _market_end_date, force=True,
+                underlying=pos.underlying,
+                market_slug=_mkt_slug,
+                market_type=pos.market_type,
+            )
         else:
             # The market may still resolve after our early exit.  Track it so the
             # background resolution-check task can fill in the outcome later.

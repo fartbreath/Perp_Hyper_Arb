@@ -47,7 +47,7 @@ TRADES_HEADER = [
     "hedge_token_id",       # CLOB token_id of the opposite (hedged) token
     "hedge_price",          # limit price the hedge bid was placed at
     "hedge_size_usd",       # USD size of the hedge order
-    "hedge_status",         # "filled_won" | "filled_lost" | "unfilled" | "" (main rows)
+    "hedge_status",         # "filled_won" | "filled_lost" | "unfilled" | "cancelled" | "filled_exited" | "" (main rows)
     "spot_resolve_price",   # oracle spot at market resolution (hedge rows only; 0.0 otherwise)
 ]
 
@@ -288,6 +288,12 @@ class RiskEngine:
             for row in rows:
                 if row.get("market_id") != market_id:
                     continue
+                # momentum_hedge rows have their own P&L semantics (settled_price of
+                # the hedge token, not the main position token).  patch_trade_outcome
+                # only knows about main-position YES/NO direction and would compute
+                # the wrong settlement value for the hedge side.  Always skip them.
+                if row.get("strategy") == "momentum_hedge":
+                    continue
                 side = row.get("side", "")
                 is_yes_side = side in _yes_sides
                 # Settlement value of the token held by this record (0.0 or 1.0)
@@ -343,6 +349,61 @@ class RiskEngine:
                 log.error("patch_trade_outcome: rewrite failed", exc=str(exc))
                 return 0
 
+            return patched
+
+    def patch_exit_spot_price(self, market_id: str, spot_price: float) -> int:
+        """Update exit_spot_price for trades.csv records where it is 0.0.
+
+        Called by _check_pending_resolutions once the Gamma API has the settlement
+        close price available (typically a few minutes after market resolution).
+        Only patches rows where exit_spot_price == 0.0 — never overwrites a valid
+        price that was recorded at exit time.
+        Returns the number of records changed.
+        """
+        if spot_price <= 0:
+            return 0
+        with self._csv_write_lock:
+            if not TRADES_CSV.exists():
+                return 0
+            try:
+                with TRADES_CSV.open(newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+                if rows and "timestamp" not in rows[0]:
+                    with TRADES_CSV.open(newline="", encoding="utf-8") as f:
+                        rows = list(csv.DictReader(f, fieldnames=TRADES_HEADER))
+            except Exception as exc:
+                log.error("patch_exit_spot_price: read failed", exc=str(exc))
+                return 0
+            patched = 0
+            for row in rows:
+                if row.get("market_id") != market_id:
+                    continue
+                try:
+                    current = float(row.get("exit_spot_price", 0) or 0)
+                except (ValueError, TypeError):
+                    current = 0.0
+                if current == 0.0:
+                    row["exit_spot_price"] = str(round(spot_price, 4))
+                    patched += 1
+            if patched == 0:
+                return 0
+            try:
+                tmp = TRADES_CSV.with_suffix(".tmp")
+                with tmp.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=TRADES_HEADER)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                tmp.replace(TRADES_CSV)
+            except Exception as exc:
+                log.error("patch_exit_spot_price: rewrite failed", exc=str(exc))
+                return 0
+            log.info(
+                "patch_exit_spot_price: settlement spot filled",
+                market_id=market_id[:20],
+                spot_price=round(spot_price, 4),
+                records=patched,
+            )
             return patched
 
     def _load_token_strategy(self) -> dict[str, str]:
@@ -675,6 +736,7 @@ class RiskEngine:
         fill_size: float,
         settled_price: float,
         *,
+        underlying: str = "",
         hedge_status: str = "filled_won",
         spot_resolve_price: float = 0.0,
     ) -> None:
@@ -704,7 +766,7 @@ class RiskEngine:
                 "market_id":        parent_market_id,
                 "market_title":     (parent_market_title or "")[:60],
                 "market_type":      "momentum_hedge",
-                "underlying":       "",
+                "underlying":       underlying,
                 "side":             "hedge",
                 "size":             round(fill_size, 6),
                 "price":            round(fill_price, 4),
