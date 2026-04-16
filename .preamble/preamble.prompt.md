@@ -152,9 +152,13 @@ per-row based on each record's `side` column.
    If a data source does not offer a WS feed, use the lowest-latency streaming alternative
    available. Never introduce polling as a "simpler" solution — the edge at near-expiry
    depends on reacting to oracle moves within milliseconds, not seconds.
-   Current routing:
-   - `bucket_5m`, `bucket_15m`, `bucket_4h` → Chainlink WS tick stream
-   - `bucket_1h`, `bucket_daily`, `bucket_weekly` → RTDS WS exchange-aggregated
+   All production oracle feeds go through the **Polymarket RTDS WebSocket** — two topics:
+   - `crypto_prices_chainlink` (RTDS-relayed Chainlink prices) → 5m / 15m / 4h buckets
+   - `crypto_prices` (RTDS exchange-aggregated) → 1h / daily / weekly buckets
+   The direct `ChainlinkWSClient` (eth_subscribe on public RPCs) was retired — public RPCs
+   are unreliable for production. Use `RTDSClient.get_chainlink_spot()` for short buckets
+   and `RTDSClient.get_mid()` / `get_spot()` for longer buckets. See `market_data/rtds_client.py`
+   and `market_data/spot_oracle.py` for routing logic.
 
 5. **Settlement oracle is Chainlink**, not Hyperliquid spot, not Pyth, not PM UI price.
    Always use `fetch_market_resolution()` for final outcome, not any spot feed value.
