@@ -56,7 +56,7 @@ import math
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -498,12 +498,21 @@ class MomentumScanner(BaseStrategy):
             if _is_updown_market(market.title):
                 _mid_pre = market.condition_id
                 if _mid_pre not in self._market_open_spot_confirmed:
-                    # polymarket.com/api/crypto/crypto-price returns openPrice immediately
-                    # when the window opens for ALL Up/Down market types (5m, 15m, 4h, daily).
-                    # Retry every scan until confirmed.
+                    # Compute the window-open time from end_date minus the known
+                    # market duration. Gamma's eventStartTime is usually the correct
+                    # window start, but deriving from end_date ensures correctness even
+                    # if the market object was loaded from a stale/partial source.
+                    # fetch_crypto_price_ptb uses variant="fifteen" internally — the PM
+                    # settlement oracle for ALL bucket durations (5m, 15m, 1h, 4h, …).
+                    _mkt_dur_s = _MARKET_TYPE_DURATION_SECS.get(market.market_type, 0)
+                    _window_open_iso: str = (
+                        (market.end_date - timedelta(seconds=_mkt_dur_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        if _mkt_dur_s and market.end_date
+                        else market.event_start_time
+                    )
                     _ptb = await self._pm.fetch_crypto_price_ptb(
                         market.underlying,
-                        market.event_start_time,
+                        _window_open_iso,
                         market.end_date,
                     )
                     if _ptb is not None:
@@ -1294,10 +1303,10 @@ class MomentumScanner(BaseStrategy):
         # must not override a model that explicitly says "don't bet here".
         if size_usd == 0.0:
             log.info(
-                "Momentum: skipping entry — negative Kelly (raw_f=%s, payout_b=%s, win_prob=%s)",
-                _kelly_debug.get("kelly_f_raw"),
-                _kelly_debug.get("kelly_payout_b"),
-                _kelly_debug.get("kelly_win_prob"),
+                "Momentum: skipping entry — negative Kelly",
+                raw_f=_kelly_debug.get("kelly_f_raw"),
+                payout_b=_kelly_debug.get("kelly_payout_b"),
+                win_prob=_kelly_debug.get("kelly_win_prob"),
                 market=signal.market_title[:60],
                 side=signal.side,
             )
@@ -1311,6 +1320,7 @@ class MomentumScanner(BaseStrategy):
         order_id: Optional[str] = None
         order_price = current_ask          # initial intent price
         actual_fill: Optional[tuple[float, float]] = None
+        _fill_from_ws: bool = False        # True when WS was the fill trigger (even if REST fetched price)
 
         _max_retries = config.MOMENTUM_MAX_RETRIES if not self._pm._paper_mode else 0
         # Slippage cap: never chase above signal_price + SLIPPAGE_CAP, nor 0.995.
@@ -1412,6 +1422,7 @@ class MomentumScanner(BaseStrategy):
                 ws_size  = float(fill_event.get("size_matched") or 0)
                 if ws_price > 0 and ws_size > 0:
                     actual_fill = (ws_price, ws_size)
+                    _fill_from_ws = True
                     log.debug(
                         "Momentum: fill confirmed via WS",
                         order_id=order_id[:20],
@@ -1430,15 +1441,19 @@ class MomentumScanner(BaseStrategy):
                     )
                     break
                 else:
+                    # WS event arrived but price/size_matched fields were absent.
+                    # The fill has occurred — fetch exact data from REST immediately
+                    # (no wait needed: WS is the trigger, not a timeout).
                     actual_fill = await self._pm.get_order_fill_rest(order_id)
                     if actual_fill:
+                        _fill_from_ws = True  # WS triggered, REST provided data
                         _emit_event(
                             "BUY_FILL",
                             market_id=signal.market_id,
                             side=signal.side,
                             fill_price=round(actual_fill[0], 6),
                             fill_size=round(actual_fill[1], 6),
-                            fill_from_ws=False,
+                            fill_from_ws=True,
                             retry=_retry,
                             order_id=order_id,
                         )
@@ -1534,6 +1549,22 @@ class MomentumScanner(BaseStrategy):
 
             entry_price = raw_fill_price  # actual token fill price for both YES and NO
             entry_size = actual_size
+
+            # PM deducts taker fees in tokens, so size_matched (gross) > actual wallet
+            # balance (net).  Reconcile against the CLOB balance so position size and
+            # all P&L calculations use the tokens we actually hold, not the gross fill.
+            if not self._pm._paper_mode:
+                _clob_bal = await self._pm.get_token_balance(signal.token_id)
+                if _clob_bal and _clob_bal > 0:
+                    if abs(_clob_bal - entry_size) > 0.005:
+                        log.info(
+                            "Momentum: entry_size adjusted to CLOB balance (taker fee deduction)",
+                            market=signal.market_title[:60],
+                            gross_size=round(entry_size, 6),
+                            net_size=round(_clob_bal, 6),
+                            fee_tokens=round(entry_size - _clob_bal, 6),
+                        )
+                    entry_size = _clob_bal
         else:
             # Paper mode or fill data unavailable.
             entry_price = order_price  # actual token price for both sides
@@ -1611,9 +1642,11 @@ class MomentumScanner(BaseStrategy):
         # Up to MOMENTUM_TP_RETRY_MAX placement attempts at increasing prices.
         if config.MOMENTUM_TP_RESTING_ENABLED:
             _tp_order_id: Optional[str] = None
+            _tick = market.tick_size if market else 0.01
+            _tp_max_price = round(1.0 - _tick, 10)  # 0.99 for 0.01-tick markets
             for _tp_attempt in range(config.MOMENTUM_TP_RETRY_MAX):
                 _tp_price = round(
-                    min(config.MOMENTUM_TAKE_PROFIT + _tp_attempt * config.MOMENTUM_TP_RETRY_STEP, 0.999),
+                    min(config.MOMENTUM_TAKE_PROFIT + _tp_attempt * config.MOMENTUM_TP_RETRY_STEP, _tp_max_price),
                     4,
                 )
                 try:
@@ -1659,12 +1692,17 @@ class MomentumScanner(BaseStrategy):
         # If the held token loses (→ $0), the opposite token may briefly trade
         # below our bid; the resting order catches that dip and redeems at $1.
         # Bid price is per-bucket (shorter buckets → higher bid to get filled).
+        # Per-bucket on/off: 5m/15m are disabled by default — at ≤120 s TTE
+        # there is no time for the fill path to develop; the cost is wasted.
         _hedge_id: str | None      = None  # set below if placed; used in Phase E fill CSV
         _hedge_price: float        = 0.0
         _hedge_contracts: float    = 0.0
         _hedge_size_usd: float     = 0.0
         _hedge_side: str           = ""
-        if config.MOMENTUM_HEDGE_ENABLED:
+        _hedge_bucket_enabled = config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get(
+            market.market_type, True
+        )
+        if config.MOMENTUM_HEDGE_ENABLED and _hedge_bucket_enabled:
             opp_token = (
                 market.token_id_no if signal.side in ("YES", "UP") else market.token_id_yes
             )
@@ -1679,19 +1717,29 @@ class MomentumScanner(BaseStrategy):
             _hedge_contracts  = hedge_contracts
             _hedge_size_usd   = hedge_size_usd
             _hedge_side       = "DOWN" if signal.side in ("YES", "UP") else "UP"
-            try:
-                hedge_id = await self._pm.place_limit(
-                    token_id=opp_token,
-                    side="BUY",
-                    price=hedge_price,
-                    size=hedge_contracts,
-                    market=market,
-                    post_only=True,
+            # PM requires minimum $1 notional per GTC order.  Skip — never
+            # inflate size to meet the minimum; that changes the hedge economics.
+            if hedge_size_usd < 1.0:
+                log.debug(
+                    "Momentum: GTD hedge skipped — below PM $1 minimum",
+                    market=signal.market_title[:50],
+                    hedge_size_usd=round(hedge_size_usd, 4),
                 )
-                _hedge_id = hedge_id
-            except Exception as _hex:
                 hedge_id = None
-                log.warning("Momentum: GTD hedge error", exc=str(_hex))
+            else:
+                try:
+                    hedge_id = await self._pm.place_limit(
+                        token_id=opp_token,
+                        side="BUY",
+                        price=hedge_price,
+                        size=hedge_contracts,
+                        market=market,
+                        post_only=True,
+                    )
+                    _hedge_id = hedge_id
+                except Exception as _hex:
+                    hedge_id = None
+                    log.warning("Momentum: GTD hedge error", exc=str(_hex))
             if hedge_id:
                 log.info(
                     "Momentum: GTD hedge placed",
@@ -1754,7 +1802,7 @@ class MomentumScanner(BaseStrategy):
                 "signal_sigma_ann": round(signal.sigma_ann, 6),
                 "tte_seconds": round(signal.tte_seconds, 1),
                 "ask_depth_usd": _ask_depth_usd,
-                "fill_from_ws": actual_fill is not None and not self._pm._paper_mode,
+                "fill_from_ws": _fill_from_ws,
                 # Kelly debug fields
                 "kelly_win_prob":     _kelly_debug["kelly_win_prob"],
                 "kelly_payout_b":     _kelly_debug["kelly_payout_b"],
