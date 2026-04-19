@@ -365,6 +365,15 @@ function HedgeSection({
     const srp = Number(fillRow?.spot_resolve_price ?? 0);
     spotResolveDisplay = srp > 0 ? `$${srp.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—";
 
+  } else if (hedgeStatus === "cancelled") {
+    // Order was cancelled by the bot before it could fill → cost = $0
+    status    = "Cancelled";
+    statusBg  = "#431407";
+    statusFg  = "#fb923c";
+    exitStr   = "—";
+    pnlDisplay = "$0.00";
+    pnlFg      = "#6b7280";
+
   } else if (fillRow) {
     // Legacy: momentum_hedge row exists but no hedge_status field (old records)
     // Treat as "Filled" — hedge was redeemed with payout > 0
@@ -395,33 +404,15 @@ function HedgeSection({
       pnlDisplay = "—";
       pnlFg      = "#94a3b8";
     } else if (isLossEarlyExit) {
-      const marketResolved = legs.some(t => !!(t.resolved_outcome ?? "").trim());
-      if (marketResolved) {
-        const mainLost = legs.some(t => (t.resolved_outcome ?? "").toUpperCase() === "LOSS");
-        if (mainLost) {
-          status    = "Expired - Unfilled";
-          statusBg  = "#1c1917";
-          statusFg  = "#6b7280";
-          exitStr   = "—";
-          pnlDisplay = "$0.00";
-          pnlFg      = "#6b7280";
-        } else {
-          status    = "Expired - LOST";
-          statusBg  = "#450a0a";
-          statusFg  = "#f87171";
-          exitStr   = "0.000";
-          const loss = -sizeUsd;
-          pnlDisplay = fmtSigned(loss, 2);
-          pnlFg      = pnlColor(loss);
-        }
-      } else {
-        status    = "Recovery";
-        statusBg  = "#1e3a5f";
-        statusFg  = "#60a5fa";
-        exitStr   = "—";
-        pnlDisplay = "—";
-        pnlFg      = "#94a3b8";
-      }
+      // Taker exits keep the hedge as an independent recovery flow. Without an
+      // explicit momentum_hedge row from the backend, do not infer final hedge
+      // state from the main leg's outcome.
+      status    = "Recovery";
+      statusBg  = "#1e3a5f";
+      statusFg  = "#60a5fa";
+      exitStr   = "—";
+      pnlDisplay = "—";
+      pnlFg      = "#94a3b8";
     } else {
       const anyResolved = legs.some(t => {
         const ex = impliedExitToken(t);

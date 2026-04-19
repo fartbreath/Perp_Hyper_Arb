@@ -521,9 +521,10 @@ _MUTABLE_CONFIG = {
     # Phase B — resolution oracle near expiry
     "momentum_use_resolution_oracle_near_expiry": ("MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY", bool),
     # Phase D — hedge
-    "momentum_hedge_enabled":          ("MOMENTUM_HEDGE_ENABLED",           bool),
-    "momentum_hedge_price":            ("MOMENTUM_HEDGE_PRICE",             float),
-    "momentum_hedge_contracts_pct":    ("MOMENTUM_HEDGE_CONTRACTS_PCT",     float),
+    "momentum_hedge_enabled":              ("MOMENTUM_HEDGE_ENABLED",               bool),
+    "momentum_hedge_price":                ("MOMENTUM_HEDGE_PRICE",                 float),
+    "momentum_hedge_contracts_pct":        ("MOMENTUM_HEDGE_CONTRACTS_PCT",         float),
+    "momentum_hedge_cancel_recovery_pct": ("MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT",   float),
     # Phase E — empirical win-rate gate
     "momentum_win_rate_gate_enabled":  ("MOMENTUM_WIN_RATE_GATE_ENABLED",   bool),
     "momentum_win_rate_gate_min_factor": ("MOMENTUM_WIN_RATE_GATE_MIN_FACTOR", float),
@@ -730,6 +731,7 @@ class ConfigPatch(BaseModel):
     momentum_hedge_enabled: bool | None = None
     momentum_hedge_price: float | None = None
     momentum_hedge_contracts_pct: float | None = None
+    momentum_hedge_cancel_recovery_pct: float | None = None
     momentum_hedge_price_5m: float | None = None
     momentum_hedge_price_15m: float | None = None
     momentum_hedge_price_1h: float | None = None
@@ -737,6 +739,14 @@ class ConfigPatch(BaseModel):
     momentum_hedge_price_daily: float | None = None
     momentum_hedge_price_weekly: float | None = None
     momentum_hedge_price_milestone: float | None = None
+    # Per-bucket hedge on/off
+    momentum_hedge_enabled_5m: bool | None = None
+    momentum_hedge_enabled_15m: bool | None = None
+    momentum_hedge_enabled_1h: bool | None = None
+    momentum_hedge_enabled_4h: bool | None = None
+    momentum_hedge_enabled_daily: bool | None = None
+    momentum_hedge_enabled_weekly: bool | None = None
+    momentum_hedge_enabled_milestone: bool | None = None
     # Phase E — empirical win-rate gate
     momentum_win_rate_gate_enabled: bool | None = None
     momentum_win_rate_gate_min_factor: float | None = None
@@ -948,9 +958,10 @@ def get_config() -> dict:
         "momentum_min_elapsed_weekly":    config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_weekly",0),
         "momentum_min_elapsed_milestone": config.MOMENTUM_MIN_ELAPSED_SECONDS.get("milestone",    0),
         # Phase D — hedge
-        "momentum_hedge_enabled":         config.MOMENTUM_HEDGE_ENABLED,
-        "momentum_hedge_price":           config.MOMENTUM_HEDGE_PRICE,
-        "momentum_hedge_contracts_pct":   config.MOMENTUM_HEDGE_CONTRACTS_PCT,
+        "momentum_hedge_enabled":              config.MOMENTUM_HEDGE_ENABLED,
+        "momentum_hedge_price":                config.MOMENTUM_HEDGE_PRICE,
+        "momentum_hedge_contracts_pct":        config.MOMENTUM_HEDGE_CONTRACTS_PCT,
+        "momentum_hedge_cancel_recovery_pct": config.MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT,
         "momentum_hedge_price_5m":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_5m",    config.MOMENTUM_HEDGE_PRICE),
         "momentum_hedge_price_15m":       config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_15m",   config.MOMENTUM_HEDGE_PRICE),
         "momentum_hedge_price_1h":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_1h",    config.MOMENTUM_HEDGE_PRICE),
@@ -958,6 +969,14 @@ def get_config() -> dict:
         "momentum_hedge_price_daily":     config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_daily",  config.MOMENTUM_HEDGE_PRICE),
         "momentum_hedge_price_weekly":    config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_weekly", config.MOMENTUM_HEDGE_PRICE),
         "momentum_hedge_price_milestone": config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("milestone",     config.MOMENTUM_HEDGE_PRICE),
+        # Per-bucket hedge on/off
+        "momentum_hedge_enabled_5m":        config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_5m",    False),
+        "momentum_hedge_enabled_15m":       config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_15m",   False),
+        "momentum_hedge_enabled_1h":        config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_1h",    True),
+        "momentum_hedge_enabled_4h":        config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_4h",    True),
+        "momentum_hedge_enabled_daily":     config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_daily",  True),
+        "momentum_hedge_enabled_weekly":    config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_weekly", True),
+        "momentum_hedge_enabled_milestone": config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("milestone",     True),
         # Phase E — empirical win-rate gate
         "momentum_win_rate_gate_enabled":     config.MOMENTUM_WIN_RATE_GATE_ENABLED,
         "momentum_win_rate_gate_min_factor":  config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR,
@@ -1100,6 +1119,22 @@ def patch_config(patch: ConfigPatch) -> dict:
             config.MOMENTUM_HEDGE_PRICE_BY_TYPE[bucket_key] = float(v)
             updated[field] = float(v)
             log.info("Config updated via API", key=f"MOMENTUM_HEDGE_PRICE_BY_TYPE[{bucket_key}]", value=float(v))
+    # Phase D — per-bucket hedge enabled overrides
+    _hedge_enabled_map = {
+        "momentum_hedge_enabled_5m":        "bucket_5m",
+        "momentum_hedge_enabled_15m":       "bucket_15m",
+        "momentum_hedge_enabled_1h":        "bucket_1h",
+        "momentum_hedge_enabled_4h":        "bucket_4h",
+        "momentum_hedge_enabled_daily":     "bucket_daily",
+        "momentum_hedge_enabled_weekly":    "bucket_weekly",
+        "momentum_hedge_enabled_milestone": "milestone",
+    }
+    for field, bucket_key in _hedge_enabled_map.items():
+        v = getattr(patch, field)
+        if v is not None:
+            config.MOMENTUM_HEDGE_ENABLED_BY_TYPE[bucket_key] = bool(v)
+            updated[field] = bool(v)
+            log.info("Config updated via API", key=f"MOMENTUM_HEDGE_ENABLED_BY_TYPE[{bucket_key}]", value=bool(v))
     # Per-coin delta stop-loss overrides — written directly into the dict
     _delta_sl_coin_map = {
         "momentum_delta_sl_pct_btc":  "BTC",
@@ -1156,6 +1191,8 @@ def patch_config(patch: ConfigPatch) -> dict:
             attr_changes["MOMENTUM_MIN_ELAPSED_SECONDS"] = dict(config.MOMENTUM_MIN_ELAPSED_SECONDS)
         if any(f in updated for f in _hedge_price_map):
             attr_changes["MOMENTUM_HEDGE_PRICE_BY_TYPE"] = dict(config.MOMENTUM_HEDGE_PRICE_BY_TYPE)
+        if any(f in updated for f in _hedge_enabled_map):
+            attr_changes["MOMENTUM_HEDGE_ENABLED_BY_TYPE"] = dict(config.MOMENTUM_HEDGE_ENABLED_BY_TYPE)
         _save_overrides(attr_changes)
     return {
         "updated": updated,
@@ -2025,7 +2062,21 @@ def trades(
     if strategy:
         rows = [r for r in rows if r.get("strategy", "").lower() == strategy.lower()]
     if underlying:
-        rows = [r for r in rows if r.get("underlying", "").upper() == underlying.upper()]
+        # Main rows: filter by underlying as usual.
+        # Hedge rows (strategy="momentum_hedge") are recorded with underlying="" so they
+        # would always be dropped by the filter, causing the per-coin P&L to appear wrong
+        # (all losses) while "All" shows positive (hedge P&L included).
+        # Fix: after identifying the matching main rows, also include any momentum_hedge
+        # rows whose market_id is in that set.
+        main_rows = [r for r in rows if r.get("underlying", "").upper() == underlying.upper()]
+        main_market_ids = {r["market_id"] for r in main_rows}
+        hedge_rows = [
+            r for r in rows
+            if r.get("strategy") == "momentum_hedge"
+            and r.get("market_id") in main_market_ids
+            and r.get("underlying", "").upper() != underlying.upper()  # avoid duplicates if underlying was set
+        ]
+        rows = main_rows + hedge_rows
 
     total = len(rows)
     page = rows[offset: offset + limit]

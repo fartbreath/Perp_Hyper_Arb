@@ -44,8 +44,8 @@ data/
 scripts/
 Reports/
 
-# Gstack
-.gstack/
+# Preamble
+.preamble/
 
 # Node (webapp)
 webapp/node_modules/

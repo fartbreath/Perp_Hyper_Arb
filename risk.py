@@ -129,6 +129,11 @@ class Position:
     hedge_token_id: str = ""
     hedge_price: float = 0.0
     hedge_size_usd: float = 0.0
+    # Set to True when a WS MATCHED event confirms the hedge order filled mid-trade
+    # (before market resolution).  Used by _record_pending_resolution_hedge() as a
+    # fallback when paper-fill simulation data is absent.
+    hedge_fill_detected: bool = False
+    hedge_fill_size: float = 0.0      # actual matched contracts from the WS event
 
     # Active TP resting limit order (Item 1): PM CLOB order ID of a pre-armed SELL
     # at the take-profit price.  Cancelled automatically on any non-TP exit.
@@ -406,6 +411,64 @@ class RiskEngine:
             )
             return patched
 
+    def patch_hedge_spot_price(self, market_id: str, spot_price: float) -> int:
+        """Update spot_resolve_price for momentum_hedge rows in trades.csv where it is 0.0.
+
+        Called by _check_pending_resolutions once the Gamma API has the settlement
+        close price available (typically a few minutes after market resolution).
+        Mirrors patch_exit_spot_price but targets the spot_resolve_price column on
+        rows where strategy == 'momentum_hedge'.  Never overwrites a valid price
+        that was recorded at the time the hedge was settled.
+        Returns the number of records changed.
+        """
+        if spot_price <= 0:
+            return 0
+        with self._csv_write_lock:
+            if not TRADES_CSV.exists():
+                return 0
+            try:
+                with TRADES_CSV.open(newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+                if rows and "timestamp" not in rows[0]:
+                    with TRADES_CSV.open(newline="", encoding="utf-8") as f:
+                        rows = list(csv.DictReader(f, fieldnames=TRADES_HEADER))
+            except Exception as exc:
+                log.error("patch_hedge_spot_price: read failed", exc=str(exc))
+                return 0
+            patched = 0
+            for row in rows:
+                if row.get("market_id") != market_id:
+                    continue
+                if row.get("strategy") != "momentum_hedge":
+                    continue
+                try:
+                    current = float(row.get("spot_resolve_price", 0) or 0)
+                except (ValueError, TypeError):
+                    current = 0.0
+                if current == 0.0:
+                    row["spot_resolve_price"] = str(round(spot_price, 4))
+                    patched += 1
+            if patched == 0:
+                return 0
+            try:
+                tmp = TRADES_CSV.with_suffix(".tmp")
+                with tmp.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=TRADES_HEADER)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                tmp.replace(TRADES_CSV)
+            except Exception as exc:
+                log.error("patch_hedge_spot_price: rewrite failed", exc=str(exc))
+                return 0
+            log.info(
+                "patch_hedge_spot_price: settlement spot filled for hedge row",
+                market_id=market_id[:20],
+                spot_price=round(spot_price, 4),
+                records=patched,
+            )
+            return patched
+
     def _load_token_strategy(self) -> dict[str, str]:
         """Load persisted token_id → strategy map from disk."""
         if OPEN_POSITIONS_JSON.exists():
@@ -669,6 +732,14 @@ class RiskEngine:
         with self._lock:
             for pos in self._positions.values():
                 if pos.hedge_token_id == hedge_token_id:
+                    return pos
+        return None
+
+    def get_position_by_hedge_order_id(self, hedge_order_id: str) -> Optional[Position]:
+        """Return the open position whose hedge_order_id matches, or None."""
+        with self._lock:
+            for pos in self._positions.values():
+                if pos.hedge_order_id == hedge_order_id and not pos.is_closed:
                     return pos
         return None
 

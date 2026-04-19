@@ -375,7 +375,7 @@ MOMENTUM_ORDER_TYPE: str = "limit"
 # strike against the position (e.g. 0.05 → exit when spot is 0.05% below
 # strike for YES, or 0.05% above strike for NO).
 MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.01  # protective buffer: exit when delta (in-the-money %) drops BELOW this threshold (fires before strike is crossed)
-MOMENTUM_DELTA_SL_MIN_TICKS: int = 2        # hysteresis: delta SL only fires after this many consecutive below-threshold ticks (prevents single-tick noise from triggering exit)
+MOMENTUM_DELTA_SL_MIN_TICKS: int = 3        # hysteresis: delta SL only fires after this many consecutive below-threshold ticks (prevents single-tick noise from triggering exit)
 MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
 # How long to wait for PM API to confirm settlement before falling back to the
 # resolution oracle.  PM can take 1–10 min to flip closed=True on the CLOB API
@@ -480,9 +480,35 @@ MOMENTUM_HEDGE_PRICE_BY_TYPE: dict[str, float] = {
     "bucket_weekly":  0.01,
     "milestone":      0.01,
 }
+# Per-bucket hedge on/off flags.
+# 5m and 15m are OFF by default: at ≤120 s TTE there is no time for the whipsaw
+# path (favorable excursion + reversal) that gives the hedge insurance value.
+# The hedge is also cancelled on any non-RESOLVED exit to prevent double-jeopardy.
+# MOMENTUM_HEDGE_ENABLED is the global master switch; per-bucket flags are only
+# consulted when the master switch is True.
+MOMENTUM_HEDGE_ENABLED_BY_TYPE: dict[str, bool] = {
+    "bucket_5m":    False,
+    "bucket_15m":   False,
+    "bucket_1h":    True,
+    "bucket_4h":    True,
+    "bucket_daily": True,
+    "bucket_weekly":True,
+    "milestone":    True,
+}
 # Hedge size as fraction of main entry contracts (1.0 = same contract count as main position).
 # Actual USDC cost = hedge_contracts × hedge_price (e.g. 25ct × $0.02 = $0.50).
 MOMENTUM_HEDGE_CONTRACTS_PCT: float = 1.0
+
+# SL hedge cancel: deferred cancellation factor.
+# When the main position exits via delta SL, the GTD hedge is NOT cancelled
+# immediately.  Instead, the cancel is held until delta recovers to
+#   cancel_threshold = coin_sl * (1 + MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT)
+# This keeps the hedge alive during transient spikes (false-positive SLs), so
+# the hedge can still catch a whipsaw fill if the opposite token dips.
+# When delta does recover back above the threshold, the hedge is cancelled.
+# If delta never recovers and the market resolves, the hedge rides to resolution.
+# Set to 0.0 to restore immediate-cancel behaviour (old default).
+MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT: float = 0.5
 
 # Paper-mode GTD hedge fill simulation.
 # When PAPER_TRADING=True the fill_simulator also checks resting hedge bids against
@@ -610,6 +636,7 @@ MOMENTUM_PROB_SL_PCT: float = 0.25        # SL fires when token drops 25% below 
 # unreliable price signal.  The oracle-delta SL remains active and is the correct
 # primary stop near expiry.  Set to 0 to disable the guard.
 MOMENTUM_PROB_SL_MIN_TTE_SECS: int = 300  # suppress prob-SL in final 5 minutes
+MOMENTUM_PROB_SL_ORACLE_STALE_SECS: float = 10.0  # suppress prob-SL when oracle ticked within this many seconds (0 = disabled)
 
 # ── Chainlink watchdog (Item 5) ──────────────────────────────────────────────
 # Seconds of silence on an established WebSocket connection before forcing a

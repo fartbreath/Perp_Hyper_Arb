@@ -2083,6 +2083,7 @@ class TestProbSlShouldExit:
 
     def test_prob_sl_fires_when_price_below_threshold(self):
         config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS = 10.0
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0  # disable oracle SL
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MIN_HOLD_SECONDS = 60
@@ -2096,6 +2097,7 @@ class TestProbSlShouldExit:
             initial_deviation=0.0,
             market_end_date=self.NOW + timedelta(minutes=10),
             now=self.NOW,
+            oracle_age_seconds=25.0,  # stale — confirmed oracle lag
         )
         assert exit_flag is True
         assert reason == ExitReason.MOMENTUM_STOP_LOSS
@@ -2202,6 +2204,7 @@ class TestProbSlShouldExit:
         """Prob-SL must still fire normally when TTE >= MOMENTUM_PROB_SL_MIN_TTE_SECS."""
         config.MOMENTUM_PROB_SL_ENABLED = True
         config.MOMENTUM_PROB_SL_MIN_TTE_SECS = 300
+        config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS = 10.0
         config.MOMENTUM_DELTA_STOP_LOSS_PCT = -999.0
         config.MOMENTUM_TAKE_PROFIT = 0.999
         config.MIN_HOLD_SECONDS = 0
@@ -2216,9 +2219,84 @@ class TestProbSlShouldExit:
             market_end_date=self.NOW + timedelta(seconds=600),
             tte_seconds=600.0,        # above the 300-second guard
             now=self.NOW,
+            oracle_age_seconds=25.0,  # stale — confirmed oracle lag
         )
         assert exit_flag is True
         assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_prob_sl_blocked_when_oracle_fresh(self):
+        """Oracle-lag gate: prob-SL must NOT fire when oracle ticked recently.
+        A fresh oracle confirms spot hasn't moved — CLOB drop is book-drain noise."""
+        config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_PROB_SL_MIN_TTE_SECS = 300
+        config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS = 10.0
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.02   # real delta SL (not disabled)
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 0
+
+        pos = self._momentum_pos(entry_price=0.85, prob_sl_threshold=0.80)
+        # Oracle is fresh (2 s ago): delta is comfortably ITM (0.5%), CLOB drops
+        exit_flag, _, _ = should_exit(
+            pos=pos,
+            current_price=0.70,
+            current_token_price=0.70,
+            current_spot=100_500.0,  # 0.5% above strike — comfortably ITM
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=600),
+            tte_seconds=600.0,
+            now=self.NOW,
+            oracle_age_seconds=2.0,  # fresh — within 10s window
+        )
+        assert exit_flag is False, "prob-SL must be blocked when oracle is fresh"
+
+    def test_prob_sl_fires_when_oracle_stale(self):
+        """Oracle-lag gate: prob-SL MUST fire when oracle is stale.
+        Stale oracle = CLOB drop may be a real move the oracle hasn't reported."""
+        config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_PROB_SL_MIN_TTE_SECS = 300
+        config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS = 10.0
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.02
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 0
+
+        pos = self._momentum_pos(entry_price=0.85, prob_sl_threshold=0.80)
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.70,
+            current_token_price=0.70,
+            current_spot=100_500.0,  # oracle says 0.5% ITM — but oracle is stale
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=600),
+            tte_seconds=600.0,
+            now=self.NOW,
+            oracle_age_seconds=25.0,  # stale — beyond 10s window
+        )
+        assert exit_flag is True
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_prob_sl_blocked_when_oracle_age_unknown(self):
+        """Oracle-lag gate: prob-SL must be BLOCKED when oracle_age_seconds is None.
+        Unknown timing = treat as fresh (conservative) — do not fire on missing data."""
+        config.MOMENTUM_PROB_SL_ENABLED = True
+        config.MOMENTUM_PROB_SL_MIN_TTE_SECS = 300
+        config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS = 10.0
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.02
+        config.MOMENTUM_TAKE_PROFIT = 0.999
+        config.MIN_HOLD_SECONDS = 0
+
+        pos = self._momentum_pos(entry_price=0.85, prob_sl_threshold=0.80)
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.70,
+            current_token_price=0.70,
+            current_spot=100_500.0,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=600),
+            tte_seconds=600.0,
+            now=self.NOW,
+            oracle_age_seconds=None,  # no timing info — must be blocked
+        )
+        assert exit_flag is False, "prob-SL must be blocked when oracle timing is unknown"
 
 
 class TestRangeStrategyExits:

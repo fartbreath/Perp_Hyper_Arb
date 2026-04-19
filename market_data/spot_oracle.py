@@ -120,6 +120,11 @@ class SpotOracle:
         Returns the ChainlinkWSClient price only (no RTDS relay, no Streams relay)
         for Chainlink market types on non-HYPE coins.  Falls back to standard
         get_mid() for HYPE (no Polygon AggregatorV3) and non-Chainlink types.
+
+        NOTE: 1h / daily / weekly markets resolve against Binance OHLC candle data
+        (close vs open), not Chainlink.  For these market types this method falls
+        through to get_mid() which returns the RTDS exchange-aggregated price — the
+        closest available proxy for Binance spot.
         """
         if market_type in CHAINLINK_MARKET_TYPES and underlying != "HYPE":
             snap = self._cl.get_spot(underlying)

@@ -2,6 +2,61 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-20] - Fix: hedge fill detection pipeline; webapp hedge state badge
+
+### Fix — GTD hedge fills silently dropped by WS fill handler (`live_fill_handler.py`, `risk.py`, `monitor.py`)
+
+**Problem:** Momentum GTD hedge orders are placed by `scanner.py` and tracked in
+`risk._positions[].hedge_order_id`, but are never added to the maker's `ActiveQuote` dict.
+`live_fill_handler._on_order_fill()` only searches `active_quotes` for the matching order,
+so when a counterparty filled the hedge the WS MATCHED event arrived and was silently
+dropped with a DEBUG log (`"fill for unknown/consumed order"`). The order disappeared from
+the open CLOB order list, the bot's wallet held the filled tokens, but no `HEDGE_FILL` event
+was recorded and `_record_pending_resolution_hedge()` would later mark the hedge as
+`"unfilled"` — losing the actual payout.
+
+Confirmed on 2026-04-19: XRP daily hedge order `0xf60fa033…` was placed at 0.02 for 45.45
+contracts; CLOB shows `status=MATCHED, size_matched=45.45`; no fill row in `trades.csv`.
+
+**Fix — three-layer detection pipeline:**
+
+1. `live_fill_handler._on_order_fill` — after the `active_quotes` lookup fails, calls
+   `risk.get_position_by_hedge_order_id(order_id)` (new method). If matched, sets
+   `pos.hedge_fill_detected = True` and `pos.hedge_fill_size = cumulative_matched`.
+   Logs at INFO. This covers real-time fills while the bot is running.
+
+2. `monitor._record_pending_resolution_hedge` — before recording `"unfilled"`, checks
+   `parent.hedge_fill_detected` + `parent.hedge_fill_size` and writes `filled_won` /
+   `filled_lost` accordingly. Covers current-session fills.
+
+3. `monitor._record_pending_resolution_hedge` (REST fallback) — calls
+   `get_order_fill_rest(hedge_order_id)` on the CLOB. Covers fills that happened while
+   the bot was offline or before WS detection was in place (e.g. the Apr-19 XRP case).
+
+**`Position` dataclass additions (`risk.py`):**
+- `hedge_fill_detected: bool = False`
+- `hedge_fill_size: float = 0.0`
+
+**New `RiskEngine` method:** `get_position_by_hedge_order_id(order_id) -> Optional[Position]`
+— finds the open position whose `hedge_order_id` matches the given CLOB order ID.
+
+### Feature — Webapp Positions page shows hedge state badge (`Positions.tsx`, `client.ts`)
+
+**Previous behaviour:** The GTD Hedge column showed a plain purple text label with price and
+USD size. No way to tell whether the hedge order was still resting or had been filled.
+
+**New behaviour:** The cell now shows a coloured state badge:
+- `—` — no hedge placed
+- Purple **"Live · 2.2¢"** — hedge order resting on CLOB (not yet filled)
+- Green **"Filled · 45.5ct"** — WS MATCHED event confirmed the hedge filled mid-trade
+
+Each badge has a detailed tooltip (order ID, token ID, fill/bid price, size).
+
+`Position` TypeScript interface gains `hedge_fill_detected?: boolean | null` and
+`hedge_fill_size?: number | null` (serialised from `dataclasses.asdict` on the backend).
+
+---
+
 ## [2026-04-16] - Bug fixes: range spot propagation, range tick delta, prob-SL oracle gate, WS fill detection, FAK fallback, hedge cancel regression, auto-redeem stale curPrice
 
 ### Fix — Auto-redeem used stale `curPrice` for WIN/LOSS determination (`monitor.py`)

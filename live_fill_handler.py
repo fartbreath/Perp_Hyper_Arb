@@ -629,12 +629,26 @@ class LiveFillHandler:
                 break
 
         if key is None:
-            # Fill arrived after the quote was already fully consumed — normal race.
-            log.debug(
-                "LiveFillHandler: fill for unknown/consumed order",
-                order_id=order_id[:20],
-                token_id=token_id[:24],
-            )
+            # Check if this is a GTD hedge order fill (placed by momentum scanner,
+            # never registered in the maker's active_quotes dict).
+            hedge_pos = self._risk.get_position_by_hedge_order_id(order_id)
+            if hedge_pos is not None:
+                hedge_pos.hedge_fill_detected = True
+                hedge_pos.hedge_fill_size = round(cumulative_matched, 6)
+                log.info(
+                    "LiveFillHandler: GTD hedge order filled via WS — marked on position",
+                    order_id=order_id[:20],
+                    market=str(hedge_pos.market_title or "")[:60],
+                    fill_price=fill_price,
+                    fill_size=round(cumulative_matched, 6),
+                )
+            else:
+                # Fill arrived after the quote was already fully consumed — normal race.
+                log.debug(
+                    "LiveFillHandler: fill for unknown/consumed order",
+                    order_id=order_id[:20],
+                    token_id=token_id[:24],
+                )
             return
 
         # Resolve the market (strip _ask suffix to get the base token key)

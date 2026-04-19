@@ -155,6 +155,9 @@ export interface Position {
   hedge_token_id?: string | null;
   hedge_price?: number | null;
   hedge_size_usd?: number | null;
+  // Set true when a WS MATCHED event confirmed the hedge order filled mid-trade
+  hedge_fill_detected?: boolean | null;
+  hedge_fill_size?: number | null;
 }
 
 export interface Trade {
@@ -184,7 +187,7 @@ export interface Trade {
   hedge_price?: string;
   hedge_size_usd?: string;
   // Hedge outcome — written when market resolves (PM API is source of truth)
-  hedge_status?: string;        // "filled_won" | "filled_lost" | "unfilled" | ""
+  hedge_status?: string;        // "filled_won" | "filled_lost" | "unfilled" | "cancelled" | ""
   spot_resolve_price?: string;  // oracle spot at market resolution (hedge rows); "0" otherwise
 }
 
@@ -545,6 +548,7 @@ export interface ConfigData {
   momentum_hedge_enabled?: boolean;
   momentum_hedge_price?: number;
   momentum_hedge_contracts_pct?: number;
+  momentum_hedge_cancel_recovery_pct?: number;
   momentum_hedge_price_5m?: number;
   momentum_hedge_price_15m?: number;
   momentum_hedge_price_1h?: number;

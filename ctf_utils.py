@@ -81,20 +81,26 @@ async def _redeem_ctf_via_safe(
     signer_address = acct.address  # EOA that owns the Safe
 
     async with aiohttp.ClientSession() as sess:
-        # ── 2. Get Safe nonce from the relayer ────────────────────────────────
-        # The relayer tracks Safe nonces via the signer (EOA) address.
-        async with sess.get(
-            f"{RELAYER_URL}/nonce",
-            params={"address": signer_address, "type": "SAFE"},
-            headers=_relayer_headers,
+        # ── 2. Get Safe nonce directly from the on-chain contract ─────────────
+        # NOTE: The relayer's /nonce endpoint can go stale when prior
+        # submissions revert (it queues ahead of reality).  A stale nonce
+        # causes the Safe to compute a different EIP-712 hash → GS026.
+        # Reading from the chain is authoritative and always correct.
+        _nonce_selector = keccak(text="nonce()")[:4]
+        async with sess.post(
+            _cfg.POLYGON_RPC_URL,
+            json={
+                "jsonrpc": "2.0", "method": "eth_call",
+                "params": [{"to": safe, "data": "0x" + _nonce_selector.hex()}, "latest"],
+                "id": 1,
+            },
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"Relayer /nonce error (HTTP {resp.status}): {body}")
-            nonce_data = await resp.json()
-        safe_nonce_str: str = nonce_data["nonce"]
-        safe_nonce = int(safe_nonce_str)
+            rpc_resp = await resp.json()
+        if "error" in rpc_resp:
+            raise RuntimeError(f"RPC eth_call /nonce error: {rpc_resp['error']}")
+        safe_nonce = int(rpc_resp["result"], 16)
+        safe_nonce_str: str = str(safe_nonce)
 
         # ── 3. Build EIP-712 SafeTx hash ──────────────────────────────────────
         DOMAIN_TYPEHASH  = keccak(text="EIP712Domain(uint256 chainId,address verifyingContract)")
@@ -160,5 +166,6 @@ async def _redeem_ctf_via_safe(
             body = await resp.json()
             if resp.status != 200:
                 raise RuntimeError(f"Relayer /submit error (HTTP {resp.status}): {body}")
-            # Return transactionID for logging; the relayer mines the tx asynchronously.
-            return body.get("transactionID") or body.get("transactionHash") or str(body)
+            # Return the Ethereum tx hash when available; fall back to the
+            # relayer's internal transactionID (UUID) for logging.
+            return body.get("transactionHash") or body.get("transactionID") or str(body)

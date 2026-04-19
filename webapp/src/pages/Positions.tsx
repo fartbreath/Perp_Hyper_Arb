@@ -394,15 +394,22 @@ function MomentumRow({
       </td>
       {/* GTD Hedge */}
       <td style={{ fontFamily: "monospace", fontSize: "0.75rem" }}>
-        {pos.hedge_order_id ? (
+        {!pos.hedge_order_id ? (
+          <span style={{ color: "#374151" }}>—</span>
+        ) : pos.hedge_fill_detected ? (
           <span
-            title={`Resting bid on opposite token\nOrder: ${pos.hedge_order_id}\nToken: ${pos.hedge_token_id ?? "—"}\nSize: $${Number(pos.hedge_size_usd ?? 0).toFixed(2)}`}
-            style={{ color: "#a78bfa", cursor: "help" }}
+            title={`Hedge filled by counterparty\nOrder: ${pos.hedge_order_id}\nToken: ${pos.hedge_token_id ?? "—"}\nFill price: ${(Number(pos.hedge_price ?? 0) * 100).toFixed(1)}¢\nFill size: ${Number(pos.hedge_fill_size ?? 0).toFixed(2)} contracts`}
+            style={{ padding: "2px 6px", borderRadius: 4, fontWeight: 600, fontSize: "0.72rem", background: "#052e16", color: "#22c55e", cursor: "help" }}
           >
-            {(Number(pos.hedge_price ?? 0) * 100).toFixed(1)}¢ · ${Number(pos.hedge_size_usd ?? 0).toFixed(2)}
+            Filled · {Number(pos.hedge_fill_size ?? 0).toFixed(1)}ct
           </span>
         ) : (
-          <span style={{ color: "#374151" }}>—</span>
+          <span
+            title={`Resting GTD bid on opposite token\nOrder: ${pos.hedge_order_id}\nToken: ${pos.hedge_token_id ?? "—"}\nBid price: ${(Number(pos.hedge_price ?? 0) * 100).toFixed(1)}¢\nSize: $${Number(pos.hedge_size_usd ?? 0).toFixed(2)}`}
+            style={{ padding: "2px 6px", borderRadius: 4, fontWeight: 600, fontSize: "0.72rem", background: "#1e1b4b", color: "#a78bfa", cursor: "help" }}
+          >
+            Live · {(Number(pos.hedge_price ?? 0) * 100).toFixed(1)}¢
+          </span>
         )}
       </td>
       {/* Opened */}

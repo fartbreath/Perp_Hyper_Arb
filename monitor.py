@@ -63,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -308,6 +309,7 @@ def should_exit(
     tte_seconds: Optional[float] = None,
     current_spot: Optional[float] = None,
     delta_sl_pct: Optional[float] = None,
+    oracle_age_seconds: Optional[float] = None,
 ) -> tuple[bool, str, float]:
     """
     Decide whether a position should be exited.
@@ -468,17 +470,20 @@ def should_exit(
             or config.MOMENTUM_PROB_SL_MIN_TTE_SECS <= 0
             or tte_seconds >= config.MOMENTUM_PROB_SL_MIN_TTE_SECS
         )
-        # Oracle-delta gate: if oracle confirms we're solidly in-the-money, the
-        # CLOB price collapse is likely book drain (near-expiry liquidity withdrawal),
-        # not a real directional move.  Only fire prob-SL when:
-        #   • oracle data is unavailable (prob-SL is the sole guard), OR
-        #   • oracle delta is already within 1% of the strike (genuinely close).
-        # When oracle delta is > 1% the position is solidly ITM — a CLOB collapse
-        # is almost certainly book drain, and firing the prob-SL would exit a
-        # winning position at the book floor.
+        # Oracle-lag gate: prob-SL's unique value is detecting oracle lag — the
+        # CLOB is repricing a move the oracle hasn't reported yet.  If the oracle
+        # ticked recently it's current: any CLOB drop is book-drain noise, not a
+        # real signal.  Only fire prob-SL when oracle lag is CONFIRMED (last tick
+        # was more than MOMENTUM_PROB_SL_ORACLE_STALE_SECS ago).  Unknown timing
+        # (None) is treated as fresh — don't fire on missing data.
+        _oracle_confirmed_stale = (
+            oracle_age_seconds is not None  # must have timing to confirm lag
+            and config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS > 0  # guard enabled
+            and oracle_age_seconds > config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS
+        )
         _prob_sl_oracle_ok = (
-            _oracle_delta_pct is None
-            or _oracle_delta_pct < 1.0
+            config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS <= 0  # guard disabled → always allow
+            or _oracle_confirmed_stale                       # confirmed oracle lag
         )
         if (
             _prob_sl_oracle_ok
@@ -605,6 +610,9 @@ class PositionMonitor:
         # Cancelled and removed once delta recovers above cancel_threshold or the
         # market resolves.
         self._pending_hedge_cancels: dict[str, dict] = {}  # market_id → info
+        # Tracks the monotonic timestamp of the last oracle tick per coin.
+        # Used to compute oracle freshness for the prob-SL oracle-lag gate.
+        self._last_oracle_tick_ts: dict[str, float] = {}  # coin → time.monotonic()
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -688,6 +696,7 @@ class PositionMonitor:
         the PM WS to echo a price change, which may not happen if the PM
         book is thin or empty near expiry.
         """
+        self._last_oracle_tick_ts[coin] = time.monotonic()
         for pos in self._risk.get_open_positions():
             if pos.strategy != "momentum" or pos.underlying != coin:
                 continue
@@ -867,6 +876,62 @@ class PositionMonitor:
                 )
                 return
 
+        # Fallback: WS fill event detected this hedge filled mid-trade (live_fill_handler
+        # set hedge_fill_detected=True when the MATCHED event arrived).
+        if parent.hedge_fill_detected and parent.hedge_fill_size > 0.0:
+            hedge_status = "filled_lost" if main_won else "filled_won"
+            hedge_settled = 0.0 if main_won else 1.0
+            self._risk.record_hedge_fill(
+                parent_market_id=parent.market_id,
+                parent_market_title=parent.market_title,
+                hedge_token_id=parent.hedge_token_id,
+                fill_price=parent.hedge_price,
+                fill_size=parent.hedge_fill_size,
+                settled_price=hedge_settled,
+                underlying=parent.underlying or "",
+                hedge_status=hedge_status,
+                spot_resolve_price=spot_resolve,
+            )
+            log.info(
+                "Pending resolution: GTD hedge fill recorded (WS-detected)",
+                condition_id=condition_id[:16],
+                hedge_token_id=parent.hedge_token_id[:16],
+                hedge_status=hedge_status,
+                fill_price=parent.hedge_price,
+                fill_size=round(parent.hedge_fill_size, 4),
+            )
+            return
+
+        # Last resort: query CLOB REST API to check if the hedge order was
+        # filled while the bot was offline or before WS detection was added.
+        if parent.hedge_order_id:
+            rest_fill = await self._pm.get_order_fill_rest(parent.hedge_order_id)
+            if rest_fill:
+                rest_fill_price, rest_fill_size = rest_fill
+                if rest_fill_size > 0.0:
+                    hedge_status = "filled_lost" if main_won else "filled_won"
+                    hedge_settled = 0.0 if main_won else 1.0
+                    self._risk.record_hedge_fill(
+                        parent_market_id=parent.market_id,
+                        parent_market_title=parent.market_title,
+                        hedge_token_id=parent.hedge_token_id,
+                        fill_price=rest_fill_price,
+                        fill_size=rest_fill_size,
+                        settled_price=hedge_settled,
+                        underlying=parent.underlying or "",
+                        hedge_status=hedge_status,
+                        spot_resolve_price=spot_resolve,
+                    )
+                    log.info(
+                        "Pending resolution: GTD hedge fill recorded (REST fallback)",
+                        condition_id=condition_id[:16],
+                        hedge_token_id=parent.hedge_token_id[:16],
+                        hedge_status=hedge_status,
+                        fill_price=rest_fill_price,
+                        fill_size=round(rest_fill_size, 4),
+                    )
+                    return
+
         self._risk.record_hedge_fill(
             parent_market_id=parent.market_id,
             parent_market_title=parent.market_title,
@@ -1017,6 +1082,22 @@ class PositionMonitor:
                         except Exception as exc:
                             log.warning(
                                 "patch_exit_spot_price failed", cid=cid[:16], exc=str(exc)
+                            )
+                        # Also back-fill spot_resolve_price on any momentum_hedge row
+                        # that was written with 0.0 (hedge token arrived in wallet
+                        # before Gamma published closePrice — same race as exit_spot).
+                        try:
+                            _hp = self._risk.patch_hedge_spot_price(cid, _settle_spot)
+                            if _hp:
+                                log.info(
+                                    "patch_hedge_spot_price: settlement spot back-filled",
+                                    condition_id=cid[:16],
+                                    spot=round(_settle_spot, 4),
+                                    records=_hp,
+                                )
+                        except Exception as exc:
+                            log.warning(
+                                "patch_hedge_spot_price failed", cid=cid[:16], exc=str(exc)
                             )
         if changed:
             _save_pending_resolutions(pending)
@@ -1677,6 +1758,10 @@ class PositionMonitor:
         coin_sl = config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get(
             pos.underlying, config.MOMENTUM_DELTA_STOP_LOSS_PCT
         ) if pos.underlying else config.MOMENTUM_DELTA_STOP_LOSS_PCT
+        _last_tick = self._last_oracle_tick_ts.get(pos.underlying or "")
+        oracle_age_secs = (
+            time.monotonic() - _last_tick if _last_tick is not None else None
+        )
         exit_flag, reason, unrealised = should_exit(
             pos=pos,
             current_price=current_price,
@@ -1687,6 +1772,7 @@ class PositionMonitor:
             tte_seconds=tte_seconds,
             current_spot=current_spot,
             delta_sl_pct=coin_sl,
+            oracle_age_seconds=oracle_age_secs,
         )
 
         # Hysteresis: suppress delta SL until it holds for MOMENTUM_DELTA_SL_MIN_TICKS
@@ -1977,6 +2063,63 @@ class PositionMonitor:
                     )
                     self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
                     return
+
+        # ── Taker exit: confirm actual fill price via WS / REST ──────────────
+        # The taker SELL often fills at a better price than the book snapshot
+        # used as sell_order_price — other resting bids above best_bid also get
+        # swept.  Without confirmation we record a stale snapshot that can be
+        # wrong by several cents, producing inaccurate P&L (as seen on prod:
+        # bot recorded 0.750, actual fill was 0.910).
+        if force_taker and order_id and not config.PAPER_TRADING:
+            _fill_future: "asyncio.Future[dict]" = asyncio.get_running_loop().create_future()
+            self._pm.register_fill_future(order_id, _fill_future)
+            _confirmed_exit_price: Optional[float] = None
+            try:
+                _fill_evt = await asyncio.wait_for(_fill_future, timeout=10.0)
+                _ws_price = float(_fill_evt.get("price") or 0)
+                _ws_size  = float(_fill_evt.get("size_matched") or 0)
+                if _ws_price > 0 and _ws_size > 0:
+                    _confirmed_exit_price = _ws_price
+                    log.info(
+                        "Taker exit fill confirmed via WS",
+                        order_id=order_id[:20],
+                        book_snapshot=round(exit_price, 4),
+                        actual_fill=round(_ws_price, 4),
+                        fill_size=round(_ws_size, 4),
+                        market_id=pos.market_id,
+                    )
+                else:
+                    # WS event arrived but price/size fields absent — REST provides data.
+                    _rest_fill = await self._pm.get_order_fill_rest(order_id)
+                    if _rest_fill:
+                        _confirmed_exit_price = _rest_fill[0]
+                        log.info(
+                            "Taker exit fill confirmed via REST (WS no price)",
+                            order_id=order_id[:20],
+                            book_snapshot=round(exit_price, 4),
+                            actual_fill=round(_rest_fill[0], 4),
+                            market_id=pos.market_id,
+                        )
+            except asyncio.TimeoutError:
+                _rest_fill = await self._pm.get_order_fill_rest(order_id)
+                if _rest_fill:
+                    _confirmed_exit_price = _rest_fill[0]
+                    log.info(
+                        "Taker exit fill confirmed via REST (WS timeout)",
+                        order_id=order_id[:20],
+                        book_snapshot=round(exit_price, 4),
+                        actual_fill=round(_rest_fill[0], 4),
+                        market_id=pos.market_id,
+                    )
+                else:
+                    log.warning(
+                        "Taker exit fill unconfirmed — recording book snapshot price",
+                        order_id=order_id[:20],
+                        book_snapshot=round(exit_price, 4),
+                        market_id=pos.market_id,
+                    )
+            if _confirmed_exit_price is not None and _confirmed_exit_price > 0:
+                exit_price = _confirmed_exit_price
 
         # Fee model depends on exit type:
         #   RESOLVED    — auto-distribution, no trade → zero fees/rebates.

@@ -1709,24 +1709,37 @@ class MomentumScanner(BaseStrategy):
             hedge_price = config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get(
                 market.market_type, config.MOMENTUM_HEDGE_PRICE
             )
-            # Size hedge by contract count (same # of contracts as main position),
-            # not by USD notional.  Actual USDC cost = contracts × hedge_price.
-            hedge_contracts = round(entry_size * config.MOMENTUM_HEDGE_CONTRACTS_PCT, 6)
-            hedge_size_usd  = round(hedge_contracts * hedge_price, 6)
-            _hedge_price     = hedge_price
-            _hedge_contracts  = hedge_contracts
-            _hedge_size_usd   = hedge_size_usd
-            _hedge_side       = "DOWN" if signal.side in ("YES", "UP") else "UP"
-            # PM requires minimum $1 notional per GTC order.  Skip — never
-            # inflate size to meet the minimum; that changes the hedge economics.
-            if hedge_size_usd < 1.0:
+            # Only place a hedge when the position's projected win PnL exceeds $1.
+            # Projected PnL = what we collect if the token settles at $1 minus
+            # what we paid:  entry_size × (1.0 − entry_price).
+            _projected_pnl = round(entry_size * (1.0 - entry_price), 6)
+            if _projected_pnl <= 1.0:
                 log.debug(
-                    "Momentum: GTD hedge skipped — below PM $1 minimum",
+                    "Momentum: GTD hedge skipped — projected PnL ≤ $1",
                     market=signal.market_title[:50],
-                    hedge_size_usd=round(hedge_size_usd, 4),
+                    projected_pnl=round(_projected_pnl, 4),
                 )
-                hedge_id = None
             else:
+                # Size hedge by contract count (same # of contracts as main position),
+                # not by USD notional.  Actual USDC cost = contracts × hedge_price.
+                hedge_contracts = round(entry_size * config.MOMENTUM_HEDGE_CONTRACTS_PCT, 6)
+                hedge_size_usd  = round(hedge_contracts * hedge_price, 6)
+                # PM requires minimum $1 notional per GTC order.  If the natural
+                # sizing falls below $1, raise to exactly $1 worth of contracts
+                # so the order is accepted without skipping the hedge entirely.
+                if hedge_size_usd < 1.0:
+                    hedge_contracts = round(1.0 / hedge_price, 6)
+                    hedge_size_usd  = round(hedge_contracts * hedge_price, 6)
+                    log.debug(
+                        "Momentum: GTD hedge size raised to $1 minimum",
+                        market=signal.market_title[:50],
+                        hedge_contracts=round(hedge_contracts, 4),
+                    )
+                _hedge_price      = hedge_price
+                _hedge_contracts  = hedge_contracts
+                _hedge_size_usd   = hedge_size_usd
+                _hedge_side       = "DOWN" if signal.side in ("YES", "UP") else "UP"
+                hedge_id: str | None = None
                 try:
                     hedge_id = await self._pm.place_limit(
                         token_id=opp_token,
@@ -1740,34 +1753,34 @@ class MomentumScanner(BaseStrategy):
                 except Exception as _hex:
                     hedge_id = None
                     log.warning("Momentum: GTD hedge error", exc=str(_hex))
-            if hedge_id:
-                log.info(
-                    "Momentum: GTD hedge placed",
-                    market=signal.market_title[:50],
-                    main_side=signal.side,
-                    hedge_side=_hedge_side,
-                    hedge_price=hedge_price,
-                    hedge_contracts=round(hedge_contracts, 4),
-                    hedge_cost_usd=hedge_size_usd,
-                    hedge_id=hedge_id[:20],
-                )
-                _emit_event(
-                    "HEDGE_SUBMIT",
-                    market_id=signal.market_id,
-                    market_title=signal.market_title[:80],
-                    underlying=signal.underlying,
-                    market_type=signal.market_type,
-                    side=signal.side,
-                    hedge_side="DOWN" if signal.side in ("YES", "UP") else "UP",
-                    hedge_price=hedge_price,
-                    hedge_contracts=round(hedge_contracts, 4),
-                    size_usd=hedge_size_usd,
-                    hedge_id=hedge_id,
-                )
-                self._risk.update_gtd_hedge(
-                    signal.market_id, signal.side,
-                    hedge_id, opp_token, hedge_price, hedge_size_usd,
-                )
+                if hedge_id:
+                    log.info(
+                        "Momentum: GTD hedge placed",
+                        market=signal.market_title[:50],
+                        main_side=signal.side,
+                        hedge_side=_hedge_side,
+                        hedge_price=hedge_price,
+                        hedge_contracts=round(hedge_contracts, 4),
+                        hedge_cost_usd=hedge_size_usd,
+                        hedge_id=hedge_id[:20],
+                    )
+                    _emit_event(
+                        "HEDGE_SUBMIT",
+                        market_id=signal.market_id,
+                        market_title=signal.market_title[:80],
+                        underlying=signal.underlying,
+                        market_type=signal.market_type,
+                        side=signal.side,
+                        hedge_side="DOWN" if signal.side in ("YES", "UP") else "UP",
+                        hedge_price=hedge_price,
+                        hedge_contracts=round(hedge_contracts, 4),
+                        size_usd=hedge_size_usd,
+                        hedge_id=hedge_id,
+                    )
+                    self._risk.update_gtd_hedge(
+                        signal.market_id, signal.side,
+                        hedge_id, opp_token, hedge_price, hedge_size_usd,
+                    )
 
         # ── Write momentum fills CSV for execution-quality analysis ──────────
         try:

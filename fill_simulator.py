@@ -213,9 +213,18 @@ class FillSimulator:
         right status when writing the trades.csv momentum_hedge row.
         """
         positions = self._risk.get_positions()
+        now = datetime.now(timezone.utc)
         for pos in positions.values():
             if pos.is_closed:
-                continue
+                mkt = self._pm._markets.get(pos.market_id)
+                end_dt = getattr(mkt, "end_date", None) if mkt is not None else None
+                if end_dt is not None:
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    # Keep simulating closed positions only while the market is
+                    # still live; once expired the GTD order is no longer active.
+                    if now >= end_dt:
+                        continue
             if not pos.hedge_token_id or not pos.hedge_order_id:
                 continue
             if not pos.hedge_order_id.startswith("paper-"):

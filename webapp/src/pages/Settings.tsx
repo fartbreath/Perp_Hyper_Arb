@@ -2000,13 +2000,62 @@ export default function Settings() {
 
             <SectionHead title="Phase D — Downside Hedge" />
             <Toggle
-              label="Hedge Enabled"
-              description="After a confirmed entry, place a low-price GTC limit BUY on the opposite token as oracle-free downside cover. If the held token goes to $0, this resting bid may catch a panic dip."
+              label="Hedge Master Switch"
+              description="Global on/off for the GTD downside hedge. When OFF, no hedge is placed for any bucket. When ON, per-bucket toggles below control which bucket types actually place a hedge."
               value={data.momentum_hedge_enabled ?? false}
               onChange={(v) => apply({ momentum_hedge_enabled: v })}
             />
             {(data.momentum_hedge_enabled ?? false) && (
               <>
+                {GAP}
+                <Toggle
+                  label="5m Bucket Hedge"
+                  description="OFF by default. At ≤60 s TTE there is no time for the fill path (favorable excursion + reversal). Cost is wasted."
+                  value={data.momentum_hedge_enabled_5m ?? false}
+                  onChange={(v) => apply({ momentum_hedge_enabled_5m: v })}
+                />
+                {GAP}
+                <Toggle
+                  label="15m Bucket Hedge"
+                  description="OFF by default. At ≤120 s TTE the whipsaw + recovery path rarely develops before expiry."
+                  value={data.momentum_hedge_enabled_15m ?? false}
+                  onChange={(v) => apply({ momentum_hedge_enabled_15m: v })}
+                />
+                {GAP}
+                <Toggle
+                  label="1h Bucket Hedge"
+                  description="ON by default. At 2–4 min TTE there is meaningful time for a fill + recovery move. Hedge is cancelled on any non-resolved exit to prevent double jeopardy."
+                  value={data.momentum_hedge_enabled_1h ?? true}
+                  onChange={(v) => apply({ momentum_hedge_enabled_1h: v })}
+                />
+                {GAP}
+                <Toggle
+                  label="4h Bucket Hedge"
+                  description="ON by default. Sufficient TTE for fill paths to develop."
+                  value={data.momentum_hedge_enabled_4h ?? true}
+                  onChange={(v) => apply({ momentum_hedge_enabled_4h: v })}
+                />
+                {GAP}
+                <Toggle
+                  label="Daily Bucket Hedge"
+                  description="ON by default."
+                  value={data.momentum_hedge_enabled_daily ?? true}
+                  onChange={(v) => apply({ momentum_hedge_enabled_daily: v })}
+                />
+                {GAP}
+                <Toggle
+                  label="Weekly Bucket Hedge"
+                  description="ON by default."
+                  value={data.momentum_hedge_enabled_weekly ?? true}
+                  onChange={(v) => apply({ momentum_hedge_enabled_weekly: v })}
+                />
+                {GAP}
+                <Toggle
+                  label="Milestone Hedge"
+                  description="ON by default."
+                  value={data.momentum_hedge_enabled_milestone ?? true}
+                  onChange={(v) => apply({ momentum_hedge_enabled_milestone: v })}
+                />
                 {GAP}
                 <FloatInput
                   label="Contracts %"
@@ -2015,6 +2064,15 @@ export default function Settings() {
                   step={10}
                   unit="%"
                   onSubmit={(v) => apply({ momentum_hedge_contracts_pct: v / 100 })}
+                />
+                {GAP}
+                <FloatInput
+                  label="SL Cancel Recovery %"
+                  description="When a delta SL fires, the hedge is NOT cancelled immediately. Instead it is cancelled once delta recovers to SL_threshold × (1 + this). E.g. 50 → cancel when delta rebounds to 1.5× the SL threshold. Set to 0 to cancel immediately on SL (old behaviour)."
+                  value={(data.momentum_hedge_cancel_recovery_pct ?? 0.5) * 100}
+                  step={10}
+                  unit="%"
+                  onSubmit={(v) => apply({ momentum_hedge_cancel_recovery_pct: v / 100 })}
                 />
                 {GAP}
                 <FloatInput
