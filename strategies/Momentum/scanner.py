@@ -1803,6 +1803,16 @@ class MomentumScanner(BaseStrategy):
                         signal.market_id, signal.side,
                         hedge_id, opp_token, hedge_price, hedge_size_usd,
                     )
+                else:
+                    # place_limit returned None without raising — CLOB rejected it.
+                    log.warning(
+                        "Momentum: GTD hedge failed — place_limit returned None",
+                        market=signal.market_title[:50],
+                        main_side=signal.side,
+                        hedge_price=hedge_price,
+                        hedge_contracts=round(hedge_contracts, 4),
+                        hedge_cost_usd=hedge_size_usd,
+                    )
 
         # ── Write momentum fills CSV for execution-quality analysis ──────────
         try:

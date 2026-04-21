@@ -415,16 +415,43 @@ class RiskEngine:
                 stored = (row.get("resolved_outcome") or "").strip()
 
                 if stored in _blank:
-                    # SL/taker exit missing an outcome: fill in resolved_outcome only.
-                    # pnl already reflects the actual CLOB fill — do NOT recompute.
+                    # SL/taker exit missing an outcome: fill in resolved_outcome.
+                    # Also correct PnL if we recorded a loss on a WIN outcome — this
+                    # indicates the GTC floor-fallback path reported the order's limit
+                    # price (e.g. 0.50) rather than the actual PM settlement price.
+                    # PM API is the source of truth: settlement = 1.0 (WIN) / 0.0 (LOSS).
                     row["resolved_outcome"] = correct_outcome
                     patched += 1
-                    log.info(
-                        "patch_trade_outcome: resolved_outcome filled (SL exit)",
-                        market_id=market_id[:20],
-                        side=side,
-                        new_outcome=correct_outcome,
-                    )
+                    _pnl_corrected = False
+                    if correct_outcome == "WIN":
+                        try:
+                            entry = float(row.get("price", 0) or 0)
+                            size  = float(row.get("size",  0) or 0)
+                            fees  = float(row.get("fees_paid",      0) or 0)
+                            reb   = float(row.get("rebates_earned", 0) or 0)
+                            old_pnl = float(row.get("pnl", 0) or 0)
+                            if size > 0 and old_pnl < 0:
+                                new_pnl = (settlement - entry) * size - fees + reb
+                                row["pnl"] = str(round(new_pnl, 10))
+                                _pnl_corrected = True
+                                log.info(
+                                    "patch_trade_outcome: pnl corrected (GTC floor WIN mismatch)",
+                                    market_id=market_id[:20],
+                                    side=side,
+                                    new_outcome=correct_outcome,
+                                    old_pnl=round(old_pnl, 4),
+                                    new_pnl=round(new_pnl, 4),
+                                    settlement=settlement,
+                                )
+                        except (ValueError, TypeError) as exc:
+                            log.warning("patch_trade_outcome: pnl correction parse error", exc=str(exc))
+                    if not _pnl_corrected:
+                        log.info(
+                            "patch_trade_outcome: resolved_outcome filled (SL exit)",
+                            market_id=market_id[:20],
+                            side=side,
+                            new_outcome=correct_outcome,
+                        )
                 elif force and stored != correct_outcome:
                     # RESOLVED exit with wrong outcome: update outcome AND recompute pnl.
                     try:
@@ -446,6 +473,30 @@ class RiskEngine:
                         )
                     except (ValueError, TypeError) as exc:
                         log.warning("patch_trade_outcome: numeric parse error", exc=str(exc))
+                elif force and correct_outcome == "WIN":
+                    # force=True: outcome already correct but PnL may be wrong due to
+                    # GTC floor-fallback recording the limit price instead of settlement.
+                    # Correct if PnL is negative on a WIN outcome.
+                    try:
+                        entry   = float(row.get("price",          0) or 0)
+                        size    = float(row.get("size",           0) or 0)
+                        fees    = float(row.get("fees_paid",      0) or 0)
+                        rebates = float(row.get("rebates_earned", 0) or 0)
+                        old_pnl = float(row.get("pnl",            0) or 0)
+                        if size > 0 and old_pnl < 0:
+                            new_pnl = (settlement - entry) * size - fees + rebates
+                            row["pnl"] = str(round(new_pnl, 10))
+                            patched += 1
+                            log.info(
+                                "patch_trade_outcome: pnl corrected (GTC floor WIN mismatch, force)",
+                                market_id=market_id[:20],
+                                side=side,
+                                old_pnl=round(old_pnl, 4),
+                                new_pnl=round(new_pnl, 4),
+                                settlement=settlement,
+                            )
+                    except (ValueError, TypeError) as exc:
+                        log.warning("patch_trade_outcome: pnl correction parse error", exc=str(exc))
 
             if patched == 0:
                 return 0

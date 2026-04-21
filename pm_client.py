@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -1210,8 +1211,21 @@ class PMClient:
                 )
                 if 0.0 < retry_price < 1.0 and abs(retry_price - rounded_price) >= tick * 0.5:
                     try:
+                        # PM requires ≥ $1 notional per GTC order.  If the price
+                        # back-off reduces notional below $1, raise size to compensate.
+                        retry_size = size
+                        retry_notional = retry_size * retry_price
+                        if retry_notional < 1.0 and retry_price > 0:
+                            retry_size = self._round_to_tick(
+                                math.ceil(1.0 / retry_price / tick) * tick, tick
+                            )
+                            log.debug(
+                                "place_limit cross-retry: size raised to meet $1 minimum",
+                                token_id=token_id, retry_price=retry_price,
+                                original_size=size, retry_size=retry_size,
+                            )
                         order_args2 = OrderArgs(
-                            token_id=token_id, price=retry_price, size=size, side=side
+                            token_id=token_id, price=retry_price, size=retry_size, side=side
                         )
                         signed2 = await asyncio.to_thread(self._clob.create_order, order_args2)
                         resp2 = await asyncio.to_thread(
@@ -1222,7 +1236,7 @@ class PMClient:
                             "Limit order posted with cross-adjusted price",
                             token_id=token_id, side=side,
                             attempted=rounded_price, actual=retry_price,
-                            size=size, order_id=order_id2,
+                            size=retry_size, order_id=order_id2,
                         )
                         return order_id2
                     except Exception as exc2:

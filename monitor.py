@@ -2156,6 +2156,8 @@ class PositionMonitor:
                 # Market order — crosses the spread for immediate fill (stop-loss/manual).
                 # Retry up to 5 times (500 ms apart) before falling back to a GTC limit.
                 order_id = None
+                _gtc_floor_fallback_used: bool = False
+                _gtc_floor_price: float = 0.0
                 for _attempt in range(5):
                     order_id = await self._pm.place_market(
                         token_id=sell_token,
@@ -2191,6 +2193,8 @@ class PositionMonitor:
                         market=market,
                         post_only=False,
                     )
+                    _gtc_floor_fallback_used = order_id is not None
+                    _gtc_floor_price = _floor_price
                 if order_id is None and not config.PAPER_TRADING:
                     log.error(
                         "EXIT_ORDER_FAILED — manual intervention required",
@@ -2300,7 +2304,24 @@ class PositionMonitor:
                         market_id=pos.market_id,
                     )
             if _confirmed_exit_price is not None and _confirmed_exit_price > 0:
-                exit_price = _confirmed_exit_price
+                # GTC floor fallback: REST returns the order's limit price (= floor),
+                # not the actual settlement price.  PM may have settled the GTC at a
+                # much better price (e.g. resolution at 1.0).  Discard the floor price
+                # so the book-snapshot exit_price is kept instead.
+                if (
+                    _gtc_floor_fallback_used
+                    and _confirmed_exit_price <= _gtc_floor_price + 0.005
+                ):
+                    log.warning(
+                        "Monitor: GTC floor fallback — REST returned floor limit price, "
+                        "keeping book-snapshot exit price",
+                        floor_price=_gtc_floor_price,
+                        rest_price=_confirmed_exit_price,
+                        keeping_price=round(exit_price, 4),
+                        market_id=pos.market_id,
+                    )
+                else:
+                    exit_price = _confirmed_exit_price
 
         # Fee model depends on exit type:
         #   RESOLVED    — auto-distribution, no trade → zero fees/rebates.
