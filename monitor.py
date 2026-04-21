@@ -903,6 +903,17 @@ class PositionMonitor:
                     fill_price=fill_price,
                     fill_size=round(fill_size, 4),
                 )
+                _emit_event(
+                    "HEDGE_FILL",
+                    market_id=parent.market_id,
+                    market_title=parent.market_title[:80],
+                    hedge_token_id=parent.hedge_token_id,
+                    hedge_order_id=parent.hedge_order_id,
+                    hedge_status=hedge_status,
+                    fill_price=fill_price,
+                    fill_size=round(fill_size, 4),
+                    source="paper",
+                )
                 return
 
         # Fallback: HedgeOrder entity tracks WS fills via update_hedge_fill()
@@ -923,6 +934,17 @@ class PositionMonitor:
                 hedge_status=hedge_status,
                 fill_price=ho.avg_fill_price,
                 fill_size=round(ho.size_filled, 4),
+            )
+            _emit_event(
+                "HEDGE_FILL",
+                market_id=parent.market_id,
+                market_title=parent.market_title[:80],
+                hedge_token_id=parent.hedge_token_id,
+                hedge_order_id=parent.hedge_order_id,
+                hedge_status=hedge_status,
+                fill_price=ho.avg_fill_price,
+                fill_size=round(ho.size_filled, 4),
+                source="ws",
             )
             return
 
@@ -965,6 +987,17 @@ class PositionMonitor:
                         hedge_status=hedge_status,
                         fill_price=rest_fill_price,
                         fill_size=round(rest_fill_size, 4),
+                    )
+                    _emit_event(
+                        "HEDGE_FILL",
+                        market_id=parent.market_id,
+                        market_title=parent.market_title[:80],
+                        hedge_token_id=parent.hedge_token_id,
+                        hedge_order_id=parent.hedge_order_id,
+                        hedge_status=hedge_status,
+                        fill_price=rest_fill_price,
+                        fill_size=round(rest_fill_size, 4),
+                        source="clob_rest",
                     )
                     return
 
@@ -1018,6 +1051,17 @@ class PositionMonitor:
                 fill_price=fill_price,
                 fill_size=round(fill_size, 4),
             )
+            _emit_event(
+                "HEDGE_FILL",
+                market_id=parent.market_id,
+                market_title=parent.market_title[:80],
+                hedge_token_id=parent.hedge_token_id,
+                hedge_order_id=parent.hedge_order_id,
+                hedge_status=hedge_status,
+                fill_price=fill_price,
+                fill_size=round(fill_size, 4),
+                source="reconciliation",
+            )
             return
 
         # All layers exhausted — mark as unfilled
@@ -1044,6 +1088,14 @@ class PositionMonitor:
             "Pending resolution: GTD hedge marked unfilled",
             condition_id=condition_id[:16],
             hedge_token_id=parent.hedge_token_id[:16],
+        )
+        _emit_event(
+            "HEDGE_EXPIRED",
+            market_id=parent.market_id,
+            market_title=parent.market_title[:80],
+            hedge_token_id=parent.hedge_token_id,
+            hedge_order_id=parent.hedge_order_id,
+            hedge_price=parent.hedge_price,
         )
 
     # ── Pending market-outcome resolution ─────────────────────────────────────

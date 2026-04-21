@@ -14,8 +14,9 @@ Event types (adapted from PTB-bot _emit_trading_analysis schema):
   SELL_CLOSE          — position closed (TP fill, SL, near-expiry, or RESOLVED)
   SELL_FAILED         — exit order placement failed (manual intervention needed)
   HEDGE_SUBMIT        — GTD hedge BUY limit order placed on opposite token
-  HEDGE_FILL          — GTD hedge token settled as winner (payout recorded)
-  HEDGE_CANCEL        — GTD hedge order cancelled on take-profit win (recovery no longer needed)
+  HEDGE_FILL          — GTD hedge outcome recorded at market resolution (filled_won / filled_lost)
+  HEDGE_EXPIRED       — GTD hedge order never filled; all detection layers exhausted
+  HEDGE_CANCEL        — GTD hedge order cancelled (delta recovered or take-profit win)
 
 Schema (schema_version=1):
   {
