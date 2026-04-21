@@ -1451,8 +1451,8 @@ class MomentumScanner(BaseStrategy):
                             "BUY_FILL",
                             market_id=signal.market_id,
                             side=signal.side,
-                            fill_price=round(actual_fill[0], 6),
-                            fill_size=round(actual_fill[1], 6),
+                            fill_price=round(actual_fill["price"], 6),
+                            fill_size=round(actual_fill["size_matched"], 6),
                             fill_from_ws=True,
                             retry=_retry,
                             order_id=order_id,
@@ -1468,8 +1468,8 @@ class MomentumScanner(BaseStrategy):
                         "BUY_FILL",
                         market_id=signal.market_id,
                         side=signal.side,
-                        fill_price=round(rest_check[0], 6),
-                        fill_size=round(rest_check[1], 6),
+                        fill_price=round(rest_check["price"], 6),
+                        fill_size=round(rest_check["size_matched"], 6),
                         fill_from_ws=False,
                         retry=_retry,
                         order_id=order_id,
@@ -1527,7 +1527,7 @@ class MomentumScanner(BaseStrategy):
         #   2. REST fallback → also set above on WS timeout.
         #   3. Paper mode / REST unavailable → derive from order_price.
         if actual_fill is not None:
-            raw_fill_price, actual_size = actual_fill
+            raw_fill_price, actual_size = actual_fill["price"], actual_fill["size_matched"]
 
             # ── Post-fill slippage guard ─────────────────────────────────────
             # Abort if the fill landed below the signal band floor.  A fill
@@ -1537,14 +1537,36 @@ class MomentumScanner(BaseStrategy):
             _band_lo = config.MOMENTUM_PRICE_BAND_LOW
             if raw_fill_price < _band_lo:
                 log.warning(
-                    "Momentum: fill price below band floor — aborting position",
+                    "Momentum: fill price below band floor — registering for settlement",
                     market=signal.market_title[:60],
                     signal_price=signal.token_price,
                     fill_price=raw_fill_price,
                     band_lo=_band_lo,
                     order_id=order_id[:20],
                 )
-                await self._pm.cancel_order(order_id)
+                # Tokens are in the wallet — outcome unknown until PM settles.
+                # Register the position so the monitor's PM-payout resolution path
+                # writes the correct trades.csv row.  Skip active SL/TP management
+                # (return False below) but let settlement handle the close.
+                _entry_cost_bfa = round(raw_fill_price * actual_size, 6)
+                _pos_bfa = Position(
+                    market_id=signal.market_id,
+                    market_type=signal.market_type,
+                    underlying=signal.underlying,
+                    side=signal.side,
+                    size=actual_size,
+                    entry_price=raw_fill_price,
+                    entry_cost_usd=_entry_cost_bfa,
+                    strategy="momentum",
+                    token_id=signal.token_id,
+                    market_title=signal.market_title,
+                    order_id=order_id,
+                    tte_years=signal.tte_seconds / (365.25 * 86400),
+                    spot_price=signal.spot,
+                    strike=signal.strike,
+                    signal_source="band_floor_abort",
+                )
+                self._risk.open_position(_pos_bfa)
                 return False
 
             entry_price = raw_fill_price  # actual token fill price for both YES and NO

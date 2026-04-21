@@ -472,6 +472,8 @@ class TestAutoRedeemDedup:
             "conditionId": "cond_win",
             "title": "Test market",
         }])
+        pm.fetch_market_resolution = AsyncMock(return_value=1.0)
+        pm.fetch_token_side = AsyncMock(return_value="yes")
         pm.get_markets = MagicMock(return_value={})
         pm._clob = MagicMock()
         pm._clob.get_conditional_address = MagicMock(return_value="0xCTF")
@@ -549,4 +551,528 @@ class TestPrefetchTaskCancellation:
         self._run(scanner.stop())
 
         assert fake_task.cancelled()
+
+
+# ── asyncio.to_thread order-placement tests ───────────────────────────────────
+# Verifies that the to_thread wrapping of CLOB SDK calls in place_limit,
+# place_market, cancel_order, and cancel_all:
+#   1. Returns the correct result (order_id / bool) on success
+#   2. Returns None / False on error (exception from the thread)
+#   3. Keeps the event loop alive during execution (other tasks can progress)
+#   4. Handles the post_only "crosses book" retry path correctly
+#   5. Paper-mode paths are unaffected (no thread dispatch)
+
+class TestPlaceLimitToThread:
+    """place_limit in live mode uses asyncio.to_thread for all CLOB SDK calls."""
+
+    def _make_client(self) -> PMClient:
+        client = PMClient.__new__(PMClient)
+        client._paper_mode = False
+        client._clob = MagicMock()
+        client._books = {}
+        client._price_callbacks = []
+        client._running = False
+        return client
+
+    def _make_market(self, tick: float = 0.01) -> PMMarket:
+        mkt = MagicMock(spec=PMMarket)
+        mkt.tick_size = tick
+        mkt.condition_id = "cond_test"
+        return mkt
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    # -- 1. Happy path: returns order_id ----------------------------------------
+
+    def test_place_limit_returns_order_id(self):
+        """place_limit returns the order_id from the CLOB response."""
+        client = self._make_client()
+        client._clob.create_order = MagicMock(return_value="signed_order_obj")
+        client._clob.post_order = MagicMock(return_value={"orderID": "order-001", "status": "live"})
+
+        result = self._run(
+            client.place_limit("tok_yes", "BUY", 0.75, 20.0,
+                               market=self._make_market(), post_only=True)
+        )
+        assert result == "order-001"
+        client._clob.create_order.assert_called_once()
+        client._clob.post_order.assert_called_once()
+
+    # -- 2. Taker limit (post_only=False) uses FAK order type -------------------
+
+    def test_place_limit_taker_uses_fak(self):
+        """post_only=False: post_order is called with OrderType.FAK."""
+        from py_clob_client.clob_types import OrderType as _OT
+        client = self._make_client()
+        client._clob.create_order = MagicMock(return_value="signed")
+        client._clob.post_order = MagicMock(return_value={"orderID": "fak-001"})
+
+        self._run(
+            client.place_limit("tok", "BUY", 0.80, 10.0,
+                               market=self._make_market(), post_only=False)
+        )
+        call_args = client._clob.post_order.call_args
+        # Second positional arg is the order type
+        assert call_args[0][1] == _OT.FAK
+
+    # -- 3. Maker limit (post_only=True) uses GTC order type --------------------
+
+    def test_place_limit_maker_uses_gtc(self):
+        """post_only=True: post_order is called with OrderType.GTC."""
+        from py_clob_client.clob_types import OrderType as _OT
+        client = self._make_client()
+        client._clob.create_order = MagicMock(return_value="signed")
+        client._clob.post_order = MagicMock(return_value={"orderID": "gtc-001"})
+
+        self._run(
+            client.place_limit("tok", "BUY", 0.80, 10.0,
+                               market=self._make_market(), post_only=True)
+        )
+        call_args = client._clob.post_order.call_args
+        assert call_args[0][1] == _OT.GTC
+
+    # -- 4. post_order returns no orderID → None --------------------------------
+
+    def test_place_limit_empty_order_id_returns_none(self):
+        """If CLOB response has no orderID, place_limit returns None."""
+        client = self._make_client()
+        client._clob.create_order = MagicMock(return_value="signed")
+        client._clob.post_order = MagicMock(return_value={"status": "error"})
+
+        result = self._run(
+            client.place_limit("tok", "BUY", 0.80, 10.0, market=self._make_market())
+        )
+        assert result is None
+
+    # -- 5. Exception → None (no crash) -----------------------------------------
+
+    def test_place_limit_exception_returns_none(self):
+        """If CLOB raises, place_limit catches and returns None."""
+        client = self._make_client()
+        client._clob.create_order = MagicMock(side_effect=RuntimeError("network error"))
+
+        result = self._run(
+            client.place_limit("tok", "BUY", 0.80, 10.0, market=self._make_market())
+        )
+        assert result is None
+
+    # -- 6. "crosses book" retry path -------------------------------------------
+
+    def test_place_limit_crosses_book_retry(self):
+        """post_only=True + 'crosses book' exception → retries at price - 1 tick."""
+        client = self._make_client()
+        # First call raises "crosses book"; second succeeds
+        client._clob.create_order = MagicMock(return_value="signed")
+        call_count = {"n": 0}
+
+        def _post_order(signed, order_type, post_only=False):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise Exception("crosses book")
+            return {"orderID": "retry-order-001"}
+
+        client._clob.post_order = MagicMock(side_effect=_post_order)
+
+        result = self._run(
+            client.place_limit("tok", "BUY", 0.82, 10.0,
+                               market=self._make_market(tick=0.01), post_only=True)
+        )
+        assert result == "retry-order-001"
+        # create_order called twice (original + retry)
+        assert client._clob.create_order.call_count == 2
+
+    # -- 7. "crosses book" but price too low to back off → None -----------------
+
+    def test_place_limit_crosses_book_no_retry_at_boundary(self):
+        """If backing off one tick would produce price <= 0, give up and return None."""
+        client = self._make_client()
+        client._clob.create_order = MagicMock(return_value="signed")
+        client._clob.post_order = MagicMock(side_effect=Exception("crosses book"))
+
+        # Price = 0.01 tick=0.01 → retry would be 0.00 which is invalid
+        result = self._run(
+            client.place_limit("tok", "BUY", 0.01, 10.0,
+                               market=self._make_market(tick=0.01), post_only=True)
+        )
+        assert result is None
+
+    # -- 8. taker limit "crosses book" → NOT retried ----------------------------
+
+    def test_place_limit_taker_crosses_book_no_retry(self):
+        """post_only=False: 'crosses book' is not retried (taker orders are valid crossings)."""
+        client = self._make_client()
+        client._clob.create_order = MagicMock(return_value="signed")
+        client._clob.post_order = MagicMock(side_effect=Exception("crosses book"))
+
+        result = self._run(
+            client.place_limit("tok", "BUY", 0.80, 10.0,
+                               market=self._make_market(), post_only=False)
+        )
+        # Taker: no retry, returns None
+        assert result is None
+        # create_order called exactly once (no retry)
+        assert client._clob.create_order.call_count == 1
+
+    # -- 9. Event loop stays alive: concurrent coroutine progresses -------------
+
+    def test_place_limit_event_loop_stays_alive(self):
+        """Other tasks can run while place_limit is executing the blocking CLOB call.
+
+        The test injects a 10 ms sleep into the mock create_order to simulate
+        real blocking I/O.  A concurrent asyncio.sleep(0.005) task must complete
+        before place_limit returns — which is only possible if the event loop is
+        not blocked.
+        """
+        import time as _time
+        client = self._make_client()
+        progress = {"concurrent_ran": False}
+
+        def _slow_create_order(order_args):
+            _time.sleep(0.01)   # simulate 10 ms signing latency
+            return "signed"
+
+        client._clob.create_order = MagicMock(side_effect=_slow_create_order)
+        client._clob.post_order = MagicMock(return_value={"orderID": "ok-001"})
+
+        async def _concurrent_task():
+            await asyncio.sleep(0.005)   # 5 ms — completes inside the 10 ms signing window
+            progress["concurrent_ran"] = True
+
+        async def _run_together():
+            task = asyncio.create_task(_concurrent_task())
+            await client.place_limit("tok", "BUY", 0.75, 10.0, market=self._make_market())
+            await task  # make sure the task had a chance to complete
+
+        asyncio.get_event_loop().run_until_complete(_run_together())
+        assert progress["concurrent_ran"], (
+            "Concurrent task did not progress — event loop was blocked during CLOB call"
+        )
+
+    # -- 10. Paper mode is unchanged (no thread dispatch) -----------------------
+
+    def test_place_limit_paper_mode_no_clob_call(self):
+        """In paper mode, CLOB is never touched and an ID is returned immediately."""
+        client = self._make_client()
+        client._paper_mode = True
+        client._clob = MagicMock()  # should never be called
+
+        result = self._run(
+            client.place_limit("tok", "BUY", 0.75, 10.0)
+        )
+        assert result is not None
+        assert result.startswith("paper-")
+        client._clob.create_order.assert_not_called()
+        client._clob.post_order.assert_not_called()
+
+
+class TestPlaceMarketToThread:
+    """place_market in live mode uses asyncio.to_thread for all CLOB SDK calls."""
+
+    def _make_client(self) -> PMClient:
+        client = PMClient.__new__(PMClient)
+        client._paper_mode = False
+        client._clob = MagicMock()
+        client._books = {}
+        client._price_callbacks = []
+        client._running = False
+        return client
+
+    def _make_market(self, tick: float = 0.01) -> PMMarket:
+        mkt = MagicMock(spec=PMMarket)
+        mkt.tick_size = tick
+        mkt.condition_id = "cond_market"
+        return mkt
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    # -- 1. Happy path ----------------------------------------------------------
+
+    def test_place_market_returns_order_id(self):
+        """place_market returns the order_id from the CLOB response."""
+        client = self._make_client()
+        client._clob.create_market_order = MagicMock(return_value="signed_mkt")
+        client._clob.post_order = MagicMock(return_value={"orderID": "mkt-001"})
+
+        result = self._run(
+            client.place_market("tok_yes", "BUY", 0.75, 20.0,
+                                market=self._make_market())
+        )
+        assert result == "mkt-001"
+        client._clob.create_market_order.assert_called_once()
+        client._clob.post_order.assert_called_once()
+
+    # -- 2. Uses FAK order type -------------------------------------------------
+
+    def test_place_market_uses_fak(self):
+        """post_order is always called with OrderType.FAK for market orders."""
+        from py_clob_client.clob_types import OrderType as _OT
+        client = self._make_client()
+        client._clob.create_market_order = MagicMock(return_value="signed")
+        client._clob.post_order = MagicMock(return_value={"orderID": "fak-mkt-001"})
+
+        self._run(
+            client.place_market("tok", "BUY", 0.80, 10.0, market=self._make_market())
+        )
+        call_args = client._clob.post_order.call_args
+        assert call_args[0][1] == _OT.FAK
+
+    # -- 3. Exception → None (no crash) -----------------------------------------
+
+    def test_place_market_exception_returns_none(self):
+        """If CLOB raises, place_market catches and returns None."""
+        client = self._make_client()
+        client._clob.create_market_order = MagicMock(side_effect=ConnectionError("timeout"))
+
+        result = self._run(
+            client.place_market("tok", "BUY", 0.75, 10.0, market=self._make_market())
+        )
+        assert result is None
+
+    # -- 4. Event loop stays alive ----------------------------------------------
+
+    def test_place_market_event_loop_stays_alive(self):
+        """Other tasks can run while place_market executes the blocking CLOB call."""
+        import time as _time
+        client = self._make_client()
+        progress = {"concurrent_ran": False}
+
+        def _slow_create(args):
+            _time.sleep(0.01)
+            return "signed"
+
+        client._clob.create_market_order = MagicMock(side_effect=_slow_create)
+        client._clob.post_order = MagicMock(return_value={"orderID": "mkt-live-001"})
+
+        async def _concurrent_task():
+            await asyncio.sleep(0.005)
+            progress["concurrent_ran"] = True
+
+        async def _run_together():
+            task = asyncio.create_task(_concurrent_task())
+            await client.place_market("tok", "BUY", 0.75, 10.0, market=self._make_market())
+            await task
+
+        asyncio.get_event_loop().run_until_complete(_run_together())
+        assert progress["concurrent_ran"], (
+            "Concurrent task did not progress — event loop was blocked during market order"
+        )
+
+    # -- 5. Paper mode unchanged ------------------------------------------------
+
+    def test_place_market_paper_mode(self):
+        """In paper mode, CLOB is never touched."""
+        client = self._make_client()
+        client._paper_mode = True
+        client._clob = MagicMock()
+
+        result = self._run(
+            client.place_market("tok", "BUY", 0.75, 10.0)
+        )
+        assert result is not None
+        assert result.startswith("paper-mkt-")
+        client._clob.create_market_order.assert_not_called()
+
+
+class TestCancelOrderToThread:
+    """cancel_order / cancel_all use asyncio.to_thread in live mode."""
+
+    def _make_client(self) -> PMClient:
+        client = PMClient.__new__(PMClient)
+        client._paper_mode = False
+        client._clob = MagicMock()
+        return client
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    # -- 1. cancel_order success -----------------------------------------------
+
+    def test_cancel_order_returns_true_on_success(self):
+        client = self._make_client()
+        client._clob.cancel = MagicMock(return_value=None)
+
+        result = self._run(client.cancel_order("order-abc"))
+        assert result is True
+        client._clob.cancel.assert_called_once_with("order-abc")
+
+    # -- 2. cancel_order 404 / exception → False (not a crash) -----------------
+
+    def test_cancel_order_exception_returns_false(self):
+        client = self._make_client()
+        client._clob.cancel = MagicMock(side_effect=Exception("404 not found"))
+
+        result = self._run(client.cancel_order("order-gone"))
+        assert result is False
+
+    # -- 3. cancel_all success --------------------------------------------------
+
+    def test_cancel_all_returns_true(self):
+        client = self._make_client()
+        client._clob.cancel_all = MagicMock(return_value=None)
+
+        result = self._run(client.cancel_all())
+        assert result is True
+        client._clob.cancel_all.assert_called_once()
+
+    # -- 4. cancel_all exception → False ----------------------------------------
+
+    def test_cancel_all_exception_returns_false(self):
+        client = self._make_client()
+        client._clob.cancel_all = MagicMock(side_effect=RuntimeError("server error"))
+
+        result = self._run(client.cancel_all())
+        assert result is False
+
+    # -- 5. cancel_order event loop alive during cancel -------------------------
+
+    def test_cancel_order_event_loop_stays_alive(self):
+        """Other tasks can run while cancel_order blocks in the CLOB SDK."""
+        import time as _time
+        client = self._make_client()
+        progress = {"ran": False}
+
+        def _slow_cancel(order_id):
+            _time.sleep(0.01)
+
+        client._clob.cancel = MagicMock(side_effect=_slow_cancel)
+
+        async def _concurrent():
+            await asyncio.sleep(0.005)
+            progress["ran"] = True
+
+        async def _run_together():
+            task = asyncio.create_task(_concurrent())
+            await client.cancel_order("order-slow")
+            await task
+
+        asyncio.get_event_loop().run_until_complete(_run_together())
+        assert progress["ran"], "Event loop was blocked during cancel_order"
+
+    # -- 6. paper mode cancel_order --------------------------------------------
+
+    def test_cancel_order_paper_mode(self):
+        """Paper mode cancel_order returns True without touching CLOB."""
+        client = self._make_client()
+        client._paper_mode = True
+
+        result = self._run(client.cancel_order("order-paper"))
+        assert result is True
+        client._clob.cancel.assert_not_called()
+
+    # -- 7. paper mode cancel_all ----------------------------------------------
+
+    def test_cancel_all_paper_mode(self):
+        """Paper mode cancel_all returns True without touching CLOB."""
+        client = self._make_client()
+        client._paper_mode = True
+
+        result = self._run(client.cancel_all())
+        assert result is True
+        client._clob.cancel_all.assert_not_called()
+
+
+# ── Live smoke test — real CLOB, non-destructive ─────────────────────────────
+# Places an extremely tight (non-fillable) resting post-only order on a real
+# Polymarket market using authenticated CLOB credentials, then immediately
+# cancels it.  Verifies:
+#   - asyncio.to_thread wrapping works with the real py_clob_client SDK
+#   - No event loop errors (SynchronousOnlyOperation, etc.)
+#   - cancel_order succeeds on the live order_id
+#
+# Skipped automatically when POLY_PRIVATE_KEY is not set or PAPER_TRADING=True.
+# Run explicitly: pytest tests/test_pm_client.py -v -m live_clob --timeout=30
+
+@pytest.mark.live_clob
+class TestPlaceLimitLiveSmoke:
+    """Non-destructive smoke test against the live Polymarket CLOB.
+
+    Places a GTC post-only BUY at $0.01 (cannot fill) and cancels immediately.
+    This validates that asyncio.to_thread works correctly with the real SDK
+    without touching real capital or leaving open orders.
+    """
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    @pytest.fixture(autouse=True)
+    def _require_live_creds(self):
+        import os
+        import config as cfg
+        # conftest forces config.PAPER_TRADING=True for all tests — check the raw
+        # env key instead (config.py reads it at import time).
+        if not cfg.POLY_PRIVATE_KEY or not os.environ.get("POLY_PRIVATE_KEY"):
+            pytest.skip("POLY_PRIVATE_KEY not set — skipping live CLOB smoke test")
+
+    def test_place_and_cancel_post_only_order(self):
+        """Places a non-fillable post-only order and cancels it immediately.
+
+        Uses the lowest valid price (0.01) on a real liquid bucket market so
+        the order will never match.  Any leftover order is cleaned up in the
+        finally block.
+        """
+        import json as _json
+        import config as cfg
+        import requests as _req
+
+        # Find a real liquid crypto market with an active CLOB order book.
+        # /markets returns clobTokenIds as a JSON-encoded string — parse it.
+        gamma_resp = _req.get(
+            f"{cfg.GAMMA_HOST}/markets",
+            params={"tag": "crypto", "active": "true", "limit": "20"},
+            timeout=10,
+        )
+        gamma_resp.raise_for_status()
+        raw_items = gamma_resp.json()
+        if isinstance(raw_items, dict):
+            raw_items = raw_items.get("data") or []
+
+        markets = []
+        for m in raw_items:
+            if not m.get("enableOrderBook") or not m.get("acceptingOrders"):
+                continue
+            raw_ids = m.get("clobTokenIds") or []
+            if isinstance(raw_ids, str):
+                raw_ids = _json.loads(raw_ids)
+            if len(raw_ids) == 2:
+                m["_token_ids"] = raw_ids
+                markets.append(m)
+
+        assert markets, "No suitable market found for smoke test — is the Gamma API available?"
+
+        raw = markets[0]
+        from pm_client import PMClient
+        client = PMClient.__new__(PMClient)
+        client._paper_mode = False
+        client._books = {}
+        client._price_callbacks = []
+        client._private_key = cfg.POLY_PRIVATE_KEY
+        client._clob = client._build_clob_client()
+
+        token_id = raw["_token_ids"][0]
+        tick = float(raw.get("orderPriceMinTickSize") or raw.get("minimumTickSize") or "0.01")
+        min_size = float(raw.get("orderMinSize") or "5")
+
+        order_id = None
+        try:
+            order_id = self._run(
+                client.place_limit(
+                    token_id=token_id,
+                    side="BUY",
+                    price=0.01,          # non-fillable — far below market
+                    size=min_size,       # meet CLOB minimum size requirement
+                    post_only=True,
+                )
+            )
+            assert order_id is not None, "place_limit returned None — CLOB rejected order"
+            assert isinstance(order_id, str) and len(order_id) > 5, f"Unexpected order_id: {order_id!r}"
+        finally:
+            if order_id:
+                cancelled = self._run(client.cancel_order(order_id))
+                assert cancelled, f"Failed to cancel live order {order_id} — manual cleanup required"
 

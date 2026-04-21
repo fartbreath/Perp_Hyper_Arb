@@ -2860,6 +2860,57 @@ def _time_of_day_heatmap(sorted_rows: list[dict]) -> list[dict]:
     ]
 
 
+# ── Market P&L ────────────────────────────────────────────────────────────────
+
+@app.get("/market_pnl")
+def market_pnl_all() -> dict:
+    """Return RiskEngine.market_pnl() for every market that has at least one
+    tracked position (open or recently closed).
+
+    Response:
+        { "markets": { <market_id>: MarketPnlDict, ... }, "timestamp": float }
+
+    Each value is the dict returned by RiskEngine.market_pnl(market_id):
+        realized_pnl        — sum of closed position legs
+        unrealised_pnl      — 0.0 (server has no live book price here;
+                              use the position-level unrealised_pnl_usd field)
+        hedge_realized_pnl  — HedgeOrder.net_pnl for the market
+        total_pnl           — realized + unrealised + hedge_realized
+        positions           — list of {side, size, entry_price, realized_pnl, is_closed}
+        hedge               — HedgeOrder summary or null
+    """
+    if state.risk_ref is None:
+        return {"markets": {}, "timestamp": time.time()}
+
+    # Collect unique market IDs from currently-tracked positions (including
+    # recently closed ones that are still in state.positions).
+    market_ids: set[str] = {
+        p["condition_id"]
+        for p in state.positions.values()
+        if p.get("condition_id") and not p.get("condition_id", "").startswith("hl_hedge_")
+    }
+    result = {}
+    for mid in market_ids:
+        try:
+            result[mid] = state.risk_ref.market_pnl(mid)
+        except Exception:
+            pass  # individual market errors must not break the whole response
+
+    return {"markets": result, "timestamp": time.time()}
+
+
+@app.get("/market_pnl/{market_id}")
+def market_pnl_single(market_id: str) -> dict:
+    """Return RiskEngine.market_pnl() for a single market.
+
+    Returns 404 if the risk engine is not yet initialised; returns a zero-value
+    dict if the market_id is unknown (no positions tracked for it).
+    """
+    if state.risk_ref is None:
+        raise HTTPException(status_code=503, detail="Risk engine not yet initialised")
+    return state.risk_ref.market_pnl(market_id)
+
+
 # ── Server entry point ────────────────────────────────────────────────────────
 
 async def run_api_server(port: int = config.API_PORT) -> None:

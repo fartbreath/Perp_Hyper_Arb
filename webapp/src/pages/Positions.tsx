@@ -9,8 +9,8 @@
  * HL hedges: individual rows (unchanged).
  */
 import { useState } from "react";
-import { usePositions, useMakerSignals, useLivePositions, useConfig, undeployQuote, closePosition, dismissGhostPosition, redeemPosition } from "../api/client";
-import type { Position, RedeemResult } from "../api/client";
+import { usePositions, useMakerSignals, useLivePositions, useConfig, useMarketPnl, undeployQuote, closePosition, dismissGhostPosition, redeemPosition } from "../api/client";
+import type { Position, MarketPnlRow, RedeemResult } from "../api/client";
 import { usePolymarketEventSlugs } from "../utils/usePolymarketEventSlugs";
 
 function timeSince(iso: string | null | undefined): string {
@@ -318,12 +318,14 @@ function MomentumRow({
   onClose,
   marketUrl,
   takeProfit,
+  pnl,
 }: {
   pos: Position;
   closeState: string | undefined;
   onClose: (id: string) => void;
   marketUrl: string | null;
   takeProfit: number;
+  pnl?: MarketPnlRow | null;
 }) {
   const tokenEntry = pos.token_entry_price ?? (pos.side === "NO" ? 1 - pos.entry_price : pos.entry_price);
   const tokenCurrent = pos.token_current_price ??
@@ -398,10 +400,25 @@ function MomentumRow({
           <span style={{ color: "#374151" }}>—</span>
         ) : pos.hedge_fill_detected ? (
           <span
-            title={`Hedge filled by counterparty\nOrder: ${pos.hedge_order_id}\nToken: ${pos.hedge_token_id ?? "—"}\nFill price: ${(Number(pos.hedge_price ?? 0) * 100).toFixed(1)}¢\nFill size: ${Number(pos.hedge_fill_size ?? 0).toFixed(2)} contracts`}
+            title={[
+              `Hedge filled by counterparty`,
+              `Order: ${pos.hedge_order_id}`,
+              `Token: ${pos.hedge_token_id ?? "—"}`,
+              `Fill price: ${(Number(pos.hedge_price ?? 0) * 100).toFixed(1)}¢`,
+              `Fill size: ${Number(pos.hedge_fill_size ?? 0).toFixed(2)} contracts`,
+              pnl?.hedge_realized_pnl != null
+                ? `Hedge P&L: ${pnl.hedge_realized_pnl >= 0 ? "+" : ""}$${pnl.hedge_realized_pnl.toFixed(2)}`
+                : "",
+            ].filter(Boolean).join("\n")}
             style={{ padding: "2px 6px", borderRadius: 4, fontWeight: 600, fontSize: "0.72rem", background: "#052e16", color: "#22c55e", cursor: "help" }}
           >
             Filled · {Number(pos.hedge_fill_size ?? 0).toFixed(1)}ct
+            {pnl?.hedge_realized_pnl != null && pnl.hedge_realized_pnl !== 0 && (
+              <span style={{ marginLeft: 4, color: pnl.hedge_realized_pnl >= 0 ? "#86efac" : "#fca5a5" }}>
+                {pnl.hedge_realized_pnl >= 0 ? "+" : ""}
+                ${Math.abs(pnl.hedge_realized_pnl).toFixed(2)}
+              </span>
+            )}
           </span>
         ) : (
           <span
@@ -445,6 +462,7 @@ export default function Positions() {
   const [closeState, setCloseState] = useState<Record<string, string>>({});
   const { data: signalsData } = useMakerSignals();
   const { data: cfg } = useConfig();
+  const { data: marketPnlData } = useMarketPnl();
   const [orderPending, setOrderPending] = useState<string | null>(null);
   const openOrders = (signalsData?.signals ?? []).filter((s) => s.is_deployed);
 
@@ -719,6 +737,7 @@ export default function Positions() {
                   onClose={handleClose}
                   marketUrl={marketUrl}
                   takeProfit={takeProfit}
+                  pnl={marketPnlData?.markets?.[pos.condition_id]}
                 />
               );
             })}
@@ -761,6 +780,7 @@ export default function Positions() {
                     onClose={handleClose}
                     marketUrl={marketUrl}
                     takeProfit={takeProfit}
+                    pnl={marketPnlData?.markets?.[pos.condition_id]}
                   />
                 );
               })}

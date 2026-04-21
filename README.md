@@ -203,6 +203,18 @@ Key parameters:
 
 ## Recent Changes
 
+### 2026-04-21 — HedgeOrder lifecycle entity; async CLOB I/O; market_pnl API; sortable Signals table
+
+- **`HedgeOrder` entity** (`risk.py`): full FIX-style lifecycle tracking for GTD hedge orders — `OPEN → PARTIALLY_FILLED → FILLED/CANCELLED/EXPIRED` with per-fill history, VWAP accumulation, and deferred-cancel state. Persisted to `data/hedge_orders.json`. Replaces scattered `Position` fields and the transient `_pending_hedge_cancels` dict in `PositionMonitor`.
+- **`market_pnl(market_id)`** (`risk.py`): new `RiskEngine` method returning a JSON-serializable P&L snapshot (realized + unrealised + hedge) for all positions/hedges in a market. Exposed via `GET /market_pnl` and `GET /market_pnl/{market_id}`.
+- **Async CLOB I/O** (`pm_client.py`): `create_order()`, `post_order()`, `create_market_order()`, `cancel()`, and `cancel_all()` now run in `asyncio.to_thread()`, eliminating event-loop stalls during order placement. `get_order_fill_rest()` returns a `dict` instead of a tuple; the `associate_trades` fetch path removed (was returning counterparty-perspective prices).
+- **Band-floor abort fix** (`scanner.py`): fill prices below `MOMENTUM_PRICE_BAND_LOW` now register the position for PM-payout settlement instead of silently discarding it.
+- **Trades.csv additive migration** (`risk.py`): new `hedge_size_filled` and `hedge_avg_fill_price` columns; `_ensure_csv()` migrates existing files in-place when the change is purely additive.
+- **Webapp — Positions**: `hedge_fill_detected/size/price` now serialised in SSE rows; hedge badge correctly transitions to "Filled"; market P&L rendered inline via `useMarketPnl()` hook.
+- **Webapp — Signals**: Momentum Scan table columns (Bucket, Δ% vs Threshold, TTE, Status) are now clickable sort controls.
+- **Webapp — Trades**: `HedgeSection` shows fill ratio and handles `filled_exited`, `cancelled_partial`, `expired_partial` statuses with distinct badge colours.
+- **Tests**: 1,095 passing; `test_pm_client.py` added (526 lines), new risk/HedgeOrder lifecycle tests.
+
 ### 2026-04-12 — Dip-market delta fix, Kelly negative-EV guard, per-bucket multiplier
 
 - **Dip-market NO delta direction fix** (`monitor.py`): `should_exit()` and `_write_momentum_tick()` now infer the winning direction for NO/DOWN positions from `pos.spot_price` recorded at entry. If `entry_spot > strike` (the "Will ETH dip to $X?" flavour), the delta formula is `(spot − strike) / strike × 100` rather than the inverted reach-market version. This fixes instant false stop-losses that fired in the same second as entry for any dip-market NO.
@@ -266,6 +278,8 @@ The API server runs on port 8080. Read-only endpoints are open; mutating endpoin
 | `GET /logs/errors` | Long-lived WARNING/ERROR log buffer |
 | `GET /proxy/polymarket/events` | Backend proxy for Polymarket event slugs |
 | `GET /fills` | Paper fill history |
+| `GET /market_pnl` | Combined realized + hedge P&L for all tracked markets |
+| `GET /market_pnl/{market_id}` | P&L snapshot for a single market |
 
 ### Mutating (require auth)
 
@@ -314,7 +328,7 @@ pytest tests/test_maker.py -v
 pytest --cov=. --cov-report=term-missing
 ```
 
-**887 tests collected** (unit tests; live RTDS/on-chain tests excluded from default run) as of the current release.
+**1,095 tests collected** (unit tests; live RTDS/on-chain tests excluded from default run) as of the current release.
 
 Test files:
 - `tests/test_maker.py` — strategy quoting, repricing, inventory skew, edge filters

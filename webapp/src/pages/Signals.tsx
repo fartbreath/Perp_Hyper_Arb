@@ -104,6 +104,20 @@ export default function Signals() {
   const { data: diagData } = useMomentumDiagnostics();
   const slugMap = usePolymarketEventSlugs();
   const [actionPending, setActionPending] = useState<string | null>(null);
+  const [momentumSort, setMomentumSort] = useState<{ col: string; dir: "asc" | "desc" }>({ col: "gap_pct", dir: "desc" });
+
+  function toggleMomentumSort(col: string) {
+    setMomentumSort(prev =>
+      prev.col === col
+        ? { col, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { col, dir: col === "tte_seconds" ? "asc" : "desc" }
+    );
+  }
+
+  function sortIndicator(col: string) {
+    if (momentumSort.col !== col) return <span style={{ color: "#334155", marginLeft: 3 }}>⇅</span>;
+    return <span style={{ marginLeft: 3 }}>{momentumSort.dir === "asc" ? "▲" : "▼"}</span>;
+  }
 
   const intervalLabel = cfg
     ? cfg.mispricing_scan_interval >= 60
@@ -382,9 +396,24 @@ export default function Signals() {
             (m) => !SCAN_HIDDEN.has(m.skip_reason)
           );
           const sortedMarkets = [...inWindowMarkets].sort((a, b) => {
-            const key = (m: MomentumDiagnosticMarket) =>
-              m.skip_reason === "signal_fired" ? Infinity : (m.gap_pct ?? -Infinity);
-            return key(b) - key(a);
+            const dir = momentumSort.dir === "desc" ? -1 : 1;
+            switch (momentumSort.col) {
+              case "gap_pct": {
+                const av = a.skip_reason === "signal_fired" ? Infinity : (a.gap_pct ?? -Infinity);
+                const bv = b.skip_reason === "signal_fired" ? Infinity : (b.gap_pct ?? -Infinity);
+                return (av - bv) * dir;
+              }
+              case "delta_pct":
+                return ((a.delta_pct ?? -Infinity) - (b.delta_pct ?? -Infinity)) * dir;
+              case "tte_seconds":
+                return ((a.tte_seconds ?? Infinity) - (b.tte_seconds ?? Infinity)) * dir;
+              case "skip_reason":
+                return (a.skip_reason ?? "").localeCompare(b.skip_reason ?? "") * dir;
+              case "market_type":
+                return (a.market_type ?? "").localeCompare(b.market_type ?? "") * dir;
+              default:
+                return 0;
+            }
           });
           const totalScanned = diagData?.summary?.bucket_markets ?? null;
           const scanAge = diagData?.scan_ts
@@ -418,13 +447,29 @@ export default function Signals() {
                         <tr style={{ borderBottom: "1px solid #1e293b", color: "#64748b", textAlign: "left" }}>
                           <th style={{ padding: "0.4rem 0.6rem" }}>Market</th>
                           <th style={{ padding: "0.4rem 0.6rem" }}>Coin</th>
-                          <th style={{ padding: "0.4rem 0.6rem" }}>Bucket</th>
+                          <th
+                            style={{ padding: "0.4rem 0.6rem", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
+                            onClick={() => toggleMomentumSort("market_type")}
+                            title="Sort by bucket type"
+                          >Bucket{sortIndicator("market_type")}</th>
                           <th style={{ padding: "0.4rem 0.6rem" }}>Side</th>
                           <th style={{ padding: "0.4rem 0.6rem" }} title="Token price in YES-space">Price</th>
                           <th style={{ padding: "0.4rem 0.6rem" }} title="Recorded strike — window-open spot for Up/Down, parsed from title otherwise">Strike / Spot</th>
-                          <th style={{ padding: "0.4rem 0.6rem" }} title="Spot move vs vol-adjusted threshold">Δ% vs ≥Threshold</th>
-                          <th style={{ padding: "0.4rem 0.6rem" }} title="Time to expiry">TTE</th>
-                          <th style={{ padding: "0.4rem 0.6rem" }}>Status</th>
+                          <th
+                            style={{ padding: "0.4rem 0.6rem", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
+                            onClick={() => toggleMomentumSort("gap_pct")}
+                            title="Sort by Δ% gap vs threshold"
+                          >Δ% vs ≥Threshold{sortIndicator("gap_pct")}</th>
+                          <th
+                            style={{ padding: "0.4rem 0.6rem", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
+                            onClick={() => toggleMomentumSort("tte_seconds")}
+                            title="Sort by time to expiry"
+                          >TTE{sortIndicator("tte_seconds")}</th>
+                          <th
+                            style={{ padding: "0.4rem 0.6rem", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
+                            onClick={() => toggleMomentumSort("skip_reason")}
+                            title="Sort by status"
+                          >Status{sortIndicator("skip_reason")}</th>
                         </tr>
                       </thead>
                       <tbody>

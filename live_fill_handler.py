@@ -631,12 +631,16 @@ class LiveFillHandler:
         if key is None:
             # Check if this is a GTD hedge order fill (placed by momentum scanner,
             # never registered in the maker's active_quotes dict).
-            hedge_pos = self._risk.get_position_by_hedge_order_id(order_id)
+            hedge_pos = self._risk.get_position_for_hedge(order_id)
             if hedge_pos is not None:
+                self._risk.update_hedge_fill(order_id, fill_price, cumulative_matched, "ws")
+                # Mirror fill data onto the Position so monitor._exit_position can
+                # use the WS-confirmed fill instead of the REST CLOB fallback.
                 hedge_pos.hedge_fill_detected = True
-                hedge_pos.hedge_fill_size = round(cumulative_matched, 6)
+                hedge_pos.hedge_fill_size = cumulative_matched
+                hedge_pos.hedge_fill_price = fill_price
                 log.info(
-                    "LiveFillHandler: GTD hedge order filled via WS — marked on position",
+                    "LiveFillHandler: GTD hedge order filled via WS — HedgeOrder updated",
                     order_id=order_id[:20],
                     market=str(hedge_pos.market_title or "")[:60],
                     fill_price=fill_price,

@@ -456,6 +456,11 @@ async def state_sync_loop(
                     "hedge_token_id": pos.hedge_token_id or None,
                     "hedge_price": pos.hedge_price if pos.hedge_price else None,
                     "hedge_size_usd": pos.hedge_size_usd if pos.hedge_size_usd else None,
+                    # Hedge fill state — populated by live_fill_handler when the
+                    # GTD bid is matched mid-trade (WS MATCHED event).
+                    "hedge_fill_detected": pos.hedge_fill_detected,
+                    "hedge_fill_size": pos.hedge_fill_size if pos.hedge_fill_size else None,
+                    "hedge_fill_price": pos.hedge_fill_price if pos.hedge_fill_price else None,
                     # Closed-position visibility (present only when recently closed)
                     "is_closed": pos.is_closed,
                     "closed_at": pos.closed_at.isoformat() if pos.closed_at else None,

@@ -2,6 +2,158 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-21] - HedgeOrder lifecycle entity; async CLOB I/O; Signals sort; Trades fill-ratio display; market_pnl API
+
+### Feature — First-class `HedgeOrder` entity (`risk.py`)
+
+**Problem:** GTD hedge state was scattered across `Position` fields, a transient
+`_pending_hedge_cancels` dict in `PositionMonitor`, and ad-hoc logic in several files.
+Fills were stored only as WS-detected booleans; there was no structured per-fill history,
+no VWAP tracking, and no FIX-style lifecycle (open → partially_filled → filled).
+
+**New `HedgeOrder` dataclass** tracks the full lifecycle of every GTD hedge order:
+- Identity fields: `order_id`, `market_id`, `token_id`, `underlying`, `market_type`,
+  `market_title`, `placed_at`
+- Order params: `order_price`, `order_size`, `order_size_usd`
+- Live state: `status` (FIX-style via `HedgeStatus` constants), `size_filled`,
+  `size_remaining`, `avg_fill_price` (VWAP), `fills: list[HedgeFill]`
+- Deferred-cancel state: `pending_cancel_threshold`, `pending_cancel_side`,
+  `pending_cancel_strike`, `pending_cancel_entry_spot` — replaces the transient
+  `PositionMonitor._pending_hedge_cancels` dict; survives bot restarts
+- Resolution: `settled_price`, `resolved_at`, `spot_at_resolution`, `net_pnl`
+- Parent reference: `parent_side` for O(1) `order_id → Position` lookup
+
+**New `HedgeFill` dataclass:** `fill_id`, `price`, `size`, `timestamp`, `source`
+(`"ws"` | `"clob_rest"` | `"reconciliation"` | `"paper"`)
+
+**New `HedgeStatus` class:** `OPEN`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`,
+`CANCELLED_PARTIAL`, `EXPIRED_UNFILLED`, `EXPIRED_PARTIAL`, `FILLED_EXITED`, and a
+`TERMINAL` frozenset.
+
+**Persistence:** `HedgeOrder` entities are persisted to `data/hedge_orders.json` on
+every state change and reloaded on startup.
+
+**New `RiskEngine` methods:**
+- `register_hedge_order(...)` — creates and persists a new `HedgeOrder`
+- `update_hedge_fill(order_id, price, size, source)` — records a fill event,
+  updates VWAP and `size_filled`, transitions status to `PARTIALLY_FILLED`/`FILLED`
+- `update_gtd_hedge(...)` — mirrors `parent_side` onto the HedgeOrder entity
+- `finalize_hedge(order_id, settled_price, spot_at_resolution, hedge_status)` — writes
+  the terminal status and `net_pnl`; called at market resolution
+- `get_position_for_hedge(order_id)` — O(1) lookup via `parent_side` key; falls back
+  to O(n) scan for legacy orders missing `parent_side`
+- `get_position_by_hedge_order_id(order_id)` — deprecated alias for the above
+- `get_hedge_order_by_market(market_id)` — returns the most recent non-terminal (or
+  any terminal) `HedgeOrder` for a market
+- `get_hedge_orders_with_pending_cancel()` — returns all HedgeOrders with a live
+  deferred-cancel threshold; replaces the in-memory `_pending_hedge_cancels` dict
+- `market_pnl(market_id) → dict` — combined realized + unrealised + hedge P&L snapshot
+  for a market; returns JSON-serializable dict consumed by the webapp and api_server
+
+### Feature — Additive `trades.csv` schema migration (`risk.py`)
+
+Two new columns added to `TRADES_HEADER`:
+- `hedge_size_filled` — contracts actually matched (hedge rows only)
+- `hedge_avg_fill_price` — VWAP across all fill events (hedge rows only)
+
+`_ensure_csv()` now distinguishes between additive schema changes (old header is a
+prefix of the new one) and incompatible ones. For additive changes it migrates the
+existing file in-place (appends empty columns to every row) rather than backing up and
+discarding the history.
+
+### Fix — Async CLOB I/O (`pm_client.py`)
+
+`create_order()`, `post_order()`, `create_market_order()`, `cancel()`, and
+`cancel_all()` all use the blocking `requests` library under the hood. These were called
+directly from the asyncio event loop, which stalled WS book-cache updates during the
+signing + HTTP POST window.
+
+All five calls now run via `asyncio.to_thread()`, keeping the event loop alive for WS
+processing right up until (and during) the order-placement round trip.
+
+`get_order_fill_rest()` return type changed from `Optional[tuple[float, float]]` to
+`Optional[dict]` with keys `price`, `size_matched`, `size_remaining`, `status`. The old
+`associate_trades` path was removed — it was fetching data from the counterparty
+perspective, producing wrong price/size values (observed: price=0.97, size=1822 for a
+0.035 × 28.57 hedge order). The order's own `price` field is now used as the fill price.
+
+### Fix — `PositionMonitor` deferred-cancel dict replaced by `HedgeOrder` (`monitor.py`)
+
+`_pending_hedge_cancels: dict[str, dict]` removed. All cancel-trigger state now lives on
+`HedgeOrder.pending_cancel_*` fields, loaded from `hedge_orders.json`. The `on_price_update`
+loop calls `risk.get_hedge_orders_with_pending_cancel()` instead of iterating the local dict.
+
+`_add_pending_resolution` now coerces `underlying`, `market_slug`, and `market_type` args
+to `str` (guards against `MagicMock` objects leaking in from test harness). `end_date` is
+only converted with `.isoformat()` if it is a `datetime` instance.
+
+### Fix — Band-floor abort path registers position (`scanner.py`)
+
+Previously, when a momentum fill landed below `MOMENTUM_PRICE_BAND_LOW`, the order was
+cancelled and the bot discarded the position entirely — tokens already in the wallet with
+no settlement path. The abort path now registers a `Position` with `signal_source="band_floor_abort"`,
+ensuring the PM-payout resolution path in `monitor.py` records the correct trades.csv row.
+
+`scanner.py` updated to use `actual_fill["price"]` and `actual_fill["size_matched"]`
+dict keys (matching the new `get_order_fill_rest()` return type).
+
+### Feature — `GET /market_pnl` and `GET /market_pnl/{market_id}` endpoints (`api_server.py`)
+
+Two new read-only endpoints expose `RiskEngine.market_pnl()` to the webapp:
+- `GET /market_pnl` — returns P&L for all markets with tracked positions
+- `GET /market_pnl/{market_id}` — returns P&L for a single market; 503 if risk engine not ready
+
+Response shape: `{ "markets": { "<market_id>": MarketPnlRow }, "timestamp": float }`
+
+### Feature — Webapp: hedge fill fields in SSE position rows (`main.py`)
+
+`hedge_fill_detected`, `hedge_fill_size`, and `hedge_fill_price` were present on the
+`Position` dataclass but never serialised into the SSE position dict in `state_sync_loop`.
+`Positions.tsx`'s hedge badge always saw `undefined` and could never transition to the
+"Filled" state even when WS detection had fired.
+
+### Feature — Webapp: market P&L inline in Positions page; hedge fill badge (`Positions.tsx`, `client.ts`)
+
+`useMarketPnl()` hook polls `/market_pnl` every 10 s. `MomentumRow` and `RangeRow`
+receive a `pnl?: MarketPnlRow | null` prop and, when a hedge fill is confirmed and
+`hedge_realized_pnl` is non-zero, render the realized hedge P&L inline next to the
+fill badge (green `+$X.XX` / red `-$X.XX`).
+
+New types in `client.ts`: `MarketPnlPosition`, `MarketPnlHedge`, `MarketPnlRow`,
+`MarketPnlResponse`. New per-bucket hedge toggle fields added to `ConfigData`
+(`momentum_hedge_enabled_5m/15m/1h/4h/daily/weekly/milestone`). `Trade` interface gains
+`hedge_size_filled` and `hedge_avg_fill_price`.
+
+### Feature — Webapp: sortable Momentum Scan table (`Signals.tsx`)
+
+Column headers Bucket, Δ% vs Threshold, TTE, and Status are now clickable sort controls.
+Default sort remains `gap_pct` descending. Clicking the same column toggles asc/desc;
+clicking a different column resets to that column's natural direction (TTE defaults to
+ascending; others descend). Active sort column shows a ▲/▼ indicator.
+
+### Feature — Webapp: hedge fill-ratio display + new statuses (`Trades.tsx`)
+
+The HedgeSection component now reads `hedge_size_filled` and `hedge_avg_fill_price` from
+the trade row and computes fill ratio when available. Three new terminal statuses are
+handled with distinct badge colours:
+- `filled_exited` — hedge order filled during deferred-cancel window, then market-sold
+- `cancelled_partial` — cancelled after accumulating partial fills
+- `expired_partial` — GTD order expired with partial fill
+
+### Tests
+
+`tests/test_pm_client.py` added (526 lines): covers `get_order_fill_rest()` dict return,
+`asyncio.to_thread()` wrapping for `create_order`/`post_order`/`cancel`/`cancel_all`,
+`fetch_token_side()`, and paper-mode guards.
+
+`tests/test_risk.py` additions: `HedgeOrder` lifecycle (`register_hedge_order`,
+`update_hedge_fill`, `finalize_hedge`, VWAP accumulation, terminal-state guard),
+`get_position_for_hedge()` O(1) path and legacy fallback, `market_pnl()`.
+
+Full suite: **1,095 passed, 1 skipped** (the skipped test is a live Chainlink feed test).
+
+---
+
 ## [2026-04-20] - Fix: hedge fill detection pipeline; webapp hedge state badge
 
 ### Fix — GTD hedge fills silently dropped by WS fill handler (`live_fill_handler.py`, `risk.py`, `monitor.py`)

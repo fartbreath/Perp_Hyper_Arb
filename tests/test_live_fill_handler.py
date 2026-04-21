@@ -153,7 +153,7 @@ class TestLiveModeStartup:
         pm.on_order_fill.assert_called_once_with(handler._on_order_fill)
 
     def test_get_live_orders_before_position_restore(self):
-        """get_live_orders must be called before get_live_positions (order matters)."""
+        """get_live_positions must be called before get_live_orders (positions populate risk first)."""
         call_order = []
 
         async def _orders():
@@ -169,7 +169,7 @@ class TestLiveModeStartup:
         pm.get_live_positions = _positions
 
         asyncio.get_event_loop().run_until_complete(handler.startup_restore())
-        assert call_order == ["get_live_orders", "get_live_positions"]
+        assert call_order == ["get_live_positions", "get_live_orders"]
 
 
 # ── Position restore ───────────────────────────────────────────────────────────

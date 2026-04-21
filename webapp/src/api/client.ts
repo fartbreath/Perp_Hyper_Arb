@@ -186,6 +186,12 @@ export interface Trade {
   hedge_token_id?: string;
   hedge_price?: string;
   hedge_size_usd?: string;
+  // Hedge fill lifecycle — set when the resting bid is matched (HedgeOrder)
+  hedge_size_filled?: string;
+  hedge_avg_fill_price?: string;
+  // Hedge fill lifecycle — set when the resting bid is matched (HedgeOrder)
+  hedge_size_filled?: string;
+  hedge_avg_fill_price?: string;
   // Hedge outcome — written when market resolves (PM API is source of truth)
   hedge_status?: string;        // "filled_won" | "filled_lost" | "unfilled" | "cancelled" | ""
   spot_resolve_price?: string;  // oracle spot at market resolution (hedge rows); "0" otherwise
@@ -543,9 +549,23 @@ export interface ConfigData {
   momentum_min_elapsed_4h?: number;
   momentum_min_elapsed_daily?: number;
   momentum_min_elapsed_weekly?: number;
-  momentum_min_elapsed_milestone?: number;
+  momentum_min_elenabled_5m?: boolean;
+  momentum_hedge_enabled_15m?: boolean;
+  momentum_hedge_enabled_1h?: boolean;
+  momentum_hedge_enabled_4h?: boolean;
+  momentum_hedge_enabled_daily?: boolean;
+  momentum_hedge_enabled_weekly?: boolean;
+  momentum_hedge_enabled_milestone?: boolean;
+  momentum_hedge_apsed_milestone?: number;
   // Phase D — hedge
   momentum_hedge_enabled?: boolean;
+  momentum_hedge_enabled_5m?: boolean;
+  momentum_hedge_enabled_15m?: boolean;
+  momentum_hedge_enabled_1h?: boolean;
+  momentum_hedge_enabled_4h?: boolean;
+  momentum_hedge_enabled_daily?: boolean;
+  momentum_hedge_enabled_weekly?: boolean;
+  momentum_hedge_enabled_milestone?: boolean;
   momentum_hedge_price?: number;
   momentum_hedge_contracts_pct?: number;
   momentum_hedge_cancel_recovery_pct?: number;
@@ -846,6 +866,51 @@ export const useMarketOutcomes = () =>
 export const usePerformance = (period: "7d" | "30d" | "all" = "all") =>
   usePolling<PerformanceData>(`/performance?period=${period}`, 30_000);
 export const useInventory = () => usePolling<InventoryData>("/maker/inventory");
+
+// ── Market P&L ────────────────────────────────────────────────────────────────
+
+/** Per-position summary as returned inside MarketPnlRow.positions. */
+export interface MarketPnlPosition {
+  side: string;
+  size: number;
+  entry_price: number;
+  realized_pnl: number;
+  is_closed: boolean;
+  strategy: string;
+}
+
+/** HedgeOrder summary embedded in MarketPnlRow. */
+export interface MarketPnlHedge {
+  order_id: string;
+  status: string;
+  order_price: number;
+  size_filled: number;
+  avg_fill_price: number;
+  net_pnl: number;
+  parent_side: string;
+}
+
+/** Aggregate P&L snapshot for a single market (from /market_pnl or /market_pnl/{id}). */
+export interface MarketPnlRow {
+  market_id: string;
+  realized_pnl: number;
+  /** Always 0.0 from the server — use position-level unrealised_pnl_usd for live value. */
+  unrealised_pnl: number;
+  hedge_realized_pnl: number;
+  total_pnl: number;
+  positions: MarketPnlPosition[];
+  hedge: MarketPnlHedge | null;
+}
+
+/** Response from GET /market_pnl (all active markets). */
+export interface MarketPnlResponse {
+  markets: Record<string, MarketPnlRow>;
+  timestamp: number;
+}
+
+/** Polls /market_pnl every 10 s — covers all markets that have open positions. */
+export const useMarketPnl = () =>
+  usePolling<MarketPnlResponse>("/market_pnl", 10_000);
 
 export async function toggleBot(active: boolean): Promise<{ active: boolean }> {
   const res = await fetch(`${BASE_URL}/bot`, {

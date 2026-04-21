@@ -2602,7 +2602,10 @@ class TestGTDHedge:
 
         config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
 
-        config.MOMENTUM_MAX_ENTRY_USD = 3.0
+        # Use a large enough max entry so projected_pnl = entry_size×(1−price) > $1
+        # (hedge is skipped when projected_pnl ≤ $1).  With bucket_5m kelly_multiplier=0.45:
+        # kelly_size_usd = 0.45 × 20 = 9 USD → entry_size = 9/0.85 ≈ 10.6 → pnl ≈ $1.59.
+        config.MOMENTUM_MAX_ENTRY_USD = 20.0
 
         config.MOMENTUM_KELLY_FRACTION = 1.0
 

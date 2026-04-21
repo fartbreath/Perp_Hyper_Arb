@@ -5,6 +5,7 @@ Run:  pytest tests/test_risk.py -v
 """
 import math
 import sys
+import tempfile
 from pathlib import Path
 
 # Make project root importable
@@ -835,6 +836,203 @@ class TestGtdHedgeLookup:
         assert pos.hedge_token_id == "tok_up_xyz"
         assert abs(pos.hedge_price - 0.04) < 1e-9
         assert abs(pos.hedge_size_usd - 15.0) < 1e-9
+
+
+# ── get_position_for_hedge (O(1) keyed lookup) ───────────────────────────────
+
+class TestGetPositionForHedge:
+    """Tests for RiskEngine.get_position_for_hedge() — the O(1) keyed variant."""
+
+    def _make_engine_with_hedge(self):
+        engine = RiskEngine()
+        pos = Position(
+            market_id="mkt_h",
+            market_type="bucket_1h",
+            underlying="ETH",
+            side="YES",
+            size=100.0,
+            entry_price=0.60,
+            strategy="momentum",
+            entry_cost_usd=60.0,
+        )
+        engine.open_position(pos)
+        engine.register_hedge_order(
+            order_id="ho_001",
+            market_id="mkt_h",
+            token_id="tok_no_h",
+            underlying="ETH",
+            market_type="bucket_1h",
+            market_title="Will ETH hit $3k?",
+            order_price=0.04,
+            order_size=25.0,
+            order_size_usd=1.0,
+            parent_side="YES",
+        )
+        engine.update_gtd_hedge(
+            market_id="mkt_h",
+            side="YES",
+            hedge_order_id="ho_001",
+            hedge_token_id="tok_no_h",
+            hedge_price=0.04,
+            hedge_size_usd=1.0,
+        )
+        return engine, pos
+
+    def test_finds_position_by_order_id(self):
+        engine, pos = self._make_engine_with_hedge()
+        result = engine.get_position_for_hedge("ho_001")
+        assert result is not None
+        assert result.market_id == "mkt_h"
+        assert result.side == "YES"
+
+    def test_returns_none_for_unknown_order(self):
+        engine, _ = self._make_engine_with_hedge()
+        assert engine.get_position_for_hedge("no_such_order") is None
+
+    def test_returns_none_after_position_closed(self):
+        engine, _ = self._make_engine_with_hedge()
+        engine.close_position("mkt_h", exit_price=0.90, side="YES")
+        assert engine.get_position_for_hedge("ho_001") is None
+
+    def test_parent_side_stored_on_hedge_order(self):
+        engine, _ = self._make_engine_with_hedge()
+        ho = engine.get_hedge_order("ho_001")
+        assert ho is not None
+        assert ho.parent_side == "YES"
+
+    def test_deprecated_alias_still_works(self):
+        """get_position_by_hedge_order_id is a backwards-compat alias."""
+        engine, _ = self._make_engine_with_hedge()
+        result = engine.get_position_by_hedge_order_id("ho_001")
+        assert result is not None
+        assert result.side == "YES"
+
+    def test_legacy_fallback_when_no_hedge_entity(self):
+        """If no HedgeOrder entity exists, falls back to O(n) scan on Position.hedge_order_id."""
+        engine = RiskEngine()
+        pos = Position(
+            market_id="mkt_legacy",
+            market_type="bucket_1h",
+            underlying="BTC",
+            side="NO",
+            size=50.0,
+            entry_price=0.40,
+            strategy="momentum",
+            entry_cost_usd=20.0,
+        )
+        engine.open_position(pos)
+        # Set hedge_order_id directly on Position without registering a HedgeOrder entity
+        pos.hedge_order_id = "legacy_order_xyz"
+        result = engine.get_position_for_hedge("legacy_order_xyz")
+        assert result is not None
+        assert result.side == "NO"
+
+
+# ── market_pnl ───────────────────────────────────────────────────────────────
+
+class TestMarketPnl:
+    """Tests for RiskEngine.market_pnl()."""
+
+    def _make_engine(self):
+        import risk as risk_module
+        self._orig_csv = risk_module.TRADES_CSV
+        tmp_dir = tempfile.mkdtemp()
+        risk_module.TRADES_CSV = Path(tmp_dir) / "trades.csv"
+        self._risk_module = risk_module
+        return RiskEngine()
+
+    def teardown_method(self):
+        if hasattr(self, "_risk_module"):
+            self._risk_module.TRADES_CSV = self._orig_csv
+
+    def test_empty_market_returns_zeros(self):
+        engine = self._make_engine()
+        result = engine.market_pnl("no_such_market")
+        assert result["market_id"] == "no_such_market"
+        assert result["realized_pnl"] == 0.0
+        assert result["unrealised_pnl"] == 0.0
+        assert result["hedge_realized_pnl"] == 0.0
+        assert result["total_pnl"] == 0.0
+        assert result["positions"] == []
+        assert result["hedge"] is None
+
+    def test_realized_pnl_from_closed_position(self):
+        engine = self._make_engine()
+        pos = Position(
+            market_id="mkt_001",
+            market_type="bucket_1h",
+            underlying="BTC",
+            side="YES",
+            size=100.0,
+            entry_price=0.40,
+            strategy="momentum",
+            entry_cost_usd=40.0,
+        )
+        engine.open_position(pos)
+        engine.close_position("mkt_001", exit_price=0.60, side="YES")
+        result = engine.market_pnl("mkt_001")
+        # pnl = (0.60 - 0.40) * 100 = $20
+        assert abs(result["realized_pnl"] - 20.0) < 1e-6
+        assert result["total_pnl"] == result["realized_pnl"]
+        assert len(result["positions"]) == 1
+        assert result["positions"][0]["is_closed"] is True
+
+    def test_open_position_shows_in_positions_list(self):
+        engine = self._make_engine()
+        pos = Position(
+            market_id="mkt_002",
+            market_type="bucket_1h",
+            underlying="ETH",
+            side="YES",
+            size=200.0,
+            entry_price=0.55,
+            strategy="momentum",
+            entry_cost_usd=110.0,
+        )
+        engine.open_position(pos)
+        result = engine.market_pnl("mkt_002")
+        assert result["realized_pnl"] == 0.0
+        assert len(result["positions"]) == 1
+        assert result["positions"][0]["is_closed"] is False
+        assert result["positions"][0]["side"] == "YES"
+
+    def test_result_is_json_serializable(self):
+        import json
+        engine = self._make_engine()
+        result = engine.market_pnl("mkt_999")
+        # Should not raise
+        json.dumps(result)
+
+    def test_hedge_summary_included_when_present(self):
+        engine = self._make_engine()
+        pos = Position(
+            market_id="mkt_003",
+            market_type="bucket_1h",
+            underlying="BTC",
+            side="YES",
+            size=100.0,
+            entry_price=0.50,
+            strategy="momentum",
+            entry_cost_usd=50.0,
+        )
+        engine.open_position(pos)
+        engine.register_hedge_order(
+            order_id="ho_mkt003",
+            market_id="mkt_003",
+            token_id="tok_no_003",
+            underlying="BTC",
+            market_type="bucket_1h",
+            market_title="Will BTC reach $80k?",
+            order_price=0.04,
+            order_size=25.0,
+            order_size_usd=1.0,
+            parent_side="YES",
+        )
+        result = engine.market_pnl("mkt_003")
+        assert result["hedge"] is not None
+        assert result["hedge"]["order_id"] == "ho_mkt003"
+        assert result["hedge"]["parent_side"] == "YES"
+        assert result["hedge"]["net_pnl"] == 0.0  # not yet finalized
 
 
 class TestRecordHedgeFill:

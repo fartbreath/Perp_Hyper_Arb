@@ -1172,11 +1172,17 @@ class PMClient:
             )
             # NOTE: post_only goes to post_order(), NOT create_order() — passing a dict
             # to create_order(options=) causes "'dict' object has no attribute 'tick_size'"
-            signed = self._clob.create_order(order_args)
+            # Sign in a thread — create_order() uses requests (blocking I/O) and
+            # would stall the event loop, freezing WS book-cache updates during the
+            # signing window.
+            signed = await asyncio.to_thread(self._clob.create_order, order_args)
             # Taker orders (post_only=False) use FAK so any unfilled remainder is
             # immediately cancelled rather than resting as a passive maker bid.
             order_type_enum = OrderType.GTC if post_only else OrderType.FAK
-            resp = self._clob.post_order(signed, order_type_enum, post_only=post_only)
+            # Post in a thread — post_order() is a blocking HTTP POST.
+            resp = await asyncio.to_thread(
+                self._clob.post_order, signed, order_type_enum, post_only
+            )
             order_id = resp.get("orderID")
             log.info("Limit order posted", token_id=token_id, side=side,
                      price=rounded_price, size=size, post_only=post_only,
@@ -1207,8 +1213,10 @@ class PMClient:
                         order_args2 = OrderArgs(
                             token_id=token_id, price=retry_price, size=size, side=side
                         )
-                        signed2 = self._clob.create_order(order_args2)
-                        resp2 = self._clob.post_order(signed2, OrderType.GTC, post_only=True)
+                        signed2 = await asyncio.to_thread(self._clob.create_order, order_args2)
+                        resp2 = await asyncio.to_thread(
+                            self._clob.post_order, signed2, OrderType.GTC, True
+                        )
                         order_id2 = resp2.get("orderID")
                         log.warning(
                             "Limit order posted with cross-adjusted price",
@@ -1263,9 +1271,12 @@ class PMClient:
                 price=rounded_price,
                 order_type=OrderType.FAK,
             )
-            # create_market_order auto-calculates price from the book if price=0
-            signed = self._clob.create_market_order(market_args)
-            resp = self._clob.post_order(signed, OrderType.FAK)
+            # Sign in a thread — create_market_order() is blocking (requests).
+            # Keeping the event loop alive during signing means WS book-cache
+            # updates continue right up until post_order() fires.
+            signed = await asyncio.to_thread(self._clob.create_market_order, market_args)
+            # Post in a thread — blocking HTTP POST.
+            resp = await asyncio.to_thread(self._clob.post_order, signed, OrderType.FAK)
             order_id = resp.get("orderID")
             log.info("Market order posted (FAK)", token_id=token_id, side=side,
                      price=rounded_price, size=size, order_id=order_id)
@@ -1285,13 +1296,16 @@ class PMClient:
             log.error("place_market failed", exc=str(exc), token_id=token_id)
             return None
 
-    async def get_order_fill_rest(self, order_id: str) -> Optional[tuple[float, float]]:
+    async def get_order_fill_rest(self, order_id: str) -> Optional[dict]:
         """Fetch fill details from the REST CLOB without the 1-second sleep.
 
         Used as the fallback when a WS fill future times out or returns a
         MATCHED message without price/size_matched fields.  The caller is
         responsible for ensuring the order is sufficiently settled before
         calling (e.g. after a WS MATCHED event or a >5 s timeout).
+
+        Returns a dict with keys: price, size_matched, size_remaining, status
+        or None if the order is not found / has no fills.
         """
         if self._paper_mode or self._clob is None:
             return None
@@ -1303,26 +1317,29 @@ class PMClient:
             size_matched = float(order.get("size_matched") or 0)
             if size_matched <= 0:
                 return None
-            trade_ids: list = order.get("associate_trades") or []
-            if not trade_ids:
-                log.warning("get_order_fill_rest: no associate_trades", order_id=order_id[:20])
-                return None
-            from py_clob_client.clob_types import TradeParams
-            params = TradeParams(id=trade_ids[0])
-            trades = await asyncio.to_thread(self._clob.get_trades, params)
-            if not trades:
-                return None
-            fill_price = float(trades[0].get("price") or 0)
-            fill_size = float(trades[0].get("size") or size_matched)
+            # Use the order's own price as the fill price.  The associated-trade
+            # endpoint returns data from the counterparty's perspective (e.g. the
+            # complementary YES-token seller), which produces wrong price/size values
+            # (observed: price=0.97 size=1822 for a 0.035 × 28.57 hedge order).
+            # The order price is a safe upper bound — GTC fills at order price or better.
+            fill_price = float(order.get("price") or 0)
             if fill_price <= 0:
                 return None
+            size_total = float(order.get("size") or order.get("original_size") or 0)
+            size_remaining = max(0.0, size_total - size_matched)
+            status = str(order.get("status") or "MATCHED")
             log.info(
                 "Order fill confirmed from CLOB (REST fallback)",
                 order_id=order_id[:20],
                 fill_price=fill_price,
-                fill_size=fill_size,
+                fill_size=size_matched,
             )
-            return fill_price, fill_size
+            return {
+                "price": fill_price,
+                "size_matched": size_matched,
+                "size_remaining": size_remaining,
+                "status": status,
+            }
         except Exception as exc:
             log.warning("get_order_fill_rest: failed", order_id=order_id[:20], exc=str(exc))
             return None
@@ -1335,7 +1352,7 @@ class PMClient:
         if self._clob is None:
             return False
         try:
-            self._clob.cancel(order_id)
+            await asyncio.to_thread(self._clob.cancel, order_id)
             log.debug("Order cancelled", order_id=order_id)
             return True
         except Exception as exc:
@@ -1351,7 +1368,7 @@ class PMClient:
         if self._clob is None:
             return False
         try:
-            self._clob.cancel_all()
+            await asyncio.to_thread(self._clob.cancel_all)
             log.info("All PM orders cancelled")
             return True
         except Exception as exc:
@@ -1548,6 +1565,34 @@ class PMClient:
                 condition_id=condition_id[:16],
                 exc=str(exc),
             )
+        return None
+
+    async def fetch_token_side(self, condition_id: str, token_id: str) -> Optional[str]:
+        """Determine whether a token is the YES/Up or NO/Down side of a market.
+
+        Calls GET /markets/{condition_id} and matches token_id against the token
+        list.  Returns "yes" or "no", or None on API failure / unrecognised token.
+
+        Used as a fallback when the local markets cache has evicted the market
+        (e.g. short-lived 5m buckets that expire before the auto-redeem cycle).
+        """
+        url = f"{config.POLY_HOST}/markets/{condition_id}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    tokens = data.get("tokens") or []
+                    for tok in tokens:
+                        if tok.get("token_id") == token_id:
+                            outcome = str(tok.get("outcome", "")).lower()
+                            return "yes" if outcome in ("yes", "up") else "no"
+        except Exception as exc:
+            log.debug("fetch_token_side failed", condition_id=condition_id[:16], exc=str(exc))
         return None
 
     async def fetch_market_is_closed(self, condition_id: str) -> Optional[bool]:

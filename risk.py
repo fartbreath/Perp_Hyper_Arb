@@ -26,6 +26,7 @@ DATA_DIR.mkdir(exist_ok=True)
 TRADES_CSV = DATA_DIR / "trades.csv"
 OPEN_POSITIONS_JSON = DATA_DIR / "open_positions.json"
 PAPER_HEDGE_FILLS_JSON = DATA_DIR / "paper_hedge_fills.json"
+HEDGE_ORDERS_JSON = DATA_DIR / "hedge_orders.json"
 TRADES_HEADER = [
     "timestamp", "entry_timestamp", "market_id", "market_title", "market_type", "underlying", "side", "size", "price",
     "fees_paid", "rebates_earned", "hl_hedge_size", "hl_entry_price",
@@ -49,6 +50,8 @@ TRADES_HEADER = [
     "hedge_size_usd",       # USD size of the hedge order
     "hedge_status",         # "filled_won" | "filled_lost" | "unfilled" | "cancelled" | "filled_exited" | "" (main rows)
     "spot_resolve_price",   # oracle spot at market resolution (hedge rows only; 0.0 otherwise)
+    "hedge_size_filled",    # contracts actually filled (empty for non-hedge rows)
+    "hedge_avg_fill_price", # VWAP of all fills (empty for non-hedge rows)
 ]
 
 
@@ -73,6 +76,83 @@ def min_edge_after_fees(p: float) -> float:
         raise ValueError(f"p must be strictly between 0 and 1, got {p}")
     pm_taker_fee = config.PM_FEE_COEFF * p * (1.0 - p)
     return pm_taker_fee + config.HL_TAKER_FEE + config.EDGE_BUFFER
+
+
+# ── HedgeOrder lifecycle ──────────────────────────────────────────────────────
+
+class HedgeStatus:
+    """FIX-protocol style order status constants for GTD hedge orders."""
+    OPEN               = "open"
+    PARTIALLY_FILLED   = "partially_filled"
+    FILLED             = "filled"
+    CANCELLED          = "cancelled"
+    CANCELLED_PARTIAL  = "cancelled_partial"   # cancel confirmed after some fills
+    EXPIRED_UNFILLED   = "expired_unfilled"    # GTD/market expiry with zero fill
+    EXPIRED_PARTIAL    = "expired_partial"     # GTD/market expiry with partial fill
+    FILLED_EXITED      = "filled_exited"       # main position exited; hedge settled
+
+    # Terminal states — no further fill updates expected.
+    TERMINAL: frozenset = frozenset({
+        "filled", "cancelled", "cancelled_partial",
+        "expired_unfilled", "expired_partial", "filled_exited",
+    })
+
+
+@dataclasses.dataclass
+class HedgeFill:
+    """A single matched fill event for a GTD hedge order."""
+    fill_id:   str    # unique id (uuid or WS sequence)
+    price:     float  # fill price
+    size:      float  # contracts filled in this event
+    timestamp: str    # ISO UTC
+    source:    str    # "ws" | "clob_rest" | "reconciliation" | "paper"
+
+
+@dataclasses.dataclass
+class HedgeOrder:
+    """First-class entity tracking the full lifecycle of a GTD hedge order."""
+    # ── Identity ──────────────────────────────────────────────────────────────
+    order_id:       str
+    market_id:      str
+    token_id:       str
+    underlying:     str
+    market_type:    str
+    market_title:   str
+    placed_at:      str   # ISO UTC
+
+    # ── Order params ─────────────────────────────────────────────────────────
+    order_price:    float
+    order_size:     float
+    order_size_usd: float
+
+    # ── Live state ────────────────────────────────────────────────────────────
+    status:         str   = dataclasses.field(default_factory=lambda: HedgeStatus.OPEN)
+    size_filled:    float = 0.0   # cumulative contracts filled (REPLACE, not ADD)
+    size_remaining: float = 0.0   # set by REST reconciliation
+    avg_fill_price: float = 0.0   # VWAP across all fills
+    fills:          list  = dataclasses.field(default_factory=list)  # list[HedgeFill] (as dicts)
+
+    # ── Parent position reference ──────────────────────────────────────────────
+    # Stored so RiskEngine can go from order_id → Position in O(1).
+    # Empty string for orders loaded from old hedge_orders.json (pre-migration).
+    parent_side:    str   = ""   # side of the parent Position (YES | NO | UP | DOWN)
+
+    # ── Parent position reference ──────────────────────────────────────────────
+    # Stored so RiskEngine can go from order_id → Position in O(1).
+    # Empty string for orders loaded from old hedge_orders.json (pre-migration).
+    parent_side:    str   = ""   # side of the parent Position (YES | NO | UP | DOWN)
+
+    # ── Deferred cancel state ─────────────────────────────────────────────────
+    pending_cancel_threshold:  float = 0.0   # HL price that triggers cancel
+    pending_cancel_side:       str   = ""    # "long" | "short"
+    pending_cancel_strike:     float = 0.0   # market strike
+    pending_cancel_entry_spot: float = 0.0   # spot at position entry
+
+    # ── Resolution ────────────────────────────────────────────────────────────
+    settled_price:      float = 0.0  # 1.0 WIN / 0.0 LOSS
+    resolved_at:        str   = ""
+    spot_at_resolution: float = 0.0
+    net_pnl:            float = 0.0
 
 
 # ── Position ──────────────────────────────────────────────────────────────────
@@ -129,11 +209,11 @@ class Position:
     hedge_token_id: str = ""
     hedge_price: float = 0.0
     hedge_size_usd: float = 0.0
-    # Set to True when a WS MATCHED event confirms the hedge order filled mid-trade
-    # (before market resolution).  Used by _record_pending_resolution_hedge() as a
-    # fallback when paper-fill simulation data is absent.
+
+    # WS fill detection — set by live_fill_handler when a GTD hedge fills mid-trade
     hedge_fill_detected: bool = False
-    hedge_fill_size: float = 0.0      # actual matched contracts from the WS event
+    hedge_fill_size: float = 0.0
+    hedge_fill_price: float = 0.0
 
     # Active TP resting limit order (Item 1): PM CLOB order ID of a pre-armed SELL
     # at the take-profit price.  Cancelled automatically on any non-TP exit.
@@ -162,6 +242,11 @@ class Position:
     def pm_delta_notional(self) -> float:
         """Signed notional exposure: positive = net long YES/UP (first token)."""
         return self.size if self.side in ("YES", "UP") else -self.size
+
+
+def _parse_iso(ts: str) -> datetime:
+    """Parse an ISO UTC timestamp string to a timezone-aware datetime."""
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
 # ── Risk Engine ───────────────────────────────────────────────────────────────
@@ -193,6 +278,9 @@ class RiskEngine:
         # keyed by hedge_token_id; value = {"fill_price": float, "fill_size": float, "ts": str}
         # Persisted to PAPER_HEDGE_FILLS_JSON so fills survive bot restarts.
         self._paper_hedge_fills: dict[str, dict] = self._load_paper_hedge_fills()
+        # First-class HedgeOrder entities keyed by order_id.
+        # Persisted to HEDGE_ORDERS_JSON on every state change.
+        self._hedge_orders: dict[str, HedgeOrder] = self._load_hedge_orders()
         self._ensure_csv()
 
     # ── CSV ────────────────────────────────────────────────────────────────────
@@ -202,16 +290,36 @@ class RiskEngine:
             with TRADES_CSV.open("w", newline="") as f:
                 csv.writer(f).writerow(TRADES_HEADER)
             return
-        # If the file exists but the header is stale (schema changed), migrate it:
-        # read the current header and, if columns differ, back up the old file
-        # and start a fresh one with the current schema.
+        # If the file exists but the header is stale (schema changed), either:
+        # 1. Migrate in-place (additive change: old header is a prefix of new header).
+        # 2. Back up and start fresh (column removed/reordered — incompatible change).
         with TRADES_CSV.open("r", newline="") as f:
             reader = csv.reader(f)
             try:
                 existing_header = next(reader)
             except StopIteration:
                 existing_header = []
-        if existing_header != TRADES_HEADER:
+        if existing_header == TRADES_HEADER:
+            return  # nothing to do
+        n = len(existing_header)
+        if existing_header == TRADES_HEADER[:n]:
+            # Additive schema change: append new empty columns to every existing row.
+            new_cols = TRADES_HEADER[n:]
+            lines = TRADES_CSV.read_bytes().splitlines(keepends=True)
+            out = []
+            for i, line in enumerate(lines):
+                stripped = line.rstrip(b"\r\n")
+                suffix = b"," + b",".join(b"" for _ in new_cols)
+                if i == 0:
+                    # Update header
+                    suffix = b"," + b",".join(c.encode() for c in new_cols)
+                out.append(stripped + suffix + b"\n")
+            TRADES_CSV.write_bytes(b"".join(out))
+            log.info(
+                "trades.csv schema migrated (additive)",
+                new_columns=new_cols,
+            )
+        else:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             backup = TRADES_CSV.with_name(f"trades_{ts}.csv.bak")
             TRADES_CSV.rename(backup)
@@ -726,6 +834,12 @@ class RiskEngine:
             pos.hedge_token_id = hedge_token_id
             pos.hedge_price = hedge_price
             pos.hedge_size_usd = hedge_size_usd
+            # Mirror parent_side onto the HedgeOrder entity so the reverse lookup
+            # (order_id → Position) can use the stored key directly (O(1)).
+            ho = self._hedge_orders.get(hedge_order_id)
+            if ho is not None and not ho.parent_side:
+                ho.parent_side = side
+                self._save_hedge_orders()
 
     def get_position_by_hedge_token(self, hedge_token_id: str) -> Optional[Position]:
         """Return the position whose GTD hedge_token_id matches, or None."""
@@ -735,13 +849,111 @@ class RiskEngine:
                     return pos
         return None
 
-    def get_position_by_hedge_order_id(self, hedge_order_id: str) -> Optional[Position]:
-        """Return the open position whose hedge_order_id matches, or None."""
+    def get_position_for_hedge(self, hedge_order_id: str) -> Optional[Position]:
+        """Return the open position whose GTD hedge_order_id matches.
+
+        O(1) when the HedgeOrder entity carries a parent_side (set by
+        update_gtd_hedge).  Falls back to an O(n) scan for legacy hedge orders
+        that pre-date the parent_side field (loaded from old hedge_orders.json).
+        """
         with self._lock:
+            ho = self._hedge_orders.get(hedge_order_id)
+            if ho is not None and ho.parent_side:
+                key = self._pos_key(ho.market_id, ho.parent_side)
+                pos = self._positions.get(key)
+                if pos is not None and not pos.is_closed:
+                    return pos
+                # Hedge may have been placed, position may have been re-keyed — fall
+                # through to scan so we never silently lose a fill.
+            # Legacy fallback: full scan
             for pos in self._positions.values():
                 if pos.hedge_order_id == hedge_order_id and not pos.is_closed:
                     return pos
         return None
+
+    def get_position_by_hedge_order_id(self, hedge_order_id: str) -> Optional[Position]:
+        """Deprecated alias for get_position_for_hedge(). Use that instead."""
+        return self.get_position_for_hedge(hedge_order_id)
+
+    # ── Market-aggregate P&L ──────────────────────────────────────────────────
+
+    def market_pnl(self, market_id: str) -> dict:
+        """Return a combined P&L snapshot for all positions and hedges in a market.
+
+        The result is a plain dict (JSON-serializable) so callers — the webapp,
+        api_server, monitor diagnostics — can consume it without extra imports.
+
+        Keys:
+            realized_pnl        float  — sum of closed position P&L for this market
+            unrealised_pnl      float  — sum of open position P&L at entry price
+                                         (caller should pass current prices if available)
+            hedge_realized_pnl  float  — net_pnl from any finalized HedgeOrder
+            total_pnl           float  — realized + unrealised + hedge_realized
+            positions           list   — one dict per (market_id, side) position
+            hedge               dict | None  — most recent non-terminal HedgeOrder summary
+
+        Note: unrealised_pnl is computed at entry_price (cost basis), not current
+        market price.  Use compute_unrealised_pnl(pos, current_price) from monitor.py
+        for a live mark-to-market figure when a current price is available.
+        """
+        with self._lock:
+            pos_list = [
+                p for p in self._positions.values() if p.market_id == market_id
+            ]
+
+        realized = sum(p.realized_pnl for p in pos_list if p.is_closed)
+        # Unrealised at cost basis (price has not moved since entry).
+        unrealised = sum(
+            (p.entry_price - p.entry_price) * p.size
+            for p in pos_list if not p.is_closed
+        )  # always 0 — kept explicit so callers know to override with live price
+
+        # Hedge P&L: look for the most recent non-terminal HedgeOrder, then
+        # fall back to the most recent terminal one (so closed markets still show).
+        ho = self.get_hedge_order_by_market(market_id)
+        if ho is None:
+            # Market may be resolved — try any HedgeOrder for it (including terminal)
+            with self._lock:
+                candidates = [
+                    h for h in self._hedge_orders.values() if h.market_id == market_id
+                ]
+            ho = max(candidates, key=lambda h: h.placed_at) if candidates else None
+
+        hedge_realized = ho.net_pnl if ho is not None else 0.0
+        hedge_summary: Optional[dict] = None
+        if ho is not None:
+            hedge_summary = {
+                "order_id":      ho.order_id,
+                "status":        ho.status,
+                "order_price":   ho.order_price,
+                "size_filled":   ho.size_filled,
+                "avg_fill_price": ho.avg_fill_price,
+                "net_pnl":       ho.net_pnl,
+                "parent_side":   ho.parent_side,
+            }
+
+        pos_summaries = [
+            {
+                "side":         p.side,
+                "size":         p.size,
+                "entry_price":  p.entry_price,
+                "realized_pnl": p.realized_pnl,
+                "is_closed":    p.is_closed,
+                "strategy":     p.strategy,
+            }
+            for p in pos_list
+        ]
+
+        total = round(realized + unrealised + hedge_realized, 6)
+        return {
+            "market_id":          market_id,
+            "realized_pnl":       round(realized, 6),
+            "unrealised_pnl":     round(unrealised, 6),
+            "hedge_realized_pnl": round(hedge_realized, 6),
+            "total_pnl":          total,
+            "positions":          pos_summaries,
+            "hedge":              hedge_summary,
+        }
 
     def record_paper_hedge_fill_sim(
         self, hedge_token_id: str, fill_price: float, fill_size: float
@@ -782,8 +994,304 @@ class RiskEngine:
         except Exception as exc:
             log.warning("Failed to persist paper hedge fills", exc=str(exc))
 
+    # ── HedgeOrder persistence ────────────────────────────────────────────────
+
+    def _load_hedge_orders(self) -> dict[str, HedgeOrder]:
+        """Load persisted HedgeOrder entities from disk."""
+        if not HEDGE_ORDERS_JSON.exists():
+            return {}
+        try:
+            raw = json.loads(HEDGE_ORDERS_JSON.read_text())
+            result: dict[str, HedgeOrder] = {}
+            for order_id, d in raw.items():
+                fills = d.pop("fills", [])
+                ho = HedgeOrder(**d)
+                ho.fills = fills
+                result[order_id] = ho
+            self._prune_old_hedge_orders(result)
+            return result
+        except Exception as exc:
+            log.warning("Failed to load hedge_orders.json", exc=str(exc))
+            return {}
+
+    def _save_hedge_orders(self) -> None:
+        """Write hedge orders to disk. Must be called under self._lock."""
+        try:
+            HEDGE_ORDERS_JSON.write_text(
+                json.dumps({k: dataclasses.asdict(v) for k, v in self._hedge_orders.items()})
+            )
+        except Exception as exc:
+            log.warning("Failed to persist hedge_orders.json", exc=str(exc))
+
+    def _prune_old_hedge_orders(self, orders: Optional[dict] = None) -> None:
+        """Remove terminal HedgeOrders older than 7 days to keep file size bounded."""
+        from datetime import timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        target = orders if orders is not None else self._hedge_orders
+        to_del = [
+            oid for oid, ho in target.items()
+            if ho.status in HedgeStatus.TERMINAL and ho.placed_at
+            and _parse_iso(ho.placed_at) < cutoff
+        ]
+        for k in to_del:
+            del target[k]
+
+    # ── HedgeOrder CRUD ───────────────────────────────────────────────────────
+
+    def register_hedge_order(
+        self,
+        order_id: str,
+        market_id: str,
+        token_id: str,
+        underlying: str,
+        market_type: str,
+        market_title: str,
+        order_price: float,
+        order_size: float,
+        order_size_usd: float,
+        *,
+        parent_side: str = "",
+    ) -> HedgeOrder:
+        """Create and persist a new HedgeOrder in OPEN status."""
+        with self._lock:
+            ho = HedgeOrder(
+                order_id=order_id,
+                market_id=market_id,
+                token_id=token_id,
+                underlying=underlying,
+                market_type=market_type,
+                market_title=market_title,
+                placed_at=datetime.now(timezone.utc).isoformat(),
+                order_price=order_price,
+                order_size=order_size,
+                order_size_usd=order_size_usd,
+                size_remaining=order_size,
+                parent_side=parent_side,
+            )
+            self._hedge_orders[order_id] = ho
+            self._save_hedge_orders()
+            return ho
+
+    def update_hedge_fill(
+        self,
+        order_id: str,
+        fill_price: float,
+        cumulative_size: float,
+        source: str = "ws",
+    ) -> Optional[HedgeOrder]:
+        """Update a HedgeOrder with a new cumulative fill snapshot (REPLACE semantics).
+
+        PM WS sends cumulative size_matched totals, not per-fill deltas.
+        VWAP is computed incrementally: only the incremental delta is new.
+
+        Returns the updated HedgeOrder or None if order_id is unknown.
+        """
+        with self._lock:
+            ho = self._hedge_orders.get(order_id)
+            if ho is None:
+                log.debug("update_hedge_fill: unknown order_id", order_id=order_id[:20])
+                return None
+            if ho.status in HedgeStatus.TERMINAL:
+                log.debug(
+                    "update_hedge_fill: order already terminal",
+                    order_id=order_id[:20], status=ho.status,
+                )
+                return ho
+
+            old_size = ho.size_filled
+            new_size = round(cumulative_size, 6)
+            delta = round(new_size - old_size, 6)
+            if delta <= 0:
+                return ho  # no new fill — idempotent
+
+            # VWAP: (old_vwap × old_size + delta × fill_price) / new_size
+            if new_size > 0:
+                ho.avg_fill_price = round(
+                    (ho.avg_fill_price * old_size + delta * fill_price) / new_size, 6
+                )
+            ho.size_filled = new_size
+
+            fill = HedgeFill(
+                fill_id=f"{order_id[:8]}_{len(ho.fills)}",
+                price=fill_price,
+                size=delta,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source=source,
+            )
+            ho.fills.append(dataclasses.asdict(fill))
+            ho.status = (
+                HedgeStatus.FILLED
+                if new_size >= ho.order_size - 1e-6
+                else HedgeStatus.PARTIALLY_FILLED
+            )
+            self._save_hedge_orders()
+            log.info(
+                "HedgeOrder fill updated",
+                order_id=order_id[:20],
+                delta=delta,
+                cumulative=new_size,
+                avg_fill=ho.avg_fill_price,
+                status=ho.status,
+            )
+            return ho
+
+    def finalize_hedge(
+        self,
+        order_id: str,
+        *,
+        settled_price: float,
+        spot_at_resolution: float = 0.0,
+        hedge_status: str = HedgeStatus.FILLED_EXITED,
+    ) -> Optional[HedgeOrder]:
+        """Mark a HedgeOrder as settled and write a momentum_hedge row to trades.csv.
+
+        This is the preferred replacement for record_hedge_fill() in the new flow.
+
+        Args:
+            order_id:             PM CLOB order ID of the hedge.
+            settled_price:        1.0 if hedge token won, 0.0 if lost.
+            spot_at_resolution:   oracle spot at market resolution time.
+            hedge_status:         terminal status constant (HedgeStatus.*).
+
+        Returns the finalized HedgeOrder or None if unknown.
+        """
+        _csv_row: Optional[dict] = None
+        with self._lock:
+            ho = self._hedge_orders.get(order_id)
+            if ho is None:
+                log.warning("finalize_hedge: unknown order_id", order_id=order_id[:20])
+                return None
+
+            fill_price = ho.avg_fill_price if ho.avg_fill_price else ho.order_price
+            fill_size = ho.size_filled
+            pnl = round((settled_price - fill_price) * fill_size, 6)
+
+            ho.status = hedge_status
+            ho.settled_price = settled_price
+            ho.resolved_at = datetime.now(timezone.utc).isoformat()
+            ho.spot_at_resolution = spot_at_resolution
+            ho.net_pnl = pnl
+            self._realized_pnl += pnl
+            self._save_hedge_orders()
+
+            if ho.token_id in self._paper_hedge_fills:
+                del self._paper_hedge_fills[ho.token_id]
+                self._save_paper_hedge_fills()
+
+            _csv_row = {
+                "timestamp":            datetime.now(timezone.utc).isoformat(),
+                "entry_timestamp":      "",
+                "market_id":            ho.market_id,
+                "market_title":         (ho.market_title or "")[:60],
+                "market_type":          "momentum_hedge",
+                "underlying":           ho.underlying,
+                "side":                 "hedge",
+                "size":                 round(fill_size, 6),
+                "price":                round(fill_price, 4),
+                "fees_paid":            0.0,
+                "rebates_earned":       0.0,
+                "hl_hedge_size":        0.0,
+                "hl_entry_price":       0.0,
+                "strategy":             "momentum_hedge",
+                "spread_id":            "",
+                "pnl":                  pnl,
+                "entry_deviation":      0.0,
+                "implied_prob":         0.0,
+                "deribit_iv":           0.0,
+                "tte_years":            0.0,
+                "spot_price":           0.0,
+                "exit_spot_price":      settled_price,
+                "strike":               0.0,
+                "kalshi_price":         0.0,
+                "signal_source":        "gtd_hedge",
+                "signal_score":         0.0,
+                "resolved_outcome":     "WIN" if settled_price >= 0.5 else "LOSS",
+                "hedge_order_id":       order_id,
+                "hedge_token_id":       ho.token_id,
+                "hedge_price":          round(ho.order_price, 4),
+                "hedge_size_usd":       round(ho.order_size_usd, 6),
+                "hedge_status":         hedge_status,
+                "spot_resolve_price":   round(spot_at_resolution, 4),
+                "hedge_size_filled":    round(fill_size, 6),
+                "hedge_avg_fill_price": round(fill_price, 6),
+            }
+            log.info(
+                "HedgeOrder finalized",
+                order_id=order_id[:20],
+                market_id=ho.market_id[:20],
+                fill_size=fill_size,
+                fill_price=fill_price,
+                settled_price=settled_price,
+                pnl=pnl,
+                status=hedge_status,
+            )
+        self._append_csv(_csv_row)
+        return ho
+
+    def get_hedge_order(self, order_id: str) -> Optional[HedgeOrder]:
+        """Return the HedgeOrder for order_id, or None."""
+        with self._lock:
+            return self._hedge_orders.get(order_id)
+
+    def get_hedge_order_by_market(self, market_id: str) -> Optional[HedgeOrder]:
+        """Return the most recent non-terminal HedgeOrder for market_id, or None."""
+        with self._lock:
+            match: Optional[HedgeOrder] = None
+            for ho in self._hedge_orders.values():
+                if ho.market_id == market_id and ho.status not in HedgeStatus.TERMINAL:
+                    if match is None or ho.placed_at > match.placed_at:
+                        match = ho
+            return match
+
+    def get_hedge_orders_with_pending_cancel(self) -> list:
+        """Return all non-terminal HedgeOrders that have a pending cancel registered."""
+        with self._lock:
+            return [
+                ho for ho in self._hedge_orders.values()
+                if ho.pending_cancel_side and ho.status not in HedgeStatus.TERMINAL
+            ]
+
+    def set_pending_cancel(
+        self,
+        order_id: str,
+        threshold: float,
+        side: str,
+        strike: float,
+        entry_spot: float,
+    ) -> None:
+        """Register a deferred cancel trigger on a HedgeOrder."""
+        with self._lock:
+            ho = self._hedge_orders.get(order_id)
+            if ho is None:
+                log.warning("set_pending_cancel: unknown order_id", order_id=order_id[:20])
+                return
+            ho.pending_cancel_threshold  = threshold
+            ho.pending_cancel_side       = side
+            ho.pending_cancel_strike     = strike
+            ho.pending_cancel_entry_spot = entry_spot
+            self._save_hedge_orders()
+
+    def clear_pending_cancel(self, order_id: str) -> None:
+        """Clear the deferred cancel trigger from a HedgeOrder."""
+        with self._lock:
+            ho = self._hedge_orders.get(order_id)
+            if ho is None:
+                return
+            ho.pending_cancel_threshold  = 0.0
+            ho.pending_cancel_side       = ""
+            ho.pending_cancel_strike     = 0.0
+            ho.pending_cancel_entry_spot = 0.0
+            self._save_hedge_orders()
+
     def has_hedge_fill(self, market_id: str) -> bool:
-        """Return True if a momentum_hedge row for market_id already exists in trades.csv."""
+        """Return True if a non-terminal HedgeOrder with fills exists for market_id.
+
+        Deprecated: new code should use get_hedge_order_by_market() directly.
+        """
+        ho = self.get_hedge_order_by_market(market_id)
+        if ho is not None and ho.size_filled > 0:
+            return True
+        # Fallback: scan trades.csv for legacy rows written before the HedgeOrder model
         try:
             if not TRADES_CSV.exists():
                 return False
@@ -865,6 +1373,8 @@ class RiskEngine:
                 "hedge_size_usd":     round(fill_size * fill_price, 6),
                 "hedge_status":       hedge_status,
                 "spot_resolve_price": round(spot_resolve_price, 4),
+                "hedge_size_filled":    round(fill_size, 6),
+                "hedge_avg_fill_price": round(fill_price, 6),
             }
             log.info(
                 "GTD hedge fill recorded",
@@ -1026,6 +1536,8 @@ class RiskEngine:
                 "hedge_size_usd": pos.hedge_size_usd,
                 "hedge_status": "",
                 "spot_resolve_price": 0.0,
+                "hedge_size_filled": "",
+                "hedge_avg_fill_price": "",
             }
             _closed_pos = pos
             log.info(

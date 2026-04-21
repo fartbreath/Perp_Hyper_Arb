@@ -48,7 +48,7 @@ def _make_trade_rows(n=5, base_pnl=10.0) -> list[dict]:
     now = time.time()
     return [
         {
-            "condition_id": f"cond_{i:03d}",
+            "market_id": f"cond_{i:03d}",
             "underlying": "BTC",
             "strategy": "maker",
             "side": "YES_BUY",

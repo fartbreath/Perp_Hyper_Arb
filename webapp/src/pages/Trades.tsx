@@ -321,6 +321,12 @@ function HedgeSection({
   const fillRow     = hedgeTrades[0];
   const hedgeStatus = fillRow?.hedge_status ?? "";  // from trades.csv (backend source of truth)
 
+  // Fill ratio fields from HedgeOrder lifecycle (new columns)
+  const sizeFilled    = Number(fillRow?.hedge_size_filled ?? 0);
+  const avgFillPrice  = Number(fillRow?.hedge_avg_fill_price ?? 0);
+  const orderSize     = Number(hedgeLeg.hedge_size_usd ?? 0) / Math.max(Number(hedgeLeg.hedge_price ?? 1), 0.001);
+  const fillRatioPct  = orderSize > 0 ? (sizeFilled / orderSize) * 100 : 0;
+
   let status: string;
   let statusBg: string;
   let statusFg: string;
@@ -328,6 +334,7 @@ function HedgeSection({
   let pnlDisplay: string;
   let pnlFg: string;
   let spotResolveDisplay: string = "—";
+  let sizeDisplay: string = `$${sizeUsd.toFixed(2)}`;
 
   // ── Backend-authoritative path (hedge_status populated by PM API callbacks) ───
   if (hedgeStatus === "filled_won") {
@@ -373,6 +380,49 @@ function HedgeSection({
     exitStr   = "—";
     pnlDisplay = "$0.00";
     pnlFg      = "#6b7280";
+
+  } else if (hedgeStatus === "filled_exited") {
+    // Hedge order filled during deferred-cancel window, then market-sold for recovery
+    status    = "Filled – Exited";
+    statusBg  = "#1e3a5f";
+    statusFg  = "#60a5fa";
+    exitStr   = "SOLD";
+    const p   = Number(fillRow?.pnl ?? 0);
+    pnlDisplay = fmtSigned(p, 2);
+    pnlFg      = pnlColor(p);
+    const srp = Number(fillRow?.spot_resolve_price ?? 0);
+    spotResolveDisplay = srp > 0 ? `$${srp.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—";
+    if (sizeFilled > 0 && avgFillPrice > 0) {
+      sizeDisplay = `${sizeFilled.toFixed(2)} ct @ ${(avgFillPrice * 100).toFixed(1)}¢`;
+    }
+
+  } else if (hedgeStatus === "cancelled_partial") {
+    // Cancelled after accumulating partial fills
+    status    = "Cancelled (partial)";
+    statusBg  = "#431407";
+    statusFg  = "#fb923c";
+    exitStr   = "—";
+    const p   = Number(fillRow?.pnl ?? 0);
+    pnlDisplay = fmtSigned(p, 2);
+    pnlFg      = pnlColor(p);
+    if (sizeFilled > 0 && orderSize > 0) {
+      sizeDisplay = `${sizeFilled.toFixed(2)}/${orderSize.toFixed(2)} ct (${fillRatioPct.toFixed(0)}%)`;
+    }
+
+  } else if (hedgeStatus === "expired_partial") {
+    // GTD order expired with partial fill
+    status    = "Expired – Partial";
+    statusBg  = "#451a03";
+    statusFg  = "#fbbf24";
+    exitStr   = "PARTIAL";
+    const p   = Number(fillRow?.pnl ?? 0);
+    pnlDisplay = fmtSigned(p, 2);
+    pnlFg      = pnlColor(p);
+    const srp = Number(fillRow?.spot_resolve_price ?? 0);
+    spotResolveDisplay = srp > 0 ? `$${srp.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—";
+    if (sizeFilled > 0 && orderSize > 0) {
+      sizeDisplay = `${sizeFilled.toFixed(2)}/${orderSize.toFixed(2)} ct (${fillRatioPct.toFixed(0)}%)`;
+    }
 
   } else if (fillRow) {
     // Legacy: momentum_hedge row exists but no hedge_status field (old records)
@@ -487,7 +537,7 @@ function HedgeSection({
               {entryPriceCents.toFixed(1)}¢
             </td>
             <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace" }}>
-              ${sizeUsd.toFixed(2)}
+              {sizeDisplay}
             </td>
             <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#94a3b8" }}>
               {exitStr}
