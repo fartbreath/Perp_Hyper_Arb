@@ -502,11 +502,11 @@ MOMENTUM_HEDGE_CONTRACTS_PCT: float = 1.0
 # Profit-safe hedge price cap: the bot will not pay more per hedge contract than
 # (projected_pnl - MOMENTUM_HEDGE_MIN_RETAIN_USD) / hedge_contracts.
 # Set to 0.0 to disable the cap (no floor on retained profit — old behaviour).
-MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.50
+MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.15
 
 # N-tick concession ladder: how many times to retry with price raised by 1 tick ($0.01).
 # 1 = single attempt at the configured price (closest to old behaviour).
-MOMENTUM_HEDGE_MAX_TICKS_CONCESSION: int = 3
+MOMENTUM_HEDGE_MAX_TICKS_CONCESSION: int = 10
 
 # TTE aggression threshold (seconds).  When time-to-expiry is below this value the
 # bot forces a taker (FAK) order regardless of the book state.

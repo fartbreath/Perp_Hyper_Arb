@@ -1658,12 +1658,27 @@ class MomentumScanner(BaseStrategy):
                 pos.range_lo, pos.range_hi = _rng
         self._risk.open_position(pos)
 
-        # ── Item 1: Pre-arm resting TP SELL order ─────────────────────────────
-        # Place a SELL limit at MOMENTUM_TAKE_PROFIT immediately after fill so
-        # the order sits in the CLOB and fills automatically when the token
-        # converges to certainty — removing monitor-latency from TP exits.
-        # Up to MOMENTUM_TP_RETRY_MAX placement attempts at increasing prices.
-        if config.MOMENTUM_TP_RESTING_ENABLED:
+        # ── Phases C+D: TP order and GTD hedge — launched concurrently ───────
+        # The hedge must not wait behind TP placement.  Every second of TP
+        # latency drains the opposite-token book.  Both are defined as local
+        # coroutines so asyncio.gather runs them in a single event-loop pass,
+        # interleaving at each network-IO await point.
+        _hedge_id: str | None   = None  # set by _do_hedge; used in Phase E
+        _hedge_price: float     = 0.0
+        _hedge_contracts: float = 0.0
+        _hedge_size_usd: float  = 0.0
+        _hedge_side: str        = ""
+        _hedge_bucket_enabled   = config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get(
+            market.market_type, True
+        )
+
+        async def _do_tp() -> None:
+            # ── Item 1: Pre-arm resting TP SELL order ────────────────────────
+            # Place a SELL limit at MOMENTUM_TAKE_PROFIT immediately after fill
+            # so the order sits in the CLOB and fills automatically when the
+            # token converges to certainty — removing monitor-latency from TP.
+            if not config.MOMENTUM_TP_RESTING_ENABLED:
+                return
             _tp_order_id: Optional[str] = None
             _tick = market.tick_size if market else 0.01
             _tp_max_price = round(1.0 - _tick, 10)  # 0.99 for 0.01-tick markets
@@ -1710,22 +1725,15 @@ class MomentumScanner(BaseStrategy):
                     market=signal.market_title[:50],
                 )
 
-        # ── Phase D: Optional GTD hedge ──────────────────────────────────────
-        # Place a post-only GTC limit BUY on the opposite token at a low price.
-        # If the held token loses (→ $0), the opposite token may briefly trade
-        # below our bid; the resting order catches that dip and redeems at $1.
-        # Bid price is per-bucket (shorter buckets → higher bid to get filled).
-        # Per-bucket on/off: 5m/15m are disabled by default — at ≤120 s TTE
-        # there is no time for the fill path to develop; the cost is wasted.
-        _hedge_id: str | None      = None  # set below if placed; used in Phase E fill CSV
-        _hedge_price: float        = 0.0
-        _hedge_contracts: float    = 0.0
-        _hedge_size_usd: float     = 0.0
-        _hedge_side: str           = ""
-        _hedge_bucket_enabled = config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get(
-            market.market_type, True
-        )
-        if config.MOMENTUM_HEDGE_ENABLED and _hedge_bucket_enabled:
+        async def _do_hedge() -> None:
+            nonlocal _hedge_id, _hedge_price, _hedge_contracts, _hedge_size_usd, _hedge_side
+            # ── Phase D: Optional GTD hedge ──────────────────────────────────
+            # Place a post-only GTC limit BUY on the opposite token at a low
+            # price.  If the held token loses (→ $0), the opposite token may
+            # briefly trade below our bid; the resting order catches that dip
+            # and redeems at $1.
+            if not (config.MOMENTUM_HEDGE_ENABLED and _hedge_bucket_enabled):
+                return
             opp_token = (
                 market.token_id_no if signal.side in ("YES", "UP") else market.token_id_yes
             )
@@ -1744,9 +1752,19 @@ class MomentumScanner(BaseStrategy):
             # Projected PnL = what we collect if the token settles at $1 minus
             # what we paid:  entry_size × (1.0 − entry_price).
             _projected_pnl = round(entry_size * (1.0 - entry_price), 6)
-            if _hedge_tte_now < 10.0:
+            # Sub-5s guard: a resting maker order has zero chance of filling.
+            # However, a taker (FAK) order can still fill immediately if someone
+            # is selling the opposite token right now.  Allow taker-mode through
+            # when MOMENTUM_HEDGE_AGGRESSIVE_TTE_S > 0 and TTE is within that
+            # threshold — that flag is exactly the "near-expiry, grab it now" path.
+            # Only block unconditionally when taker aggression is also disabled.
+            _taker_tte_allowed = (
+                config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S > 0
+                and _hedge_tte_now < config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S
+            ) or config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER
+            if _hedge_tte_now < 5.0 and not _taker_tte_allowed:
                 log.warning(
-                    "Momentum: GTD hedge skipped — market expires in < 10s",
+                    "Momentum: GTD hedge skipped — market expires in < 5s and taker aggression disabled",
                     market=signal.market_title[:50],
                     tte_s=round(_hedge_tte_now, 1),
                 )
@@ -1813,7 +1831,9 @@ class MomentumScanner(BaseStrategy):
                     #   a) Global taker flag is set, OR
                     #   b) TTE threshold configured and market is close to expiry, OR
                     #   c) Book has a seller already within our cap (grab the fill now)
-                    _tte = signal.tte_seconds if signal.tte_seconds is not None else 999
+                    # Use _hedge_tte_now (live recomputed) not signal.tte_seconds (stale
+                    # scan-time value) — fill confirmation latency can burn several seconds.
+                    _tte = _hedge_tte_now
                     _use_taker = (
                         config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER
                         or (config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S > 0
@@ -1827,7 +1847,7 @@ class MomentumScanner(BaseStrategy):
                         log.debug(
                             "Momentum: GTD hedge — TTE aggression active",
                             market=signal.market_title[:50],
-                            tte_s=_tte,
+                            tte_s=round(_tte, 1),
                             threshold_s=config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S,
                         )
 
@@ -2005,6 +2025,8 @@ class MomentumScanner(BaseStrategy):
                             opp_best_ask=_opp_best_ask_log,
                             reason="all_attempts_exhausted",
                         )
+
+        await asyncio.gather(_do_tp(), _do_hedge(), return_exceptions=True)
 
         # ── Write momentum fills CSV for execution-quality analysis ──────────
         try:
