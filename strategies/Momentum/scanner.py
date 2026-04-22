@@ -1527,6 +1527,10 @@ class MomentumScanner(BaseStrategy):
         #   1. WS MATCHED event → actual_fill set inside the retry loop above.
         #   2. REST fallback → also set above on WS timeout.
         #   3. Paper mode / REST unavailable → derive from order_price.
+        # True when fill landed below MOMENTUM_PRICE_BAND_LOW.  The position is
+        # registered immediately; only the GTD hedge runs — TP and the normal
+        # monitor SL/TP loop are suppressed.
+        _band_floor_aborted = False
         if actual_fill is not None:
             raw_fill_price, actual_size = actual_fill["price"], actual_fill["size_matched"]
 
@@ -1568,7 +1572,10 @@ class MomentumScanner(BaseStrategy):
                     signal_source="band_floor_abort",
                 )
                 self._risk.open_position(_pos_bfa)
-                return False
+                # Do NOT return yet — fall through so _do_hedge() runs.
+                # The opposite token may be buyable cheap right now; a $1
+                # resting hedge recovers up to $19 if the position settles wrong.
+                _band_floor_aborted = True
 
             entry_price = raw_fill_price  # actual token fill price for both YES and NO
             entry_size = actual_size
@@ -1656,7 +1663,9 @@ class MomentumScanner(BaseStrategy):
             _rng = _extract_range_bounds(market.title)
             if _rng is not None:
                 pos.range_lo, pos.range_hi = _rng
-        self._risk.open_position(pos)
+        if not _band_floor_aborted:
+            # band_floor_abort positions were already registered above as _pos_bfa.
+            self._risk.open_position(pos)
 
         # ── Phases C+D: TP order and GTD hedge — launched concurrently ───────
         # The hedge must not wait behind TP placement.  Every second of TP
@@ -1677,7 +1686,9 @@ class MomentumScanner(BaseStrategy):
             # Place a SELL limit at MOMENTUM_TAKE_PROFIT immediately after fill
             # so the order sits in the CLOB and fills automatically when the
             # token converges to certainty — removing monitor-latency from TP.
-            if not config.MOMENTUM_TP_RESTING_ENABLED:
+            if _band_floor_aborted or not config.MOMENTUM_TP_RESTING_ENABLED:
+                # band_floor_abort: entry price is far from any rational TP level;
+                # skip TP and let settlement handle the close.
                 return
             _tp_order_id: Optional[str] = None
             _tick = market.tick_size if market else 0.01
@@ -2115,6 +2126,9 @@ class MomentumScanner(BaseStrategy):
             kelly_multiplier=_kelly_debug["kelly_multiplier"],
             kelly_size_usd=_kelly_debug["kelly_size_usd"],
         )
+        if _band_floor_aborted:
+            # Hedge was placed above; skip monitor's active SL/TP loop.
+            return False
         return True
 
 

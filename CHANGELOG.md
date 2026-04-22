@@ -2,6 +2,56 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-23] - Concurrent TP+hedge; band_floor_abort hedge fix
+
+### Bug fix — Sequential TP blocking hedge placement (`strategies/Momentum/scanner.py`)
+
+**Root cause:** After a fill, the scanner placed the take-profit SELL limit (Phase C) and
+only then placed the GTD hedge (Phase D). A TP retry loop of up to N attempts (~2 s wall
+time) ran before the hedge started. On fast-moving markets (e.g. BTC 9:05AM April 22) the
+opposite-token book drained during that delay, leaving nothing to bid on when the hedge
+eventually ran.
+
+**Fix:** Both coroutines (`_do_tp` and `_do_hedge`) are now defined as local `async def`
+functions and launched together with `asyncio.gather(_do_tp(), _do_hedge(),
+return_exceptions=True)`. They share the same event-loop and interleave at every `await`
+point, meaning the hedge bid hits the CLOB at essentially the same instant as the TP order.
+
+No new config keys.
+
+---
+
+### Bug fix — `band_floor_abort` path skipped GTD hedge entirely (`strategies/Momentum/scanner.py`)
+
+**Root cause:** When a taker fill landed below `MOMENTUM_PRICE_BAND_LOW` (swept-book fill,
+e.g. signal 0.88 → fill 0.34), the scanner registered the position via `_pos_bfa` and
+immediately `return False`-ed. Phase D (the GTD hedge coroutine) was never reached.
+
+This is precisely the scenario where the hedge matters most: a fill deep in the band means
+the position is already underwater. A $0.05 resting BUY on the opposite token costs ~$1
+and pays up to ~$19 if the position ultimately resolves against the main side.
+
+**Measured miss (April 22 ETH 9:05AM):** fill 0.34 (signal 0.88), no hedge placed → loss
+-$2.38. A DOWN hedge at $0.05 would have recovered ~$18 if ETH settled DOWN.
+
+**Fix:** Replaced the early `return False` with a `_band_floor_aborted` flag. Execution now
+falls through to the normal Phase C+D `asyncio.gather` block. `_do_tp` returns immediately
+when the flag is set (no TP management for swept-book entries). `_do_hedge` runs normally
+and is subject to all existing hedge rules:
+
+- Projected win PnL must exceed $1 (`entry_size × (1 − entry_price) > 1.0`)
+- Profit-safe price cap: `max_hedge_price = (projected_pnl − MOMENTUM_HEDGE_MIN_RETAIN_USD) / hedge_contracts`
+- PnL cap ≤ 0 → hedge skipped
+- TTE < 5 s guard still applies
+- Book depth / ladder exhaustion still applies
+
+After the CSV write and position-opened log, `return False` is restored so the monitor's
+active SL/TP loop is skipped — exactly as before for band_floor positions.
+
+No new config keys.
+
+---
+
 ## [2026-04-22] - Hedge optimization (cap + ladder + taker + TTE); fill price fix; winner-flag resolution; test hardening
 
 ### Feature — Hedge optimization: profit-safe price cap (`strategies/Momentum/scanner.py`, `config.py`)
