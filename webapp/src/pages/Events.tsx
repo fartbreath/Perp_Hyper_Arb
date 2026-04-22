@@ -21,6 +21,11 @@ const EVENT_COLOURS: Record<string, { bg: string; fg: string }> = {
   SELL_SUBMIT:         { bg: "#0e7490", fg: "#cffafe" },
   SELL_CLOSE:          { bg: "#065f46", fg: "#d1fae5" },
   SELL_FAILED:         { bg: "#9f1239", fg: "#ffe4e6" },
+  HEDGE_SUBMIT:        { bg: "#0f766e", fg: "#ccfbf1" },
+  HEDGE_FAIL:          { bg: "#991b1b", fg: "#fee2e2" },
+  HEDGE_FILL:          { bg: "#065f46", fg: "#d1fae5" },
+  HEDGE_EXPIRED:       { bg: "#374151", fg: "#f9fafb" },
+  HEDGE_CANCEL:        { bg: "#4b5563", fg: "#f3f4f6" },
 };
 
 function EventBadge({ event }: { event: string }) {

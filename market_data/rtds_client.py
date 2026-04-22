@@ -4,7 +4,7 @@ rtds_client.py — Polymarket RTDS exchange-aggregated price feed.
 Connects to the Polymarket RTDS WebSocket (wss://ws-live-data.polymarket.com)
 and subscribes to two topics on the same connection:
 
-  crypto_prices            — exchange-aggregated spot prices for BTC/ETH/SOL/XRP/BNB/DOGE.
+  crypto_prices            — exchange-aggregated spot prices for BTC/ETH/SOL/XRP/BNB/DOGE/HYPE.
   crypto_prices_chainlink  — Chainlink Data Stream push for HYPE/USD (and others).
 
 This feed is used for:
@@ -68,6 +68,7 @@ _RTDS_SYM_TO_COIN: dict[str, str] = {
     "xrpusdt":  "XRP",
     "bnbusdt":  "BNB",
     "dogeusdt": "DOGE",
+    "hypeusdt": "HYPE",
 }
 
 # crypto_prices_chainlink topic: slash-delimited symbol → bot coin label.
@@ -90,7 +91,7 @@ class RTDSClient:
     Streams real-time spot prices from the Polymarket RTDS WebSocket
     (wss://ws-live-data.polymarket.com) via two subscriptions on one connection:
 
-    - ``crypto_prices`` (exchange-aggregated): BTC/ETH/SOL/XRP/BNB/DOGE
+    - ``crypto_prices`` (exchange-aggregated): BTC/ETH/SOL/XRP/BNB/DOGE/HYPE
       Used for 1h/daily/weekly market resolution.
     - ``crypto_prices_chainlink`` (Chainlink Data Stream push): HYPE/USD
       Polymarket's own Chainlink Data Streams relay — sub-second, no API key

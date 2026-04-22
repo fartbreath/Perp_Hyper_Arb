@@ -382,13 +382,18 @@ class TestWSMessageHandling:
 # Covers M-3 items: WS-path resolution, early-fill race, stale-cache pruning.
 
 class TestFillFuture:
-    """Unit tests for register_fill_future / _fire_order_fill / _recent_fills."""
+    """Unit tests for register_fill_future / _fire_trade_fill / _fire_order_fill / _recent_fills.
+
+    Fill-future resolution is owned by _fire_trade_fill (trade events carry the
+    actual execution price).  _fire_order_fill dispatches to maker callbacks only.
+    """
 
     def setup_method(self):
         self.client = PMClient.__new__(PMClient)
         self.client._pending_fill_futures = {}
         self.client._recent_fills = {}
         self.client._order_fill_callbacks = []
+        self.client._trade_exec_cache = {}
 
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
@@ -402,31 +407,63 @@ class TestFillFuture:
     def _fill_msg(self, order_id: str = "order_abc") -> dict:
         return {"id": order_id, "status": "MATCHED", "size_matched": "10", "price": "0.55"}
 
+    def _trade_msg(self, taker_order_id: str, price: str = "0.48", size: str = "10") -> dict:
+        """Build a minimal trade event as PM user WS sends it."""
+        return {
+            "event_type":     "trade",
+            "type":           "TRADE",
+            "taker_order_id": taker_order_id,
+            "price":          price,
+            "size":           size,
+            "status":         "MATCHED",
+            "maker_orders":   [],
+        }
+
     # -- test 1 --
 
-    def test_fill_future_resolved_via_ws(self):
-        """Happy path: future registered before fill arrives is resolved by _fire_order_fill."""
+    def test_fill_future_resolved_via_trade_event(self):
+        """Happy path: future registered before trade event arrives is resolved by _fire_trade_fill."""
+        fut = self._make_future()
+        self.client.register_fill_future("order_abc", fut)
+        assert not fut.done()
+
+        self._run(self.client._fire_trade_fill(self._trade_msg("order_abc", price="0.48", size="10")))
+
+        assert fut.done()
+        result = fut.result()
+        assert result["id"] == "order_abc"
+        assert abs(result["price"] - 0.48) < 1e-9
+        assert abs(result["size_matched"] - 10.0) < 1e-9
+
+    # -- test 1b: _fire_order_fill must NOT resolve pending futures --
+
+    def test_order_fill_does_not_resolve_future(self):
+        """_fire_order_fill must not resolve pending futures — that is _fire_trade_fill's job.
+
+        If order events could resolve futures, a race where the order MATCHED event
+        arrives before the trade event would lock in the wrong limit price.
+        """
         fut = self._make_future()
         self.client.register_fill_future("order_abc", fut)
         assert not fut.done()
 
         self._run(self.client._fire_order_fill(self._fill_msg("order_abc")))
 
-        assert fut.done()
-        assert fut.result()["id"] == "order_abc"
+        # Future must still be pending — no trade event arrived yet
+        assert not fut.done()
 
     # -- test 2 --
 
-    def test_fill_future_race_early_fill(self):
-        """Race: fill event arrives before register_fill_future is called.
+    def test_fill_future_race_early_trade(self):
+        """Race: trade event arrives before register_fill_future is called.
 
         This happens when the REST order-placement suspends (e.g. slow network)
-        and the user WS processes the MATCHED event first.  The fill lands in
+        and the user WS processes the trade event first.  The fill lands in
         _recent_fills; register_fill_future must resolve the future immediately
         from the cache rather than leaving it pending indefinitely.
         """
-        # Fire fill first (no future registered yet)
-        self._run(self.client._fire_order_fill(self._fill_msg("order_xyz")))
+        # Fire trade event first (no future registered yet)
+        self._run(self.client._fire_trade_fill(self._trade_msg("order_xyz")))
         assert "order_xyz" in self.client._recent_fills
 
         # Now register — should resolve immediately from cache
@@ -434,6 +471,7 @@ class TestFillFuture:
         self.client.register_fill_future("order_xyz", fut)
         assert fut.done()
         assert fut.result()["id"] == "order_xyz"
+        assert abs(fut.result()["price"] - 0.48) < 1e-9
         # Cache entry must be consumed (not left as a dangling entry)
         assert "order_xyz" not in self.client._recent_fills
 
@@ -451,6 +489,121 @@ class TestFillFuture:
         self.client.register_fill_future("new_order", fut)
 
         assert "stale_order" not in self.client._recent_fills
+
+    # -- test 4: taker price used directly; maker_orders provide size only --
+
+    def test_trade_fill_uses_taker_price_not_maker_vwap(self):
+        """Fill price comes from trade_msg['price'] (taker's execution price).
+
+        maker_orders are used ONLY to aggregate matched size — their individual
+        price fields are ignored.  This is correct per the Polymarket types.ts
+        spec: Trade.price is the taker's price; MakerOrder.price is the maker's
+        price on the maker's token CLOB, which diverges on neg-risk markets.
+
+        The three maker prices here deliberately do NOT average to 0.50 — they
+        average to 0.47 — to confirm that maker VWAP is never used.
+        """
+        trade_msg = {
+            "event_type":     "trade",
+            "type":           "TRADE",
+            "taker_order_id": "order_sweep",
+            "price":          "0.50",   # taker's execution price — must be what we record
+            "size":           "30",
+            "status":         "MATCHED",
+            "maker_orders": [
+                {"order_id": "maker_1", "price": "0.44", "matched_amount": "10"},
+                {"order_id": "maker_2", "price": "0.47", "matched_amount": "10"},
+                {"order_id": "maker_3", "price": "0.50", "matched_amount": "10"},
+                # VWAP of these maker prices = (0.44+0.47+0.50)/3 = 0.47 ≠ 0.50
+                # If the code incorrectly used maker VWAP it would assert 0.47,
+                # catching any regression that reverts the neg-risk fix.
+            ],
+        }
+        fut = self._make_future()
+        self.client.register_fill_future("order_sweep", fut)
+        self._run(self.client._fire_trade_fill(trade_msg))
+
+        assert fut.done()
+        result = fut.result()
+        # Must be the taker's price (0.50), not the maker VWAP (0.47)
+        assert abs(result["price"] - 0.50) < 1e-9
+        assert abs(result["size_matched"] - 30.0) < 1e-9
+
+    # -- test 4b: neg-risk complement — maker prices are NO token, taker price is YES --
+
+    def test_trade_fill_neg_risk_uses_taker_price_not_maker_complement(self):
+        """Regression test for the neg-risk complement inversion bug.
+
+        On a neg-risk Polymarket market the taker buys YES at 0.79.
+        The matched makers are on the NO CLOB and are priced at ~0.21
+        (the complement).  trade_msg['price'] = 0.79 (taker's price).
+        _fire_trade_fill must record 0.79, not 0.21.
+
+        The original bug: VWAP was computed from maker_orders[i]['price']
+        (0.21) instead of trade_msg['price'] (0.79), producing a fill price
+        of ~0.21.  That caused band_floor_abort on every live YES trade
+        (0.21 < MOMENTUM_PRICE_BAND_LOW=0.6) and bypassed Phase D entirely.
+        """
+        trade_msg = {
+            "event_type":     "trade",
+            "type":           "TRADE",
+            "taker_order_id": "order_yes_buy",
+            "price":          "0.79",   # taker buys YES at 0.79
+            "size":           "17.5",
+            "status":         "MATCHED",
+            "maker_orders": [
+                # These makers are on the NO CLOB at the complement price (0.21).
+                # They must NOT be used to derive the taker's fill price.
+                {"order_id": "no_maker_1", "price": "0.21", "matched_amount": "10.0"},
+                {"order_id": "no_maker_2", "price": "0.215", "matched_amount": "7.5"},
+            ],
+        }
+        fut = self._make_future()
+        self.client.register_fill_future("order_yes_buy", fut)
+        self._run(self.client._fire_trade_fill(trade_msg))
+
+        assert fut.done()
+        result = fut.result()
+        # Must record the taker YES price (0.79), NOT the NO-complement (≈0.21)
+        assert abs(result["price"] - 0.79) < 1e-9, (
+            f"Expected taker price 0.79, got {result['price']:.6f} — "
+            "neg-risk complement inversion bug may have been reintroduced"
+        )
+        assert abs(result["size_matched"] - 17.5) < 1e-9
+
+    # -- test 5: maker-side price injection into _fire_order_fill --
+
+    def test_order_fill_injects_maker_trade_price(self):
+        """When we are the maker, _fire_order_fill injects the cached trade price."""
+        collected = []
+
+        async def capture_cb(data):
+            collected.append(data)
+
+        self.client._order_fill_callbacks = [capture_cb]
+
+        # Simulate trade event arriving first — caches the maker order price
+        trade_msg = {
+            "event_type":     "trade",
+            "type":           "TRADE",
+            "taker_order_id": "counterparty_order",
+            "price":          "0.48",
+            "size":           "10",
+            "status":         "MATCHED",
+            "maker_orders": [
+                {"order_id": "our_maker_order", "price": "0.48", "matched_amount": "10"},
+            ],
+        }
+        self._run(self.client._fire_trade_fill(trade_msg))
+
+        # Now order MATCHED event arrives — price should be injected
+        order_event = {"id": "our_maker_order", "status": "MATCHED",
+                       "size_matched": "10", "price": "0.68"}  # limit price
+        self._run(self.client._fire_order_fill(order_event))
+
+        assert len(collected) == 1
+        # price must be injected from trade cache (0.48), not limit price (0.68)
+        assert abs(collected[0]["price"] - 0.48) < 1e-9
 
 
 # ── Auto-redeem deduplication ─────────────────────────────────────────────────
@@ -1075,4 +1228,141 @@ class TestPlaceLimitLiveSmoke:
             if order_id:
                 cancelled = self._run(client.cancel_order(order_id))
                 assert cancelled, f"Failed to cancel live order {order_id} — manual cleanup required"
+
+
+# ── fetch_market_resolution: winner-flag priority ────────────────────────────
+# Per preamble: the CLOB `winner` flag is the source of truth.  `price` can
+# show ~1.0 for a losing token in the brief window right after settlement and
+# must NEVER be used as the primary signal.
+
+class TestFetchMarketResolution:
+    """Unit tests for PMClient.fetch_market_resolution().
+
+    All HTTP calls are mocked.  Tests verify that:
+    1. `winner: True` on the YES token  → returns 1.0
+    2. `winner: True` on the NO token   → returns 0.0
+    3. winner flag absent               → falls back to YES token price
+    4. `price` field is NOT used when winner flag is present (anti-regression)
+    5. Not-yet-closed market            → returns None
+    """
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _make_client(self):
+        client = PMClient.__new__(PMClient)
+        client._paper_mode = True
+        return client
+
+    def _mock_response(self, payload: dict):
+        """Return a context manager that yields a mock aiohttp response."""
+        import json as _json
+
+        class _Resp:
+            status = 200
+            async def json(self):
+                return payload
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): pass
+
+        class _Session:
+            def get(self, url, **kwargs): return _Resp()
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): pass
+
+        return _Session
+
+    def test_yes_winner_flag_returns_1(self):
+        """winner:True on YES token → 1.0 regardless of price field."""
+        payload = {
+            "closed": True,
+            "tokens": [
+                {"outcome": "Yes", "price": 0.999, "winner": True},
+                {"outcome": "No",  "price": 0.001, "winner": False},
+            ],
+        }
+        client = self._make_client()
+        with patch("aiohttp.ClientSession", self._mock_response(payload)):
+            result = self._run(client.fetch_market_resolution("cid_001"))
+        assert result == 1.0
+
+    def test_no_winner_flag_returns_0(self):
+        """winner:True on NO token → 0.0 (YES token lost)."""
+        payload = {
+            "closed": True,
+            "tokens": [
+                {"outcome": "Yes", "price": 0.0,   "winner": False},
+                {"outcome": "No",  "price": 1.0,   "winner": True},
+            ],
+        }
+        client = self._make_client()
+        with patch("aiohttp.ClientSession", self._mock_response(payload)):
+            result = self._run(client.fetch_market_resolution("cid_002"))
+        assert result == 0.0
+
+    def test_winner_flag_beats_wrong_price(self):
+        """Anti-regression: even if price shows wrong value, winner flag wins.
+
+        Simulates the settlement window where a losing YES token still shows
+        price≈1.0 briefly.  The winner flag must override this.
+        """
+        payload = {
+            "closed": True,
+            "tokens": [
+                # YES token price mistakenly shows 0.99 but winner=False
+                {"outcome": "Yes", "price": 0.99, "winner": False},
+                {"outcome": "No",  "price": 0.01, "winner": True},
+            ],
+        }
+        client = self._make_client()
+        with patch("aiohttp.ClientSession", self._mock_response(payload)):
+            result = self._run(client.fetch_market_resolution("cid_003"))
+        # Must return 0.0 (NO won, YES lost) from winner flag, not 0.99 from price
+        assert result == 0.0, (
+            f"Expected 0.0 (NO winner flag), got {result} — "
+            "price field incorrectly took priority over winner flag"
+        )
+
+    def test_no_winner_flag_falls_back_to_yes_price(self):
+        """When winner flag absent, falls back to YES token price."""
+        payload = {
+            "closed": True,
+            "tokens": [
+                {"outcome": "Yes", "price": 1.0},
+                {"outcome": "No",  "price": 0.0},
+            ],
+        }
+        client = self._make_client()
+        with patch("aiohttp.ClientSession", self._mock_response(payload)):
+            result = self._run(client.fetch_market_resolution("cid_004"))
+        assert result == 1.0
+
+    def test_not_closed_returns_none(self):
+        """Market not yet closed → None (do not record a resolution)."""
+        payload = {
+            "closed": False,
+            "tokens": [
+                {"outcome": "Yes", "price": 0.75, "winner": False},
+                {"outcome": "No",  "price": 0.25, "winner": False},
+            ],
+        }
+        client = self._make_client()
+        with patch("aiohttp.ClientSession", self._mock_response(payload)):
+            result = self._run(client.fetch_market_resolution("cid_005"))
+        assert result is None
+
+    def test_up_down_labels_recognised(self):
+        """UP/DOWN outcome labels (crypto bucket markets) are handled correctly."""
+        payload = {
+            "closed": True,
+            "tokens": [
+                {"outcome": "Up",   "price": 0.0, "winner": False},
+                {"outcome": "Down", "price": 1.0, "winner": True},
+            ],
+        }
+        client = self._make_client()
+        with patch("aiohttp.ClientSession", self._mock_response(payload)):
+            result = self._run(client.fetch_market_resolution("cid_006"))
+        # Down won → YES/Up lost → 0.0
+        assert result == 0.0
 

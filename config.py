@@ -499,6 +499,31 @@ MOMENTUM_HEDGE_ENABLED_BY_TYPE: dict[str, bool] = {
 # Actual USDC cost = hedge_contracts × hedge_price (e.g. 25ct × $0.02 = $0.50).
 MOMENTUM_HEDGE_CONTRACTS_PCT: float = 1.0
 
+# Profit-safe hedge price cap: the bot will not pay more per hedge contract than
+# (projected_pnl - MOMENTUM_HEDGE_MIN_RETAIN_USD) / hedge_contracts.
+# Set to 0.0 to disable the cap (no floor on retained profit — old behaviour).
+MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.50
+
+# N-tick concession ladder: how many times to retry with price raised by 1 tick ($0.01).
+# 1 = single attempt at the configured price (closest to old behaviour).
+MOMENTUM_HEDGE_MAX_TICKS_CONCESSION: int = 3
+
+# TTE aggression threshold (seconds).  When time-to-expiry is below this value the
+# bot forces a taker (FAK) order regardless of the book state.
+# 0 = disabled.  Recommended starting value if enabling: 30.
+MOMENTUM_HEDGE_AGGRESSIVE_TTE_S: int = 0
+
+# Global taker override.  True = always use taker for hedge regardless of TTE or book.
+# Useful for paper-mode testing.  Leave False in production.
+MOMENTUM_HEDGE_AGGRESSIVE_TAKER: bool = False
+
+# ── Logging toggles (post-trade analysis files) ───────────────────────────────
+# These CSV files are only needed for post-trade analysis and calibration.
+# Disable them when running in production to save disk space and improve I/O
+# performance.  Both default to True so analysis data is collected by default.
+MOMENTUM_HEDGE_CLOB_LOG_ENABLED: bool = True   # hedge_clob_ticks.csv — CLOB prices for open hedge bids
+MOMENTUM_TICKS_LOG_ENABLED: bool = True         # momentum_ticks.csv   — intra-hold price ticks
+
 # SL hedge cancel: deferred cancellation factor.
 # When the main position exits via delta SL, the GTD hedge is NOT cancelled
 # immediately.  Instead, the cancel is held until delta recovers to

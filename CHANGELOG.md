@@ -2,6 +2,57 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-22] - Fill price complement fix; winner-flag resolution; test coverage hardening
+
+### Bug fix — Fill price complement inversion (`pm_client.py`)
+
+**Root cause:** `_fire_trade_fill` was computing taker execution price as a VWAP over
+`maker_orders[i].price`. On neg-risk Polymarket markets, YES takers are matched against
+NO-side makers whose price is the complement (e.g. 0.21 when the taker bought YES at
+0.79). Using maker prices produced fill_price ≈ 0.21 for every YES entry.
+
+**Cascading consequence:** Every live YES trade had fill_price < MOMENTUM_PRICE_BAND_LOW
+(0.6), triggering `band_floor_abort` on every position. Phase D (GTD hedge placement)
+was never reached for any live trade.
+
+**Fix:** `exec_price` now comes exclusively from `trade_msg["price"]` — the taker's
+execution price per the Polymarket CLOB API `types.ts` spec. `maker_orders` are used
+only to aggregate matched size.
+
+### Bug fix — `fetch_market_resolution` winner-flag priority (`pm_client.py`)
+
+**Root cause:** `fetch_market_resolution` checked `tok.get("price")` first, then the
+`winner` flag as a fallback. The preamble explicitly states that `price` can show ~1.0
+for a losing token during the settlement window and must never be used as the primary
+signal. This could cause WIN/LOSS outcomes in `trades.csv` to be recorded incorrectly
+when the monitor ran in the brief window after market close.
+
+**Fix:** `winner: True` flag is now checked first. `price` is only used as a fallback
+when the `winner` field is absent from the CLOB API response entirely.
+
+### Tests — Fill and resolution pipeline coverage
+
+**`tests/test_pm_client.py`**
+- Replaced `test_trade_fill_vwap_multi_level` with
+  `test_trade_fill_uses_taker_price_not_maker_vwap`: maker prices now average to 0.47
+  (not 0.50) so the old maker-VWAP path would fail — accidental symmetry removed.
+- Added `test_trade_fill_neg_risk_uses_taker_price_not_maker_complement`: exact
+  reproduction of the live bug (YES buy at 0.79, NO makers at 0.21). Asserts
+  fill price = 0.79.
+- Added `TestFetchMarketResolution` (6 tests): winner-flag priority, NO-win path,
+  `test_winner_flag_beats_wrong_price` (anti-regression for settlement window race),
+  price fallback when flag absent, closed=False → None, UP/DOWN label handling.
+
+**`tests/test_momentum_scanner.py` — `TestGTDHedge`**
+- Added `test_live_fill_valid_price_does_not_trigger_band_floor_abort`: live-mode
+  scanner test (`_paper_mode=False`) that injects a correct WS fill at 0.79, then
+  asserts position opens without `band_floor_abort` and Phase D hedge fires on the
+  NO token. Directly catches any regression that reverts the complement price fix.
+
+Total non-live-network tests: 1114 passed, 1 skipped.
+
+---
+
 ## [2026-04-21] - HedgeOrder lifecycle entity; async CLOB I/O; Signals sort; Trades fill-ratio display; market_pnl API
 
 ### Feature — First-class `HedgeOrder` entity (`risk.py`)

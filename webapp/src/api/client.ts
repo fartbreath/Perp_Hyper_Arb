@@ -857,6 +857,29 @@ export const useTrades = (limit = 100, offset = 0, strategy?: string, underlying
   return usePolling<{ trades: Trade[]; total: number }>(`/trades?${params}`, 30_000);
 };
 
+/** Polymarket source-of-truth activity rows from data-api.polymarket.com.
+ *  Each row: { proxyWallet, timestamp, type, size, usdcSize, price, side, title, slug, outcome }
+ *  'type' is "TRADE" | "REDEEM". Refreshed every 30 s. */
+export interface PmActivityRow {
+  proxyWallet: string;
+  timestamp: number;
+  conditionId: string;
+  type: "TRADE" | "REDEEM" | string;
+  size: number;
+  usdcSize: number;
+  price: number;
+  asset: string;
+  side: "BUY" | "SELL" | string;
+  outcomeIndex: number;
+  title: string;
+  slug: string;
+  eventSlug: string;
+  outcome: string;
+}
+
+export const usePmHistory = (limit = 50) =>
+  usePolling<{ rows: PmActivityRow[] }>(`/pm_history?limit=${limit}`, 30_000);
+
 /** Resolved YES-token prices keyed by condition_id.
  *  { [condition_id: string]: { resolved_yes_price: number } }
  *  Populated by monitor.py from RESOLVED exits and retroactively for taker/stop exits. */

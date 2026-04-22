@@ -500,6 +500,7 @@ export default function Positions() {
   const mispricingPositions = pmPositions.filter((p) => p.strategy === "mispricing" && !p.is_closed);
   const momentumPositions = pmPositions.filter((p) => p.strategy === "momentum" && !p.is_closed);
   const rangePositions = pmPositions.filter((p) => p.strategy === "range" && !p.is_closed);
+  const hedgeFilledPositions = pmPositions.filter((p) => p.strategy === "momentum_hedge" && !p.is_closed);
   const unknownPositions = pmPositions.filter((p) => p.strategy === "unknown" && !p.is_closed);
 
   // Group maker positions by condition_id -> Map<condition_id, {yes?, no?}>
@@ -525,6 +526,7 @@ export default function Positions() {
             {mispricingPositions.length > 0 && ` \u00B7 ${mispricingPositions.length} mispricing`}
             {momentumPositions.length > 0 && ` · ${momentumPositions.length} momentum`}
             {rangePositions.length > 0 && ` · ${rangePositions.length} range`}
+            {hedgeFilledPositions.length > 0 && ` · ${hedgeFilledPositions.length} hedge fill`}
             {unknownPositions.length > 0 && ` \u00B7 ${unknownPositions.length} unknown`}
             {" · "}{hlHedges.length} HL hedge{hlHedges.length !== 1 ? "s" : ""}
           </span>
@@ -782,6 +784,86 @@ export default function Positions() {
                     takeProfit={takeProfit}
                     pnl={marketPnlData?.markets?.[pos.condition_id]}
                   />
+                );
+              })}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {/* -- Filled GTD hedge positions (strategy="momentum_hedge") ---------- */}
+      {hedgeFilledPositions.length > 0 && (
+        <>
+          <h3 style={{ marginTop: "2rem", marginBottom: "0.5rem", fontSize: "0.9rem", color: "#a78bfa" }}>
+            GTD Hedge Fills
+            <span style={{ fontWeight: 400, marginLeft: "0.5rem", fontSize: "0.8rem", color: "#94a3b8" }}>
+              — opposite-token hedge bids that filled; hold to resolution or close manually
+            </span>
+          </h3>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>Underlying</th>
+                <th>Side</th>
+                <th>Entry</th>
+                <th>Current</th>
+                <th>Deployed</th>
+                <th>Unrealised P&L</th>
+                <th>Opened</th>
+                <th>Ends</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {hedgeFilledPositions.map((pos) => {
+                const slug = pos.market_slug || slugMap[pos.condition_id];
+                const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+                // token_entry_price and current_mid are already in native token space
+                // (NO token price, not YES-probability), so no YES/NO flipping needed.
+                const tokenPrice = pos.token_entry_price ?? pos.entry_price;
+                const currentTokenPrice = pos.token_current_price ?? pos.current_mid ?? null;
+                const unrealizedPnl = pos.unrealised_pnl_usd ?? (currentTokenPrice != null ? (currentTokenPrice - tokenPrice) * pos.contracts : null);
+                return (
+                  <tr key={pos.condition_id + pos.side}>
+                    <td title={pos.market_title} style={{ maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {marketUrl ? <a href={marketUrl} target="_blank" rel="noopener noreferrer">{pos.market_title}</a> : pos.market_title}
+                    </td>
+                    <td>{pos.underlying}</td>
+                    <td>
+                      <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: "0.8rem", fontWeight: 600, background: sideBg(pos.side), color: "#fff" }}>
+                        {pos.side}
+                      </span>
+                    </td>
+                    <td style={{ fontFamily: "monospace" }}>{(tokenPrice * 100).toFixed(2)}&cent;</td>
+                    <td style={{ fontFamily: "monospace", color: "#94a3b8" }}>
+                      {currentTokenPrice != null ? `${(currentTokenPrice * 100).toFixed(1)}\u00A2` : "\u2014"}
+                    </td>
+                    <td style={{ fontFamily: "monospace", color: "#a78bfa", fontWeight: 600 }}>
+                      ${(pos.entry_cost_usd ?? 0).toFixed(2)}
+                    </td>
+                    <td style={{ fontFamily: "monospace", fontWeight: 600, color: pnlColor(unrealizedPnl) }}>
+                      {pnlStr(unrealizedPnl)}
+                    </td>
+                    <td className="muted">{timeSince(pos.opened_at)}</td>
+                    <td style={{ fontFamily: "monospace", fontWeight: 600, color: timeUntilEnd(pos.end_date).color }}
+                        title={pos.end_date ? new Date(pos.end_date).toLocaleString() : undefined}>
+                      {timeUntilEnd(pos.end_date).label}
+                    </td>
+                    <td>
+                      {closeState[pos.condition_id] && closeState[pos.condition_id] !== "closing" ? (
+                        <span style={{ fontSize: "0.78rem", color: "#94a3b8" }}>{closeState[pos.condition_id]}</span>
+                      ) : (
+                        <button
+                          disabled={closeState[pos.condition_id] === "closing"}
+                          onClick={() => handleClose(pos.condition_id)}
+                          style={{ padding: "3px 10px", fontSize: "0.78rem", borderRadius: 4, border: "1px solid #ef4444", background: "transparent", color: "#ef4444", cursor: closeState[pos.condition_id] === "closing" ? "wait" : "pointer", opacity: closeState[pos.condition_id] === "closing" ? 0.5 : 1 }}
+                        >
+                          {closeState[pos.condition_id] === "closing" ? "Closing..." : "Close"}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
                 );
               })}
             </tbody>

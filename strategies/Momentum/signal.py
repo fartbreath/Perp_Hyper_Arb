@@ -23,7 +23,8 @@ class MomentumSignal:
     side: str               # "YES"/"NO" for standard Yes/No markets; "UP"/"DOWN" for Up-or-Down bucket markets
     token_id: str           # CLOB token_id of the token to buy
     token_price: float      # current price of the token to buy (0.80–0.90)
-    p_yes: float            # YES-token price at signal time
+    p_yes: float            # YES-token CLOB mid at signal time
+    p_no: float             # NO-token CLOB mid at signal time (opposite side)
 
     # ── Delta & threshold ──────────────────────────────────────────────────
     delta_pct: float        # signed % delta toward winning direction (> threshold)

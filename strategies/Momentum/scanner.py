@@ -981,6 +981,7 @@ class MomentumScanner(BaseStrategy):
                 token_id=token_id,
                 token_price=token_price,
                 p_yes=p_yes,
+                p_no=p_no,
                 delta_pct=delta_pct,
                 threshold_pct=_effective_threshold,  # max(vol_threshold, MIN_DELTA_PCT floor)
                 spot=spot,
@@ -1421,7 +1422,7 @@ class MomentumScanner(BaseStrategy):
                 ws_price = float(fill_event.get("price") or 0)
                 ws_size  = float(fill_event.get("size_matched") or 0)
                 if ws_price > 0 and ws_size > 0:
-                    actual_fill = (ws_price, ws_size)
+                    actual_fill = {"price": ws_price, "size_matched": ws_size}
                     _fill_from_ws = True
                     log.debug(
                         "Momentum: fill confirmed via WS",
@@ -1731,11 +1732,25 @@ class MomentumScanner(BaseStrategy):
             hedge_price = config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get(
                 market.market_type, config.MOMENTUM_HEDGE_PRICE
             )
+            # Recompute TTE at hedge-placement time.  signal.tte_seconds was captured
+            # at scan time; fill confirmation latency can burn several seconds.  A hedge
+            # placed with < 10 s remaining has no time to develop and will be
+            # immediately monitored post-expiry (Hedge C root cause).
+            _hedge_tte_now = (
+                (market.end_date - datetime.now(timezone.utc)).total_seconds()
+                if market.end_date is not None else signal.tte_seconds
+            )
             # Only place a hedge when the position's projected win PnL exceeds $1.
             # Projected PnL = what we collect if the token settles at $1 minus
             # what we paid:  entry_size × (1.0 − entry_price).
             _projected_pnl = round(entry_size * (1.0 - entry_price), 6)
-            if _projected_pnl <= 1.0:
+            if _hedge_tte_now < 10.0:
+                log.warning(
+                    "Momentum: GTD hedge skipped — market expires in < 10s",
+                    market=signal.market_title[:50],
+                    tte_s=round(_hedge_tte_now, 1),
+                )
+            elif _projected_pnl <= 1.0:
                 log.debug(
                     "Momentum: GTD hedge skipped — projected PnL ≤ $1",
                     market=signal.market_title[:50],
@@ -1761,58 +1776,235 @@ class MomentumScanner(BaseStrategy):
                 _hedge_contracts  = hedge_contracts
                 _hedge_size_usd   = hedge_size_usd
                 _hedge_side       = "DOWN" if signal.side in ("YES", "UP") else "UP"
-                hedge_id: str | None = None
-                try:
-                    hedge_id = await self._pm.place_limit(
-                        token_id=opp_token,
-                        side="BUY",
-                        price=hedge_price,
-                        size=hedge_contracts,
-                        market=market,
-                        post_only=True,
+
+                # ── Cap calculation ──────────────────────────────────────────────────
+                # Maximum price per contract we can pay while retaining at least
+                # MOMENTUM_HEDGE_MIN_RETAIN_USD of projected win PnL.
+                _tick = 0.01  # Polymarket minimum price tick
+                _max_hedge_price: float = hedge_price  # default: no external cap
+                _cap_check_ok: bool = True
+                if config.MOMENTUM_HEDGE_MIN_RETAIN_USD > 0.0 and hedge_contracts > 0:
+                    _pnl_cap = (_projected_pnl - config.MOMENTUM_HEDGE_MIN_RETAIN_USD) / hedge_contracts
+                    if _pnl_cap <= 0.0:
+                        _cap_check_ok = False
+                        log.debug(
+                            "Momentum: GTD hedge skipped — PnL cap ≤ 0",
+                            market=signal.market_title[:50],
+                            projected_pnl=round(_projected_pnl, 4),
+                            min_retain=config.MOMENTUM_HEDGE_MIN_RETAIN_USD,
+                        )
+                    else:
+                        _max_hedge_price = round(min(_pnl_cap, 1.0 - _tick), 4)
+                        log.debug(
+                            "Momentum: GTD hedge cap computed",
+                            market=signal.market_title[:50],
+                            max_hedge_price=_max_hedge_price,
+                            config_price=hedge_price,
+                            projected_pnl=round(_projected_pnl, 4),
+                        )
+
+                if _cap_check_ok:
+                    # ── Book pre-check ───────────────────────────────────────────────
+                    _opp_book = self._pm.get_book(opp_token)
+                    _opp_best_ask = round(_opp_book.best_ask, 4) if (_opp_book and _opp_book.best_ask) else None
+
+                    # ── Tactic selection ─────────────────────────────────────────────
+                    # Use taker (immediate FAK) if:
+                    #   a) Global taker flag is set, OR
+                    #   b) TTE threshold configured and market is close to expiry, OR
+                    #   c) Book has a seller already within our cap (grab the fill now)
+                    _tte = signal.tte_seconds if signal.tte_seconds is not None else 999
+                    _use_taker = (
+                        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER
+                        or (config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S > 0
+                            and _tte < config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S)
+                        or (_opp_best_ask is not None
+                            and _opp_best_ask > 0.0
+                            and _opp_best_ask <= _max_hedge_price)
                     )
-                    _hedge_id = hedge_id
-                except Exception as _hex:
-                    hedge_id = None
-                    log.warning("Momentum: GTD hedge error", exc=str(_hex))
-                if hedge_id:
-                    log.info(
-                        "Momentum: GTD hedge placed",
-                        market=signal.market_title[:50],
-                        main_side=signal.side,
-                        hedge_side=_hedge_side,
-                        hedge_price=hedge_price,
-                        hedge_contracts=round(hedge_contracts, 4),
-                        hedge_cost_usd=hedge_size_usd,
-                        hedge_id=hedge_id[:20],
-                    )
-                    _emit_event(
-                        "HEDGE_SUBMIT",
-                        market_id=signal.market_id,
-                        market_title=signal.market_title[:80],
-                        underlying=signal.underlying,
-                        market_type=signal.market_type,
-                        side=signal.side,
-                        hedge_side="DOWN" if signal.side in ("YES", "UP") else "UP",
-                        hedge_price=hedge_price,
-                        hedge_contracts=round(hedge_contracts, 4),
-                        size_usd=hedge_size_usd,
-                        hedge_id=hedge_id,
-                    )
-                    self._risk.update_gtd_hedge(
-                        signal.market_id, signal.side,
-                        hedge_id, opp_token, hedge_price, hedge_size_usd,
-                    )
-                else:
-                    # place_limit returned None without raising — CLOB rejected it.
-                    log.warning(
-                        "Momentum: GTD hedge failed — place_limit returned None",
-                        market=signal.market_title[:50],
-                        main_side=signal.side,
-                        hedge_price=hedge_price,
-                        hedge_contracts=round(hedge_contracts, 4),
-                        hedge_cost_usd=hedge_size_usd,
-                    )
+
+                    if config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S > 0 and _tte < config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S:
+                        log.debug(
+                            "Momentum: GTD hedge — TTE aggression active",
+                            market=signal.market_title[:50],
+                            tte_s=_tte,
+                            threshold_s=config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S,
+                        )
+
+                    # Sentinel values so the success-log block never hits UnboundLocalError
+                    _attempt_price: float   = hedge_price
+                    _taker_price: float     = hedge_price
+                    _taker_contracts: float = hedge_contracts
+                    hedge_id: str | None    = None
+
+                    try:
+                        if _use_taker:
+                            # ── Taker branch: single FAK at current best ask ──────────
+                            _taker_price = _opp_best_ask if _opp_best_ask else hedge_price
+                            if _taker_price > _max_hedge_price:
+                                log.debug(
+                                    "Momentum: GTD hedge taker skipped — ask above cap",
+                                    market=signal.market_title[:50],
+                                    best_ask=_taker_price,
+                                    max_price=_max_hedge_price,
+                                )
+                            else:
+                                # ── $1 minimum size check for taker ─────────────────
+                                # Taker price may be lower than config price, so the
+                                # pre-existing $1 raise (done at hedge_price) may not
+                                # cover the taker notional — recompute here.
+                                _taker_contracts = hedge_contracts
+                                _taker_cost = round(_taker_contracts * _taker_price, 6)
+                                if _taker_cost < 1.0:
+                                    _taker_contracts = round(1.0 / _taker_price, 6)
+                                    _taker_cost = round(_taker_contracts * _taker_price, 6)
+                                # Cap budget = total dollars we can spend
+                                _cap_budget = _projected_pnl - config.MOMENTUM_HEDGE_MIN_RETAIN_USD
+                                if config.MOMENTUM_HEDGE_MIN_RETAIN_USD > 0.0 and _taker_cost > _cap_budget:
+                                    log.debug(
+                                        "Momentum: GTD hedge taker skipped — $1 minimum exceeds cap budget",
+                                        market=signal.market_title[:50],
+                                        taker_price=_taker_price,
+                                        taker_contracts=round(_taker_contracts, 4),
+                                        taker_cost=_taker_cost,
+                                        cap_budget=round(_cap_budget, 4),
+                                    )
+                                else:
+                                    log.debug(
+                                        "Momentum: GTD hedge taker attempt",
+                                        market=signal.market_title[:50],
+                                        taker_price=_taker_price,
+                                        taker_contracts=round(_taker_contracts, 4),
+                                        best_ask=_opp_best_ask,
+                                    )
+                                    hedge_id = await self._pm.place_limit(
+                                        token_id=opp_token,
+                                        side="BUY",
+                                        price=_taker_price,
+                                        size=_taker_contracts,
+                                        market=market,
+                                        post_only=False,
+                                    )
+                        else:
+                            # ── Maker ladder: up to N ticks of concession ────────────
+                            for _step in range(config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION):
+                                _attempt_price = round(hedge_price + _step * _tick, 4)
+                                if _attempt_price > _max_hedge_price:
+                                    break
+                                if _step > 0:
+                                    log.debug(
+                                        "Momentum: GTD hedge ladder step",
+                                        market=signal.market_title[:50],
+                                        step=_step,
+                                        attempt_price=_attempt_price,
+                                        max_price=_max_hedge_price,
+                                    )
+                                hedge_id = await self._pm.place_limit(
+                                    token_id=opp_token,
+                                    side="BUY",
+                                    price=_attempt_price,
+                                    size=hedge_contracts,
+                                    market=market,
+                                    post_only=True,
+                                )
+                                if hedge_id:
+                                    break
+
+                    except Exception as _hex:
+                        hedge_id = None
+                        log.warning("Momentum: GTD hedge error", exc=str(_hex))
+                        _emit_event(
+                            "HEDGE_FAIL",
+                            market_id=signal.market_id,
+                            market_title=signal.market_title[:80],
+                            underlying=signal.underlying,
+                            market_type=signal.market_type,
+                            side=signal.side,
+                            hedge_side=_hedge_side,
+                            hedge_price=hedge_price,
+                            hedge_contracts=round(hedge_contracts, 4),
+                            size_usd=hedge_size_usd,
+                            reason=str(_hex)[:120],
+                        )
+
+                    if hedge_id:
+                        # Resolve actual placed price and contracts
+                        _placed_price     = _taker_price if _use_taker else _attempt_price
+                        _placed_contracts = _taker_contracts if _use_taker else hedge_contracts
+                        _placed_size_usd  = round(_placed_contracts * _placed_price, 6)
+                        _hedge_id         = hedge_id
+                        # Update Phase E CSV vars to reflect actual placement
+                        _hedge_price      = _placed_price
+                        _hedge_contracts  = _placed_contracts
+                        _hedge_size_usd   = _placed_size_usd
+                        log.info(
+                            "Momentum: GTD hedge placed",
+                            market=signal.market_title[:50],
+                            main_side=signal.side,
+                            hedge_side=_hedge_side,
+                            hedge_price=_placed_price,
+                            config_price=hedge_price,
+                            hedge_contracts=round(_placed_contracts, 4),
+                            hedge_cost_usd=_placed_size_usd,
+                            taker=_use_taker,
+                            hedge_id=hedge_id[:20],
+                        )
+                        _emit_event(
+                            "HEDGE_SUBMIT",
+                            market_id=signal.market_id,
+                            market_title=signal.market_title[:80],
+                            underlying=signal.underlying,
+                            market_type=signal.market_type,
+                            side=signal.side,
+                            hedge_side=_hedge_side,
+                            hedge_price=_placed_price,
+                            hedge_contracts=round(_placed_contracts, 4),
+                            size_usd=_placed_size_usd,
+                            hedge_id=hedge_id,
+                        )
+                        self._risk.register_hedge_order(
+                            order_id=hedge_id,
+                            market_id=signal.market_id,
+                            token_id=opp_token,
+                            underlying=signal.underlying,
+                            market_type=signal.market_type,
+                            market_title=signal.market_title[:80],
+                            order_price=_placed_price,
+                            order_size=_placed_contracts,
+                            order_size_usd=_placed_size_usd,
+                            parent_side=signal.side,
+                        )
+                        self._risk.update_gtd_hedge(
+                            signal.market_id, signal.side,
+                            hedge_id, opp_token, _placed_price, _placed_size_usd,
+                        )
+                    else:
+                        # All attempts failed (ladder exhausted or taker skipped/rejected)
+                        _opp_best_ask_log = round(_opp_book.best_ask, 4) if _opp_book and _opp_book.best_ask else None
+                        log.warning(
+                            "Momentum: GTD hedge failed — all attempts exhausted",
+                            market=signal.market_title[:50],
+                            main_side=signal.side,
+                            config_price=hedge_price,
+                            max_price=_max_hedge_price,
+                            opp_best_ask=_opp_best_ask_log,
+                            taker_attempted=_use_taker,
+                            steps_tried=config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION,
+                        )
+                        _emit_event(
+                            "HEDGE_FAIL",
+                            market_id=signal.market_id,
+                            market_title=signal.market_title[:80],
+                            underlying=signal.underlying,
+                            market_type=signal.market_type,
+                            side=signal.side,
+                            hedge_side=_hedge_side,
+                            hedge_price=hedge_price,
+                            hedge_contracts=round(hedge_contracts, 4),
+                            size_usd=hedge_size_usd,
+                            opp_best_ask=_opp_best_ask_log,
+                            reason="all_attempts_exhausted",
+                        )
 
         # ── Write momentum fills CSV for execution-quality analysis ──────────
         try:
@@ -2110,6 +2302,7 @@ def _signal_log_dict(s: MomentumSignal) -> dict:
         "token_id":      s.token_id,
         "token_price":   round(s.token_price, 3),
         "p_yes":         round(s.p_yes, 3),
+        "p_no":          round(s.p_no, 3),
         "delta_pct":     round(s.delta_pct, 3),
         "threshold_pct": round(s.threshold_pct, 3),
         "spot":          round(s.spot, 2),

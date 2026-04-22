@@ -38,6 +38,7 @@ from py_clob_client.clob_types import (
     OpenOrderParams,
     OrderArgs,
     OrderType,
+    TradeParams,
 )
 from py_clob_client.exceptions import PolyApiException
 
@@ -484,6 +485,12 @@ class PMClient:
         # is called (race: fill completes during REST order-placement round-trip).
         # Entries are (msg, timestamp); pruned lazily on each new fill event.
         self._recent_fills: dict[str, tuple[dict, float]] = {}
+        # Cache of actual execution prices from WS `trade` events, keyed by our
+        # order_id (taker_order_id for taker fills, maker_orders[i].order_id for
+        # maker fills).  Stores (vwap_numerator, total_size, timestamp) so that
+        # _fire_order_fill can inject the real price before dispatching callbacks.
+        # Also used by get_order_fill_rest as a zero-latency price source.
+        self._trade_exec_cache: dict[str, tuple[float, float, float]] = {}
         self._api_creds: Optional[ApiCreds] = None  # populated after CLOB auth
         self._running = False
         self._paper_mode: bool = config.PAPER_TRADING
@@ -556,6 +563,18 @@ class PMClient:
                 log.error("user_ws_reconnect callback error", exc=str(exc))
 
     async def _fire_order_fill(self, order_data: dict) -> None:
+        """Dispatch an order MATCHED/FILLED event to registered callbacks.
+
+        Ownership of fill-future resolution belongs exclusively to
+        _fire_trade_fill, which carries the actual execution price.  This
+        method injects the cached VWAP price (if a trade event already arrived)
+        before calling callbacks, but intentionally does NOT resolve
+        _pending_fill_futures — doing so would race against _fire_trade_fill:
+        if the order event arrives first, resolving the future here would lock
+        in the limit price before the trade event can provide the real price.
+        The scanner.py timeout → REST-fallback path handles the case where
+        trade events never arrive (e.g. WS drop at match time).
+        """
         # Prune stale cached fills (older than 30 s) to prevent unbounded growth.
         _now = time.time()
         if self._recent_fills:
@@ -564,28 +583,114 @@ class PMClient:
                 k: v for k, v in self._recent_fills.items() if v[1] > cutoff
             }
 
-        # Resolve any registered one-shot future for this order.
+        # Inject actual execution price from trade event cache if available.
+        # Trade events arrive alongside order MATCHED events and carry the real
+        # fill price; the order event's `price` field is the limit/order price.
         order_id = order_data.get("id") or order_data.get("order_id", "")
-        if order_id:
-            fut = self._pending_fill_futures.pop(order_id, None)
-            if fut is not None and not fut.done():
-                fut.set_result(order_data)
-            elif fut is not None:
-                # fut.done() is True — the future already timed out (scanner moved to
-                # REST fallback).  The fill event is intentionally dropped here; the
-                # REST path already retrieved the fill details independently.
-                pass
-            else:
-                # fut is None — no waiter registered yet.  Park the event so
-                # register_fill_future() can resolve it immediately if called
-                # shortly after (race: fill arrived during REST round-trip).
-                self._recent_fills[order_id] = (order_data, _now)
+        cached_trade = self._trade_exec_cache.get(order_id) if order_id else None
+        if cached_trade is not None:
+            vwap_num, total_size, _ = cached_trade
+            if total_size > 0:
+                order_data = dict(order_data)  # shallow copy — never mutate caller's dict
+                order_data["price"] = vwap_num / total_size
 
+        # Dispatch to maker/monitor callbacks (live_fill_handler, etc.).
+        # Do NOT touch _pending_fill_futures here — that is _fire_trade_fill's job.
         for cb in self._order_fill_callbacks:
             try:
                 await cb(order_data)
             except Exception as exc:
                 log.error("order_fill callback error", exc=str(exc))
+
+    async def _fire_trade_fill(self, trade_msg: dict) -> None:
+        """Handle a `trade` event from the PM user WS channel.
+
+        Trade events carry the actual execution price (not the order limit price)
+        and fire at match time with zero additional latency.  Responsibilities:
+        - Compute VWAP across maker_orders for multi-level taker sweeps
+        - Cache (vwap_numerator, total_size, ts) by our order_id in
+          _trade_exec_cache so _fire_order_fill can inject the real price
+          for both taker fills (taker_order_id) and maker fills
+          (maker_orders[i].order_id).
+        - Resolve pending fill futures (scanner.py path) immediately.
+        """
+        _now = time.time()
+        maker_orders = trade_msg.get("maker_orders") or []
+
+        # ── Taker-side: use taker_order_id ──────────────────────────────────
+        taker_order_id = trade_msg.get("taker_order_id", "")
+        if taker_order_id:
+            # The top-level `price` is always the taker's execution price on their
+            # CLOB side (e.g. YES price = 0.79).  Do NOT use maker_orders[i].price
+            # for the taker's exec price: YES and NO are separate CLOBs, so makers
+            # matched against a YES taker are on the NO CLOB at the complement price
+            # (e.g. 0.21), which would produce the wrong fill price.
+            # Use maker_orders only to aggregate the matched size.
+            exec_price = float(trade_msg.get("price", 0))
+            if maker_orders:
+                mo_size = sum(float(m.get("matched_amount", 0)) for m in maker_orders)
+                exec_size = mo_size if mo_size > 0 else float(trade_msg.get("size", 0))
+            else:
+                exec_size = float(trade_msg.get("size", 0))
+
+            if exec_price > 0 and exec_size > 0:
+                existing = self._trade_exec_cache.get(taker_order_id)
+                if existing is None:
+                    new_entry: tuple[float, float, float] = (exec_price * exec_size, exec_size, _now)
+                else:
+                    prev_num, prev_size, _ = existing
+                    new_entry = (prev_num + exec_price * exec_size, prev_size + exec_size, _now)
+                self._trade_exec_cache[taker_order_id] = new_entry
+
+                vwap_num, total_size, _ = new_entry
+                vwap_price = vwap_num / total_size
+
+                # Resolve pending fill future so scanner.py gets the real price
+                normalized: dict = {
+                    "id":           taker_order_id,
+                    "price":        vwap_price,
+                    "size_matched": total_size,
+                    "status":       "MATCHED",
+                }
+                fut = self._pending_fill_futures.pop(taker_order_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(normalized)
+                elif fut is None:
+                    self._recent_fills[taker_order_id] = (normalized, _now)
+
+                log.debug(
+                    "PM user WS: taker trade execution cached",
+                    taker_order_id=taker_order_id[:20],
+                    exec_price=round(vwap_price, 6),
+                    exec_size=round(total_size, 6),
+                )
+
+        # ── Maker-side: cache individual maker order prices ──────────────────
+        # When we are the maker, our order_id appears in maker_orders[i].order_id.
+        # Cache per-maker prices so _fire_order_fill can inject them when the
+        # corresponding order MATCHED event fires.
+        for mo in maker_orders:
+            mo_id    = mo.get("order_id", "")
+            mo_price = float(mo.get("price", 0))
+            mo_size  = float(mo.get("matched_amount", 0))
+            if mo_id and mo_price > 0 and mo_size > 0:
+                existing_mo = self._trade_exec_cache.get(mo_id)
+                if existing_mo is None:
+                    self._trade_exec_cache[mo_id] = (mo_price * mo_size, mo_size, _now)
+                else:
+                    prev_num, prev_size, _ = existing_mo
+                    self._trade_exec_cache[mo_id] = (
+                        prev_num + mo_price * mo_size,
+                        prev_size + mo_size,
+                        _now,
+                    )
+
+        # Prune stale cache entries to prevent unbounded growth
+        if len(self._trade_exec_cache) > 200:
+            cutoff = _now - 60.0
+            self._trade_exec_cache = {
+                k: v for k, v in self._trade_exec_cache.items() if v[2] > cutoff
+            }
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -1320,10 +1425,64 @@ class PMClient:
 
         Returns a dict with keys: price, size_matched, size_remaining, status
         or None if the order is not found / has no fills.
+
+        Price is sourced in priority order:
+        1. _trade_exec_cache  — populated by WS trade events (zero-latency, exact)
+        2. GET /data/trades?id=<taker_order_id>  — REST trade records (taker fills)
+        3. GET /data/orders/<order_id>  — order limit price (safe fallback)
         """
         if self._paper_mode or self._clob is None:
             return None
+
+        # 1. If a trade event already arrived via WS, use that cached VWAP price.
+        cached = self._trade_exec_cache.get(order_id)
+        if cached is not None:
+            vwap_num, total_size, _ = cached
+            if total_size > 0:
+                vwap_price = vwap_num / total_size
+                log.info(
+                    "Order fill confirmed from trade-event cache",
+                    order_id=order_id[:20],
+                    fill_price=round(vwap_price, 6),
+                    fill_size=round(total_size, 6),
+                )
+                return {
+                    "price":         vwap_price,
+                    "size_matched":  total_size,
+                    "size_remaining": 0.0,
+                    "status":        "MATCHED",
+                }
+
         try:
+            # 2. Query /data/trades?id=<taker_order_id> — returns actual execution
+            #    records for taker fills.  This is the correct approach: querying by
+            #    asset_id (old approach) returned counterparty records with wrong prices.
+            trades = await asyncio.to_thread(
+                self._clob.get_trades, TradeParams(id=order_id)
+            )
+            if trades:
+                total_size  = sum(float(t.get("size", 0)) for t in trades)
+                total_value = sum(
+                    float(t.get("price", 0)) * float(t.get("size", 0))
+                    for t in trades
+                )
+                if total_size > 0 and total_value > 0:
+                    vwap_price = total_value / total_size
+                    log.info(
+                        "Order fill confirmed from CLOB trades (REST fallback)",
+                        order_id=order_id[:20],
+                        fill_price=round(vwap_price, 6),
+                        fill_size=round(total_size, 6),
+                        trade_count=len(trades),
+                    )
+                    return {
+                        "price":          vwap_price,
+                        "size_matched":   total_size,
+                        "size_remaining": 0.0,
+                        "status":         "MATCHED",
+                    }
+
+            # 3. Fall back to order record — limit price is a safe upper bound.
             order = await asyncio.to_thread(self._clob.get_order, order_id)
             if not order:
                 log.warning("get_order_fill_rest: order not found", order_id=order_id[:20])
@@ -1331,28 +1490,23 @@ class PMClient:
             size_matched = float(order.get("size_matched") or 0)
             if size_matched <= 0:
                 return None
-            # Use the order's own price as the fill price.  The associated-trade
-            # endpoint returns data from the counterparty's perspective (e.g. the
-            # complementary YES-token seller), which produces wrong price/size values
-            # (observed: price=0.97 size=1822 for a 0.035 × 28.57 hedge order).
-            # The order price is a safe upper bound — GTC fills at order price or better.
             fill_price = float(order.get("price") or 0)
             if fill_price <= 0:
                 return None
-            size_total = float(order.get("size") or order.get("original_size") or 0)
+            size_total     = float(order.get("size") or order.get("original_size") or 0)
             size_remaining = max(0.0, size_total - size_matched)
-            status = str(order.get("status") or "MATCHED")
+            status         = str(order.get("status") or "MATCHED")
             log.info(
-                "Order fill confirmed from CLOB (REST fallback)",
+                "Order fill confirmed from order record (limit-price fallback)",
                 order_id=order_id[:20],
                 fill_price=fill_price,
                 fill_size=size_matched,
             )
             return {
-                "price": fill_price,
-                "size_matched": size_matched,
+                "price":          fill_price,
+                "size_matched":   size_matched,
                 "size_remaining": size_remaining,
-                "status": status,
+                "status":         status,
             }
         except Exception as exc:
             log.warning("get_order_fill_rest: failed", order_id=order_id[:20], exc=str(exc))
@@ -1443,14 +1597,20 @@ class PMClient:
                         for msg in msgs:
                             if not isinstance(msg, dict):
                                 continue
-                            log.debug("PM user WS msg", status=msg.get("status"), type=msg.get("type"), keys=list(msg.keys())[:8])
+                            log.debug("PM user WS msg", status=msg.get("status"), type=msg.get("type"), event_type=msg.get("event_type"), keys=list(msg.keys())[:8])
+                            _event_type = msg.get("event_type", "")
+                            _type       = msg.get("type", "")
+                            _status     = msg.get("status", "")
+                            # Route `trade` events (actual execution data) before
+                            # the generic MATCHED check — trade events have
+                            # status=MATCHED too, so they must be intercepted first.
+                            if _event_type == "trade" or _type.upper() == "TRADE":
+                                await self._fire_trade_fill(msg)
                             # PM sends status=="MATCHED" (or "FILLED") on order fill events.
                             # Also handle nested {"event_type": "order", "order": {...}} format.
-                            _status = msg.get("status", "")
-                            _type   = msg.get("type", "")
-                            if _status.upper() in ("MATCHED", "FILLED") or _type.upper() in ("MATCHED", "FILLED"):
+                            elif _status.upper() in ("MATCHED", "FILLED") or _type.upper() in ("MATCHED", "FILLED"):
                                 await self._fire_order_fill(msg)
-                            elif msg.get("event_type") == "order":
+                            elif _event_type == "order":
                                 inner = msg.get("order") or {}
                                 if isinstance(inner, dict) and inner.get("status", "").upper() in ("MATCHED", "FILLED"):
                                     await self._fire_order_fill(inner)
@@ -1556,19 +1716,21 @@ class PMClient:
                     tokens = data.get("tokens") or []
                     if not tokens:
                         return None
-                    # Find the YES/Up token by its outcome label — more robust than
-                    # relying on ordering, which can vary across markets.
-                    for tok in tokens:
-                        if str(tok.get("outcome", "")).lower() in ("yes", "up"):
-                            yes_price = tok.get("price")
-                            if yes_price is not None:
-                                return float(yes_price)
-                    # Outcome label absent — fall back to winner flag or first token.
+                    # PRIMARY: use the `winner` flag — this is the authoritative source
+                    # of truth per the CLOB API spec.  `price` can be stale or show
+                    # ~1.0 for a losing token in the brief window after settlement.
                     for tok in tokens:
                         if tok.get("winner") is True:
                             # This token won; determine if it's the YES/UP side.
                             is_yes = str(tok.get("outcome", "")).lower() not in ("no", "down")
                             return 1.0 if is_yes else 0.0
+                    # FALLBACK: winner flag absent — use the YES/Up token's settled price.
+                    # Only reached when the CLOB response omits the winner field entirely.
+                    for tok in tokens:
+                        if str(tok.get("outcome", "")).lower() in ("yes", "up"):
+                            yes_price = tok.get("price")
+                            if yes_price is not None:
+                                return float(yes_price)
                     # Last resort: assume tokens[0] is YES/Up.
                     yes_price = tokens[0].get("price")
                     if yes_price is not None:

@@ -885,6 +885,12 @@ class RiskEngine:
             pos.hedge_token_id = hedge_token_id
             pos.hedge_price = hedge_price
             pos.hedge_size_usd = hedge_size_usd
+            # Register hedge token in the token→strategy map so that if the hedge
+            # fills and the bot restarts, the filled token is restored with the
+            # correct "momentum_hedge" strategy (not "unknown").
+            if hedge_token_id:
+                self._token_strategy[hedge_token_id] = "momentum_hedge"
+                self._save_token_strategy()
             # Mirror parent_side onto the HedgeOrder entity so the reverse lookup
             # (order_id → Position) can use the stored key directly (O(1)).
             ho = self._hedge_orders.get(hedge_order_id)
@@ -1302,6 +1308,14 @@ class RiskEngine:
                 if ho.pending_cancel_side and ho.status not in HedgeStatus.TERMINAL
             ]
 
+    def get_open_hedge_orders(self) -> list:
+        """Return all non-terminal HedgeOrders (open / partially_filled)."""
+        with self._lock:
+            return [
+                ho for ho in self._hedge_orders.values()
+                if ho.status not in HedgeStatus.TERMINAL
+            ]
+
     def set_pending_cancel(
         self,
         order_id: str,
@@ -1335,13 +1349,23 @@ class RiskEngine:
             self._save_hedge_orders()
 
     def has_hedge_fill(self, market_id: str) -> bool:
-        """Return True if a non-terminal HedgeOrder with fills exists for market_id.
+        """Return True if a momentum_hedge record already exists for market_id.
+
+        Guards against double-writes: returns True for any terminal HedgeOrder
+        (cancelled, expired, filled) so that concurrent asyncio paths that pass
+        through an await between the guard check and the eventual CSV write do
+        not both proceed to write a row.
 
         Deprecated: new code should use get_hedge_order_by_market() directly.
         """
         ho = self.get_hedge_order_by_market(market_id)
-        if ho is not None and ho.size_filled > 0:
-            return True
+        if ho is not None:
+            if ho.size_filled > 0:
+                return True
+            # Any terminal status means finalize_hedge() already committed or
+            # is mid-commit (status is set inside the lock before _append_csv).
+            if ho.status in HedgeStatus.TERMINAL:
+                return True
         # Fallback: scan trades.csv for legacy rows written before the HedgeOrder model
         try:
             if not TRADES_CSV.exists():

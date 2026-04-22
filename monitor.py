@@ -133,6 +133,33 @@ _MOMENTUM_TICKS_HEADER = [
     "exit", "reason",
 ]
 
+# ── Hedge CLOB tick CSV ───────────────────────────────────────────────────────
+# Dedicated file for CLOB price sampling of open GTD hedge limit orders.
+# Sampled once per _check_all_positions() sweep while the hedge is unfilled.
+# Used post-trade to understand why a hedge didn't fill (was CLOB far from bid?).
+#
+# Columns:
+#   ts              — UTC ISO timestamp
+#   market_id       — first 20 chars of condition_id
+#   market_title    — human label (truncated to 60)
+#   underlying      — BTC / ETH / SOL / …
+#   parent_side     — side of the parent momentum position (YES/NO/UP/DOWN)
+#   hedge_order_id  — PM order ID of the resting GTD hedge bid
+#   hedge_token_id  — token_id of the hedge token (opposite of parent)
+#   hedge_bid_price — the price at which the hedge limit bid was placed
+#   clob_mid        — CLOB mid of the hedge token at sample time
+#   clob_best_bid   — CLOB best bid of the hedge token at sample time
+#   clob_best_ask   — CLOB best ask of the hedge token at sample time
+#   tte_s           — seconds to market expiry at sample time
+#   status          — HedgeOrder status (open / partially_filled / …)
+
+HEDGE_CLOB_TICKS_CSV    = _DATA_DIR / "hedge_clob_ticks.csv"
+_HEDGE_CLOB_TICKS_HEADER = [
+    "ts", "market_id", "market_title", "underlying", "parent_side",
+    "hedge_order_id", "hedge_token_id", "hedge_bid_price",
+    "clob_mid", "clob_best_bid", "clob_best_ask", "tte_s", "status",
+]
+
 def _ensure_momentum_ticks_csv() -> None:
     _DATA_DIR.mkdir(exist_ok=True)
     if not MOMENTUM_TICKS_CSV.exists():
@@ -191,6 +218,51 @@ def _write_momentum_tick(
             csv.DictWriter(f, fieldnames=_MOMENTUM_TICKS_HEADER).writerow(row)
     except Exception as _ex:
         log.debug("_write_momentum_tick failed", exc=str(_ex))  # never let tick logging crash the monitor
+
+
+def _ensure_hedge_clob_ticks_csv() -> None:
+    _DATA_DIR.mkdir(exist_ok=True)
+    if not HEDGE_CLOB_TICKS_CSV.exists():
+        with HEDGE_CLOB_TICKS_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=_HEDGE_CLOB_TICKS_HEADER).writeheader()
+
+
+def _write_hedge_clob_tick(
+    market_id: str,
+    market_title: str,
+    underlying: str,
+    parent_side: str,
+    hedge_order_id: str,
+    hedge_token_id: str,
+    hedge_bid_price: float,
+    clob_mid: Optional[float],
+    clob_best_bid: Optional[float],
+    clob_best_ask: Optional[float],
+    tte_s: Optional[float],
+    status: str,
+) -> None:
+    """Append one CLOB price sample for an open GTD hedge order to hedge_clob_ticks.csv."""
+    try:
+        _ensure_hedge_clob_ticks_csv()
+        row = {
+            "ts":               datetime.now(timezone.utc).isoformat(),
+            "market_id":        market_id[:20],
+            "market_title":     market_title[:60],
+            "underlying":       underlying,
+            "parent_side":      parent_side,
+            "hedge_order_id":   hedge_order_id[:20],
+            "hedge_token_id":   hedge_token_id[:20] if hedge_token_id else "",
+            "hedge_bid_price":  round(hedge_bid_price, 4),
+            "clob_mid":         round(clob_mid, 4) if clob_mid is not None else "",
+            "clob_best_bid":    round(clob_best_bid, 4) if clob_best_bid is not None else "",
+            "clob_best_ask":    round(clob_best_ask, 4) if clob_best_ask is not None else "",
+            "tte_s":            round(tte_s, 1) if tte_s is not None else "",
+            "status":           status,
+        }
+        with HEDGE_CLOB_TICKS_CSV.open("a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=_HEDGE_CLOB_TICKS_HEADER).writerow(row)
+    except Exception as _ex:
+        log.debug("_write_hedge_clob_tick failed", exc=str(_ex))
 
 
 def _load_market_outcomes() -> dict:
@@ -644,6 +716,8 @@ class PositionMonitor:
             self._spot.on_chainlink_update(self._on_spot_update)
         log.info("PositionMonitor started (event-driven)")
         asyncio.create_task(self._auto_redeem_loop())
+        if not config.PAPER_TRADING:
+            asyncio.create_task(self._pm_reconcile_loop())
         # Rare backstop sweep: catches resolved markets that PM WS never echoes
         # (e.g. resolution during a transient disconnect) and any other edge-case
         # positions that slipped through.  self._interval is acceptable for
@@ -1271,6 +1345,35 @@ class PositionMonitor:
                     log.error("Auto-redeem loop error", exc=str(exc))
             await asyncio.sleep(config.REDEEM_POLL_INTERVAL)
 
+    # ── PM reconciliation ─────────────────────────────────────────────────────
+
+    async def _pm_reconcile_loop(self) -> None:
+        """Periodically reconcile trades.csv against Polymarket Data API.
+
+        Runs every 5 minutes in live mode.  Patches trades.csv with actual fill
+        prices and PnL from data-api.polymarket.com/activity — correcting the two
+        known recording bugs:
+          1. Entry price stored as order price instead of actual CLOB fill price.
+          2. TP-sell exits recorded as WIN at $1 when the position was sold early.
+        """
+        # Initial delay: let startup restore and first trades settle
+        await asyncio.sleep(90)
+        while self._running:
+            try:
+                from pm_reconcile import reconcile_trades_csv
+                result = await reconcile_trades_csv(config.POLY_FUNDER)
+                if result.get("patched", 0) > 0:
+                    log.info(
+                        "PM reconciliation: trades.csv patched",
+                        patched=result["patched"],
+                        markets=[m["market_title"][:40] for m in result.get("markets", [])],
+                    )
+                if result.get("errors"):
+                    log.warning("PM reconciliation errors", errors=result["errors"])
+            except Exception as exc:
+                log.error("PM reconcile loop error", exc=str(exc))
+            await asyncio.sleep(300)  # every 5 minutes
+
     async def _fetch_hedge_resolve_spot(self, parent_pos: "Position") -> float:
         """Return the settlement spot price for parent_pos's market.
 
@@ -1784,6 +1887,48 @@ class PositionMonitor:
             except Exception as exc:
                 log.error("Error checking position", market_id=pos.market_id, exc=str(exc))
 
+        # ── Hedge CLOB tick logging ─────────────────────────────────────────────
+        # Sample the CLOB price of every open (non-terminal) GTD hedge order.
+        # Written once per backstop sweep; guarded by MOMENTUM_HEDGE_CLOB_LOG_ENABLED.
+        if getattr(config, "MOMENTUM_HEDGE_CLOB_LOG_ENABLED", True):
+            for ho in self._risk.get_open_hedge_orders():
+                if not ho.token_id:
+                    continue
+                try:
+                    market = self._pm._markets.get(ho.market_id)
+                    book = self._pm._books.get(ho.token_id) if ho.token_id else None
+                    clob_mid: Optional[float] = None
+                    clob_bid: Optional[float] = None
+                    clob_ask: Optional[float] = None
+                    if book is not None:
+                        clob_bid = book.best_bid
+                        clob_ask = book.best_ask
+                        if clob_bid is not None and clob_ask is not None:
+                            clob_mid = (clob_bid + clob_ask) / 2
+                        elif clob_bid is not None:
+                            clob_mid = clob_bid
+                        elif clob_ask is not None:
+                            clob_mid = clob_ask
+                    tte_s: Optional[float] = None
+                    if market is not None and market.end_date is not None:
+                        tte_s = (market.end_date - datetime.now(timezone.utc)).total_seconds()
+                    _write_hedge_clob_tick(
+                        market_id=ho.market_id,
+                        market_title=ho.market_title or "",
+                        underlying=ho.underlying or "",
+                        parent_side=ho.parent_side or "",
+                        hedge_order_id=ho.order_id,
+                        hedge_token_id=ho.token_id,
+                        hedge_bid_price=ho.order_price or 0.0,
+                        clob_mid=clob_mid,
+                        clob_best_bid=clob_bid,
+                        clob_best_ask=clob_ask,
+                        tte_s=tte_s,
+                        status=ho.status,
+                    )
+                except Exception as _hex:
+                    log.debug("Hedge CLOB tick logging failed", order_id=ho.order_id[:20], exc=str(_hex))
+
     async def _check_position(
         self,
         pos: Position,
@@ -1979,7 +2124,8 @@ class PositionMonitor:
         # Write every intra-hold price check to momentum_ticks.csv for momentum
         # and range positions. Kept out of bot.log to avoid noise; the dedicated
         # CSV is easy to filter and analyse for calibrating exit stop thresholds.
-        if pos.strategy in ("momentum", "range"):
+        # Guarded by MOMENTUM_TICKS_LOG_ENABLED so it can be disabled in production.
+        if pos.strategy in ("momentum", "range") and getattr(config, "MOMENTUM_TICKS_LOG_ENABLED", True):
             _tick_delta: Optional[float] = None
             if current_spot is not None:
                 if pos.strategy == "range" and pos.range_lo > 0 and pos.range_hi > 0:

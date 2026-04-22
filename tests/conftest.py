@@ -1,9 +1,23 @@
 """
 conftest.py — Shared pytest fixtures.
 
-Redirects risk.TRADES_CSV to a temp file for every test so the real
-data/trades.csv is never polluted by the test suite.
+Redirects all mutable data-file paths to per-test temp files so the real
+data/ directory is never polluted by the test suite.
+
+Files isolated (module-level constants → tmp_path):
+  risk.TRADES_CSV                              → trades.csv
+  risk.OPEN_POSITIONS_JSON                     → open_positions.json
+  risk.HEDGE_ORDERS_JSON                       → hedge_orders.json
+  risk.PAPER_HEDGE_FILLS_JSON                  → paper_hedge_fills.json
+  strategies.Momentum.scanner.MOMENTUM_FILLS_CSV → momentum_fills.csv
+  strategies.Momentum.event_log.MOMENTUM_EVENTS_PATH → momentum_events.jsonl
+  fill_simulator.FILLS_CSV                     → fills.csv
+  monitor._PENDING_RESOLUTIONS_PATH            → pending_resolutions.json
+  monitor.HEDGE_CLOB_TICKS_CSV                 → hedge_clob_ticks.csv
+  logger file handlers                         → bot.log / errors.log
 """
+import logging
+import logging.handlers as _log_handlers
 import sys
 from pathlib import Path
 
@@ -11,7 +25,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 import config
+import fill_simulator as _fill_sim_mod
+import monitor as _monitor_mod
 import risk
+import strategies.Momentum.event_log as _event_log_mod
+import strategies.Momentum.scanner as _scanner_mod
+
+
+@pytest.fixture(autouse=True)
+def _isolate_momentum_fills_csv(tmp_path):
+    """Patch scanner.MOMENTUM_FILLS_CSV to a per-test temp file."""
+    original = _scanner_mod.MOMENTUM_FILLS_CSV
+    _scanner_mod.MOMENTUM_FILLS_CSV = tmp_path / "momentum_fills.csv"
+    yield
+    _scanner_mod.MOMENTUM_FILLS_CSV = original
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +61,88 @@ def _isolate_open_positions(tmp_path):
     risk.OPEN_POSITIONS_JSON = tmp_path / "open_positions.json"
     yield
     risk.OPEN_POSITIONS_JSON = original
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hedge_orders(tmp_path):
+    """Patch risk.HEDGE_ORDERS_JSON to a per-test temp file."""
+    original = risk.HEDGE_ORDERS_JSON
+    risk.HEDGE_ORDERS_JSON = tmp_path / "hedge_orders.json"
+    yield
+    risk.HEDGE_ORDERS_JSON = original
+
+
+@pytest.fixture(autouse=True)
+def _isolate_paper_hedge_fills(tmp_path):
+    """Patch risk.PAPER_HEDGE_FILLS_JSON to a per-test temp file."""
+    original = risk.PAPER_HEDGE_FILLS_JSON
+    risk.PAPER_HEDGE_FILLS_JSON = tmp_path / "paper_hedge_fills.json"
+    yield
+    risk.PAPER_HEDGE_FILLS_JSON = original
+
+
+@pytest.fixture(autouse=True)
+def _isolate_momentum_events(tmp_path):
+    """Patch event_log.MOMENTUM_EVENTS_PATH to a per-test temp file."""
+    original = _event_log_mod.MOMENTUM_EVENTS_PATH
+    _event_log_mod.MOMENTUM_EVENTS_PATH = tmp_path / "momentum_events.jsonl"
+    yield
+    _event_log_mod.MOMENTUM_EVENTS_PATH = original
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fills_csv(tmp_path):
+    """Patch fill_simulator.FILLS_CSV to a per-test temp file."""
+    original = _fill_sim_mod.FILLS_CSV
+    _fill_sim_mod.FILLS_CSV = tmp_path / "fills.csv"
+    yield
+    _fill_sim_mod.FILLS_CSV = original
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pending_resolutions(tmp_path):
+    """Patch monitor._PENDING_RESOLUTIONS_PATH to a per-test temp file."""
+    original = _monitor_mod._PENDING_RESOLUTIONS_PATH
+    _monitor_mod._PENDING_RESOLUTIONS_PATH = tmp_path / "pending_resolutions.json"
+    yield
+    _monitor_mod._PENDING_RESOLUTIONS_PATH = original
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hedge_clob_ticks(tmp_path):
+    """Patch monitor.HEDGE_CLOB_TICKS_CSV to a per-test temp file."""
+    original = _monitor_mod.HEDGE_CLOB_TICKS_CSV
+    _monitor_mod.HEDGE_CLOB_TICKS_CSV = tmp_path / "hedge_clob_ticks.csv"
+    yield
+    _monitor_mod.HEDGE_CLOB_TICKS_CSV = original
+
+
+@pytest.fixture(autouse=True)
+def _isolate_log_files(tmp_path):
+    """Redirect rotating file handlers (bot.log, errors.log) to tmp_path.
+
+    _setup_root_logger() runs at import time and attaches RotatingFileHandlers
+    to the root logger.  Simply patching module-level LOG_FILE / ERRORS_FILE
+    constants has no effect on already-attached handlers, so we must reach into
+    the handler objects and swap out the underlying file path.
+    """
+    root = logging.getLogger()
+    redirected: dict = {}
+    for h in root.handlers:
+        if not isinstance(h, _log_handlers.RotatingFileHandler):
+            continue
+        fname = Path(h.baseFilename).name
+        if fname not in ("bot.log", "errors.log"):
+            continue
+        h.close()
+        redirected[h] = h.baseFilename
+        h.baseFilename = str(tmp_path / fname)
+        h.stream = h._open()
+    yield
+    for h, orig_path in redirected.items():
+        h.close()
+        h.baseFilename = orig_path
+        h.stream = h._open()
 
 
 @pytest.fixture(autouse=True)

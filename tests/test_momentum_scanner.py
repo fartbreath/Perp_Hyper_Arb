@@ -50,7 +50,7 @@ from pathlib import Path
 
 from typing import Optional
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 
@@ -259,6 +259,8 @@ def _make_signal(**kwargs) -> MomentumSignal:
         token_price=0.85,
 
         p_yes=0.85,
+
+        p_no=0.15,
 
         delta_pct=3.0,
 
@@ -2436,6 +2438,18 @@ class TestGTDHedge:
 
             "MOMENTUM_TP_RESTING_ENABLED": config.MOMENTUM_TP_RESTING_ENABLED,
 
+            "MOMENTUM_HEDGE_MIN_RETAIN_USD": config.MOMENTUM_HEDGE_MIN_RETAIN_USD,
+
+            "MOMENTUM_HEDGE_MAX_TICKS_CONCESSION": config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION,
+
+            "MOMENTUM_HEDGE_AGGRESSIVE_TTE_S": config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S,
+
+            "MOMENTUM_HEDGE_AGGRESSIVE_TAKER": config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER,
+
+            "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
+
+            "MOMENTUM_KELLY_FRACTION": config.MOMENTUM_KELLY_FRACTION,
+
         }
 
         config.STRATEGY_MOMENTUM_ENABLED = True
@@ -2680,6 +2694,564 @@ class TestGTDHedge:
         assert result is True
 
         assert len(scanner._risk.get_open_positions()) == 1
+
+    # ── Live-mode fill: band_floor_abort must NOT fire on a valid taker price ──
+
+    def test_live_fill_valid_price_does_not_trigger_band_floor_abort(self, tmp_path):
+        """Regression: when _fire_trade_fill returns the correct taker price (~0.79),
+        band_floor_abort must NOT be triggered and Phase D (hedge) must fire.
+
+        Historical bug: _fire_trade_fill used maker_orders[i]['price'] (the NO
+        complement, ~0.21) instead of trade_msg['price'] (the YES taker price,
+        ~0.79).  Because 0.21 < MOMENTUM_PRICE_BAND_LOW (0.6), band_floor_abort
+        fired on every live YES trade, recording signal_source='band_floor_abort'
+        and bypassing Phase D entirely so no hedge was ever placed.
+
+        This test sets pm._paper_mode=False and injects a WS fill event that
+        carries the correct taker price (0.79), then asserts:
+          1. The position is opened with entry_price ≈ 0.79 (not band_floor_abort).
+          2. place_limit (Phase D hedge) is called on the opposite token.
+        """
+        import asyncio
+
+        config.MOMENTUM_HEDGE_ENABLED = True
+        config.MOMENTUM_HEDGE_PRICE = 0.03
+        config.MOMENTUM_PRICE_BAND_LOW = 0.60   # 0.79 is above this → no abort
+        config.MOMENTUM_PRICE_BAND_HIGH = 0.95
+        config.MOMENTUM_MAX_ENTRY_USD = 20.0
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        scanner = _make_scanner(tmp_path)
+        # Switch to live mode so the fill-tracking path is exercised
+        scanner._pm._paper_mode = False
+
+        ask_price = 0.79
+        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
+        scanner._pm.get_book = MagicMock(return_value=book)
+        scanner._pm.get_token_balance = AsyncMock(return_value=None)  # skip balance reconcile
+
+        # Intercept register_fill_future and immediately resolve the future with
+        # the correct TAKER price (0.79), simulating what _fire_trade_fill now
+        # does after the neg-risk complement fix.
+        def _inject_fill(order_id: str, fut: asyncio.Future):
+            fut.get_loop().call_soon(
+                fut.set_result,
+                {"price": ask_price, "size_matched": 12.0},
+            )
+
+        scanner._pm.register_fill_future = MagicMock(side_effect=_inject_fill)
+
+        mkt = _make_market()
+        sig = _make_signal(
+            side="YES",
+            token_id=mkt.token_id_yes,
+            token_price=ask_price,
+            p_yes=ask_price,
+        )
+
+        result = _run(scanner._execute_signal(sig, mkt))
+
+        # ── Assert 1: position opened (not band_floor_abort) ──────────────────
+        assert result is True, (
+            "Expected True (position opened) but got False — "
+            "band_floor_abort may have fired due to wrong complement fill price"
+        )
+        positions = scanner._risk.get_open_positions()
+        assert len(positions) == 1
+        pos = positions[0]
+        assert pos.signal_source != "band_floor_abort", (
+            f"Position recorded signal_source='band_floor_abort' — "
+            "fill price was likely the complement (0.21) not the taker price (0.79)"
+        )
+        assert abs(pos.entry_price - ask_price) < 0.01, (
+            f"entry_price {pos.entry_price:.4f} diverges from taker price {ask_price}"
+        )
+
+        # ── Assert 2: Phase D hedge placed on opposite (NO) token ─────────────
+        scanner._pm.place_limit.assert_called_once()
+        hedge_call = scanner._pm.place_limit.call_args
+        hedge_token = hedge_call.kwargs.get("token_id") or (
+            hedge_call.args[0] if hedge_call.args else None
+        )
+        assert hedge_token == mkt.token_id_no, (
+            f"Hedge should target NO token ({mkt.token_id_no!r}), "
+            f"got {hedge_token!r}"
+        )
+
+    # ── New Phase D tests: profit-safe cap, tactic selection, event emission ──
+
+    def _cap_setup(self, scanner_pm, mkt, ask_price, opp_mid):
+        """Helper: wire get_book so the main token and opp token return different books."""
+        main_book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
+        opp_book = _make_book(mid=opp_mid, age_secs=0.1)
+
+        def _mock(tid):
+            return opp_book if tid == mkt.token_id_no else main_book
+
+        scanner_pm.get_book = MagicMock(side_effect=_mock)
+        return main_book, opp_book
+
+    def _cap_none_setup(self, scanner_pm, mkt, ask_price):
+        """Helper: opp book is None; main book returns ask_price."""
+        main_book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
+
+        def _mock(tid):
+            return None if tid == mkt.token_id_no else main_book
+
+        scanner_pm.get_book = MagicMock(side_effect=_mock)
+        return main_book
+
+    def _compute_cap(self, sig, ask_price, hedge_price, min_retain, contracts_pct=1.0):
+        """Replicate the scanner's cap computation for assertion in tests."""
+        size_usd, _ = _compute_kelly_size_usd(sig)
+        entry_size = round(size_usd / ask_price, 6)
+        hc = round(entry_size * contracts_pct, 6)
+        if round(hc * hedge_price, 6) < 1.0:
+            hc = round(1.0 / hedge_price, 6)
+        proj_pnl = round(entry_size * (1.0 - ask_price), 6)
+        return round(min((proj_pnl - min_retain) / hc, 0.99), 4)
+
+    def test_profit_safe_cap_limits_ladder_max_price(self, tmp_path):
+
+        """Maker ladder never bids above the PnL cap computed from MIN_RETAIN_USD."""
+
+        config.MOMENTUM_HEDGE_ENABLED = True
+
+        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
+
+        config.MOMENTUM_HEDGE_PRICE = 0.05
+
+        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
+
+        config.MOMENTUM_MAX_ENTRY_USD = 100.0   # large → entry_size×hedge_price > $1, no raise
+
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 1.0
+
+        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 10
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
+
+        scanner = _make_scanner(tmp_path)
+
+        ask_price = 0.85
+
+        mkt = _make_market()
+
+        # opp book best_ask = 0.80 — well above any cap → maker mode
+
+        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=0.795)
+
+        scanner._pm.place_limit = AsyncMock(return_value=None)  # all attempts fail
+
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+
+                           token_price=ask_price, p_yes=ask_price)
+
+        expected_cap = self._compute_cap(sig, ask_price,
+
+                                         config.MOMENTUM_HEDGE_PRICE,
+
+                                         config.MOMENTUM_HEDGE_MIN_RETAIN_USD)
+
+        _run(scanner._execute_signal(sig, mkt))
+
+        calls = scanner._pm.place_limit.call_args_list
+
+        assert len(calls) >= 1, "Expected at least one ladder attempt"
+
+        for call in calls:
+
+            price_used = call.kwargs.get("price")
+
+            assert price_used is not None
+
+            assert price_used <= expected_cap + 0.0001, (
+
+                f"Ladder price {price_used:.4f} exceeded cap {expected_cap:.4f}"
+
+            )
+
+    def test_taker_branch_fires_when_best_ask_within_cap(self, tmp_path):
+
+        """Book ask ≤ PnL cap triggers a single taker placement (post_only=False)."""
+
+        config.MOMENTUM_HEDGE_ENABLED = True
+
+        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
+
+        config.MOMENTUM_HEDGE_PRICE = 0.10
+
+        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
+
+        config.MOMENTUM_MAX_ENTRY_USD = 20.0   # no $1 raise: entry_size×0.10 ≈ 1.06
+
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.50
+
+        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 3
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
+
+        scanner = _make_scanner(tmp_path)
+
+        ask_price = 0.85
+
+        opp_ask = 0.08  # below cap (≈0.103) and below hedge_price (0.10) → taker fires
+
+        mkt = _make_market()
+
+        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=opp_ask - 0.005)
+
+        scanner._pm.place_limit = AsyncMock(return_value="hedge_taker_001")
+
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+
+                           token_price=ask_price, p_yes=ask_price)
+
+        _run(scanner._execute_signal(sig, mkt))
+
+        # Taker = exactly one call, post_only=False, priced at the opp book ask
+
+        assert scanner._pm.place_limit.call_count == 1
+
+        call = scanner._pm.place_limit.call_args
+
+        assert call.kwargs.get("post_only") is False
+
+        assert call.kwargs.get("price") == pytest.approx(opp_ask, abs=0.001)
+
+    def test_ladder_stops_at_cap_not_at_config_n(self, tmp_path):
+
+        """Maker ladder exits early at the PnL cap even when MAX_TICKS_CONCESSION is large."""
+
+        config.MOMENTUM_HEDGE_ENABLED = True
+
+        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
+
+        config.MOMENTUM_HEDGE_PRICE = 0.05
+
+        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
+
+        config.MOMENTUM_MAX_ENTRY_USD = 100.0   # large → no $1-minimum raise
+
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 1.0
+
+        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 20
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
+
+        scanner = _make_scanner(tmp_path)
+
+        ask_price = 0.85
+
+        mkt = _make_market()
+
+        # opp book best_ask = 0.80 → above cap (≈0.131) → maker mode
+
+        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=0.795)
+
+        scanner._pm.place_limit = AsyncMock(return_value=None)
+
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+
+                           token_price=ask_price, p_yes=ask_price)
+
+        expected_cap = self._compute_cap(sig, ask_price,
+
+                                         config.MOMENTUM_HEDGE_PRICE,
+
+                                         config.MOMENTUM_HEDGE_MIN_RETAIN_USD)
+
+        _run(scanner._execute_signal(sig, mkt))
+
+        calls = scanner._pm.place_limit.call_args_list
+
+        # Cap cuts the loop short before hitting MAX_TICKS_CONCESSION=20
+
+        assert len(calls) < 20, (
+
+            f"Expected fewer than 20 calls but got {len(calls)}"
+
+        )
+
+        assert len(calls) >= 1
+
+        for call in calls:
+
+            assert call.kwargs.get("price") <= expected_cap + 0.0001
+
+    def test_tte_aggression_forces_taker_mode(self, tmp_path):
+
+        """MOMENTUM_HEDGE_AGGRESSIVE_TTE_S triggers taker when signal tte < threshold."""
+
+        config.MOMENTUM_HEDGE_ENABLED = True
+
+        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
+
+        config.MOMENTUM_HEDGE_PRICE = 0.10
+
+        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
+
+        config.MOMENTUM_MAX_ENTRY_USD = 20.0   # no $1 raise: entry_size×0.10 ≈ 1.06
+
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.0
+
+        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 3
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 30  # taker fires when tte < 30s
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
+
+        scanner = _make_scanner(tmp_path)
+
+        ask_price = 0.85
+
+        mkt = _make_market()  # end_date = now + 90s → hedge TTE ≈ 90s > 10s
+
+        # No opp book → _opp_best_ask = None; condition-3 taker NOT triggered
+
+        # TTE=15 < 30 fires condition-2; taker_price = hedge_price = 0.10 ≤ max = 0.10 ✓
+
+        self._cap_none_setup(scanner._pm, mkt, ask_price)
+
+        scanner._pm.place_limit = AsyncMock(return_value="hedge_tte_001")
+
+        # tte_seconds = 15 < AGGRESSIVE_TTE_S = 30 → taker fires by condition-2
+
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+
+                           token_price=ask_price, p_yes=ask_price, tte_seconds=15.0)
+
+        _run(scanner._execute_signal(sig, mkt))
+
+        # TTE aggression → taker: exactly one call, post_only=False
+
+        assert scanner._pm.place_limit.call_count == 1
+
+        call = scanner._pm.place_limit.call_args
+
+        assert call.kwargs.get("post_only") is False
+
+    def test_ladder_exhausted_emits_hedge_fail(self, tmp_path):
+
+        """All maker ladder attempts returning None triggers a HEDGE_FAIL event."""
+
+        config.MOMENTUM_HEDGE_ENABLED = True
+
+        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
+
+        config.MOMENTUM_HEDGE_PRICE = 0.10
+
+        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
+
+        config.MOMENTUM_MAX_ENTRY_USD = 20.0
+
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.0
+
+        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 1
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
+
+        scanner = _make_scanner(tmp_path)
+
+        ask_price = 0.85
+
+        mkt = _make_market()
+
+        # opp best_ask = 0.85 >> max_hedge_price = 0.10 → maker mode (taker not triggered)
+
+        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=ask_price - 0.005)
+
+        scanner._pm.place_limit = AsyncMock(return_value=None)
+
+        scanner._risk.register_hedge_order = MagicMock()
+
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+
+                           token_price=ask_price, p_yes=ask_price)
+
+        with patch("strategies.Momentum.scanner._emit_event") as mock_emit:
+
+            result = _run(scanner._execute_signal(sig, mkt))
+
+        hedge_fail_calls = [c for c in mock_emit.call_args_list
+
+                            if c.args and c.args[0] == "HEDGE_FAIL"]
+
+        assert len(hedge_fail_calls) == 1
+
+        assert hedge_fail_calls[0].kwargs.get("reason") == "all_attempts_exhausted"
+
+        # Position still opened
+
+        assert result is True
+
+        # No hedge order registered
+
+        scanner._risk.register_hedge_order.assert_not_called()
+
+    def test_negative_pnl_cap_skips_hedge(self, tmp_path):
+
+        """When MIN_RETAIN_USD exceeds projected PnL, cap is negative and hedge is skipped."""
+
+        config.MOMENTUM_HEDGE_ENABLED = True
+
+        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
+
+        config.MOMENTUM_HEDGE_PRICE = 0.10
+
+        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
+
+        config.MOMENTUM_MAX_ENTRY_USD = 20.0
+
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        # 2.0 > projected_pnl ≈ 1.59 → cap < 0 → hedge skipped
+
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 2.0
+
+        scanner = _make_scanner(tmp_path)
+
+        ask_price = 0.85
+
+        mkt = _make_market()
+
+        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=ask_price - 0.005)
+
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+
+                           token_price=ask_price, p_yes=ask_price)
+
+        result = _run(scanner._execute_signal(sig, mkt))
+
+        scanner._pm.place_limit.assert_not_called()
+
+        assert result is True
+
+    def test_global_aggressive_taker_fires_without_book(self, tmp_path):
+
+        """AGGRESSIVE_TAKER=True places a taker order even when no opp book is available."""
+
+        config.MOMENTUM_HEDGE_ENABLED = True
+
+        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
+
+        config.MOMENTUM_HEDGE_PRICE = 0.10
+
+        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
+
+        config.MOMENTUM_MAX_ENTRY_USD = 20.0   # no $1 raise: entry_size×0.10 ≈ 1.06
+
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.0
+
+        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 3
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = True
+
+        scanner = _make_scanner(tmp_path)
+
+        ask_price = 0.85
+
+        mkt = _make_market()
+
+        # No opp book → _opp_best_ask = None; taker fires from global flag alone
+
+        # taker_price = hedge_price = 0.10 ≤ max_hedge_price = 0.10 ✓
+
+        self._cap_none_setup(scanner._pm, mkt, ask_price)
+
+        scanner._pm.place_limit = AsyncMock(return_value="hedge_agg_001")
+
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+
+                           token_price=ask_price, p_yes=ask_price)
+
+        _run(scanner._execute_signal(sig, mkt))
+
+        # Single taker call (post_only=False) at hedge_price (0.10)
+
+        assert scanner._pm.place_limit.call_count == 1
+
+        call = scanner._pm.place_limit.call_args
+
+        assert call.kwargs.get("post_only") is False
+
+        assert call.kwargs.get("price") == pytest.approx(0.10, abs=0.001)
+
+    def test_taker_min_size_budget_check_skips_when_exceeds_cap(self, tmp_path):
+
+        """$1 minimum-size raise makes taker_cost exceed cap_budget — taker is skipped."""
+
+        config.MOMENTUM_HEDGE_ENABLED = True
+
+        config.MOMENTUM_HEDGE_PRICE = 0.05
+
+        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
+
+        config.MOMENTUM_MAX_ENTRY_USD = 20.0
+
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+
+        # cap ≈ (1.59 - 1.00) / 10.59 ≈ 0.056; opp_ask = 0.04 triggers taker
+
+        # $1 min raise: 10.59×0.04 = 0.42 < $1 → raised to 25 contracts → cost = $1
+
+        # cap_budget = 1.59 - 1.00 = 0.59 < $1 → skip
+
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 1.00
+
+        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 3
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
+
+        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
+
+        scanner = _make_scanner(tmp_path)
+
+        ask_price = 0.85
+
+        # Opposite book: best_ask = 0.04, which is within the cap (≈0.056)
+
+        opp_book = _make_book(mid=0.035, age_secs=0.1)  # asks at 0.04
+
+        scanner._pm.get_book = MagicMock(return_value=opp_book)
+
+        scanner._pm.place_limit = AsyncMock(return_value="should_not_be_called")
+
+        mkt = _make_market()
+
+        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
+
+                           token_price=ask_price, p_yes=ask_price)
+
+        _run(scanner._execute_signal(sig, mkt))
+
+        # Taker price (0.04) ≤ cap (≈0.056), but $1 minimum makes cost = $1 > cap_budget (≈0.59)
+
+        # → no placement
+
+        scanner._pm.place_limit.assert_not_called()
 
 
 

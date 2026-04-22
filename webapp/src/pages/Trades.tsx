@@ -15,8 +15,8 @@
  *   Rebate      — total rebates earned (sum)
  *   Net P&L     — realised PnL (sum) with colour
  */
-import { useState, useMemo, Fragment } from "react";
-import { useTrades, useMarketOutcomes } from "../api/client";
+import { useState, useMemo, Fragment, useCallback } from "react";
+import { useTrades, useMarketOutcomes, BASE_URL } from "../api/client";
 import type { Trade } from "../api/client";
 
 const UNDERLYINGS = ["", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"];
@@ -683,12 +683,22 @@ function LegDetail({
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
+interface ReconcileResult {
+  patched: number;
+  markets: { market_title: string; side: string; corrections: Record<string, string> }[];
+  errors: string[];
+  status?: string;
+  reason?: string;
+}
+
 export default function Trades() {
   const [underlying, setUnderlying] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
   const [expanded,   setExpanded]   = useState<Set<string>>(new Set());
+  const [reconciling,      setReconciling]      = useState(false);
+  const [reconcileResult,  setReconcileResult]  = useState<ReconcileResult | null>(null);
 
-  const { data, loading, error } = useTrades(ALL_LIMIT, 0, undefined, underlying || undefined);
+  const { data, loading, error, refresh } = useTrades(ALL_LIMIT, 0, undefined, underlying || undefined);
   const { data: outcomes } = useMarketOutcomes();
 
   const groups = useMemo(() => {
@@ -703,6 +713,21 @@ export default function Trades() {
       return next;
     });
   }
+
+  const handleReconcile = useCallback(async () => {
+    setReconciling(true);
+    setReconcileResult(null);
+    try {
+      const resp = await fetch(`${BASE_URL}/reconcile`, { method: "POST" });
+      const data = await resp.json();
+      setReconcileResult(data);
+      if (data.patched > 0) refresh();
+    } catch (e) {
+      setReconcileResult({ patched: 0, markets: [], errors: [String(e)] });
+    } finally {
+      setReconciling(false);
+    }
+  }, [refresh]);
 
   return (
     <div className="page">
@@ -720,7 +745,43 @@ export default function Trades() {
           </select>
         </label>
         <span className="muted">{groups.length} markets</span>
+        <button
+          onClick={handleReconcile}
+          disabled={reconciling}
+          title="Sync trades.csv with actual Polymarket fill prices (source of truth)"
+          style={{
+            marginLeft: "auto", padding: "4px 14px", borderRadius: 5,
+            border: "1px solid #334155", cursor: reconciling ? "default" : "pointer",
+            fontWeight: 600, fontSize: "0.8em",
+            background: reconciling ? "#1e293b" : "#0f172a",
+            color: reconciling ? "#64748b" : "#94a3b8",
+          }}
+        >
+          {reconciling ? "Syncing…" : "Sync from PM"}
+        </button>
       </div>
+
+      {/* Reconciliation result banner */}
+      {reconcileResult && (
+        <div style={{
+          marginBottom: 12, padding: "8px 14px", borderRadius: 5,
+          background: reconcileResult.errors.length ? "#450a0a" : reconcileResult.patched > 0 ? "#14532d" : "#1e293b",
+          color: reconcileResult.errors.length ? "#fca5a5" : reconcileResult.patched > 0 ? "#86efac" : "#94a3b8",
+          fontSize: "0.82em", display: "flex", alignItems: "center", gap: 12,
+        }}>
+          {reconcileResult.status === "skipped"
+            ? `⚠ Skipped: ${reconcileResult.reason}`
+            : reconcileResult.errors.length
+            ? `✗ Sync failed: ${reconcileResult.errors.join("; ")}`
+            : reconcileResult.patched > 0
+            ? `✓ Synced ${reconcileResult.patched} trade${reconcileResult.patched !== 1 ? "s" : ""} with PM fill prices`
+            : "✓ No corrections needed — records match PM"}
+          <button
+            onClick={() => setReconcileResult(null)}
+            style={{ marginLeft: "auto", background: "none", border: "none", cursor: "pointer", color: "inherit", fontSize: "1.1em" }}
+          >×</button>
+        </div>
+      )}
 
       {error   && <div className="error">Failed to load trades: {error}</div>}
       {loading && <div className="skeleton" style={{ height: 200 }} />}
@@ -837,3 +898,4 @@ export default function Trades() {
     </div>
   );
 }
+

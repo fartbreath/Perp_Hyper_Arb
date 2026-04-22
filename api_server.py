@@ -525,6 +525,9 @@ _MUTABLE_CONFIG = {
     "momentum_hedge_price":                ("MOMENTUM_HEDGE_PRICE",                 float),
     "momentum_hedge_contracts_pct":        ("MOMENTUM_HEDGE_CONTRACTS_PCT",         float),
     "momentum_hedge_cancel_recovery_pct": ("MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT",   float),
+    # Logging toggles (post-trade analysis files)
+    "momentum_hedge_clob_log_enabled":     ("MOMENTUM_HEDGE_CLOB_LOG_ENABLED",      bool),
+    "momentum_ticks_log_enabled":          ("MOMENTUM_TICKS_LOG_ENABLED",           bool),
     # Phase E — empirical win-rate gate
     "momentum_win_rate_gate_enabled":  ("MOMENTUM_WIN_RATE_GATE_ENABLED",   bool),
     "momentum_win_rate_gate_min_factor": ("MOMENTUM_WIN_RATE_GATE_MIN_FACTOR", float),
@@ -747,6 +750,9 @@ class ConfigPatch(BaseModel):
     momentum_hedge_enabled_daily: bool | None = None
     momentum_hedge_enabled_weekly: bool | None = None
     momentum_hedge_enabled_milestone: bool | None = None
+    # Logging toggles (post-trade analysis files)
+    momentum_hedge_clob_log_enabled: bool | None = None
+    momentum_ticks_log_enabled: bool | None = None
     # Phase E — empirical win-rate gate
     momentum_win_rate_gate_enabled: bool | None = None
     momentum_win_rate_gate_min_factor: float | None = None
@@ -962,6 +968,9 @@ def get_config() -> dict:
         "momentum_hedge_price":                config.MOMENTUM_HEDGE_PRICE,
         "momentum_hedge_contracts_pct":        config.MOMENTUM_HEDGE_CONTRACTS_PCT,
         "momentum_hedge_cancel_recovery_pct": config.MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT,
+        # Logging toggles (post-trade analysis files)
+        "momentum_hedge_clob_log_enabled":     config.MOMENTUM_HEDGE_CLOB_LOG_ENABLED,
+        "momentum_ticks_log_enabled":          config.MOMENTUM_TICKS_LOG_ENABLED,
         "momentum_hedge_price_5m":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_5m",    config.MOMENTUM_HEDGE_PRICE),
         "momentum_hedge_price_15m":       config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_15m",   config.MOMENTUM_HEDGE_PRICE),
         "momentum_hedge_price_1h":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_1h",    config.MOMENTUM_HEDGE_PRICE),
@@ -2107,6 +2116,67 @@ def market_outcomes_endpoint() -> dict:
     except Exception as exc:
         log.error("Failed to read market_outcomes.json", exc=str(exc))
         return {}
+
+
+# ── Polymarket source-of-truth trade history ──────────────────────────────────
+
+@app.get("/pm_history")
+async def pm_history_endpoint(
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict:
+    """Fetch trade/redeem activity directly from the Polymarket Data API.
+
+    Uses data-api.polymarket.com/activity?user=<funder_address> which is the
+    same source Polymarket's own UI uses for the history panel.  Returns raw
+    activity rows so the frontend can display the source-of-truth alongside
+    our internal trades.csv records.
+
+    Response shape:
+        { "rows": [ { proxyWallet, timestamp, type, size, usdcSize, price,
+                       side, title, slug, outcome, ... }, ... ] }
+    """
+    funder = config.POLY_FUNDER
+    if not funder:
+        raise HTTPException(status_code=503, detail="POLY_FUNDER not configured")
+    url = f"https://data-api.polymarket.com/activity?user={funder}&limit={limit}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            # Data API returns either a list directly or {"value": [...]}
+            rows = data if isinstance(data, list) else data.get("value", [])
+            return {"rows": rows}
+    except httpx.HTTPStatusError as exc:
+        log.error("PM Data API error", status=exc.response.status_code, url=url)
+        raise HTTPException(status_code=502, detail=f"PM Data API returned {exc.response.status_code}")
+    except Exception as exc:
+        log.error("PM history fetch failed", exc=str(exc))
+        raise HTTPException(status_code=502, detail="Failed to fetch PM history")
+
+
+@app.post("/reconcile", dependencies=[Depends(require_auth)])
+async def reconcile_endpoint() -> dict:
+    """Reconcile trades.csv against Polymarket Data API (source of truth).
+
+    Fetches actual fill prices from data-api.polymarket.com/activity and patches
+    trades.csv rows where the bot's recorded prices diverge from PM's on-chain data.
+
+    Fixes two known recording bugs:
+      1. Entry price stored as order price instead of actual CLOB fill price.
+      2. TP-sell exits recorded as WIN at $1.00 when the position was actually
+         sold early at a taker price (e.g. 43¢) — often a loss.
+
+    Paper-trading runs are skipped (no PM on-chain activity to reference).
+    Returns:
+        { "status": "ok"|"skipped", "patched": int, "markets": [...], "errors": [...] }
+    """
+    if config.PAPER_TRADING:
+        return {"status": "skipped", "reason": "paper trading — no PM source of truth", "patched": 0}
+
+    from pm_reconcile import reconcile_trades_csv
+    result = await reconcile_trades_csv(config.POLY_FUNDER)
+    return {"status": "ok", **result}
 
 
 # ── Order event log ───────────────────────────────────────────────────────────
