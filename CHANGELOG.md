@@ -2,7 +2,94 @@
 
 All notable changes to this repository are documented in this file.
 
-## [2026-04-22] - Fill price complement fix; winner-flag resolution; test coverage hardening
+## [2026-04-22] - Hedge optimization (cap + ladder + taker + TTE); fill price fix; winner-flag resolution; test hardening
+
+### Feature — Hedge optimization: profit-safe price cap (`strategies/Momentum/scanner.py`, `config.py`)
+
+Before placing any hedge, the bot now computes the maximum price per contract it may pay
+while still retaining at least `MOMENTUM_HEDGE_MIN_RETAIN_USD` of projected win PnL.
+
+```
+max_hedge_price = (projected_win_pnl − MOMENTUM_HEDGE_MIN_RETAIN_USD) / hedge_contracts
+```
+
+If the cap comes out ≤ 0 (the trade isn't profitable enough to afford any hedge), Phase D
+is skipped entirely. The cap is always respected by both the taker and maker-ladder branches.
+
+**New config key:** `MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.50`  
+Set to `0.0` to disable (old behaviour — no floor on retained profit).
+
+---
+
+### Feature — Hedge optimization: N-tick concession maker ladder (`strategies/Momentum/scanner.py`, `config.py`)
+
+Instead of a single maker-only attempt at the configured price, the bot now retries up to N
+times, raising the bid price by one tick (`$0.01`) per attempt. The ladder stops as soon as
+a placement succeeds or the next price would exceed the profit-safe cap.
+
+**New config key:** `MOMENTUM_HEDGE_MAX_TICKS_CONCESSION: int = 3`  
+Set to `1` for a single attempt (closest to old behaviour).
+
+---
+
+### Feature — Hedge optimization: book-aware taker fallback (`strategies/Momentum/scanner.py`)
+
+Before starting the maker ladder, the bot fetches the live order book for the opposite
+token. If the current best ask is at or below the profit-safe cap, it switches to a taker
+(FAK, `post_only=False`) order to grab the fill immediately rather than resting.
+
+No new config key — fires automatically when `best_ask ≤ max_hedge_price`.
+
+---
+
+### Feature — Hedge optimization: TTE aggression mode (`strategies/Momentum/scanner.py`, `config.py`)
+
+When time-to-expiry (`tte_seconds`) falls below a threshold, the bot forces taker mode even
+if the book wouldn't have triggered it. This handles near-expiry thin-book scenarios where a
+resting maker order has no realistic chance of being matched.
+
+**New config keys:**
+- `MOMENTUM_HEDGE_AGGRESSIVE_TTE_S: int = 0` — 0 = disabled; set e.g. 30 to activate
+- `MOMENTUM_HEDGE_AGGRESSIVE_TAKER: bool = False` — True = always use taker (paper-mode testing)
+
+---
+
+### Feature — Hedge optimization: per-attempt $1 minimum size (taker branch) (`strategies/Momentum/scanner.py`)
+
+The taker branch now recomputes contract count at the actual taker price (which may be
+lower than the config price) and raises it to meet Polymarket's $1 minimum notional floor.
+If meeting the $1 minimum would exceed the profit-safe cap budget, the hedge is skipped
+rather than placing an oversized order.
+
+No new config key — uses existing `MOMENTUM_HEDGE_MIN_RETAIN_USD`.
+
+---
+
+### Feature — Hedge CLOB tick log (`monitor.py`, `config.py`, `webapp/src/pages/Settings.tsx`)
+
+New `hedge_clob_ticks.csv` sampled once per `_check_all_positions()` sweep while a GTD
+hedge order is open and unfilled. Records CLOB mid, best bid, best ask, and TTE alongside
+the hedge bid price — used post-trade to diagnose why a hedge didn't fill.
+
+Columns: `ts`, `market_id`, `market_title`, `underlying`, `parent_side`, `hedge_order_id`,
+`hedge_token_id`, `hedge_bid_price`, `clob_mid`, `clob_best_bid`, `clob_best_ask`, `tte_s`, `status`.
+
+**New config keys:**
+- `MOMENTUM_HEDGE_CLOB_LOG_ENABLED: bool = True` — toggle the hedge_clob_ticks.csv log
+- `MOMENTUM_TICKS_LOG_ENABLED: bool = True` — toggle the existing momentum_ticks.csv log
+
+Both are exposed as toggles in the webapp Settings page under **Analysis Logging**.
+
+---
+
+### Feature — Positions page: GTD Hedge Fills section (`webapp/src/pages/Positions.tsx`)
+
+Open positions where `strategy="momentum_hedge"` are now surfaced in a dedicated
+**GTD Hedge Fills** table on the Positions page, separate from main momentum positions.
+Shows entry price, current CLOB price, deployed capital, and unrealised P&L for each
+filled hedge.
+
+---
 
 ### Bug fix — Fill price complement inversion (`pm_client.py`)
 
