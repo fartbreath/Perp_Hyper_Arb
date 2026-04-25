@@ -5,7 +5,9 @@ import { useState } from "react";
 import {
   useHealth, usePnl, usePositions, useLauncherStatus,
   startBotProcess, stopBotProcess, usePerformance, useInventory, useConfig, updateConfig,
+  useMomentumSignals, useMomentumScanSummary,
 } from "../api/client";
+import type { Position } from "../api/client";
 
 // P3-G: WCAG-compliant status indicator (role="img" + text-based symbol for screen reader)
 function StatusDot({ ok, label }: { ok: boolean; label?: string }) {
@@ -23,6 +25,7 @@ function StatusDot({ ok, label }: { ok: boolean; label?: string }) {
 function BotControlCard() {
   const launcher = useLauncherStatus();
   const health = useHealth();
+  const { data: cfg } = useConfig();
   const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
 
@@ -81,6 +84,20 @@ function BotControlCard() {
           {launcher.data?.pid && botRunning ? ` (PID ${launcher.data.pid})` : ""}
         </p>
         {localError && <p style={{ margin: "4px 0 0", color: "#ef4444", fontSize: "0.8rem" }}>{localError}</p>}
+        {/* Strategy enable indicators */}
+        {botRunning && cfg && (
+          <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
+            {cfg.strategy_momentum && (
+              <span style={{ padding: "1px 7px", borderRadius: 999, fontSize: "0.7rem", fontWeight: 700, background: "#2e1065", color: "#a78bfa" }}>Momentum</span>
+            )}
+            {cfg.strategy_maker && (
+              <span style={{ padding: "1px 7px", borderRadius: 999, fontSize: "0.7rem", fontWeight: 700, background: "#1e3a5f", color: "#60a5fa" }}>Maker</span>
+            )}
+            {cfg.strategy_mispricing && (
+              <span style={{ padding: "1px 7px", borderRadius: 999, fontSize: "0.7rem", fontWeight: 700, background: "#064e3b", color: "#34d399" }}>Mispricing</span>
+            )}
+          </div>
+        )}
       </div>
       {!launcherOffline && (
         <button
@@ -107,11 +124,12 @@ function BotControlCard() {
 }
 
 // P3-B: Bucket performance strip — shows per-bucket P&L + disable toggle
-const BUCKET_ORDER = ["bucket_5m", "bucket_15m", "bucket_1h"] as const;
+const BUCKET_ORDER = ["bucket_5m", "bucket_15m", "bucket_1h", "bucket_4h"] as const;
 const BUCKET_LABELS: Record<string, string> = {
   bucket_5m: "5m",
   bucket_15m: "15m",
   bucket_1h: "1h",
+  bucket_4h: "4h",
 };
 
 function BucketPerformanceStrip() {
@@ -444,39 +462,221 @@ function PnlCard() {
   );
 }
 
+function timeUntilEnd(iso: string | null | undefined): { label: string; color: string } {
+  if (!iso) return { label: "—", color: "#4b5563" };
+  const diff = new Date(iso).getTime() - Date.now();
+  if (diff <= 0) return { label: "Resolved", color: "#6b7280" };
+  const totalMin = Math.floor(diff / 60_000);
+  const h = Math.floor(totalMin / 60);
+  const d = Math.floor(h / 24);
+  if (d >= 2) return { label: `${d}d`, color: "#94a3b8" };
+  if (h >= 4) return { label: `${h}h`, color: "#f59e0b" };
+  if (h >= 1) return { label: `${h}h ${totalMin % 60}m`, color: "#ef4444" };
+  return { label: `${totalMin}m`, color: "#ef4444" };
+}
+
+const STRATEGY_BADGE: Record<string, { label: string; color: string; bg: string }> = {
+  momentum:   { label: "MOM",  color: "#a78bfa", bg: "#2e1065" },
+  maker:      { label: "MKR",  color: "#60a5fa", bg: "#1e3a5f" },
+  mispricing: { label: "MIS",  color: "#34d399", bg: "#064e3b" },
+};
+
+function StrategyBadge({ strategy }: { strategy: string }) {
+  const b = STRATEGY_BADGE[strategy] ?? { label: strategy.slice(0, 3).toUpperCase(), color: "#94a3b8", bg: "#1e293b" };
+  return (
+    <span style={{ padding: "1px 6px", borderRadius: 3, fontSize: "0.7rem", fontWeight: 700,
+      background: b.bg, color: b.color, fontFamily: "monospace" }}>
+      {b.label}
+    </span>
+  );
+}
+
+function sideBg(side: string): string {
+  if (side === "YES" || side === "UP")   return "#166534";
+  if (side === "NO"  || side === "DOWN") return "#7f1d1d";
+  return "#374151";
+}
+
+function PositionRow({ p }: { p: Position }) {
+  const tokenPrice  = p.token_current_price ?? (p.side === "NO" ? 1 - p.entry_price : p.entry_price);
+  const entryToken  = p.side === "NO" ? 1 - p.entry_price : p.entry_price;
+  const unrealised  = p.unrealised_pnl_usd;
+  const pnlColor    = unrealised == null ? "#94a3b8" : unrealised >= 0 ? "#22c55e" : "#ef4444";
+  const tte         = timeUntilEnd(p.end_date);
+  const hasHedge    = !!(p.hedge_order_id);
+  const hedgeFilled = !!(p.hedge_fill_detected);
+
+  return (
+    <tr>
+      {/* Market title (truncated) */}
+      <td style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+          title={p.market_title}>
+        {p.market_title ?? p.condition_id.slice(0, 10) + "…"}
+      </td>
+
+      {/* Underlying */}
+      <td style={{ fontWeight: 600 }}>{p.underlying}</td>
+
+      {/* Side */}
+      <td>
+        <span style={{ padding: "2px 6px", borderRadius: 3, fontSize: "0.72rem",
+          fontWeight: 700, background: sideBg(p.side), color: "#fff" }}>
+          {p.side}
+        </span>
+      </td>
+
+      {/* Strategy */}
+      <td><StrategyBadge strategy={p.strategy} /></td>
+
+      {/* Capital deployed */}
+      <td style={{ fontFamily: "monospace" }}>${(p.entry_cost_usd ?? 0).toFixed(0)}</td>
+
+      {/* Entry → current token price */}
+      <td style={{ fontFamily: "monospace", fontSize: "0.82rem" }}
+          title={`Entry: ${(entryToken * 100).toFixed(1)}¢  Current: ${(tokenPrice * 100).toFixed(1)}¢`}>
+        {(entryToken * 100).toFixed(0)}→{(tokenPrice * 100).toFixed(0)}<span style={{ color: "#64748b" }}>¢</span>
+      </td>
+
+      {/* Unrealised P&L */}
+      <td style={{ fontFamily: "monospace", fontWeight: 600, color: pnlColor }}>
+        {unrealised == null ? "—" : `${unrealised >= 0 ? "+" : ""}$${unrealised.toFixed(2)}`}
+      </td>
+
+      {/* Hedge status (momentum only) */}
+      <td>
+        {p.strategy === "momentum" && hasHedge ? (
+          hedgeFilled
+            ? <span style={{ color: "#22c55e", fontSize: "0.75rem" }}>🛡 Filled</span>
+            : <span style={{ color: "#a78bfa", fontSize: "0.75rem" }} title={`Price: $${(p.hedge_price ?? 0).toFixed(3)}`}>🛡 Resting</span>
+        ) : p.strategy === "momentum" ? (
+          <span style={{ color: "#4b5563", fontSize: "0.75rem" }}>—</span>
+        ) : null}
+      </td>
+
+      {/* TTE */}
+      <td style={{ fontFamily: "monospace", fontSize: "0.8rem", color: tte.color }}>
+        {tte.label}
+      </td>
+    </tr>
+  );
+}
+
 function PositionsCard() {
   const { data, error } = usePositions();
   if (error) return <div className="card error">Positions unavailable</div>;
   if (!data) return <div className="card skeleton" />;
 
+  // Exclude closed grace-period rows and HL hedge rows from the dashboard summary
+  const active = data.positions.filter(p => !p.is_closed && p.venue !== "HL");
+
   return (
     <div className="card">
-      <h3>Open Positions ({data.count})</h3>
-      {data.count === 0 ? (
+      <h3>Open Positions ({active.length})</h3>
+      {active.length === 0 ? (
         <p className="muted">No open positions</p>
       ) : (
         <div className="table-scroll">
           <table className="data-table">
             <thead>
               <tr>
-                <th>Market</th><th>Underlying</th><th>Side</th><th>Capital</th><th>Entry (token)</th>
+                <th>Market</th><th>Coin</th><th>Side</th><th>Strat</th>
+                <th>Capital</th><th>Entry→Now</th><th>Unreal P&amp;L</th><th>Hedge</th><th>TTE</th>
               </tr>
             </thead>
             <tbody>
-              {data.positions.map((p) => {
-                const tokenPrice = p.side === "NO" ? 1 - Number(p.entry_price) : Number(p.entry_price);
-                return (
-                  <tr key={p.condition_id}>
-                    <td className="mono">{p.condition_id.slice(0, 10)}…</td>
-                    <td>{p.underlying}</td>
-                    <td>{p.side}</td>
-                    <td>${Number(p.entry_cost_usd ?? 0).toFixed(2)}</td>
-                    <td>{(tokenPrice * 100).toFixed(2)}¢</td>
-                  </tr>
-                );
-              })}
+              {active.map(p => <PositionRow key={p.condition_id + p.side} p={p} />)}
             </tbody>
           </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MomentumCard() {
+  const { data: scanData } = useMomentumScanSummary();
+  const { data: sigsData } = useMomentumSignals(10);
+  const { data: cfgData }  = useConfig();
+
+  const enabled = cfgData?.strategy_momentum ?? false;
+  const s = scanData?.summary ?? {};
+  const scanTs = scanData?.scan_ts ?? 0;
+  const scanAge = scanTs > 0 ? Math.round((Date.now() / 1000) - scanTs) : null;
+  const fired = s.signals_fired ?? 0;
+  const markets = s.bucket_markets ?? 0;
+  const recentSigs = sigsData?.signals ?? [];
+
+  if (!enabled && recentSigs.length === 0 && scanTs === 0) {
+    return null; // hide entirely when strategy is off and never ran
+  }
+
+  const scanAgeColor = scanAge == null ? "#64748b" : scanAge < 30 ? "#22c55e" : scanAge < 120 ? "#f59e0b" : "#ef4444";
+
+  return (
+    <div className="card">
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginBottom: "0.6rem" }}>
+        <h3 style={{ margin: 0 }}>Momentum Strategy</h3>
+        <span style={{
+          padding: "2px 8px", borderRadius: 999, fontSize: "0.72rem", fontWeight: 700,
+          background: enabled ? "#2e1065" : "#1f2937",
+          color: enabled ? "#a78bfa" : "#64748b",
+        }}>
+          {enabled ? "● Active" : "○ Disabled"}
+        </span>
+      </div>
+
+      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "0.75rem" }}>
+        {/* Scan health */}
+        <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 100 }}>
+          <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Last scan</div>
+          <div style={{ fontFamily: "monospace", color: scanAgeColor, fontWeight: 600 }}>
+            {scanAge == null ? "Never" : `${scanAge}s ago`}
+          </div>
+        </div>
+        <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 100 }}>
+          <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Markets</div>
+          <div style={{ fontFamily: "monospace", fontWeight: 600 }}>{markets}</div>
+        </div>
+        <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 100 }}>
+          <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Signals fired</div>
+          <div style={{ fontFamily: "monospace", fontWeight: 600, color: fired > 0 ? "#a78bfa" : "#94a3b8" }}>{fired}</div>
+        </div>
+        {(s.skipped_delta ?? 0) + (s.skipped_band ?? 0) + (s.skipped_vol ?? 0) + (s.skipped_phase_c ?? 0) > 0 && (
+          <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 140 }}>
+            <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Skipped</div>
+            <div style={{ fontFamily: "monospace", fontSize: "0.78rem", color: "#64748b" }}>
+              {s.skipped_delta ?? 0} delta
+              {(s.skipped_band ?? 0) > 0 && ` · ${s.skipped_band} band`}
+              {(s.skipped_vol ?? 0) > 0 && ` · ${s.skipped_vol} vol`}
+              {(s.skipped_phase_c ?? 0) > 0 && ` · ${s.skipped_phase_c} tte`}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Recent signals */}
+      {recentSigs.length > 0 && (
+        <div>
+          <div style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.4rem" }}>Recent signals</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+            {recentSigs.slice(0, 5).map((sig, i) => {
+              const age = Math.round((Date.now() / 1000) - sig.timestamp);
+              const ageLabel = age < 60 ? `${age}s ago` : `${Math.round(age / 60)}m ago`;
+              return (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: "0.5rem",
+                  fontSize: "0.8rem", background: "#1e293b", borderRadius: 6, padding: "0.3rem 0.6rem" }}>
+                  <span style={{ fontWeight: 700, color: "#a78bfa" }}>{sig.underlying}</span>
+                  <span style={{ color: sig.side === "YES" || sig.side === "UP" ? "#22c55e" : "#ef4444",
+                    fontWeight: 600 }}>{sig.side}</span>
+                  <span style={{ color: "#64748b" }}>{sig.market_type}</span>
+                  <span style={{ fontFamily: "monospace" }}>
+                    Δ{sig.delta_pct >= 0 ? "+" : ""}{sig.delta_pct.toFixed(1)}%
+                  </span>
+                  <span style={{ color: "#64748b", marginLeft: "auto" }}>{ageLabel}</span>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
     </div>
@@ -492,10 +692,9 @@ export default function Dashboard() {
         <PnlCard />
         <BucketPerformanceStrip />
       </div>
-      <div className="grid-2">
-        <HealthCard />
-        <PositionsCard />
-      </div>
+      <MomentumCard />
+      <PositionsCard />
+      <HealthCard />
     </div>
   );
 }

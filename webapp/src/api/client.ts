@@ -189,9 +189,6 @@ export interface Trade {
   // Hedge fill lifecycle — set when the resting bid is matched (HedgeOrder)
   hedge_size_filled?: string;
   hedge_avg_fill_price?: string;
-  // Hedge fill lifecycle — set when the resting bid is matched (HedgeOrder)
-  hedge_size_filled?: string;
-  hedge_avg_fill_price?: string;
   // Hedge outcome — written when market resolves (PM API is source of truth)
   hedge_status?: string;        // "filled_won" | "filled_lost" | "unfilled" | "cancelled" | ""
   spot_resolve_price?: string;  // oracle spot at market resolution (hedge rows); "0" otherwise
@@ -555,14 +552,6 @@ export interface ConfigData {
   momentum_phase_c_min_tte_daily?: number;
   momentum_phase_c_min_tte_weekly?: number;
   momentum_phase_c_min_tte_milestone?: number;
-  momentum_min_elenabled_5m?: boolean;
-  momentum_hedge_enabled_15m?: boolean;
-  momentum_hedge_enabled_1h?: boolean;
-  momentum_hedge_enabled_4h?: boolean;
-  momentum_hedge_enabled_daily?: boolean;
-  momentum_hedge_enabled_weekly?: boolean;
-  momentum_hedge_enabled_milestone?: boolean;
-  momentum_hedge_apsed_milestone?: number;
   // Phase D — hedge
   momentum_hedge_enabled?: boolean;
   momentum_hedge_enabled_5m?: boolean;
@@ -726,6 +715,27 @@ export const useMakerQuotes = () => useSSE<{ quotes: MakerQuote[]; count: number
 export const useMakerSignals = () => useSSE<{ signals: MakerSignal[]; count: number; strategy_enabled: boolean }>("maker_signals", "/maker/signals");
 export const useCapital = () => useSSE<CapitalData>("capital", "/maker/capital");
 export const useMomentumSignals = (limit = 50) => useSSE<{ signals: MomentumSignal[]; total: number }>("momentum_signals", `/momentum/signals?limit=${limit}`);
+
+export interface MomentumScanSummary {
+  scan_ts: number;
+  summary: {
+    bucket_markets?: number;
+    signals_fired?: number;
+    skipped_band?: number;
+    skipped_delta?: number;
+    skipped_tte?: number;
+    skipped_phase_c?: number;
+    skipped_vol?: number;
+    skipped_cooldown?: number;
+    skipped_position_cap?: number;
+    skipped_duplicate?: number;
+    [key: string]: number | undefined;
+  };
+  timestamp: number;
+}
+
+export const useMomentumScanSummary = () =>
+  usePolling<MomentumScanSummary>("/momentum/scan_summary", 15_000);
 
 // Slow/expensive hooks — keep REST polling at relaxed intervals:
 export const useConfig = () => usePolling<ConfigData>("/config", 30_000);

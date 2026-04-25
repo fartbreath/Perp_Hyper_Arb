@@ -2207,19 +2207,6 @@ export default function Settings() {
             )}
 
             <SectionHead title="Analysis Logging" />
-            <Toggle
-              label="Hedge CLOB Log Enabled"
-              description="Log CLOB prices for open GTD hedge bids to hedge_clob_ticks.csv once per monitor sweep. Disable in production to save disk space and I/O when calibration is complete."
-              value={data.momentum_hedge_clob_log_enabled ?? true}
-              onChange={(v) => apply({ momentum_hedge_clob_log_enabled: v })}
-            />
-            {GAP}
-            <Toggle
-              label="Momentum Ticks Log Enabled"
-              description="Log every intra-hold price check for momentum and range positions to momentum_ticks.csv. Disable in production to save disk space (this file can grow to 100s of MB)."
-              value={data.momentum_ticks_log_enabled ?? true}
-              onChange={(v) => apply({ momentum_ticks_log_enabled: v })}
-            />
 
             <SectionHead title="Phase E — Empirical Win-Rate Gate" />
             <Toggle
