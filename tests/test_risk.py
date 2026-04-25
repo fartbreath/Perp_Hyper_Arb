@@ -1119,3 +1119,160 @@ class TestRecordHedgeFill:
         assert rows, "CSV must have a data row"
         for col in TRADES_HEADER:
             assert col in rows[0], f"Column {col!r} missing from hedge fill CSV row"
+
+
+# ── replace_hedge_order ────────────────────────────────────────────────────────
+
+class TestReplaceHedgeOrder:
+    """Tests for RiskEngine.replace_hedge_order()."""
+
+    def _make_engine_with_open_hedge(self):
+        from risk import HedgeStatus
+        engine = RiskEngine()
+        pos = Position(
+            market_id="mkt_replace",
+            market_type="bucket_1h",
+            underlying="BTC",
+            side="YES",
+            size=100.0,
+            entry_price=0.40,
+            strategy="momentum",
+            entry_cost_usd=40.0,
+        )
+        engine.open_position(pos)
+        engine.register_hedge_order(
+            order_id="old_ho_001",
+            market_id="mkt_replace",
+            token_id="tok_no_replace",
+            underlying="BTC",
+            market_type="bucket_1h",
+            market_title="BTC replace test",
+            order_price=0.05,
+            order_size=50.0,
+            order_size_usd=2.5,
+            parent_side="YES",
+            price_cap=0.12,
+        )
+        engine.update_gtd_hedge(
+            market_id="mkt_replace",
+            side="YES",
+            hedge_order_id="old_ho_001",
+            hedge_token_id="tok_no_replace",
+            hedge_price=0.05,
+            hedge_size_usd=2.5,
+        )
+        return engine, pos
+
+    def test_old_order_marked_cancelled(self):
+        from risk import HedgeStatus
+        engine, _ = self._make_engine_with_open_hedge()
+        engine.replace_hedge_order("old_ho_001", "new_ho_001", 0.06)
+        old_ho = engine.get_hedge_order("old_ho_001")
+        assert old_ho is not None
+        assert old_ho.status == HedgeStatus.CANCELLED
+
+    def test_new_order_is_open_with_new_price(self):
+        from risk import HedgeStatus
+        engine, _ = self._make_engine_with_open_hedge()
+        new_ho = engine.replace_hedge_order("old_ho_001", "new_ho_001", 0.06)
+        assert new_ho is not None
+        assert new_ho.status == HedgeStatus.OPEN
+        assert abs(new_ho.order_price - 0.06) < 1e-9
+
+    def test_metadata_copied_to_new_order(self):
+        engine, _ = self._make_engine_with_open_hedge()
+        new_ho = engine.replace_hedge_order("old_ho_001", "new_ho_001", 0.06)
+        assert new_ho.market_id == "mkt_replace"
+        assert new_ho.token_id == "tok_no_replace"
+        assert new_ho.underlying == "BTC"
+        assert new_ho.parent_side == "YES"
+        assert abs(new_ho.price_cap - 0.12) < 1e-9
+
+    def test_parent_position_hedge_order_id_updated(self):
+        engine, pos = self._make_engine_with_open_hedge()
+        engine.replace_hedge_order("old_ho_001", "new_ho_001", 0.06)
+        assert pos.hedge_order_id == "new_ho_001"
+        assert abs(pos.hedge_price - 0.06) < 1e-9
+
+    def test_unknown_old_id_returns_none(self):
+        engine, _ = self._make_engine_with_open_hedge()
+        result = engine.replace_hedge_order("does_not_exist", "new_ho_001", 0.06)
+        assert result is None
+
+    def test_size_remaining_excludes_filled_contracts(self):
+        engine, _ = self._make_engine_with_open_hedge()
+        # Simulate 10 contracts filled before the reprice
+        engine.update_hedge_fill(
+            "old_ho_001", fill_price=0.05, cumulative_size=10.0, source="test"
+        )
+        new_ho = engine.replace_hedge_order("old_ho_001", "new_ho_001", 0.06)
+        # size_remaining should be order_size (50) - size_filled (10) = 40
+        assert abs(new_ho.size_remaining - 40.0) < 1e-9
+
+    def test_new_order_appears_in_open_hedge_orders(self):
+        from risk import HedgeStatus
+        engine, _ = self._make_engine_with_open_hedge()
+        engine.replace_hedge_order("old_ho_001", "new_ho_001", 0.06)
+        open_ids = [ho.order_id for ho in engine.get_open_hedge_orders()]
+        assert "new_ho_001" in open_ids
+        assert "old_ho_001" not in open_ids
+
+
+# ── register_hedge_order price_cap field ─────────────────────────────────────
+
+class TestRegisterHedgeOrderPriceCap:
+    """price_cap kwarg is stored in HedgeOrder and defaults to 0.0."""
+
+    def test_price_cap_stored(self):
+        engine = RiskEngine()
+        engine.register_hedge_order(
+            order_id="cap_ho_001",
+            market_id="mkt_cap",
+            token_id="tok_cap",
+            underlying="ETH",
+            market_type="bucket_1h",
+            market_title="ETH cap test",
+            order_price=0.04,
+            order_size=25.0,
+            order_size_usd=1.0,
+            parent_side="YES",
+            price_cap=0.09,
+        )
+        ho = engine.get_hedge_order("cap_ho_001")
+        assert ho is not None
+        assert abs(ho.price_cap - 0.09) < 1e-9
+
+    def test_price_cap_defaults_to_zero(self):
+        engine = RiskEngine()
+        engine.register_hedge_order(
+            order_id="cap_ho_002",
+            market_id="mkt_cap2",
+            token_id="tok_cap2",
+            underlying="ETH",
+            market_type="bucket_1h",
+            market_title="ETH cap test 2",
+            order_price=0.04,
+            order_size=25.0,
+            order_size_usd=1.0,
+        )
+        ho = engine.get_hedge_order("cap_ho_002")
+        assert ho is not None
+        assert ho.price_cap == 0.0
+
+    def test_last_clob_ask_defaults_to_none(self):
+        """last_clob_ask starts as None (no prior sweep baseline)."""
+        engine = RiskEngine()
+        engine.register_hedge_order(
+            order_id="cap_ho_003",
+            market_id="mkt_cap3",
+            token_id="tok_cap3",
+            underlying="BTC",
+            market_type="bucket_1h",
+            market_title="BTC last ask test",
+            order_price=0.03,
+            order_size=10.0,
+            order_size_usd=0.3,
+        )
+        ho = engine.get_hedge_order("cap_ho_003")
+        assert ho is not None
+        assert ho.last_clob_ask is None

@@ -534,6 +534,11 @@ export interface ConfigData {
   momentum_min_delta_pct_sol?: number;
   momentum_min_delta_pct_doge?: number;
   momentum_min_delta_pct_hype?: number;
+  momentum_min_delta_pct_5m?: number;
+  momentum_min_delta_pct_15m?: number;
+  momentum_min_delta_pct_1h?: number;
+  momentum_min_delta_pct_4h?: number;
+  momentum_min_delta_pct_daily?: number;
   momentum_scan_interval?: number;
   momentum_max_concurrent?: number;
   momentum_min_gap_pct?: number;
@@ -542,13 +547,14 @@ export interface ConfigData {
   monitor_interval?: number;
   // Phase B — resolution oracle near expiry
   momentum_use_resolution_oracle_near_expiry?: boolean;
-  // Phase C — per-type elapsed-time guard
-  momentum_min_elapsed_5m?: number;
-  momentum_min_elapsed_15m?: number;
-  momentum_min_elapsed_1h?: number;
-  momentum_min_elapsed_4h?: number;
-  momentum_min_elapsed_daily?: number;
-  momentum_min_elapsed_weekly?: number;
+  // Phase C — per-type TTE floor (block last N seconds, 0 = OFF)
+  momentum_phase_c_min_tte_5m?: number;
+  momentum_phase_c_min_tte_15m?: number;
+  momentum_phase_c_min_tte_1h?: number;
+  momentum_phase_c_min_tte_4h?: number;
+  momentum_phase_c_min_tte_daily?: number;
+  momentum_phase_c_min_tte_weekly?: number;
+  momentum_phase_c_min_tte_milestone?: number;
   momentum_min_elenabled_5m?: boolean;
   momentum_hedge_enabled_15m?: boolean;
   momentum_hedge_enabled_1h?: boolean;
@@ -569,6 +575,7 @@ export interface ConfigData {
   momentum_hedge_price?: number;
   momentum_hedge_contracts_pct?: number;
   momentum_hedge_cancel_recovery_pct?: number;
+  momentum_hedge_suppresses_delta_sl?: boolean;
   momentum_hedge_price_5m?: number;
   momentum_hedge_price_15m?: number;
   momentum_hedge_price_1h?: number;

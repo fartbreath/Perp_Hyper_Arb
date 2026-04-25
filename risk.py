@@ -148,6 +148,15 @@ class HedgeOrder:
     pending_cancel_strike:     float = 0.0   # market strike
     pending_cancel_entry_spot: float = 0.0   # spot at position entry
 
+    # ── Gap-closing reprice state ─────────────────────────────────────────────
+    # price_cap: max bid price the hedge may be repriced to without eroding profit
+    # below MOMENTUM_HEDGE_MIN_RETAIN_USD.  Set at placement; copied on each reprice.
+    price_cap:          float          = 0.0
+    # last_clob_ask: best_ask from the previous monitor sweep, used to detect
+    # whether the seller is coming toward us (ask falling → step up bid by $0.01).
+    # Persisted so bot restarts don't lose the reference point.
+    last_clob_ask:      Optional[float] = None
+
     # ── Resolution ────────────────────────────────────────────────────────────
     settled_price:      float = 0.0  # 1.0 WIN / 0.0 LOSS
     resolved_at:        str   = ""
@@ -1108,6 +1117,7 @@ class RiskEngine:
         order_size_usd: float,
         *,
         parent_side: str = "",
+        price_cap: float = 0.0,
     ) -> HedgeOrder:
         """Create and persist a new HedgeOrder in OPEN status."""
         with self._lock:
@@ -1124,10 +1134,67 @@ class RiskEngine:
                 order_size_usd=order_size_usd,
                 size_remaining=order_size,
                 parent_side=parent_side,
+                price_cap=price_cap,
             )
             self._hedge_orders[order_id] = ho
             self._save_hedge_orders()
             return ho
+
+    def replace_hedge_order(
+        self,
+        old_order_id: str,
+        new_order_id: str,
+        new_price: float,
+    ) -> Optional["HedgeOrder"]:
+        """Cancel old hedge order and register a replacement at new_price.
+
+        Atomically:
+          1. Marks old HedgeOrder as CANCELLED.
+          2. Creates a new HedgeOrder copying all metadata (including price_cap).
+          3. Updates the parent Position's hedge_order_id to the new order.
+          4. Persists.
+
+        Returns the new HedgeOrder, or None if old_order_id is unknown.
+        """
+        with self._lock:
+            old_ho = self._hedge_orders.get(old_order_id)
+            if old_ho is None:
+                log.warning("replace_hedge_order: unknown old order", order_id=old_order_id[:20])
+                return None
+
+            new_ho = HedgeOrder(
+                order_id=new_order_id,
+                market_id=old_ho.market_id,
+                token_id=old_ho.token_id,
+                underlying=old_ho.underlying,
+                market_type=old_ho.market_type,
+                market_title=old_ho.market_title,
+                placed_at=datetime.now(timezone.utc).isoformat(),
+                order_price=new_price,
+                order_size=old_ho.order_size,
+                order_size_usd=round(old_ho.order_size * new_price, 6),
+                size_remaining=max(0.0, old_ho.order_size - old_ho.size_filled),
+                parent_side=old_ho.parent_side,
+                price_cap=old_ho.price_cap,
+                pending_cancel_threshold=old_ho.pending_cancel_threshold,
+                pending_cancel_side=old_ho.pending_cancel_side,
+                pending_cancel_strike=old_ho.pending_cancel_strike,
+                pending_cancel_entry_spot=old_ho.pending_cancel_entry_spot,
+            )
+
+            old_ho.status = HedgeStatus.CANCELLED
+
+            self._hedge_orders[new_order_id] = new_ho
+
+            # Update the parent Position so future monitor sweeps reference the new order.
+            for pos in self._positions.values():
+                if pos.hedge_order_id == old_order_id:
+                    pos.hedge_order_id = new_order_id
+                    pos.hedge_price = new_price
+                    break
+
+            self._save_hedge_orders()
+            return new_ho
 
     def update_hedge_fill(
         self,
@@ -1300,6 +1367,19 @@ class RiskEngine:
                         match = ho
             return match
 
+    def get_hedge_order_by_token_id(self, token_id: str) -> Optional[HedgeOrder]:
+        """Return the HedgeOrder whose token_id matches, or None.
+
+        Used as a fallback in the auto-redeem loop when the parent Position has
+        been evicted from memory (e.g. after a bot restart).  The HedgeOrder
+        entity persists in hedge_orders.json across restarts.
+        """
+        with self._lock:
+            for ho in self._hedge_orders.values():
+                if ho.token_id == token_id:
+                    return ho
+        return None
+
     def get_hedge_orders_with_pending_cancel(self) -> list:
         """Return all non-terminal HedgeOrders that have a pending cancel registered."""
         with self._lock:
@@ -1349,23 +1429,24 @@ class RiskEngine:
             self._save_hedge_orders()
 
     def has_hedge_fill(self, market_id: str) -> bool:
-        """Return True if a momentum_hedge record already exists for market_id.
+        """Return True if a momentum_hedge record has already been FINALIZED for market_id.
 
-        Guards against double-writes: returns True for any terminal HedgeOrder
-        (cancelled, expired, filled) so that concurrent asyncio paths that pass
-        through an await between the guard check and the eventual CSV write do
-        not both proceed to write a row.
+        Guards against double-writes: returns True only when finalize_hedge() or
+        record_hedge_fill() has committed the outcome (terminal status or
+        filled_won/filled_lost).  A non-terminal order with size_filled>0 means
+        "we have WS fill data but haven't written the outcome yet" — returning
+        True there would prevent _record_pending_resolution_hedge from ever
+        committing the result (the original bug that caused XRP hedge wins to
+        go unrecorded).
 
         Deprecated: new code should use get_hedge_order_by_market() directly.
         """
-        ho = self.get_hedge_order_by_market(market_id)
-        if ho is not None:
-            if ho.size_filled > 0:
-                return True
-            # Any terminal status means finalize_hedge() already committed or
-            # is mid-commit (status is set inside the lock before _append_csv).
-            if ho.status in HedgeStatus.TERMINAL:
-                return True
+        # Statuses that mean finalize_hedge() already committed the outcome row.
+        _FINALIZED = frozenset({"filled_won", "filled_lost"}) | HedgeStatus.TERMINAL
+        with self._lock:
+            for ho in self._hedge_orders.values():
+                if ho.market_id == market_id and ho.status in _FINALIZED:
+                    return True
         # Fallback: scan trades.csv for legacy rows written before the HedgeOrder model
         try:
             if not TRADES_CSV.exists():

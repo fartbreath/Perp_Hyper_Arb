@@ -68,7 +68,6 @@ from market_data.rtds_client import SpotPrice
 
 log = get_bot_logger(__name__)
 
-_DS_WS_HOST = "wss://ws.dataengine.chain.link"
 _DS_WS_PATH_PREFIX = "/api/v1/ws"
 
 # Data Streams uses uint192 benchmarkPrice with 18 decimal places.
@@ -82,11 +81,14 @@ class ChainlinkStreamsClient:
     """
     Direct Chainlink Data Streams WebSocket client for HYPE/USD.
 
-    When CHAINLINK_DS_API_KEY is configured, connects directly to the Chainlink
-    Data Streams engine WebSocket and receives HYPE/USD oracle reports with
-    minimum latency — no Polymarket intermediary, no polling.
+    Supports two authentication modes (first match wins):
+      1. Mercury Basic auth — set CHAINLINK_DS_USERNAME + CHAINLINK_DS_PASSWORD.
+         Host is taken from CHAINLINK_DS_HOST (default wss://ws.dataengine.chain.link).
+         Used for direct Mercury pipeline access (e.g. pipeline management endpoints).
+      2. Legacy HMAC — set CHAINLINK_DS_API_KEY + CHAINLINK_DS_API_SECRET.
+         Connects to the standard Data Streams consumer WS with HMAC-signed headers.
 
-    If CHAINLINK_DS_API_KEY is not set, start() logs guidance and returns
+    If neither credential set is configured, start() logs guidance and returns
     immediately.  SpotOracle degrades gracefully to the RTDS
     crypto_prices_chainlink relay (which Polymarket pushes sub-second from the
     same source).
@@ -102,6 +104,10 @@ class ChainlinkStreamsClient:
         self._running = False
         self._ws = None
         self._enabled = False
+        # Active feeds for this client instance (set in start())
+        self._active_feeds: dict[str, str] = {}
+        # Reverse lookup: lowercase feed ID -> coin name (rebuilt in start())
+        self._feedid_to_coin: dict[str, str] = {}
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -129,23 +135,51 @@ class ChainlinkStreamsClient:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    async def start(self) -> None:
-        """Begin streaming.  No-op (with warning) if API key is not configured."""
-        if not config.CHAINLINK_DS_API_KEY or not config.CHAINLINK_DS_HYPE_FEED_ID:
+    def _has_credentials(self) -> bool:
+        """Return True if at least one auth mode is fully configured."""
+        has_basic = bool(config.CHAINLINK_DS_USERNAME and config.CHAINLINK_DS_PASSWORD)
+        has_hmac  = bool(config.CHAINLINK_DS_API_KEY and config.CHAINLINK_DS_API_SECRET)
+        return has_basic or has_hmac
+
+    async def start(self, coin: Optional[str] = None) -> None:
+        """Begin streaming.
+
+        Args:
+            coin: If provided, subscribe only to this coin's feed (e.g. "HYPE",
+                  "BTC").  Useful when the API account has a per-connection feed
+                  limit and you want one client per coin.  If omitted, all
+                  configured feeds are subscribed in a single connection.
+        """
+        all_feeds = {c: fid for c, fid in config.CHAINLINK_DS_FEED_IDS.items() if fid}
+        if coin is not None:
+            fid = all_feeds.get(coin.upper())
+            self._active_feeds = {coin.upper(): fid} if fid else {}
+        else:
+            self._active_feeds = all_feeds
+
+        if not self._active_feeds or not self._has_credentials():
             log.info(
-                "ChainlinkStreamsClient: disabled — CHAINLINK_DS_API_KEY or "
-                "CHAINLINK_DS_HYPE_FEED_ID not set. "
-                "Obtain a free sponsored key at https://pm-ds-request.streams.chain.link/ "
-                "for direct oracle access. HYPE prices will be sourced from the "
-                "RTDS crypto_prices_chainlink relay instead."
+                "ChainlinkStreamsClient: disabled — credentials or feed IDs not set. "
+                "Set CHAINLINK_DS_USERNAME+PASSWORD (Mercury) or "
+                "CHAINLINK_DS_API_KEY+SECRET (HMAC) plus per-coin CHAINLINK_DS_{COIN}_FEED_ID vars. "
+                "Prices will be sourced from the RTDS crypto_prices_chainlink relay instead."
             )
             return
+
+        # Build reverse lookup from the active subset.
+        self._feedid_to_coin = {
+            fid.lower(): c for c, fid in self._active_feeds.items()
+        }
+
         self._running = True
         self._enabled = True
         asyncio.create_task(self._ws_loop())
         log.info(
             "ChainlinkStreamsClient: started",
-            feed_id=config.CHAINLINK_DS_HYPE_FEED_ID,
+            coins=list(self._active_feeds.keys()),
+            num_feeds=len(self._active_feeds),
+            host=config.CHAINLINK_DS_HOST,
+            auth_mode="hmac",
         )
 
     async def stop(self) -> None:
@@ -156,39 +190,60 @@ class ChainlinkStreamsClient:
     # ── WebSocket loop ────────────────────────────────────────────────────────
 
     def _build_auth_headers(self) -> dict[str, str]:
-        """Build the three HMAC authentication headers required by the Data Streams API.
+        """Build HMAC authentication headers for the WebSocket upgrade request.
 
-        Signature spec (from Chainlink Data Streams documentation):
-          HMAC-SHA256(api_secret, "GET\\n{path_with_query}\\n{timestamp_ms}")
-        where path_with_query = /api/v1/ws?feedIDs=<feed_id>
+        Chainlink Data Streams HMAC auth (per official spec):
+          Authorization:                    <api_key>
+          X-Authorization-Timestamp:        <unix_ms>
+          X-Authorization-Signature-SHA256: hex(HMAC-SHA256(secret,
+              "GET {path} {sha256_empty_body} {api_key} {unix_ms}"))
+
+        Credentials: CHAINLINK_DS_USERNAME + CHAINLINK_DS_PASSWORD are treated
+        as api_key + api_secret (they are HMAC credentials, not Basic auth).
+        CHAINLINK_DS_API_KEY + CHAINLINK_DS_API_SECRET are an alternative name
+        for the same values.
         """
-        feed_id = config.CHAINLINK_DS_HYPE_FEED_ID
-        path = f"{_DS_WS_PATH_PREFIX}?feedIDs={feed_id}"
-        timestamp_ms = str(int(time.time() * 1000))
-        message = f"GET\n{path}\n{timestamp_ms}"
+        if config.CHAINLINK_DS_USERNAME:
+            api_key    = config.CHAINLINK_DS_USERNAME
+            api_secret = config.CHAINLINK_DS_PASSWORD
+        else:
+            api_key    = config.CHAINLINK_DS_API_KEY
+            api_secret = config.CHAINLINK_DS_API_SECRET
+
+        feed_ids_str = ",".join(fid for fid in self._active_feeds.values() if fid)
+        path         = f"{_DS_WS_PATH_PREFIX}?feedIDs={feed_ids_str}"
+        timestamp_ms = int(time.time() * 1000)
+        body_hash    = hashlib.sha256(b"").hexdigest()
+        string_to_sign = f"GET {path} {body_hash} {api_key} {timestamp_ms}"
         signature = hmac.new(
-            config.CHAINLINK_DS_API_SECRET.encode("utf-8"),
-            message.encode("utf-8"),
+            api_secret.encode("utf-8"),
+            string_to_sign.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
         return {
-            "CHAINLINK-DS-APIKEY": config.CHAINLINK_DS_API_KEY,
-            "CHAINLINK-DS-TIMESTAMP": timestamp_ms,
-            "CHAINLINK-DS-SIGNATURE": signature,
+            "Authorization": api_key,
+            "X-Authorization-Timestamp": str(timestamp_ms),
+            "X-Authorization-Signature-SHA256": signature,
         }
 
     async def _ws_loop(self) -> None:
         """Persistent WebSocket loop with exponential backoff reconnect."""
         backoff = 1.0
-        feed_id = config.CHAINLINK_DS_HYPE_FEED_ID
-        url = f"{_DS_WS_HOST}{_DS_WS_PATH_PREFIX}?feedIDs={feed_id}"
+        feed_ids_str = ",".join(fid for fid in self._active_feeds.values() if fid)
+        # Strip a trailing http(s):// scheme from the host if the user set an https:// URL.
+        host = config.CHAINLINK_DS_HOST
+        if host.startswith("http://"):
+            host = "ws://" + host[len("http://"):]
+        elif host.startswith("https://"):
+            host = "wss://" + host[len("https://"):]
+        url = f"{host}{_DS_WS_PATH_PREFIX}?feedIDs={feed_ids_str}"
 
         while self._running:
             try:
                 auth_headers = self._build_auth_headers()
                 async with websockets.connect(
                     url,
-                    additional_headers=auth_headers,
+                    extra_headers=auth_headers,
                     ping_interval=None,
                     open_timeout=15,
                 ) as ws:
@@ -196,7 +251,7 @@ class ChainlinkStreamsClient:
                     backoff = 1.0
                     log.info(
                         "ChainlinkStreamsClient: connected to Data Streams",
-                        feed_id=feed_id,
+                        feeds=feed_ids_str[:80],
                     )
 
                     while True:
@@ -206,14 +261,14 @@ class ChainlinkStreamsClient:
                             )
                         except asyncio.TimeoutError:
                             log.warning(
-                                "ChainlinkStreamsClient: %ds silence — forcing reconnect",
-                                _WS_SILENCE_TIMEOUT_S,
+                                "ChainlinkStreamsClient: silence — forcing reconnect",
+                                silence_s=_WS_SILENCE_TIMEOUT_S,
                             )
                             break
                         await self._handle_message(json.loads(raw))
 
             except ConnectionClosed as exc:
-                log.warning("ChainlinkStreamsClient: WS disconnected", code=exc.code)
+                log.warning("ChainlinkStreamsClient: WS disconnected", code=exc.code if hasattr(exc, 'code') else exc)
             except asyncio.TimeoutError:
                 log.warning("ChainlinkStreamsClient: WS open timeout")
             except Exception as exc:
@@ -252,22 +307,30 @@ class ChainlinkStreamsClient:
         if not full_report_hex:
             return
 
+        # Determine which coin this report is for via the feedID field.
+        raw_feed_id = report.get("feedID", "").lower()
+        coin = self._feedid_to_coin.get(raw_feed_id)
+        if coin is None:
+            log.debug("ChainlinkStreamsClient: unknown feedID", feed_id=raw_feed_id[:20])
+            return
+
         result = decode_streams_report(full_report_hex)
         if result is None:
             log.warning(
                 "ChainlinkStreamsClient: could not decode fullReport",
+                coin=coin,
                 raw_prefix=full_report_hex[:66],
             )
             return
 
         price, _ = result
-        snap = SpotPrice(coin="HYPE", price=price, timestamp=time.time())
-        self._prices["HYPE"] = snap
-        log.debug("ChainlinkStreamsClient: HYPE report", price=round(price, 6))
+        snap = SpotPrice(coin=coin, price=price, timestamp=time.time())
+        self._prices[coin] = snap
+        log.debug("ChainlinkStreamsClient: report", coin=coin, price=round(price, 6))
 
         for cb in self._callbacks:
             try:
-                await cb("HYPE", price)
+                await cb(coin, price)
             except Exception as exc:
                 log.error("ChainlinkStreamsClient: callback error", exc=str(exc))
 
@@ -279,44 +342,48 @@ def decode_streams_report(full_report_hex: str) -> Optional[tuple[float, int]]:
 
     Returns (price_usd, observations_timestamp_unix) or None on malformed input.
 
-    V3 report ABI layout (all fields padded to 32 bytes):
-      The fullReport contains a 32-byte context prefix, then:
-      [0]  bytes32  feedId
-      [1]  uint32   validFromTimestamp
-      [2]  uint32   observationsTimestamp
-      [3]  uint192  nativeFee
-      [4]  uint192  linkFee
-      [5]  uint32   expiresAt
-      [6]  int192   benchmarkPrice         ← 18 decimal places
-      [7]  int192   bid
-      [8]  int192   ask
+    V3 fullReport ABI layout (Mercury pipeline, 992 bytes typical):
+      The fullReport is ABI-encoded as:
+        (bytes32[3] reportContext, bytes reportBlob, bytes32[] rawRs, bytes32[] rawSs, bytes rawVs)
 
-    Total: 32 (context) + 9 * 32 (struct) = 320 bytes minimum.
+      Fixed-header (7 × 32 bytes):
+        [0:32]    reportContext[0]
+        [32:64]   reportContext[1]
+        [64:96]   reportContext[2]
+        [96:128]  ABI offset for reportBlob  = 224 (0xE0)
+        [128:160] ABI offset for rawRs
+        [160:192] ABI offset for rawSs
+        [192:224] ABI offset for rawVs
+        [224:256] reportBlob length = 288 (0x120)
+
+      reportBlob (9 × 32 bytes, starting at byte 256):
+        [256:288]  bytes32  feedId
+        [288:320]  uint32   validFromTimestamp
+        [320:352]  uint32   observationsTimestamp
+        [352:384]  uint192  nativeFee
+        [384:416]  uint192  linkFee
+        [416:448]  uint32   expiresAt
+        [448:480]  int192   benchmarkPrice  ← 18 decimal places
+        [480:512]  int192   bid
+        [512:544]  int192   ask
 
     Data Streams prices use 18 decimal places (NOT 8 like AggregatorV3):
       price_usd = benchmarkPrice / 10**18
-
-    NOTE: If this decoder returns None or gives implausible prices against
-    your first live response, log the raw full_report_hex and compare the
-    byte layout against the actual API response.  Chainlink may update the
-    context prefix size in future schema versions.
     """
     try:
         raw = bytes.fromhex(full_report_hex.removeprefix("0x"))
     except ValueError:
         return None
 
-    # Minimum size: 32-byte context prefix + 9 ABI slots × 32 bytes = 320 bytes.
-    if len(raw) < 320:
+    # Minimum: 7 header slots (224 bytes) + length slot (32) + struct through benchmarkPrice (7 slots = 224).
+    if len(raw) < 480:
         return None
 
-    # 32-byte context prefix is skipped; struct begins at byte 32.
-    # Slot [2] (relative) = observationsTimestamp: bytes 96–127 after context → raw[128:160]
-    obs_ts = int.from_bytes(raw[128:160], byteorder="big", signed=False)
+    # observationsTimestamp: reportBlob slot 2 → fullReport byte 320
+    obs_ts = int.from_bytes(raw[320:352], byteorder="big", signed=False)
 
-    # Slot [6] (relative) = benchmarkPrice: bytes 224–255 after context → raw[256:288]
-    # int192 sign-extended to 256 bits (big-endian two's complement).
-    benchmark = int.from_bytes(raw[256:288], byteorder="big", signed=True)
+    # benchmarkPrice: reportBlob slot 6 → fullReport byte 448; int192 in two's complement
+    benchmark = int.from_bytes(raw[448:480], byteorder="big", signed=True)
 
     if benchmark <= 0:
         return None

@@ -128,22 +128,22 @@ class TestGetMidResolutionOracle:
         standard = oracle.get_mid("BTC", "bucket_5m")
         resolution = oracle.get_mid_resolution_oracle("BTC", "bucket_5m")
 
-        assert standard == pytest.approx(70_100.0)   # freshest-wins → RTDS
+        assert standard == pytest.approx(70_100.0)   # explicit priority: streams(None) → RTDS wins
         assert resolution == pytest.approx(70_000.0)  # AggregatorV3 only
 
 
-# ── get_mid still uses freshest-wins (not broken by Phase B) ─────────────────
+# ── get_mid uses explicit priority (not broken by Phase B) ───────────────────
 
 class TestGetMidUnchanged:
-    def test_get_mid_still_picks_fresher_rtds(self):
+    def test_get_mid_still_picks_rtds_when_no_streams(self):
         cl_snap = _make_snap("ETH", 3_400.0, ts=1_000.0)
         rtds_snap = _make_snap("ETH", 3_450.0, ts=2_000.0)
         oracle = _make_oracle(rtds_chainlink_snap=rtds_snap, cl_ws_snap=cl_snap)
         assert oracle.get_mid("ETH", "bucket_15m") == pytest.approx(3_450.0)
 
-    def test_get_mid_chainlink_non_hype_uses_freshest(self):
+    def test_get_mid_chainlink_non_hype_rtds_before_cl_ws(self):
         cl_snap = _make_snap("BTC", 68_000.0, ts=5_000.0)
-        rtds_snap = _make_snap("BTC", 68_500.0, ts=4_000.0)  # older
+        rtds_snap = _make_snap("BTC", 68_500.0, ts=4_000.0)  # older timestamp but higher priority
         oracle = _make_oracle(rtds_chainlink_snap=rtds_snap, cl_ws_snap=cl_snap)
-        # cl_ws is newer (5000 > 4000) → cl_ws wins
-        assert oracle.get_mid("BTC", "bucket_4h") == pytest.approx(68_000.0)
+        # Explicit priority: streams (None) → RTDS → cl_ws; RTDS wins regardless of timestamp
+        assert oracle.get_mid("BTC", "bucket_4h") == pytest.approx(68_500.0)

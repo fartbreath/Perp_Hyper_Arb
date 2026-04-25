@@ -2382,3 +2382,278 @@ class TestRangeStrategyExits:
         )
         assert exit_flag is True
         assert reason == ExitReason.RESOLVED
+
+
+# ── Helpers for gap-closing reprice / near-expiry tests ───────────────────────
+
+def _make_book_ba(bid, ask):
+    """Standalone helper: build a mock CLOB book with explicit bid/ask."""
+    book = MagicMock()
+    book.best_bid = bid
+    book.best_ask = ask
+    book.mid = (bid + ask) / 2 if bid is not None and ask is not None else (bid or ask)
+    return book
+
+
+def _open_pos_with_hedge(
+    risk,
+    *,
+    pos_market_id="mkt_pos",
+    hedge_order_id="ho_reprice",
+    hedge_market_id="mkt_hedge",
+    order_price=0.02,
+    order_size=50.0,
+    price_cap=0.10,
+):
+    """Open a dummy position and register a linked hedge order.
+
+    The position uses *pos_market_id* which should NOT be in pm._markets so
+    _check_position exits early without evaluating any exits.
+    The hedge CLOB token id is 'tok_hedge'; pos.token_id is 'tok_yes_held'
+    (used by the near-expiry cancel path to read the held-token mid).
+    """
+    pos = _make_position(
+        market_id=pos_market_id, side="YES",
+        entry_price=0.50, size=100.0, seconds_ago=120,
+    )
+    risk.open_position(pos)
+    risk.register_hedge_order(
+        order_id=hedge_order_id,
+        market_id=hedge_market_id,
+        token_id="tok_hedge",
+        underlying="BTC",
+        market_type="bucket_1h",
+        market_title="BTC hedge test",
+        order_price=order_price,
+        order_size=order_size,
+        order_size_usd=round(order_price * order_size, 4),
+        parent_side="YES",
+        price_cap=price_cap,
+    )
+    risk.update_gtd_hedge(
+        market_id=pos_market_id,
+        side="YES",
+        hedge_order_id=hedge_order_id,
+        hedge_token_id="tok_hedge",
+        hedge_price=order_price,
+        hedge_size_usd=round(order_price * order_size, 4),
+    )
+    # Set pos.token_id so the near-expiry cancel path can read the held-token mid.
+    pos.token_id = "tok_yes_held"
+    return pos, risk.get_hedge_order(hedge_order_id)
+
+
+# ── TestHedgeGapClosingReprice ─────────────────────────────────────────────────
+
+class TestHedgeGapClosingReprice:
+    """Gap-closing reprice logic inside _check_all_positions.
+
+    Rule: if best_ask FELL since last sweep → cancel + repost at bid + $0.01.
+    If ask is flat or rising → hold.  Capped by ho.price_cap.
+    """
+
+    def _setup(
+        self,
+        prev_ask=0.15,
+        curr_ask=0.14,
+        order_price=0.02,
+        price_cap=0.10,
+        cancel_ok=True,
+        new_order_id="new_ho_001",
+    ):
+        monitor, pm, risk = _make_monitor()
+        pm.cancel_order = AsyncMock(return_value=cancel_ok)
+        pm.place_limit = AsyncMock(return_value=new_order_id)
+        config.MOMENTUM_HEDGE_CLOB_LOG_ENABLED = False
+        config.MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS = 5
+        pos, ho = _open_pos_with_hedge(
+            risk, order_price=order_price, price_cap=price_cap
+        )
+        # Simulate a previous sweep by pre-loading last_clob_ask.
+        ho.last_clob_ask = prev_ask
+        # Set current hedge book (ask = curr_ask).
+        pm._books["tok_hedge"] = _make_book_ba(bid=order_price, ask=curr_ask)
+        # No market in pm._markets for the hedge → tte_s = None → no near-expiry cancel.
+        return monitor, pm, risk, ho
+
+    def test_ask_falls_triggers_reprice(self):
+        """Ask dropped → cancel called; new order placed at current_bid + $0.01."""
+        monitor, pm, risk, ho = self._setup(prev_ask=0.15, curr_ask=0.14)
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_called_once_with("ho_reprice")
+        pm.place_limit.assert_called_once()
+        kwargs = pm.place_limit.call_args.kwargs
+        assert abs(kwargs["price"] - 0.03) < 1e-9   # 0.02 + 0.01
+        assert kwargs["side"] == "BUY"
+
+    def test_ask_flat_no_reprice(self):
+        """Ask unchanged → no cancel, no replace."""
+        monitor, pm, risk, ho = self._setup(prev_ask=0.15, curr_ask=0.15)
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_not_called()
+        pm.place_limit.assert_not_called()
+
+    def test_ask_rises_no_reprice(self):
+        """Ask went up (seller moved away) → hold, no cancel."""
+        monitor, pm, risk, ho = self._setup(prev_ask=0.14, curr_ask=0.15)
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_not_called()
+        pm.place_limit.assert_not_called()
+
+    def test_price_cap_prevents_reprice(self):
+        """new_bid > price_cap → no cancel (would erode PnL below minimum)."""
+        # order_price=0.02, tick=$0.01 → new_bid=0.03; price_cap=0.02 → blocked
+        monitor, pm, risk, ho = self._setup(
+            prev_ask=0.15, curr_ask=0.14, order_price=0.02, price_cap=0.02
+        )
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_not_called()
+
+    def test_cancel_returns_false_no_replace(self):
+        """cancel_order returns False (already filled) → place_limit never called."""
+        monitor, pm, risk, ho = self._setup(prev_ask=0.15, curr_ask=0.14, cancel_ok=False)
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_called_once()
+        pm.place_limit.assert_not_called()
+
+    def test_place_limit_fails_finalizes_cancelled(self):
+        """Placement returns None after cancel → finalize_hedge as CANCELLED."""
+        from risk import HedgeStatus
+        monitor, pm, risk, ho = self._setup(prev_ask=0.15, curr_ask=0.14)
+        pm.place_limit = AsyncMock(return_value=None)
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_called_once()
+        ho_after = risk.get_hedge_order("ho_reprice")
+        assert ho_after.status == HedgeStatus.CANCELLED
+
+    def test_first_sweep_no_reprice_baseline_stored(self):
+        """last_clob_ask=None → first sweep: no cancel; current ask stored for next sweep."""
+        monitor, pm, risk, ho = self._setup(prev_ask=0.15, curr_ask=0.14)
+        ho.last_clob_ask = None   # reset to first-sweep state
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_not_called()
+        # Baseline for next sweep should now be set to current ask.
+        assert abs(ho.last_clob_ask - 0.14) < 1e-9
+
+    def test_reprice_updates_risk_engine_order(self):
+        """Successful reprice: old order CANCELLED, new order OPEN at higher price."""
+        from risk import HedgeStatus
+        monitor, pm, risk, ho = self._setup(
+            prev_ask=0.15, curr_ask=0.14, new_order_id="new_ho_001"
+        )
+        _run(monitor._check_all_positions())
+        old_ho = risk.get_hedge_order("ho_reprice")
+        assert old_ho.status == HedgeStatus.CANCELLED
+        new_ho = risk.get_hedge_order("new_ho_001")
+        assert new_ho is not None
+        assert abs(new_ho.order_price - 0.03) < 1e-9
+
+    def test_no_reprice_when_no_ask_data(self):
+        """Missing best_ask in book → last_clob_ask cleared; no cancel."""
+        monitor, pm, risk, ho = self._setup(prev_ask=0.15, curr_ask=0.14)
+        # Override book to have no ask (book draining at resolution)
+        book = MagicMock()
+        book.best_bid = 0.01
+        book.best_ask = None
+        pm._books["tok_hedge"] = book
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_not_called()
+        assert ho.last_clob_ask is None
+
+    def test_price_cap_zero_means_no_cap(self):
+        """price_cap=0.0 → cap check skipped, reprice always allowed."""
+        monitor, pm, risk, ho = self._setup(
+            prev_ask=0.15, curr_ask=0.14, order_price=0.02, price_cap=0.0
+        )
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_called_once()
+
+
+# ── TestHedgeNearExpiryCancel ──────────────────────────────────────────────────
+
+class TestHedgeNearExpiryCancel:
+    """Near-expiry cancel: TTE ≤ MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS and winning → cancel.
+
+    'Winning' = held-token mid > 0.50 (we are on the correct side of resolution).
+    """
+
+    def _setup_near_expiry(
+        self,
+        tte_secs=3,
+        held_mid=0.90,
+        expiry_cancel_secs=5,
+        cancel_ok=True,
+    ):
+        monitor, pm, risk = _make_monitor()
+        pm.cancel_order = AsyncMock(return_value=cancel_ok)
+        pm.place_limit = AsyncMock(return_value=None)
+        config.MOMENTUM_HEDGE_CLOB_LOG_ENABLED = False
+        config.MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS = expiry_cancel_secs
+
+        pos, ho = _open_pos_with_hedge(risk)
+
+        # Hedge book: flat ask (no reprice should fire)
+        pm._books["tok_hedge"] = _make_book_ba(bid=0.10, ask=0.11)
+        ho.last_clob_ask = 0.11  # flat → ask unchanged → no reprice
+
+        # Hedge market with end_date slightly in the future
+        future = datetime.now(timezone.utc) + timedelta(seconds=tte_secs)
+        market = MagicMock()
+        market.end_date = future
+        pm._markets["mkt_hedge"] = market
+
+        # Held token book with the desired mid
+        pm._books["tok_yes_held"] = _make_book_ba(
+            bid=held_mid - 0.01,
+            ask=held_mid + 0.01,
+        )
+
+        return monitor, pm, risk, ho
+
+    def test_winning_position_cancels_hedge(self):
+        """TTE=3s, held_mid=0.90 → winning → cancel_order called; hedge finalised."""
+        from risk import HedgeStatus
+        monitor, pm, risk, ho = self._setup_near_expiry(tte_secs=3, held_mid=0.90)
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_called_once_with("ho_reprice")
+        ho_after = risk.get_hedge_order("ho_reprice")
+        assert ho_after.status == HedgeStatus.CANCELLED
+
+    def test_losing_position_no_cancel(self):
+        """TTE=3s, held_mid=0.30 → losing → hedge kept alive (still useful insurance)."""
+        monitor, pm, risk, ho = self._setup_near_expiry(tte_secs=3, held_mid=0.30)
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_not_called()
+
+    def test_tte_above_window_no_cancel(self):
+        """TTE=30s > 5s threshold → near-expiry block skipped."""
+        monitor, pm, risk, ho = self._setup_near_expiry(tte_secs=30, held_mid=0.90)
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_not_called()
+
+    def test_expiry_cancel_disabled(self):
+        """MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS=0 → feature disabled, no cancel."""
+        monitor, pm, risk, ho = self._setup_near_expiry(
+            tte_secs=2, held_mid=0.90, expiry_cancel_secs=0
+        )
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_not_called()
+
+    def test_cancel_failure_hedge_stays_open(self):
+        """cancel_order returns False → hedge stays OPEN (will reconcile next sweep)."""
+        from risk import HedgeStatus
+        monitor, pm, risk, ho = self._setup_near_expiry(
+            tte_secs=3, held_mid=0.90, cancel_ok=False
+        )
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_called_once()
+        ho_after = risk.get_hedge_order("ho_reprice")
+        assert ho_after.status == HedgeStatus.OPEN
+
+    def test_exactly_at_threshold_triggers_cancel(self):
+        """TTE exactly at MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS → condition is inclusive (<=)."""
+        monitor, pm, risk, ho = self._setup_near_expiry(
+            tte_secs=5, held_mid=0.90, expiry_cancel_secs=5
+        )
+        _run(monitor._check_all_positions())
+        pm.cancel_order.assert_called_once_with("ho_reprice")

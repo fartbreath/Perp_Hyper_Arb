@@ -525,6 +525,7 @@ _MUTABLE_CONFIG = {
     "momentum_hedge_price":                ("MOMENTUM_HEDGE_PRICE",                 float),
     "momentum_hedge_contracts_pct":        ("MOMENTUM_HEDGE_CONTRACTS_PCT",         float),
     "momentum_hedge_cancel_recovery_pct": ("MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT",   float),
+    "momentum_hedge_suppresses_delta_sl": ("MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL",   bool),
     # Logging toggles (post-trade analysis files)
     "momentum_hedge_clob_log_enabled":     ("MOMENTUM_HEDGE_CLOB_LOG_ENABLED",      bool),
     "momentum_ticks_log_enabled":          ("MOMENTUM_TICKS_LOG_ENABLED",           bool),
@@ -715,6 +716,12 @@ class ConfigPatch(BaseModel):
     momentum_min_delta_pct_sol: float | None = None
     momentum_min_delta_pct_doge: float | None = None
     momentum_min_delta_pct_hype: float | None = None
+    # Per-bucket-type minimum delta entry floor overrides
+    momentum_min_delta_pct_5m: float | None = None
+    momentum_min_delta_pct_15m: float | None = None
+    momentum_min_delta_pct_1h: float | None = None
+    momentum_min_delta_pct_4h: float | None = None
+    momentum_min_delta_pct_daily: float | None = None
     momentum_scan_interval: int | None = None
     momentum_max_concurrent: int | None = None
     momentum_min_gap_pct: float | None = None
@@ -722,19 +729,20 @@ class ConfigPatch(BaseModel):
     monitor_interval: int | None = None
     # Phase B — resolution oracle near expiry
     momentum_use_resolution_oracle_near_expiry: bool | None = None
-    # Phase C — per-type elapsed-time guard (flattened)
-    momentum_min_elapsed_5m: int | None = None
-    momentum_min_elapsed_15m: int | None = None
-    momentum_min_elapsed_1h: int | None = None
-    momentum_min_elapsed_4h: int | None = None
-    momentum_min_elapsed_daily: int | None = None
-    momentum_min_elapsed_weekly: int | None = None
-    momentum_min_elapsed_milestone: int | None = None
+    # Phase C — per-type TTE floor (flattened)
+    momentum_phase_c_min_tte_5m: int | None = None
+    momentum_phase_c_min_tte_15m: int | None = None
+    momentum_phase_c_min_tte_1h: int | None = None
+    momentum_phase_c_min_tte_4h: int | None = None
+    momentum_phase_c_min_tte_daily: int | None = None
+    momentum_phase_c_min_tte_weekly: int | None = None
+    momentum_phase_c_min_tte_milestone: int | None = None
     # Phase D — hedge
     momentum_hedge_enabled: bool | None = None
     momentum_hedge_price: float | None = None
     momentum_hedge_contracts_pct: float | None = None
     momentum_hedge_cancel_recovery_pct: float | None = None
+    momentum_hedge_suppresses_delta_sl: bool | None = None
     momentum_hedge_price_5m: float | None = None
     momentum_hedge_price_15m: float | None = None
     momentum_hedge_price_1h: float | None = None
@@ -948,6 +956,12 @@ def get_config() -> dict:
         "momentum_min_delta_pct_sol":  config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("SOL",  config.MOMENTUM_MIN_DELTA_PCT),
         "momentum_min_delta_pct_doge": config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("DOGE", config.MOMENTUM_MIN_DELTA_PCT),
         "momentum_min_delta_pct_hype": config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get("HYPE", config.MOMENTUM_MIN_DELTA_PCT),
+        # Per-bucket-type minimum delta entry floor overrides
+        "momentum_min_delta_pct_5m":    config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE.get("bucket_5m",    config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_15m":   config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE.get("bucket_15m",   config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_1h":    config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE.get("bucket_1h",    config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_4h":    config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE.get("bucket_4h",    config.MOMENTUM_MIN_DELTA_PCT),
+        "momentum_min_delta_pct_daily": config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE.get("bucket_daily",  config.MOMENTUM_MIN_DELTA_PCT),
         "momentum_scan_interval":         config.MOMENTUM_SCAN_INTERVAL,
         "momentum_max_concurrent":        config.MOMENTUM_MAX_CONCURRENT,
         "momentum_min_gap_pct":           config.MOMENTUM_MIN_GAP_PCT,
@@ -956,18 +970,19 @@ def get_config() -> dict:
         # Phase B — resolution oracle near expiry
         "momentum_use_resolution_oracle_near_expiry": config.MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY,
         # Phase C — per-type elapsed-time guard (flattened)
-        "momentum_min_elapsed_5m":        config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_5m",    0),
-        "momentum_min_elapsed_15m":       config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_15m",   0),
-        "momentum_min_elapsed_1h":        config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_1h",    0),
-        "momentum_min_elapsed_4h":        config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_4h",    0),
-        "momentum_min_elapsed_daily":     config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_daily", 0),
-        "momentum_min_elapsed_weekly":    config.MOMENTUM_MIN_ELAPSED_SECONDS.get("bucket_weekly",0),
-        "momentum_min_elapsed_milestone": config.MOMENTUM_MIN_ELAPSED_SECONDS.get("milestone",    0),
+        "momentum_phase_c_min_tte_5m":        config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("bucket_5m",    0),
+        "momentum_phase_c_min_tte_15m":       config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("bucket_15m",   0),
+        "momentum_phase_c_min_tte_1h":        config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("bucket_1h",    0),
+        "momentum_phase_c_min_tte_4h":        config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("bucket_4h",    0),
+        "momentum_phase_c_min_tte_daily":     config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("bucket_daily", 0),
+        "momentum_phase_c_min_tte_weekly":    config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("bucket_weekly",0),
+        "momentum_phase_c_min_tte_milestone": config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("milestone",    0),
         # Phase D — hedge
         "momentum_hedge_enabled":              config.MOMENTUM_HEDGE_ENABLED,
         "momentum_hedge_price":                config.MOMENTUM_HEDGE_PRICE,
         "momentum_hedge_contracts_pct":        config.MOMENTUM_HEDGE_CONTRACTS_PCT,
         "momentum_hedge_cancel_recovery_pct": config.MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT,
+        "momentum_hedge_suppresses_delta_sl": config.MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL,
         # Logging toggles (post-trade analysis files)
         "momentum_hedge_clob_log_enabled":     config.MOMENTUM_HEDGE_CLOB_LOG_ENABLED,
         "momentum_ticks_log_enabled":          config.MOMENTUM_TICKS_LOG_ENABLED,
@@ -1082,22 +1097,22 @@ def patch_config(patch: ConfigPatch) -> dict:
             config.MOMENTUM_VOL_Z_SCORE_BY_TYPE[bucket_key] = float(v)
             updated[field] = float(v)
             log.info("Config updated via API", key=f"MOMENTUM_VOL_Z_SCORE_BY_TYPE[{bucket_key}]", value=float(v))
-    # Phase C — per-type elapsed-time guard — written directly into the dict
-    _elapsed_map = {
-        "momentum_min_elapsed_5m":        "bucket_5m",
-        "momentum_min_elapsed_15m":       "bucket_15m",
-        "momentum_min_elapsed_1h":        "bucket_1h",
-        "momentum_min_elapsed_4h":        "bucket_4h",
-        "momentum_min_elapsed_daily":     "bucket_daily",
-        "momentum_min_elapsed_weekly":    "bucket_weekly",
-        "momentum_min_elapsed_milestone": "milestone",
+    # Phase C — per-type TTE floor — written directly into the dict
+    _phase_c_map = {
+        "momentum_phase_c_min_tte_5m":        "bucket_5m",
+        "momentum_phase_c_min_tte_15m":       "bucket_15m",
+        "momentum_phase_c_min_tte_1h":        "bucket_1h",
+        "momentum_phase_c_min_tte_4h":        "bucket_4h",
+        "momentum_phase_c_min_tte_daily":     "bucket_daily",
+        "momentum_phase_c_min_tte_weekly":    "bucket_weekly",
+        "momentum_phase_c_min_tte_milestone": "milestone",
     }
-    for field, bucket_key in _elapsed_map.items():
+    for field, bucket_key in _phase_c_map.items():
         v = getattr(patch, field)
         if v is not None:
-            config.MOMENTUM_MIN_ELAPSED_SECONDS[bucket_key] = int(v)
+            config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS[bucket_key] = int(v)
             updated[field] = int(v)
-            log.info("Config updated via API", key=f"MOMENTUM_MIN_ELAPSED_SECONDS[{bucket_key}]", value=int(v))
+            log.info("Config updated via API", key=f"MOMENTUM_PHASE_C_MIN_TTE_SECONDS[{bucket_key}]", value=int(v))
     # Per-bucket Kelly multiplier overrides — written directly into the dict
     _kelly_mult_map = {
         "momentum_kelly_multiplier_5m":      "bucket_5m",
@@ -1176,6 +1191,20 @@ def patch_config(patch: ConfigPatch) -> dict:
             config.MOMENTUM_MIN_DELTA_PCT_BY_COIN[coin] = float(v)
             updated[field] = float(v)
             log.info("Config updated via API", key=f"MOMENTUM_MIN_DELTA_PCT_BY_COIN[{coin}]", value=float(v))
+    # Per-bucket-type minimum delta entry floor overrides — written directly into the dict
+    _min_delta_type_map = {
+        "momentum_min_delta_pct_5m":    "bucket_5m",
+        "momentum_min_delta_pct_15m":   "bucket_15m",
+        "momentum_min_delta_pct_1h":    "bucket_1h",
+        "momentum_min_delta_pct_4h":    "bucket_4h",
+        "momentum_min_delta_pct_daily": "bucket_daily",
+    }
+    for field, bucket_key in _min_delta_type_map.items():
+        v = getattr(patch, field)
+        if v is not None:
+            config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE[bucket_key] = float(v)
+            updated[field] = float(v)
+            log.info("Config updated via API", key=f"MOMENTUM_MIN_DELTA_PCT_BY_TYPE[{bucket_key}]", value=float(v))
     if updated:
         # Build attr-name → value dict for only the keys that changed so that
         # _save_overrides does a targeted merge (not a full overwrite).
@@ -1196,8 +1225,8 @@ def patch_config(patch: ConfigPatch) -> dict:
             attr_changes["MOMENTUM_DELTA_SL_PCT_BY_COIN"] = dict(config.MOMENTUM_DELTA_SL_PCT_BY_COIN)
         if any(f in updated for f in _min_delta_coin_map):
             attr_changes["MOMENTUM_MIN_DELTA_PCT_BY_COIN"] = dict(config.MOMENTUM_MIN_DELTA_PCT_BY_COIN)
-        if any(f in updated for f in _elapsed_map):
-            attr_changes["MOMENTUM_MIN_ELAPSED_SECONDS"] = dict(config.MOMENTUM_MIN_ELAPSED_SECONDS)
+        if any(f in updated for f in _min_delta_type_map):
+            attr_changes["MOMENTUM_MIN_DELTA_PCT_BY_TYPE"] = dict(config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE)
         if any(f in updated for f in _hedge_price_map):
             attr_changes["MOMENTUM_HEDGE_PRICE_BY_TYPE"] = dict(config.MOMENTUM_HEDGE_PRICE_BY_TYPE)
         if any(f in updated for f in _hedge_enabled_map):

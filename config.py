@@ -23,14 +23,32 @@ POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.pub
 #   wss://polygon.getblock.io/<KEY>/mainnet/           (GetBlock)
 POLYGON_WS_URL: str = os.getenv("POLYGON_WS_URL", "wss://polygon-bor-rpc.publicnode.com")
 
-# Chainlink Data Streams — direct WebSocket feed for HYPE/USD.
-# Obtain a free sponsored key at: https://pm-ds-request.streams.chain.link/
-# Leave empty to run in RTDS-only mode (HYPE price still delivered sub-second via
-# the crypto_prices_chainlink RTDS topic, but without direct oracle access).
+# Chainlink Data Streams / Mercury Pipeline — direct WebSocket feed for HYPE/USD.
+# Two auth modes are supported (first match wins):
+#   1. Mercury Basic auth — set CHAINLINK_DS_USERNAME + CHAINLINK_DS_PASSWORD.
+#      WS host should point to your Mercury pipeline endpoint (wss://...).
+#   2. Legacy HMAC — set CHAINLINK_DS_API_KEY + CHAINLINK_DS_API_SECRET.
+#      Connects to wss://ws.dataengine.chain.link with HMAC-signed headers.
+# Leave all empty to run in RTDS-only mode (HYPE price still delivered sub-second
+# via the crypto_prices_chainlink RTDS topic, without direct oracle access).
+#
+# Mercury pipeline endpoint (wss:// scheme required for WebSocket).
+CHAINLINK_DS_HOST: str = os.getenv("CHAINLINK_DS_HOST", "wss://ws.dataengine.chain.link")
+# Mercury Basic-auth credentials (provided by Chainlink DevEx for pipeline access).
+CHAINLINK_DS_USERNAME: str = os.getenv("CHAINLINK_DS_USERNAME", "")
+CHAINLINK_DS_PASSWORD: str = os.getenv("CHAINLINK_DS_PASSWORD", "")
+# Candlestick REST API key — for historical OHLCV queries (separate from streaming).
+CHAINLINK_DS_CANDLESTICK_KEY: str = os.getenv("CHAINLINK_DS_CANDLESTICK_KEY", "")
+# Legacy HMAC auth (standard Data Streams consumer API).
 CHAINLINK_DS_API_KEY: str = os.getenv("CHAINLINK_DS_API_KEY", "")
 CHAINLINK_DS_API_SECRET: str = os.getenv("CHAINLINK_DS_API_SECRET", "")
 # Feed ID for HYPE/USD on Chainlink Data Streams — provided with your API key.
 CHAINLINK_DS_HYPE_FEED_ID: str = os.getenv("CHAINLINK_DS_HYPE_FEED_ID", "")
+# Per-coin feed IDs for all tracked underlyings.
+CHAINLINK_DS_FEED_IDS: dict[str, str] = {
+    coin: os.getenv(f"CHAINLINK_DS_{coin}_FEED_ID", "")
+    for coin in ["BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP"]
+}
 
 RELAYER_API_KEY: str = os.getenv("RELAYER_API_KEY", "")
 RELAYER_API_KEY_ADDRESS: str = os.getenv("RELAYER_API_KEY_ADDRESS", "")
@@ -442,6 +460,12 @@ MOMENTUM_MIN_DELTA_PCT: float = 0.0
 # Per-coin overrides for MOMENTUM_MIN_DELTA_PCT.  If a coin is listed here its
 # value replaces the global floor; unlisted coins use MOMENTUM_MIN_DELTA_PCT.
 MOMENTUM_MIN_DELTA_PCT_BY_COIN: dict[str, float] = {}
+# Per-bucket-type overrides for MOMENTUM_MIN_DELTA_PCT.  If a bucket type is
+# listed here its value is compared with the coin floor and the HIGHER of the
+# two is used as the effective floor.  Unlisted bucket types fall back to the
+# coin floor (or global default if that is also absent).
+# Example: {"bucket_5m": 0.10, "bucket_15m": 0.08}
+MOMENTUM_MIN_DELTA_PCT_BY_TYPE: dict[str, float] = {}
 
 # Per-coin overrides for MOMENTUM_DELTA_STOP_LOSS_PCT.  Higher-IV coins (DOGE,
 # SOL, HYPE) need a wider stop because a single oracle tick routinely exceeds
@@ -459,7 +483,7 @@ MOMENTUM_MIN_GAP_PCT: float = 0.0
 # Phase C — Minimum elapsed-time guard: suppress entries fired in the first N
 # seconds of a market window (thin book, wide spreads, noisy ticks).
 # Empty dict = disabled for all types.  Per-type example: {"bucket_5m": 30}.
-MOMENTUM_MIN_ELAPSED_SECONDS: dict[str, int] = {}
+MOMENTUM_PHASE_C_MIN_TTE_SECONDS: dict[str, int] = {}  # 0 = OFF; N = block entries in last N s
 
 # Phase D — GTD (GTC resting) hedge: after a confirmed entry, optionally place
 # a low-price GTC limit BUY on the opposite token as oracle-free downside cover.
@@ -506,7 +530,20 @@ MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.15
 
 # N-tick concession ladder: how many times to retry with price raised by 1 tick ($0.01).
 # 1 = single attempt at the configured price (closest to old behaviour).
-MOMENTUM_HEDGE_MAX_TICKS_CONCESSION: int = 10
+MOMENTUM_HEDGE_MAX_TICKS_CONCESSION: int = 15
+
+# Post-placement gap-closing reprice.
+# On every monitor sweep, if the hedge token's best_ask has FALLEN since the prior
+# sweep (seller moving toward us), cancel + repost the hedge at current_bid + $0.01.
+# If the ask is flat or rising (seller moved away), hold — we don't chase upward.
+# Repricing is capped by price_cap (computed at placement from projected PnL minus
+# MOMENTUM_HEDGE_MIN_RETAIN_USD), so the hedge is always PnL-positive.
+#
+# Near-expiry cancel: if TTE ≤ MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS and the held
+# token's CLOB mid is above 0.50 (we are winning), the hedge is cancelled — the
+# insurance is no longer needed and we prevent an adverse fill at resolution.
+# Set to 0 to disable the near-expiry cancel.
+MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS: int = 5
 
 # TTE aggression threshold (seconds).  When time-to-expiry is below this value the
 # bot forces a taker (FAK) order regardless of the book state.
@@ -534,6 +571,15 @@ MOMENTUM_TICKS_LOG_ENABLED: bool = True         # momentum_ticks.csv   — intra
 # If delta never recovers and the market resolves, the hedge rides to resolution.
 # Set to 0.0 to restore immediate-cancel behaviour (old default).
 MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT: float = 0.5
+
+# When True, suppress ALL stop-losses for any position that already has an
+# active GTD hedge order placed.  This includes the oracle delta SL, the
+# near-expiry time stop, and the CLOB prob-SL.  The hedge is the insurance
+# leg — once it is resting in the CLOB the downside is bounded, so any SL
+# exit would only lock in a loss before the hedge can pay off at resolution.
+# Take-profit remains active (winning path; hedge is irrelevant there).
+# Defaults to False (conservative) — all SLs fire regardless of hedge status.
+MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL: bool = False
 
 # Paper-mode GTD hedge fill simulation.
 # When PAPER_TRADING=True the fill_simulator also checks resting hedge bids against

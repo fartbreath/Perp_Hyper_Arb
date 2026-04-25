@@ -1825,6 +1825,57 @@ export default function Settings() {
               onSubmit={(v) => apply({ momentum_min_delta_pct_hype: v })}
             />
 
+            <SectionHead title="Per-Bucket Entry Floor Overrides" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Per-bucket minimum delta required to enter. Combined with the per-coin floor
+              by taking the higher of the two. Unlisted buckets fall back to the global floor.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0" }}>
+              <FloatInput
+                label="5-Min Bucket"
+                description="5m entry floor override. Tighter floor filters noise near expiry."
+                value={data.momentum_min_delta_pct_5m ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_5m: v })}
+              />
+              <FloatInput
+                label="15-Min Bucket"
+                description="15m entry floor override."
+                value={data.momentum_min_delta_pct_15m ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_15m: v })}
+              />
+              <FloatInput
+                label="1-Hour Bucket"
+                description="1h entry floor override."
+                value={data.momentum_min_delta_pct_1h ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_1h: v })}
+              />
+              <FloatInput
+                label="4-Hour Bucket"
+                description="4h entry floor override."
+                value={data.momentum_min_delta_pct_4h ?? data.momentum_min_delta_pct ?? 0}
+                step={0.01}
+                unit="%"
+                onSubmit={(v) => apply({ momentum_min_delta_pct_4h: v })}
+              />
+            </div>
+            {GAP}
+            <FloatInput
+              label="Daily Bucket"
+              description="Daily entry floor override."
+              value={data.momentum_min_delta_pct_daily ?? data.momentum_min_delta_pct ?? 0}
+              step={0.01}
+              unit="%"
+              onSubmit={(v) => apply({ momentum_min_delta_pct_daily: v })}
+            />
+
+            {GAP}
+
             <SectionHead title="Per-Bucket Z-Score Overrides" />
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
               Each market type can use a different signal strength threshold.
@@ -1933,69 +1984,68 @@ export default function Settings() {
               onChange={(v) => apply({ momentum_use_resolution_oracle_near_expiry: v })}
             />
 
-            <SectionHead title="Phase C — Entry Cooldown per Market Type" />
+            <SectionHead title="Phase C — Near-Expiry Block (per Market Type)" />
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
-              Suppress entries in the first N seconds of a market window (thin book, wide spreads, noisy ticks).
-              0 = no cooldown for that type.
+              Block entries when fewer than N seconds remain. Prevents entering too close to expiry for bucket types where the fill path is too short. 0 = OFF.
             </p>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0" }}>
               <NumberInput
                 label="5-Minute"
-                description="bucket_5m elapsed cooldown (s)."
-                value={data.momentum_min_elapsed_5m ?? 0}
+                description="bucket_5m — block entries in the last N seconds. 0 = OFF."
+                value={data.momentum_phase_c_min_tte_5m ?? 0}
                 step={5}
                 unit="s"
-                onSubmit={(v) => apply({ momentum_min_elapsed_5m: v })}
+                onSubmit={(v) => apply({ momentum_phase_c_min_tte_5m: v })}
               />
               <NumberInput
                 label="15-Minute"
-                description="bucket_15m elapsed cooldown (s)."
-                value={data.momentum_min_elapsed_15m ?? 0}
+                description="bucket_15m — block entries in the last N seconds. 0 = OFF."
+                value={data.momentum_phase_c_min_tte_15m ?? 0}
                 step={5}
                 unit="s"
-                onSubmit={(v) => apply({ momentum_min_elapsed_15m: v })}
+                onSubmit={(v) => apply({ momentum_phase_c_min_tte_15m: v })}
               />
               <NumberInput
                 label="1-Hour"
-                description="bucket_1h elapsed cooldown (s)."
-                value={data.momentum_min_elapsed_1h ?? 0}
+                description="bucket_1h — block entries in the last N seconds. 0 = OFF."
+                value={data.momentum_phase_c_min_tte_1h ?? 0}
                 step={15}
                 unit="s"
-                onSubmit={(v) => apply({ momentum_min_elapsed_1h: v })}
+                onSubmit={(v) => apply({ momentum_phase_c_min_tte_1h: v })}
               />
               <NumberInput
                 label="4-Hour"
-                description="bucket_4h elapsed cooldown (s)."
-                value={data.momentum_min_elapsed_4h ?? 0}
+                description="bucket_4h — block entries in the last N seconds. 0 = OFF."
+                value={data.momentum_phase_c_min_tte_4h ?? 0}
                 step={30}
                 unit="s"
-                onSubmit={(v) => apply({ momentum_min_elapsed_4h: v })}
+                onSubmit={(v) => apply({ momentum_phase_c_min_tte_4h: v })}
               />
               <NumberInput
                 label="Daily"
-                description="bucket_daily elapsed cooldown (s)."
-                value={data.momentum_min_elapsed_daily ?? 0}
+                description="bucket_daily — block entries in the last N seconds. 0 = OFF."
+                value={data.momentum_phase_c_min_tte_daily ?? 0}
                 step={60}
                 unit="s"
-                onSubmit={(v) => apply({ momentum_min_elapsed_daily: v })}
+                onSubmit={(v) => apply({ momentum_phase_c_min_tte_daily: v })}
               />
               <NumberInput
                 label="Weekly"
-                description="bucket_weekly elapsed cooldown (s)."
-                value={data.momentum_min_elapsed_weekly ?? 0}
+                description="bucket_weekly — block entries in the last N seconds. 0 = OFF."
+                value={data.momentum_phase_c_min_tte_weekly ?? 0}
                 step={300}
                 unit="s"
-                onSubmit={(v) => apply({ momentum_min_elapsed_weekly: v })}
+                onSubmit={(v) => apply({ momentum_phase_c_min_tte_weekly: v })}
               />
             </div>
             {GAP}
             <NumberInput
               label="Milestone"
-              description="milestone market elapsed cooldown (s)."
-              value={data.momentum_min_elapsed_milestone ?? 0}
+              description="milestone — block entries in the last N seconds. 0 = OFF."
+              value={data.momentum_phase_c_min_tte_milestone ?? 0}
               step={60}
               unit="s"
-              onSubmit={(v) => apply({ momentum_min_elapsed_milestone: v })}
+              onSubmit={(v) => apply({ momentum_phase_c_min_tte_milestone: v })}
             />
 
             <SectionHead title="Phase D — Downside Hedge" />
@@ -2073,6 +2123,13 @@ export default function Settings() {
                   step={10}
                   unit="%"
                   onSubmit={(v) => apply({ momentum_hedge_cancel_recovery_pct: v / 100 })}
+                />
+                {GAP}
+                <Toggle
+                  label="Hedge Suppresses Delta SL"
+                  description="When ON, ALL stop-losses are suppressed for any position that has an active GTD hedge order: oracle delta SL, near-expiry time stop, and CLOB prob-SL. The hedge bounds the downside — any SL exit would lock in a loss before the hedge pays off. Take-profit remains active."
+                  value={data.momentum_hedge_suppresses_delta_sl ?? false}
+                  onChange={(v) => apply({ momentum_hedge_suppresses_delta_sl: v })}
                 />
                 {GAP}
                 <FloatInput
@@ -2323,8 +2380,8 @@ export default function Settings() {
             {GAP}
 
             <NumberInput
-              label="Min TTE (s)"
-              description="Minimum seconds to expiry required before entering a range market. Range markets often have longer durations than bucket markets — set appropriately."
+              label="Entry Window (s)"
+              description="Only enter in the last N seconds before expiry (same ceiling gate as the Entry Window section above, applied to range markets). e.g. 300 = only enter in the final 5 minutes. Markets with more TTE than this are skipped."
               value={data.momentum_range_min_tte_seconds ?? 300}
               step={60}
               unit="s"

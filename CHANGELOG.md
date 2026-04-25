@@ -2,6 +2,130 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-25] - Chainlink Data Streams direct feed for all coins; hedge reprice + SL suppression; Phase C TTE gate; per-type delta floor
+
+### Feature — Chainlink Data Streams direct feed extended to all 7 coins (`market_data/chainlink_streams_client.py`, `market_data/spot_oracle.py`, `config.py`)
+
+Previously `ChainlinkStreamsClient` only fed HYPE/USD; all other coins used the RTDS
+`crypto_prices_chainlink` relay as primary. After benchmarking all seven supported coins
+(HYPE, BTC, ETH, SOL, BNB, DOGE, XRP), the direct Data Streams WebSocket consistently
+arrives ~190ms ahead of the relay with 0.000bps price delta (100% direct wins over 58
+matched rounds per coin in 60s tests).
+
+**Changes:**
+
+- `config.py`: Added `CHAINLINK_DS_FEED_IDS` dict — maps all 7 coins to their feed IDs,
+  read from per-coin env vars `CHAINLINK_DS_{COIN}_FEED_ID`. Old single
+  `CHAINLINK_DS_HYPE_FEED_ID` var retained for backwards compatibility.
+
+- `chainlink_streams_client.py`: Multi-feed support — connects to a single WebSocket with
+  all configured feed IDs and dispatches messages by `report.feedID`. `start()` now accepts
+  an optional `coin=` parameter to subscribe to a single feed (used by the comparison
+  script to avoid per-connection rate limiting during testing). `_active_feeds` dict replaces
+  direct `config.CHAINLINK_DS_FEED_IDS` references in `_build_auth_headers` and `_ws_loop`.
+
+- `spot_oracle.py`: `_get_chainlink_spot()` now prioritises ChainlinkStreamsClient for all
+  coins in Chainlink bucket types (5m/15m/4h), falling back to RTDS relay then ChainlinkWSClient.
+  Previous logic used freshest-timestamp arbitration and only used direct streams for HYPE.
+
+**New env vars (all optional — bot degrades gracefully to RTDS-only without them):**
+```
+CHAINLINK_DS_BTC_FEED_ID=0x00039d9e4539...
+CHAINLINK_DS_ETH_FEED_ID=0x000362205e10...
+CHAINLINK_DS_SOL_FEED_ID=0x0003b778d3f6...
+CHAINLINK_DS_BNB_FEED_ID=0x000335fd3f3f...
+CHAINLINK_DS_DOGE_FEED_ID=0x000356ca64d3...
+CHAINLINK_DS_XRP_FEED_ID=0x0003c16c6aed...
+```
+
+**New comparison script:** `scripts/compare_oracle_feeds.py --coin <COIN> --duration <S>`
+runs a live side-by-side benchmark of direct vs relay for any coin.
+
+---
+
+### Feature — Hedge gap-closing reprice (`risk.py`, `monitor.py`, `config.py`)
+
+When a GTD hedge order is resting in the CLOB, the monitor now tracks whether the
+opposite-token's `best_ask` is falling (seller moving toward our bid). If the ask drops
+since the last sweep, the hedge is cancelled and reposted at `current_bid + $0.01` —
+closing the spread without chasing a rising ask.
+
+Repricing is bounded by `price_cap` (set at placement: max price that keeps projected PnL
+above `MOMENTUM_HEDGE_MIN_RETAIN_USD`). Reprices that would exceed the cap are skipped.
+
+**New `HedgeOrder` fields:** `price_cap: float`, `last_clob_ask: Optional[float]` — both
+persisted in `hedge_orders.json` so restarts don't lose the reference ask.
+
+**New `RiskEngine` method:** `replace_hedge_order(old_id, new_id, new_price)` — atomically
+marks the old order CANCELLED, creates a replacement with all metadata copied, updates
+the parent Position's `hedge_order_id`, and persists.
+
+**New config key:** `MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS: int = 5`  
+Near-expiry cancel: if TTE ≤ this threshold and the held token's CLOB mid is above 0.50
+(winning), the hedge is cancelled — insurance no longer needed and adverse fill prevented.
+Set to `0` to disable.
+
+---
+
+### Feature — Hedge SL suppression (`monitor.py`, `config.py`)
+
+When `MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL = True` and a position has a resting GTD hedge,
+all stop-losses (oracle delta SL, near-expiry time stop, CLOB prob-SL) are suppressed.
+The hedge bounds the downside; any SL exit would lock in a loss before the hedge pays off.
+Take-profit remains active. Defaults to `False` (conservative — all SLs fire regardless).
+
+**New config key:** `MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL: bool = False`
+
+---
+
+### Feature — Phase C per-type TTE floor (`strategies/Momentum/scanner.py`, `config.py`)
+
+A new per-bucket-type TTE ceiling blocks entries when time-to-expiry falls below a
+configured threshold. Complements Phase B (global TTE ceiling) with type-specific tuning.
+
+**New config key:** `MOMENTUM_PHASE_C_MIN_TTE_SECONDS: dict[str, int] = {}`  
+Example: `{"bucket_5m": 30, "bucket_15m": 45}` — block entries in the last 30s of 5m
+markets and last 45s of 15m markets. `0` or absent = disabled for that type.
+
+Skipped markets are counted in scan diagnostics as `skipped_phase_c`.
+
+---
+
+### Feature — Per-bucket-type delta floor (`strategies/Momentum/scanner.py`, `config.py`)
+
+`MOMENTUM_MIN_DELTA_PCT` can now be overridden per bucket type. The effective floor is
+`max(coin_floor, type_floor)` — never lower than either individual setting.
+
+**New config key:** `MOMENTUM_MIN_DELTA_PCT_BY_TYPE: dict[str, float] = {}`  
+Example: `{"bucket_5m": 0.10, "bucket_15m": 0.08}`. Absent = falls back to coin floor.
+
+`min_delta_floor` in scan diagnostics now reflects the combined (type + coin) floor.
+
+---
+
+### Fix — GTD hedge finalization after bot restart (`monitor.py`, `risk.py`)
+
+Auto-redeem loop now handles the case where the parent Position was evicted from memory
+after a restart but the HedgeOrder entity persisted in `hedge_orders.json`.
+
+Previously: hedge payout silently lost (no `finalize_hedge` call, no trades.csv entry).  
+Now: `get_hedge_order_by_token_id()` is called as a secondary lookup. If the HedgeOrder
+is found, `finalize_hedge()` is called directly with the correct `filled_won`/`filled_lost`
+status, updating both `hedge_orders.json` and `trades.csv`.
+
+**New `RiskEngine` method:** `get_hedge_order_by_token_id(token_id)` — O(n) scan of
+`_hedge_orders` by token_id; used only in the auto-redeem path (low frequency).
+
+---
+
+### Fix — Pending exit retry on EXIT_ORDER_FAILED (`monitor.py`)
+
+Positions where all CLOB exit attempts fail now register in `_pending_exit_positions`
+(maps `"market_id:side"` → original exit reason). On the next monitor sweep, the exit
+is retried automatically. Cleared once the retry reaches `_exit_position`.
+
+---
+
 ## [2026-04-23] - Concurrent TP+hedge; band_floor_abort hedge fix
 
 ### Bug fix — Sequential TP blocking hedge placement (`strategies/Momentum/scanner.py`)

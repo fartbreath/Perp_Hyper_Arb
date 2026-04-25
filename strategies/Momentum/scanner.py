@@ -420,7 +420,7 @@ class MomentumScanner(BaseStrategy):
         skipped_no_strike = 0
         skipped_delta = 0
         skipped_tte = 0
-        skipped_too_early = 0    # Phase C: elapsed-time guard
+        skipped_phase_c = 0      # Phase C: per-type TTE ceiling
         skipped_duplicate = 0
         skipped_depth = 0
         skipped_vol = 0
@@ -849,12 +849,18 @@ class MomentumScanner(BaseStrategy):
             _d["observed_z"] = round(delta_pct / (sigma_tau * 100), 4) if sigma_tau > 0 else None
 
             # Effective threshold: vol-scaled y or the configured absolute floor,
-            # whichever is larger.  Recorded so diagnostics reflect the actual gate.
+            # whichever is larger.  The floor is the higher of the per-coin and
+            # per-bucket-type floors (both fall back to the global default when
+            # not listed).  Recorded so diagnostics reflect the actual gate.
             _coin_floor = config.MOMENTUM_MIN_DELTA_PCT_BY_COIN.get(
                 market.underlying, config.MOMENTUM_MIN_DELTA_PCT
             )
-            _effective_threshold = max(y, _coin_floor)
-            _d["min_delta_floor"]      = round(_coin_floor, 6)
+            _type_floor = config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE.get(
+                market.market_type, 0.0  # 0.0 = no type override; global fallback is in _coin_floor
+            )
+            _abs_floor = max(_coin_floor, _type_floor)
+            _effective_threshold = max(y, _abs_floor)
+            _d["min_delta_floor"]      = round(_abs_floor, 6)
             _d["effective_threshold"]  = round(_effective_threshold, 6)
             _d["effective_gap_pct"]    = round(delta_pct - _effective_threshold, 6)  # +ve = passed gate
 
@@ -864,21 +870,16 @@ class MomentumScanner(BaseStrategy):
                 scan_diags.append(_d)
                 continue
 
-            # ── Gate: minimum elapsed time since market open ───────────────────
-            # Guards against early-market thin-book entries where spot/strike gaps
-            # may be real but the bid stack is not yet established.  Per-type via
-            # MOMENTUM_MIN_ELAPSED_SECONDS; 0 = disabled (no cost when empty dict).
-            _min_elapsed = config.MOMENTUM_MIN_ELAPSED_SECONDS.get(market.market_type, 0)
-            if _min_elapsed > 0:
-                _mkt_dur = _MARKET_TYPE_DURATION_SECS.get(market.market_type, 0)
-                _elapsed_s = _mkt_dur - tte_seconds
-                _d["elapsed_s"] = round(_elapsed_s, 1)
-                if _elapsed_s < _min_elapsed:
-                    skipped_too_early += 1
-                    self._signal_first_valid.pop(market.condition_id, None)
-                    _d["skip_reason"] = "too_early"
-                    scan_diags.append(_d)
-                    continue
+            # ── Phase C: per-type TTE floor (block last-N-seconds) ───────────
+            # Blocks entries when TTE is below this threshold, preventing entries
+            # that are too close to expiry for a given bucket type.  0 = disabled.
+            _phase_c_min_tte = config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get(market.market_type, 0)
+            if _phase_c_min_tte > 0 and tte_seconds < _phase_c_min_tte:
+                skipped_phase_c += 1
+                self._signal_first_valid.pop(market.condition_id, None)
+                _d["skip_reason"] = "phase_c_tte"
+                scan_diags.append(_d)
+                continue
 
             # ── Gate: delta must exceed threshold ────────────────────────────
             # max() enforces an absolute floor independent of time bucket.
@@ -1095,7 +1096,7 @@ class MomentumScanner(BaseStrategy):
             skipped_no_strike=skipped_no_strike,
             skipped_delta=skipped_delta,
             skipped_tte=skipped_tte,
-            skipped_too_early=skipped_too_early,
+            skipped_phase_c=skipped_phase_c,
             skipped_duplicate=skipped_duplicate,
             skipped_depth=skipped_depth,
             skipped_vol=skipped_vol,
@@ -1117,7 +1118,7 @@ class MomentumScanner(BaseStrategy):
             "skipped_no_strike":       skipped_no_strike,
             "skipped_delta":           skipped_delta,
             "skipped_tte":             skipped_tte,
-            "skipped_too_early":       skipped_too_early,
+            "skipped_phase_c":         skipped_phase_c,
             "skipped_duplicate":       skipped_duplicate,
             "skipped_depth":           skipped_depth,
             "skipped_vol":             skipped_vol,
@@ -2004,6 +2005,7 @@ class MomentumScanner(BaseStrategy):
                             order_size=_placed_contracts,
                             order_size_usd=_placed_size_usd,
                             parent_side=signal.side,
+                            price_cap=_max_hedge_price,
                         )
                         self._risk.update_gtd_hedge(
                             signal.market_id, signal.side,
