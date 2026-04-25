@@ -78,8 +78,12 @@ export interface DataQuality {
   fresh_book_count: number;
   stale_book_count: number;
   no_book_count: number;
-  spot_mids?: Record<string, number>;    // coin → latest price
-  spot_ages_s?: Record<string, number | null>;  // coin → seconds since last RTDS update; null if never received (inf)
+  spot_mids?: Record<string, number>;    // coin → latest RTDS exchange price
+  spot_ages_s?: Record<string, number | null>;  // coin → seconds since last RTDS exchange update; null if never received
+  chainlink_ages_s?: Record<string, number | null>; // coin → seconds since last Chainlink oracle update; null if never received
+  chainlink_mids?: Record<string, number | null>;   // coin → latest Chainlink oracle price
+  chainlink_streams_connected?: boolean;  // ChainlinkStreamsClient WS open
+  chainlink_ws_connected?: boolean;       // ChainlinkWSClient (on-chain Polygon) WS open
 }
 
 export interface HealthData {

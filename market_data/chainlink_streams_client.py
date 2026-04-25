@@ -133,6 +133,11 @@ class ChainlinkStreamsClient:
         """True if the client has valid API credentials and is actively streaming."""
         return self._enabled
 
+    @property
+    def is_connected(self) -> bool:
+        """True if the WebSocket is currently open and receiving messages."""
+        return self._running and self._ws is not None
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def _has_credentials(self) -> bool:

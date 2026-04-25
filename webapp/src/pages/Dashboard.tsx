@@ -334,6 +334,26 @@ function HealthCard() {
         <tbody>
           <tr><td>PM WebSocket</td><td><StatusDot ok={data.pm_ws_connected} label="PM WebSocket" /> {data.pm_ws_connected ? "Connected" : "Disconnected"}</td></tr>
           <tr><td>HL WebSocket</td><td><StatusDot ok={data.hl_ws_connected} label="HL WebSocket" /> {data.hl_ws_connected ? "Connected" : "Disconnected"}</td></tr>
+          {dq && (
+            <>
+              <tr>
+                <td>CL Streams WS</td>
+                <td>
+                  <StatusDot ok={dq.chainlink_streams_connected ?? false} label="CL Streams WS" />
+                  {" "}{dq.chainlink_streams_connected ? "Connected" : "Disconnected"}
+                  {dq.chainlink_streams_connected === undefined && <span style={{ color: "#64748b" }}> (bot offline)</span>}
+                </td>
+              </tr>
+              <tr>
+                <td>CL On-chain WS</td>
+                <td>
+                  <StatusDot ok={dq.chainlink_ws_connected ?? false} label="CL On-chain WS" />
+                  {" "}{dq.chainlink_ws_connected ? "Connected" : "Disconnected"}
+                  {dq.chainlink_ws_connected === undefined && <span style={{ color: "#64748b" }}> (bot offline)</span>}
+                </td>
+              </tr>
+            </>
+          )}
           <tr><td>Heartbeat</td><td><StatusDot ok={hbOk} label="Heartbeat" /> {hbAge !== null ? `${hbAge.toFixed(0)}s ago` : data.paper_trading ? "N/A (paper)" : "Never"}</td></tr>
           <tr><td>Uptime</td><td>{Math.floor(data.uptime_seconds / 60)}m {Math.floor(data.uptime_seconds % 60)}s</td></tr>
           <tr><td>Mode</td><td>{data.paper_trading ? "📋 Paper" : "🔴 LIVE"}</td></tr>
@@ -369,9 +389,40 @@ function HealthCard() {
                   )}
                 </td>
               </tr>
+              {dq.chainlink_ages_s && Object.keys(dq.chainlink_ages_s).length > 0 && (
+                <tr>
+                  <td>CL Oracle</td>
+                  <td>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      {Object.entries(dq.chainlink_ages_s).sort().map(([coin, age]) => {
+                        const price = dq.chainlink_mids?.[coin];
+                        const noData = age == null;
+                        const stale = !noData && (age as number) > 30;
+                        const color = noData ? "#ef4444" : stale ? "#f97316" : "#22c55e";
+                        const ageLabel = noData
+                          ? " (no data)"
+                          : stale
+                          ? ` ⚠${(age as number).toFixed(0)}s`
+                          : price
+                          ? ` $${price < 10 ? price.toFixed(4) : price.toFixed(2)}`
+                          : " ✓";
+                        return (
+                          <span
+                            key={coin}
+                            title={noData ? `${coin}: never received` : `${coin}: ${(age as number).toFixed(1)}s ago`}
+                            style={{ color, fontFamily: "monospace", fontSize: "0.85em" }}
+                          >
+                            {coin}{ageLabel}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </td>
+                </tr>
+              )}
               {dq.spot_ages_s && Object.keys(dq.spot_ages_s).length > 0 && (
                 <tr>
-                  <td>Spot Oracle</td>
+                  <td>RTDS Oracle</td>
                   <td>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                       {Object.entries(dq.spot_ages_s).sort().map(([coin, age]) => {

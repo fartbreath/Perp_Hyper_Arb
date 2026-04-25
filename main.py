@@ -531,6 +531,7 @@ async def state_sync_loop(
                 if m.get("yes_book_ts") and _now_ts - m["yes_book_ts"] > 30
             )
             _no_book = sum(1 for m in markets_raw.values() if not m.get("yes_book_ts"))
+            _cl_coins = sorted(config.CHAINLINK_DS_FEED_IDS.keys())
             api_state.data_quality = {
                 "sub_token_count":    getattr(pm, "sub_token_count", 0),
                 "sub_rejected_count": getattr(pm, "sub_rejected_count", 0),
@@ -543,6 +544,10 @@ async def state_sync_loop(
                     coin: round(spot_client.get_spot_age_rtds(coin), 1)
                     for coin in sorted(spot_client.tracked_coins)
                 },
+                "chainlink_ages_s":   spot_client.get_chainlink_ages_s(_cl_coins),
+                "chainlink_mids":     spot_client.get_chainlink_mids(_cl_coins),
+                "chainlink_streams_connected": spot_client.chainlink_streams_connected,
+                "chainlink_ws_connected":      spot_client.chainlink_ws_connected,
             }
             quotes_raw = {}
             for tid, q in active_quotes_snap.items():

@@ -174,6 +174,11 @@ class ChainlinkWSClient:
         """Return a copy of the current Chainlink coin → price dict."""
         return {coin: snap.price for coin, snap in self._prices.items()}
 
+    @property
+    def is_connected(self) -> bool:
+        """True if the WebSocket is currently open and receiving messages."""
+        return self._running and self._ws is not None
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:

@@ -32,6 +32,7 @@ use the Chainlink oracle.  Import it here; do not import from rtds_client.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Callable, Coroutine, Optional
 
@@ -214,4 +215,34 @@ class SpotOracle:
     def tracked_coins(self) -> set[str]:
         """Coins tracked by the RTDS feed."""
         return self._rtds.tracked_coins
+
+    # ── Chainlink health conveniences (used by state_sync_loop) ──────────────
+
+    @property
+    def chainlink_streams_connected(self) -> bool:
+        """True if the ChainlinkStreamsClient WebSocket is currently open."""
+        return self._streams.is_connected if self._streams is not None else False
+
+    @property
+    def chainlink_ws_connected(self) -> bool:
+        """True if the ChainlinkWSClient WebSocket is currently open."""
+        return self._cl.is_connected
+
+    def get_chainlink_ages_s(self, coins: list[str]) -> dict[str, float | None]:
+        """Per-coin age (seconds) of the best available Chainlink oracle price.
+
+        Uses the same priority order as _get_chainlink_spot(): Streams → RTDS
+        relay → on-chain WS.  Returns None instead of inf for coins with no data
+        so the result is safely JSON-serialisable.
+        """
+        result: dict[str, float | None] = {}
+        for coin in coins:
+            age = self.get_spot_age(coin, "bucket_5m")
+            result[coin] = None if math.isinf(age) else round(age, 1)
+        return result
+
+    def get_chainlink_mids(self, coins: list[str]) -> dict[str, float | None]:
+        """Per-coin mid price from the best available Chainlink oracle source."""
+        return {coin: self.get_mid(coin, "bucket_5m") for coin in coins}
+
 
