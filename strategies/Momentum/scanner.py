@@ -202,6 +202,9 @@ class MomentumScanner(BaseStrategy):
         # Tracks which condition_ids had their strike confirmed via the Gamma API
         # (priceToBeat).  Retried every scan until gamma returns a value.
         self._market_open_spot_confirmed: set[str] = set(self._market_open_spot.keys())
+        # Deduplication set: market_ids that have already been warned about missing
+        # window-open spot.  Prevents log flooding at 1 Hz for expired markets.
+        self._warned_no_open_spot: set[str] = set()
         # Diagnostics: per-market snapshot from the last completed _scan_once pass.
         # Read by /momentum/diagnostics — no lock needed (GIL + single asyncio writer).
         self._last_scan_diags: list[dict] = []
@@ -767,11 +770,13 @@ class MomentumScanner(BaseStrategy):
                 if mid_id in self._market_open_spot:
                     strike = self._market_open_spot[mid_id]
                 else:
-                    log.warning(
-                        "MomentumScanner: no window-open spot recorded for Up/Down market — skipping",
-                        market=market.title[:60],
-                        market_id=mid_id[:16],
-                    )
+                    if mid_id not in self._warned_no_open_spot:
+                        self._warned_no_open_spot.add(mid_id)
+                        log.warning(
+                            "MomentumScanner: no window-open spot recorded for Up/Down market — skipping",
+                            market=market.title[:60],
+                            market_id=mid_id[:16],
+                        )
 
             if strike is None:
                 skipped_no_strike += 1
@@ -1790,17 +1795,25 @@ class MomentumScanner(BaseStrategy):
                 # Size hedge by contract count (same # of contracts as main position),
                 # not by USD notional.  Actual USDC cost = contracts × hedge_price.
                 hedge_contracts = round(entry_size * config.MOMENTUM_HEDGE_CONTRACTS_PCT, 6)
+                # Preserve the position-matched count BEFORE any $1 PM-minimum floor
+                # is applied.  Used for cap computation, ladder sizing, taker sizing,
+                # and stored on HedgeOrder so the monitor reprice loop can recalculate
+                # correctly at each step: max(natural, 1.0/new_price).
+                _natural_hedge_contracts: float = hedge_contracts
                 hedge_size_usd  = round(hedge_contracts * hedge_price, 6)
                 # PM requires minimum $1 notional per GTC order.  If the natural
-                # sizing falls below $1, raise to exactly $1 worth of contracts
-                # so the order is accepted without skipping the hedge entirely.
+                # sizing falls below $1, raise the placed count to exactly $1 worth
+                # of contracts at the initial price so the order is accepted.
+                _dollar_floor_applied: bool = False
                 if hedge_size_usd < 1.0:
                     hedge_contracts = round(1.0 / hedge_price, 6)
                     hedge_size_usd  = round(hedge_contracts * hedge_price, 6)
+                    _dollar_floor_applied = True
                     log.debug(
                         "Momentum: GTD hedge size raised to $1 minimum",
                         market=signal.market_title[:50],
-                        hedge_contracts=round(hedge_contracts, 4),
+                        natural_contracts=round(_natural_hedge_contracts, 4),
+                        placed_contracts=round(hedge_contracts, 4),
                     )
                 _hedge_price      = hedge_price
                 _hedge_contracts  = hedge_contracts
@@ -1813,8 +1826,14 @@ class MomentumScanner(BaseStrategy):
                 _tick = 0.01  # Polymarket minimum price tick
                 _max_hedge_price: float = hedge_price  # default: no external cap
                 _cap_check_ok: bool = True
-                if config.MOMENTUM_HEDGE_MIN_RETAIN_USD > 0.0 and hedge_contracts > 0:
-                    _pnl_cap = (_projected_pnl - config.MOMENTUM_HEDGE_MIN_RETAIN_USD) / hedge_contracts
+                if config.MOMENTUM_HEDGE_MIN_RETAIN_USD > 0.0 and _natural_hedge_contracts > 0:
+                    # Cap is computed against the NATURAL (position-matched) count, not the
+                    # $1-floor-inflated placed count.  Inflating the divisor would shrink the
+                    # cap to ~3¢ when natural coverage costs < $1, preventing correct repricing.
+                    # With natural contracts as divisor the cap reflects how much per-contract
+                    # we can pay while retaining MIN_RETAIN of PnL, which is correct at all
+                    # reprice steps (the monitor recalculates size at each step anyway).
+                    _pnl_cap = (_projected_pnl - config.MOMENTUM_HEDGE_MIN_RETAIN_USD) / _natural_hedge_contracts
                     if _pnl_cap <= 0.0:
                         _cap_check_ok = False
                         log.debug(
@@ -1829,6 +1848,8 @@ class MomentumScanner(BaseStrategy):
                             "Momentum: GTD hedge cap computed",
                             market=signal.market_title[:50],
                             max_hedge_price=_max_hedge_price,
+                            dollar_floor=_dollar_floor_applied,
+                            natural_contracts=round(_natural_hedge_contracts, 4),
                             config_price=hedge_price,
                             projected_pnl=round(_projected_pnl, 4),
                         )
@@ -1866,7 +1887,7 @@ class MomentumScanner(BaseStrategy):
                     # Sentinel values so the success-log block never hits UnboundLocalError
                     _attempt_price: float   = hedge_price
                     _taker_price: float     = hedge_price
-                    _taker_contracts: float = hedge_contracts
+                    _taker_contracts: float = _natural_hedge_contracts
                     hedge_id: str | None    = None
 
                     try:
@@ -1882,10 +1903,10 @@ class MomentumScanner(BaseStrategy):
                                 )
                             else:
                                 # ── $1 minimum size check for taker ─────────────────
-                                # Taker price may be lower than config price, so the
-                                # pre-existing $1 raise (done at hedge_price) may not
-                                # cover the taker notional — recompute here.
-                                _taker_contracts = hedge_contracts
+                                # Taker price may differ from config price so always
+                                # recompute from natural_contracts.  If natural coverage
+                                # costs < $1 at the taker price, floor to exactly $1.
+                                _taker_contracts = _natural_hedge_contracts
                                 _taker_cost = round(_taker_contracts * _taker_price, 6)
                                 if _taker_cost < 1.0:
                                     _taker_contracts = round(1.0 / _taker_price, 6)
@@ -1919,23 +1940,41 @@ class MomentumScanner(BaseStrategy):
                                     )
                         else:
                             # ── Maker ladder: up to N ticks of concession ────────────
+                            # Contract sizing per step:
+                            #   natural_contracts = entry_size × PCT (equal to main position)
+                            #   natural_cost = natural_contracts × attempt_price
+                            #   if natural_cost >= $1: place natural_contracts (full coverage)
+                            #   else: place 1.0 / attempt_price  ($1 minimum floor, contracts
+                            #         decrease as price ticks up, keeping spend at exactly $1)
+                            _step_contracts: float = _natural_hedge_contracts  # sentinel
                             for _step in range(config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION):
                                 _attempt_price = round(hedge_price + _step * _tick, 4)
                                 if _attempt_price > _max_hedge_price:
                                     break
+                                # Use natural (position-matched) count for the $1 check.
+                                # If natural coverage costs ≥ $1 at this price, use it
+                                # (full hedge, possibly > $1).  Otherwise floor to $1.
+                                _natural_cost = round(_natural_hedge_contracts * _attempt_price, 6)
+                                if _natural_cost >= 1.0:
+                                    _step_contracts = _natural_hedge_contracts
+                                else:
+                                    # Below $1 notional — floor to exactly $1
+                                    _step_contracts = round(1.0 / _attempt_price, 6)
                                 if _step > 0:
                                     log.debug(
                                         "Momentum: GTD hedge ladder step",
                                         market=signal.market_title[:50],
                                         step=_step,
                                         attempt_price=_attempt_price,
+                                        step_contracts=round(_step_contracts, 4),
+                                        natural_cost=_natural_cost,
                                         max_price=_max_hedge_price,
                                     )
                                 hedge_id = await self._pm.place_limit(
                                     token_id=opp_token,
                                     side="BUY",
                                     price=_attempt_price,
-                                    size=hedge_contracts,
+                                    size=_step_contracts,
                                     market=market,
                                     post_only=True,
                                 )
@@ -1962,7 +2001,7 @@ class MomentumScanner(BaseStrategy):
                     if hedge_id:
                         # Resolve actual placed price and contracts
                         _placed_price     = _taker_price if _use_taker else _attempt_price
-                        _placed_contracts = _taker_contracts if _use_taker else hedge_contracts
+                        _placed_contracts = _taker_contracts if _use_taker else _step_contracts
                         _placed_size_usd  = round(_placed_contracts * _placed_price, 6)
                         _hedge_id         = hedge_id
                         # Update Phase E CSV vars to reflect actual placement
@@ -2006,6 +2045,8 @@ class MomentumScanner(BaseStrategy):
                             order_size_usd=_placed_size_usd,
                             parent_side=signal.side,
                             price_cap=_max_hedge_price,
+                            projected_pnl_usd=round(_projected_pnl, 6),
+                            natural_contracts=_natural_hedge_contracts,
                         )
                         self._risk.update_gtd_hedge(
                             signal.market_id, signal.side,
@@ -2023,6 +2064,13 @@ class MomentumScanner(BaseStrategy):
                             opp_best_ask=_opp_best_ask_log,
                             taker_attempted=_use_taker,
                             steps_tried=config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION,
+                        )
+                        self._risk.set_hedge_failed(
+                            market_id=signal.market_id,
+                            side=signal.side,
+                            reason="all_attempts_exhausted",
+                            opp_best_ask=_opp_best_ask_log or 0.0,
+                            max_price=_max_hedge_price,
                         )
                         _emit_event(
                             "HEDGE_FAIL",
@@ -2265,14 +2313,43 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     # the signal.  Higher z → higher win_prob → bigger Kelly bet, as intended.
     observed_z_total = min(observed_z_raw + _z_boost, 6.0)
 
-    # Model win probability: P(underlying finishes on the winning side)
-    win_prob = 0.5 * (1.0 + math.erf(observed_z_total / math.sqrt(2.0)))
+    # Vol-model win probability (kept for audit/debug; NOT used for sizing).
+    win_prob_vol = 0.5 * (1.0 + math.erf(observed_z_total / math.sqrt(2.0)))
 
     # Payout multiple: for a binary token at price p, you risk p dollars to
     # win (1 - p) dollars, so b = (1 - p) / p.
     # Safety-clamp token_price so we never divide by 0 or get negative b.
     token_p = max(0.01, min(0.99, signal.token_price))
     payout_b = (1.0 - token_p) / token_p
+
+    # ── CLOB-Oracle Blend (COB) win probability ───────────────────────────
+    # Two independent estimates blended by TTE weight:
+    #   CLOB-based (reliable when book is liquid, degrades near expiry as
+    #               bid collapses and mid becomes unreliable).
+    #   Oracle-delta-based (purely physical distance from strike; stable near
+    #               expiry since it doesn't use sigma_tau at all).
+    # As TTE shrinks below CLOB_RELIABLE_TTE, weight shifts from CLOB to
+    # oracle-delta so neither failure mode dominates sizing.
+    _clob_reliable_tte = float(config.MOMENTUM_KELLY_CLOB_RELIABLE_TTE)
+    _edge_premium = config.MOMENTUM_KELLY_EDGE_PREMIUM
+    _win_prob_cap = config.MOMENTUM_KELLY_WIN_PROB_CAP
+
+    # Component 1: CLOB ask + our alpha over the market's settlement probability.
+    win_prob_clob = min(token_p + _edge_premium, _win_prob_cap)
+
+    # Component 2: oracle-delta strength. strength=1 → right at threshold (0.50
+    # baseline); each multiple above adds ORACLE_SENSITIVITY to win_prob, capped
+    # at 0.95. Only depends on oracle spot vs strike — robust near expiry.
+    _strength = signal.delta_pct / max(signal.threshold_pct, 1e-9)
+    win_prob_oracle = min(
+        0.95,
+        0.50 + max(0.0, (_strength - 1.0) * config.MOMENTUM_KELLY_ORACLE_SENSITIVITY),
+    )
+
+    # Blend weight: 1.0 when book is reliable (TTE comfortable), shifts toward
+    # oracle-delta as TTE shrinks toward zero (draining book).
+    _clob_weight = min(1.0, signal.tte_seconds / max(_clob_reliable_tte, 1.0))
+    win_prob = _clob_weight * win_prob_clob + (1.0 - _clob_weight) * win_prob_oracle
 
     # Full Kelly fraction: the fraction of bankroll a perfect model would bet.
     lose_prob = 1.0 - win_prob
@@ -2306,20 +2383,24 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
         )
 
     debug: dict = {
-        "kelly_tte_eff_s":    round(tte_eff, 1),
-        "kelly_sigma_eff":    round(sigma_eff, 6),
+        "kelly_tte_eff_s":       round(tte_eff, 1),
+        "kelly_sigma_eff":       round(sigma_eff, 6),
         "kelly_persistence_pct": round(_persistence_pct, 3),
-        "kelly_z_boost":      round(_z_boost, 4),
-        "kelly_z_before_boost": round(observed_z_raw, 4),
-        "kelly_sigma_tau":    round(sigma_tau, 6),
-        "kelly_z_total":      round(observed_z_total, 4),
-        "kelly_win_prob":     round(win_prob, 4),
-        "kelly_payout_b":     round(payout_b, 4),
-        "kelly_f_raw":        round(raw_kelly_f, 4),  # pre-clip; negative = no EV
-        "kelly_f":            round(kelly_f, 4),
-        "kelly_fraction_cfg": _fraction_cfg,
-        "kelly_multiplier":   round(kelly_multiplier, 4),
-        "kelly_size_usd":     size_usd,
+        "kelly_z_boost":         round(_z_boost, 4),
+        "kelly_z_before_boost":  round(observed_z_raw, 4),
+        "kelly_sigma_tau":       round(sigma_tau, 6),
+        "kelly_z_total":         round(observed_z_total, 4),
+        "kelly_win_prob_vol":    round(win_prob_vol, 4),    # N(z) vol model — audit only
+        "kelly_win_prob_clob":   round(win_prob_clob, 4),  # CLOB ask + edge premium
+        "kelly_win_prob_oracle": round(win_prob_oracle, 4),# delta-strength based
+        "kelly_clob_weight":     round(_clob_weight, 4),   # 1.0=CLOB, 0.0=oracle
+        "kelly_win_prob":        round(win_prob, 4),       # COB blend (used for sizing)
+        "kelly_payout_b":        round(payout_b, 4),
+        "kelly_f_raw":           round(raw_kelly_f, 4),    # pre-clip; negative = no EV
+        "kelly_f":               round(kelly_f, 4),
+        "kelly_fraction_cfg":    _fraction_cfg,
+        "kelly_multiplier":      round(kelly_multiplier, 4),
+        "kelly_size_usd":        size_usd,
     }
     return size_usd, debug
 

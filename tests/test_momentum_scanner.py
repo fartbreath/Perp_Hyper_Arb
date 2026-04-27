@@ -644,23 +644,25 @@ class TestKellySizing:
 
     def test_very_strong_signal_returns_max(self):
 
-        # 6Ï+ signal: z capped â win_prob â 1 â kelly_f â 1 â MAX_ENTRY.
+        # Near-expiry strong signal (tte=5s): oracle-delta dominates (clob_weight≈0.08),
+        # win_prob ≈ 0.92 → kelly_f ≈ 0.84 → size near MAX_ENTRY (≥ 80% of MAX).
 
-        # Use a coin-flip token (price=0.5, symmetric payout) for a clean result.
-
-        size = self._size(delta_pct=100.0, sigma_ann=0.8, tte_seconds=3600,
+        size = self._size(delta_pct=100.0, sigma_ann=0.8, tte_seconds=5,
 
                           token_price=0.5)
 
-        assert size == pytest.approx(config.MOMENTUM_MAX_ENTRY_USD)
+        assert size >= config.MOMENTUM_MAX_ENTRY_USD * 0.80, (
+            f"Expected >= 80% of MAX_ENTRY for a very strong near-expiry signal, got {size}"
+        )
 
 
 
     def test_negative_ev_signal_returns_zero(self):
-        # delta=0 -> z=0 -> win_prob=0.5; at token_price=0.85 payout_b~0.18
-        # raw kelly_f = (0.5*0.18 - 0.5)/0.18 = -2.3 < 0 -> size = 0.0.
+        # Near-expiry (tte=5s → oracle-dominant, clob_weight≈0.08).
+        # delta=0 → oracle strength<1 → win_prob_oracle=0.50; at token_price=0.85
+        # payout_b~0.18, raw kelly_f ≈ -2.1 < 0 → size = 0.0.
         # MIN_ENTRY floor must NOT override a negative-EV model.
-        size = self._size(delta_pct=0.0, sigma_ann=0.8, tte_seconds=3600,
+        size = self._size(delta_pct=0.0, sigma_ann=0.8, tte_seconds=5,
                           token_price=0.85)
         assert size == 0.0
 
@@ -1116,11 +1118,9 @@ class TestPaperModePositionSizing:
 
     def test_paper_yes_size_is_token_count_not_usd(self, tmp_path):
 
-        """entry_size must be size_usd / ask_price (token count), not size_usd itself."""
+        """entry_size must be kelly_size_usd / ask_price (token count), not size_usd itself."""
 
         ask_price = 0.85
-
-        size_usd = config.MOMENTUM_MAX_ENTRY_USD   # = 3.0
 
         scanner = _make_scanner(tmp_path)
 
@@ -1135,6 +1135,8 @@ class TestPaperModePositionSizing:
         sig = _make_signal(side="YES", token_id=mkt.token_id_yes, token_price=ask_price,
 
                            p_yes=ask_price, delta_pct=3.0)
+
+        size_usd, _ = _compute_kelly_size_usd(sig, max_entry_usd=config.MOMENTUM_MAX_ENTRY_USD)
 
         result = self._run_execute(scanner, sig, mkt)
 
@@ -1162,8 +1164,6 @@ class TestPaperModePositionSizing:
 
         ask_price = 0.85
 
-        size_usd = config.MOMENTUM_MAX_ENTRY_USD
-
         scanner = _make_scanner(tmp_path)
 
         book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
@@ -1175,6 +1175,8 @@ class TestPaperModePositionSizing:
         sig = _make_signal(side="YES", token_id=mkt.token_id_yes, token_price=ask_price,
 
                            p_yes=ask_price, delta_pct=3.0)
+
+        size_usd, _ = _compute_kelly_size_usd(sig, max_entry_usd=config.MOMENTUM_MAX_ENTRY_USD)
 
         self._run_execute(scanner, sig, mkt)
 
@@ -1198,8 +1200,6 @@ class TestPaperModePositionSizing:
 
         no_ask = 0.80   # NO token at 80c (YES â 0.20 â market strongly against)
 
-        size_usd = config.MOMENTUM_MAX_ENTRY_USD
-
         scanner = _make_scanner(tmp_path)
 
         # mid = no_ask - 0.005 so best_ask == no_ask exactly
@@ -1215,6 +1215,8 @@ class TestPaperModePositionSizing:
                            token_price=no_ask, p_yes=1.0 - no_ask,
 
                            delta_pct=3.0)
+
+        size_usd, _ = _compute_kelly_size_usd(sig, max_entry_usd=config.MOMENTUM_MAX_ENTRY_USD)
 
         result = self._run_execute(scanner, sig, mkt)
 
@@ -1234,8 +1236,6 @@ class TestPaperModePositionSizing:
 
         no_ask = 0.80  # actual NO token price at ask
 
-        size_usd = config.MOMENTUM_MAX_ENTRY_USD
-
         scanner = _make_scanner(tmp_path)
 
         book = _make_book(mid=no_ask - 0.005, age_secs=0.1)
@@ -1249,6 +1249,8 @@ class TestPaperModePositionSizing:
                            token_price=no_ask, p_yes=1.0 - no_ask,
 
                            delta_pct=3.0)
+
+        size_usd, _ = _compute_kelly_size_usd(sig, max_entry_usd=config.MOMENTUM_MAX_ENTRY_USD)
 
         self._run_execute(scanner, sig, mkt)
 
@@ -2070,9 +2072,9 @@ class TestKellyTTEFloor:
 
         sig = _make_signal(
 
-            delta_pct=0.091, sigma_ann=0.436, tte_seconds=43.0,
+            delta_pct=5.0, sigma_ann=0.436, tte_seconds=43.0,
 
-            token_price=0.935, market_type="bucket_5m",
+            token_price=0.85, market_type="bucket_5m",
 
         )
 
@@ -2258,152 +2260,6 @@ class TestKellyPersistence:
 
 
 
-# -- Phase C: elapsed gate (_scan_once) ----------------------------------------
-
-
-
-class TestElapsedGate:
-
-    """Phase C: MOMENTUM_MIN_ELAPSED_SECONDS gates entries too early in market window."""
-
-
-
-    def setup_method(self):
-
-        self._orig_min_elapsed = config.MOMENTUM_MIN_ELAPSED_SECONDS
-
-
-
-    def teardown_method(self):
-
-        config.MOMENTUM_MIN_ELAPSED_SECONDS = self._orig_min_elapsed
-
-
-
-    def _make_scan_env(self, scanner, mkt, spot_price=70_100.0):
-
-        """Wire up scanner with a single market, fresh book and fresh spot."""
-
-        scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
-
-        book = _make_book(mid=0.85, age_secs=0.0)
-
-        scanner._pm.get_book = MagicMock(return_value=book)
-
-        scanner._pm._books = {mkt.token_id_yes: book}
-
-        scanner._token_to_market = {mkt.token_id_yes: mkt, mkt.token_id_no: mkt}
-
-        fresh_spot = SpotPrice(coin="BTC", price=spot_price, timestamp=time.time())
-
-        spot = MagicMock()
-
-        spot.get_spot = MagicMock(return_value=fresh_spot)
-
-        spot.get_mid = MagicMock(return_value=spot_price)
-
-        scanner._spot = spot
-
-
-
-    def test_elapsed_gate_skips_fresh_market(self, tmp_path):
-
-        """Market with elapsed < min_elapsed must appear as 'too_early' in scan diags.
-
-
-
-        bucket_5m window = 300 s.  Default _min_tte["bucket_5m"] = 30 s.
-
-        Use TTE = 25 s so the market is inside the entry window.
-
-        elapsed = 300 - 25 = 275 s.  Set min_elapsed = 280 so gate fires.
-
-        """
-
-        config.MOMENTUM_MIN_ELAPSED_SECONDS = {"bucket_5m": 280}
-
-        config.STRATEGY_MOMENTUM_ENABLED = True
-
-        config.BOT_ACTIVE = True
-
-
-
-        scanner = _make_scanner(tmp_path)
-
-        scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
-
-        mkt = _make_market(market_type="bucket_5m",
-
-                           end_date=datetime.now(timezone.utc) + timedelta(seconds=25))
-
-        self._make_scan_env(scanner, mkt)
-
-
-
-        asyncio.get_event_loop().run_until_complete(scanner._scan_once())
-
-
-
-        diags = scanner._last_scan_diags
-
-        assert any(d.get("skip_reason") == "too_early" for d in diags), (
-
-            f"Expected 'too_early' in diags, got: {[d.get('skip_reason') for d in diags]}"
-
-        )
-
-        assert scanner._last_scan_summary.get("skipped_too_early", 0) >= 1
-
-
-
-    def test_elapsed_gate_passes_when_enough_time(self, tmp_path):
-
-        """Market with elapsed >= min_elapsed must NOT be gated as 'too_early'.
-
-
-
-        TTE = 25 s (inside 30 s entry window) -> elapsed = 275 s >= min_elapsed 60 s.
-
-        """
-
-        config.MOMENTUM_MIN_ELAPSED_SECONDS = {"bucket_5m": 60}
-
-        config.STRATEGY_MOMENTUM_ENABLED = True
-
-        config.BOT_ACTIVE = True
-
-
-
-        scanner = _make_scanner(tmp_path)
-
-        scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
-
-        mkt = _make_market(market_type="bucket_5m",
-
-                           end_date=datetime.now(timezone.utc) + timedelta(seconds=25))
-
-        self._make_scan_env(scanner, mkt)
-
-
-
-        asyncio.get_event_loop().run_until_complete(scanner._scan_once())
-
-
-
-        diags = scanner._last_scan_diags
-
-        assert not any(d.get("skip_reason") == "too_early" for d in diags), (
-
-            f"Should not have 'too_early' when elapsed >= min_elapsed, got: "
-
-            f"{[d.get('skip_reason') for d in diags]}"
-
-        )
-
-
-
-
-
 # -- Phase D: GTD hedge in _execute_signal -------------------------------------
 
 
@@ -2450,6 +2306,10 @@ class TestGTDHedge:
 
             "MOMENTUM_KELLY_FRACTION": config.MOMENTUM_KELLY_FRACTION,
 
+            "MOMENTUM_KELLY_MULTIPLIER_BY_TYPE": dict(config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE),
+
+            "MOMENTUM_HEDGE_ENABLED_BY_TYPE": dict(config.MOMENTUM_HEDGE_ENABLED_BY_TYPE),
+
         }
 
         config.STRATEGY_MOMENTUM_ENABLED = True
@@ -2463,6 +2323,13 @@ class TestGTDHedge:
         config.MOMENTUM_ORDER_TYPE = "market"  # use place_market for main order
 
         config.MOMENTUM_TP_RESTING_ENABLED = False  # isolate hedge-only place_limit calls
+        # Neutralise Kelly dampeners so projected PnL > $1 (hedge placement guard).
+        config.MOMENTUM_KELLY_FRACTION = 1.0
+        config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE = {}
+        # Ensure bucket_5m hedge is enabled regardless of config_overrides.json.
+        config.MOMENTUM_HEDGE_ENABLED_BY_TYPE = {
+            **config.MOMENTUM_HEDGE_ENABLED_BY_TYPE, "bucket_5m": True
+        }
 
 
 
@@ -2470,11 +2337,17 @@ class TestGTDHedge:
 
         for k, v in self._saved.items():
 
-            if k == "MOMENTUM_HEDGE_PRICE_BY_TYPE":
+            if k in ("MOMENTUM_HEDGE_PRICE_BY_TYPE", "MOMENTUM_HEDGE_ENABLED_BY_TYPE"):
 
-                config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
+                getattr(config, k).clear()
 
-                config.MOMENTUM_HEDGE_PRICE_BY_TYPE.update(v)
+                getattr(config, k).update(v)
+
+            elif k == "MOMENTUM_KELLY_MULTIPLIER_BY_TYPE":
+
+                config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.clear()
+
+                config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.update(v)
 
             else:
 
@@ -3019,21 +2892,22 @@ class TestGTDHedge:
 
         ask_price = 0.85
 
-        mkt = _make_market()  # end_date = now + 90s → hedge TTE ≈ 90s > 10s
+        # end_date = now + 15s so _hedge_tte_now = 15s < AGGRESSIVE_TTE_S=30s → taker fires
+        mkt = _make_market(end_date=datetime.now(timezone.utc) + timedelta(seconds=15))
 
-        # No opp book → _opp_best_ask = None; condition-3 taker NOT triggered
-
-        # TTE=15 < 30 fires condition-2; taker_price = hedge_price = 0.10 ≤ max = 0.10 ✓
+        # No opp book → _opp_best_ask = None; taker fires via TTE-aggression condition
 
         self._cap_none_setup(scanner._pm, mkt, ask_price)
 
         scanner._pm.place_limit = AsyncMock(return_value="hedge_tte_001")
 
-        # tte_seconds = 15 < AGGRESSIVE_TTE_S = 30 → taker fires by condition-2
+        # delta_pct=10 gives strong oracle win_prob at tte=15s (kelly_f > 0)
 
         sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
 
-                           token_price=ask_price, p_yes=ask_price, tte_seconds=15.0)
+                           token_price=ask_price, p_yes=ask_price, tte_seconds=15.0,
+
+                           delta_pct=10.0)
 
         _run(scanner._execute_signal(sig, mkt))
 

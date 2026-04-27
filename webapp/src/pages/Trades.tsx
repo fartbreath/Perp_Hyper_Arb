@@ -309,7 +309,7 @@ function HedgeSection({
   hedgeTrades: Trade[];
   closeTypeLabel: string;
 }) {
-  const hedgeLeg = legs.find(t => t.hedge_order_id);
+  const hedgeLeg = legs.find(t => t.hedge_order_id) ?? legs.find(t => t.hedge_status === "rejected_price");
   if (!hedgeLeg) return null;
 
   const entryPriceCents = Number(hedgeLeg.hedge_price ?? 0) * 100;
@@ -330,6 +330,7 @@ function HedgeSection({
   let status: string;
   let statusBg: string;
   let statusFg: string;
+  let statusTitle: string = "";
   let exitStr: string;
   let pnlDisplay: string;
   let pnlFg: string;
@@ -355,11 +356,14 @@ function HedgeSection({
     statusBg  = "#450a0a";
     statusFg  = "#f87171";
     exitStr   = "0.000";
-    const loss = -sizeUsd;
-    pnlDisplay = fmtSigned(loss, 2);
-    pnlFg      = pnlColor(loss);
+    const p   = fillRow ? Number(fillRow.pnl) : -sizeUsd;
+    pnlDisplay = fmtSigned(p, 2);
+    pnlFg      = pnlColor(p);
     const srp = Number(fillRow?.spot_resolve_price ?? 0);
     spotResolveDisplay = srp > 0 ? `$${srp.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—";
+    if (sizeFilled > 0 && avgFillPrice > 0) {
+      sizeDisplay = `${sizeFilled.toFixed(2)} ct @ ${(avgFillPrice * 100).toFixed(1)}¢`;
+    }
 
   } else if (hedgeStatus === "unfilled") {
     // Order was never filled (token never in wallet) → cost = $0
@@ -423,6 +427,23 @@ function HedgeSection({
     if (sizeFilled > 0 && orderSize > 0) {
       sizeDisplay = `${sizeFilled.toFixed(2)}/${orderSize.toFixed(2)} ct (${fillRatioPct.toFixed(0)}%)`;
     }
+
+  } else if (hedgeStatus === "rejected_price") {
+    // Hedge was attempted but priced out — no order ever reached the book
+    const oppAsk    = Number(hedgeLeg.spot_resolve_price ?? 0);  // opp_best_ask at failure
+    const oppAskC   = oppAsk > 0 ? (oppAsk * 100).toFixed(1) : "?";
+    const maxPriceC = (Number(hedgeLeg.hedge_price ?? 0) * 100).toFixed(1);
+    status    = "Attempted (rejected)";
+    statusBg  = "#451a03";
+    statusFg  = "#fbbf24";
+    statusTitle = `Priced out — max bid: ${maxPriceC}¢ · opp ask: ${oppAskC}¢`;
+    exitStr   = "—";
+    pnlDisplay = "$0.00";
+    pnlFg      = "#6b7280";
+    sizeDisplay = "—";
+    // entryPriceCents = max price offered (hedge_price repurposed); shown in Entry cell
+    // spotResolveDisplay = opp best ask at failure time
+    spotResolveDisplay = oppAsk > 0 ? `Ask: ${oppAskC}¢` : "—";
 
   } else if (fillRow) {
     // Legacy: momentum_hedge row exists but no hedge_status field (old records)
@@ -526,14 +547,21 @@ function HedgeSection({
           <tr>
             <td style={{ padding: "3px 8px", color: "#64748b" }}>{fmtTs(hedgeLeg.timestamp)}</td>
             <td style={{ padding: "3px 8px" }}>
-              <span style={{
-                background: statusBg, color: statusFg, fontWeight: 700,
-                fontSize: "0.85em", padding: "2px 7px", borderRadius: 4,
-              }}>
+              <span
+                title={statusTitle || undefined}
+                style={{
+                  background: statusBg, color: statusFg, fontWeight: 700,
+                  fontSize: "0.85em", padding: "2px 7px", borderRadius: 4,
+                  cursor: statusTitle ? "help" : undefined,
+                }}
+              >
                 {status}
               </span>
             </td>
-            <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#a78bfa" }}>
+            <td
+              style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#a78bfa" }}
+              title={hedgeStatus === "rejected_price" ? "Max bid price offered (no fill)" : undefined}
+            >
               {entryPriceCents.toFixed(1)}¢
             </td>
             <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace" }}>
@@ -550,7 +578,7 @@ function HedgeSection({
             </td>
             <td style={{ padding: "3px 8px", textAlign: "right", fontFamily: "monospace", color: "#374151", fontSize: "0.75em" }}
                 title={`Token: ${hedgeLeg.hedge_token_id ?? "—"}`}>
-              {hedgeLeg.hedge_order_id?.slice(0, 10)}…
+              {hedgeLeg.hedge_order_id ? `${hedgeLeg.hedge_order_id.slice(0, 10)}…` : "—"}
             </td>
           </tr>
         </tbody>

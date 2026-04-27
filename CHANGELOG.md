@@ -2,6 +2,65 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-27] - GTD hedge reprice sizing fix; `natural_contracts` field; parametric sweep tests
+
+### Bug fix — Hedge reprice used inflated contract count instead of position-matched count (`monitor.py`, `risk.py`, `strategies/Momentum/scanner.py`)
+
+When the natural coverage cost was below the PM $1 minimum at placement, `hedge_contracts`
+was inflated to `1 / hedge_price` (e.g. 50ct for a 7.75ct position at 2¢). The monitor
+reprice loop carried that inflated size forward on each tick, so repricing to 3¢ cost
+`50 × 0.03 = $1.50` instead of the correct `ceil(1/0.03) × 0.03 = $1.00`. This eroded
+`MIN_RETAIN_USD` and in some cases made the reprice unprofitable.
+
+**Root cause:** `_pnl_cap` used the inflated `hedge_contracts` as divisor (6× too narrow),
+and `monitor.py` reused `ho.order_size` (the inflated placement size) rather than the
+natural position-matched count.
+
+**Fix:**
+
+- `scanner.py`: Capture `_natural_hedge_contracts = hedge_contracts` *before* the `$1` floor
+  overwrites it. Use `_natural_hedge_contracts` for `price_cap`, ladder, and taker
+  computations. Pass it to `register_hedge_order(natural_contracts=...)`.
+
+- `risk.py` — `HedgeOrder` dataclass: Added `natural_contracts: float = 0.0` field (the
+  pre-floor count, stored at placement). `register_hedge_order` accepts and stores it.
+  `replace_hedge_order` accepts `new_order_size: float = 0.0`; if provided, the replacement
+  `HedgeOrder` uses the new size rather than propagating the old inflated count.
+  `natural_contracts` is always propagated across reprices.
+
+- `monitor.py` — reprice sizing block: Replaced `max(remaining, 1/new_bid)` with
+  a two-branch formula mirroring scanner placement:
+  - If `ho.natural_contracts × new_bid >= $1` → use `natural_contracts` (full coverage).
+  - Else → use `1 / new_bid` (PM $1 minimum, correct floor size for new price).
+  Falls back to `ho.order_size` for legacy `HedgeOrder` objects without `natural_contracts`.
+  PnL ceiling (projected_pnl − MIN_RETAIN) applied afterwards.
+
+- `config.py`: `MOMENTUM_HEDGE_MIN_RETAIN_USD` changed from `0.15` → `0.25`.
+
+### Feature — COB (CLOB-Oracle Blend) Kelly win-probability (`config.py`)
+
+Added four new config parameters for the planned CLOB-Oracle Blend sizing model:
+- `MOMENTUM_KELLY_EDGE_PREMIUM = 0.07` — systematic alpha above CLOB ask.
+- `MOMENTUM_KELLY_WIN_PROB_CAP = 0.95` — hard cap on blended win_prob.
+- `MOMENTUM_KELLY_CLOB_RELIABLE_TTE = 60` — seconds above which CLOB is fully weighted.
+- `MOMENTUM_KELLY_ORACLE_SENSITIVITY = 0.15` — signal-strength → win_prob slope.
+
+### Tests — Hedge sizing mathematical model and parametric sweep (`tests/test_hedge_sizing.py`, `tests/test_hedge_sweep.py`)
+
+- `test_hedge_sizing.py`: 83-test pure-math suite verifying the scanner→monitor sizing
+  pipeline: floor/natural branch crossover, `price_cap` profitability proof, `HedgeOrder`
+  `natural_contracts` round-trip through `register`/`replace`, 7 scenario reprice ladders,
+  and `HedgeOrder` risk-engine unit tests.
+
+- `test_hedge_sweep.py`: 200-case parametric sweep (10 entry prices 0.65→0.83 × 20 buy
+  notionals $1→$20) each running 94 hedge price steps (1¢–94¢). Confirms across 4,434
+  non-blocked steps: PM $1 minimum never violated, over-hedge margin $0.00, MIN_RETAIN
+  floor always maintained. Runs in < 1 second.
+
+### Fix — Webapp trades page (`webapp/src/pages/Trades.tsx`)
+
+Minor display improvements to the Trades dashboard page.
+
 ## [2026-04-25] - Chainlink Data Streams direct feed for all coins; hedge reprice + SL suppression; Phase C TTE gate; per-type delta floor
 
 ### Feature — Chainlink Data Streams direct feed extended to all 7 coins (`market_data/chainlink_streams_client.py`, `market_data/spot_oracle.py`, `config.py`)

@@ -902,14 +902,35 @@ class PositionMonitor:
                                 )
                 else:
                     # Cancel succeeded (or paper mode) — record as cancelled.
+                    # But if WS fills were already tracked, honour them with the correct
+                    # status so the frontend shows the true P&L rather than "$0.00".
                     from risk import HedgeStatus
                     if ho.status not in HedgeStatus.TERMINAL:
-                        self._risk.finalize_hedge(
-                            ho.order_id,
-                            settled_price=0.0,
-                            spot_at_resolution=price,
-                            hedge_status="cancelled",
-                        )
+                        if ho.size_filled > 0:
+                            # Cancel confirmed after partial or full fill.
+                            # Delta-recovery fires when main is winning → hedge token (opposite) lost.
+                            _fill_ratio = ho.size_filled / ho.order_size if ho.order_size > 0 else 1.0
+                            _fill_status = "filled_lost" if _fill_ratio >= 0.99 else "cancelled_partial"
+                            self._risk.finalize_hedge(
+                                ho.order_id,
+                                settled_price=0.0,
+                                spot_at_resolution=price,
+                                hedge_status=_fill_status,
+                            )
+                            log.info(
+                                "GTD hedge cancel-ok (delta-recovery) but WS fills detected — recorded fill outcome",
+                                hedge_order_id=ho.order_id[:20],
+                                size_filled=round(ho.size_filled, 4),
+                                order_size=round(ho.order_size, 4),
+                                status=_fill_status,
+                            )
+                        else:
+                            self._risk.finalize_hedge(
+                                ho.order_id,
+                                settled_price=0.0,
+                                spot_at_resolution=price,
+                                hedge_status="cancelled",
+                            )
 
                 # Resolve market_title from position or HedgeOrder
                 _market_title = ho.market_title or ""
@@ -1630,6 +1651,25 @@ class PositionMonitor:
                 # skip the main-position close entirely.
                 if _hedge_parent is not None:
                     # Hedge token was in wallet and resolved to 0 (main WON, hedge LOST).
+                    # Guard: if the HedgeOrder was already finalized by the cancel-ok or
+                    # reprice path (e.g., status="filled_lost"), skip writing a duplicate
+                    # trades.csv row — the cancel path already wrote the correct record.
+                    from risk import HedgeStatus as _HS_AR
+                    _ho_ar = (
+                        self._risk.get_hedge_order(_hedge_parent.hedge_order_id)
+                        if _hedge_parent.hedge_order_id else None
+                    )
+                    if _ho_ar is not None and (
+                        _ho_ar.status in _HS_AR.TERMINAL
+                        or _ho_ar.status in ("filled_lost", "filled_won")
+                    ):
+                        log.info(
+                            "Auto-redeem: GTD hedge already finalized — skipping duplicate record",
+                            token_id=token_id[:20],
+                            parent_market_id=_hedge_parent.market_id[:20],
+                            existing_status=_ho_ar.status,
+                        )
+                        continue
                     # Record the outcome so the webapp can show "Expired - LOST".
                     _spot_hl = await self._fetch_hedge_resolve_spot(_hedge_parent)
                     self._risk.record_hedge_fill(
@@ -2100,20 +2140,63 @@ class PositionMonitor:
                     )
                     continue
 
+                # Reprice sizing rules:
+                #   1. PM minimum order = $1, so we always spend at least $1.
+                #   2. Goal is to match the NATURAL (position-matched) contract count.
+                #   3. If natural coverage costs < $1 at the new price: use $1 worth
+                #      of contracts (PM floor — fewer contracts than the inflated
+                #      original placement, spending exactly $1).
+                #   4. If natural coverage costs >= $1 at the new price: use natural
+                #      contracts (full hedge coverage, possibly > $1).
+                #   5. Hard ceiling: total spend never exceeds projected win PnL minus
+                #      MIN_RETAIN_USD — maintained by the PnL cap block below.
+                #
+                # ho.natural_contracts is the position-matched count stored at placement
+                # (entry_size × HEDGE_CONTRACTS_PCT, before any $1 floor inflation).
+                # Fallback for old hedges without this field: use ho.order_size which
+                # was the inflated count — preserves pre-fix behaviour on legacy objects.
+                _nat = ho.natural_contracts if ho.natural_contracts > 0.0 else max(0.0, ho.order_size - ho.size_filled)
+                _natural_cost = _nat * _new_bid
+                if _natural_cost >= 1.0:
+                    _reprice_size = _nat              # full position coverage
+                else:
+                    _reprice_size = 1.0 / _new_bid    # PM $1 minimum at new price
+                if ho.projected_pnl_usd > 0.0:
+                    # Use the same retained-profit floor as placement: ceiling is
+                    # projected_pnl minus MIN_RETAIN_USD, not the full projected_pnl.
+                    # This keeps the hedge cost constraint consistent end-to-end.
+                    _pnl_budget  = max(0.0, ho.projected_pnl_usd - config.MOMENTUM_HEDGE_MIN_RETAIN_USD)
+                    _pnl_ceiling = _pnl_budget / _new_bid if _pnl_budget > 0.0 else 0.0
+                    if _reprice_size > _pnl_ceiling:
+                        log.debug(
+                            "Hedge reprice: capping size to projected PnL ceiling",
+                            uncapped_size=round(_reprice_size, 4),
+                            capped_size=round(_pnl_ceiling, 4),
+                            notional_usd=round(_pnl_ceiling * _new_bid, 4),
+                            projected_pnl=round(ho.projected_pnl_usd, 4),
+                            min_retain=config.MOMENTUM_HEDGE_MIN_RETAIN_USD,
+                            pnl_budget=round(_pnl_budget, 4),
+                            market_id=ho.market_id[:20],
+                        )
+                        _reprice_size = _pnl_ceiling
+                _reprice_size = round(_reprice_size, 6)
+
                 _new_order_id = await self._pm.place_limit(
                     token_id=ho.token_id,
                     side="BUY",
                     price=_new_bid,
-                    size=max(0.0, ho.order_size - ho.size_filled),
+                    size=_reprice_size,
                     market=market,
                     post_only=True,
                 )
                 if _new_order_id:
-                    self._risk.replace_hedge_order(ho.order_id, _new_order_id, _new_bid)
+                    self._risk.replace_hedge_order(ho.order_id, _new_order_id, _new_bid, new_order_size=_reprice_size)
                     log.info(
                         "Hedge reprice: new order placed",
                         new_order_id=_new_order_id[:20],
                         new_bid=_new_bid,
+                        reprice_size=_reprice_size,
+                        notional_usd=round(_reprice_size * _new_bid, 4),
                         market_id=ho.market_id[:20],
                     )
                 else:
@@ -3090,15 +3173,36 @@ class PositionMonitor:
                             hedge_order_id=closed.hedge_order_id[:20],
                         )
                 else:
-                    # Cancel succeeded — order was resting when we hit it.
+                    # Cancel succeeded — but PM cancel-ok can fire on a fully-consumed
+                    # order (nothing remaining to cancel).  If WS fill detection already
+                    # recorded fills, honour them rather than overwriting with "cancelled".
                     _ho = self._risk.get_hedge_order(closed.hedge_order_id)
-                    if _ho is not None and _ho.status not in ("cancelled", "filled_won", "filled_lost", "filled_exited"):
-                        self._risk.finalize_hedge(
-                            closed.hedge_order_id,
-                            settled_price=0.0,
-                            spot_at_resolution=_exit_spot,
-                            hedge_status="cancelled",
-                        )
+                    if _ho is not None and _ho.status not in ("cancelled", "filled_won", "filled_lost", "filled_exited", "cancelled_partial"):
+                        if _ho.size_filled > 0:
+                            # WS fills exist: order was consumed before cancel arrived.
+                            # Main position WON → hedge token (opposite side) LOST.
+                            _fill_ratio = _ho.size_filled / _ho.order_size if _ho.order_size > 0 else 1.0
+                            _fill_status = "filled_lost" if _fill_ratio >= 0.99 else "cancelled_partial"
+                            self._risk.finalize_hedge(
+                                closed.hedge_order_id,
+                                settled_price=0.0,
+                                spot_at_resolution=_exit_spot,
+                                hedge_status=_fill_status,
+                            )
+                            log.info(
+                                "GTD hedge cancel-ok but WS fills detected — recorded fill outcome",
+                                hedge_order_id=closed.hedge_order_id[:20],
+                                size_filled=round(_ho.size_filled, 4),
+                                order_size=round(_ho.order_size, 4),
+                                status=_fill_status,
+                            )
+                        else:
+                            self._risk.finalize_hedge(
+                                closed.hedge_order_id,
+                                settled_price=0.0,
+                                spot_at_resolution=_exit_spot,
+                                hedge_status="cancelled",
+                            )
                     elif closed.hedge_token_id and not self._risk.has_hedge_fill(closed.market_id):
                         self._risk.record_hedge_fill(
                             parent_market_id=closed.market_id,

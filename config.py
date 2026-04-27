@@ -372,6 +372,32 @@ MOMENTUM_KELLY_MULTIPLIER_BY_TYPE: dict[str, float] = {
     "bucket_weekly": 1.00,
 }
 
+# ── CLOB-Oracle Blend (COB) win-probability for Kelly sizing ──────────────
+# The vol-model win_prob = N(z) collapses near expiry (sigma_tau → 0 → z → ∞
+# → win_prob ≈ 1.0 on every signal).  The CLOB ask price is reliable when the
+# book is liquid but drains near expiry (bid → 0.01, mid unreliable).
+# COB blends two independent estimates, shifting weight from CLOB to oracle-
+# delta as TTE shrinks, so neither failure mode dominates sizing:
+#
+#   win_prob_clob   = min(ask_price + EDGE_PREMIUM, WIN_PROB_CAP)
+#                     market consensus; reliable when book has depth.
+#
+#   win_prob_oracle = 0.50 + min(0.45, (strength − 1) × ORACLE_SENSITIVITY)
+#                     where strength = delta_pct / threshold_pct.
+#                     Purely physical distance from strike; stable near expiry.
+#
+#   clob_weight     = min(1.0, tte_seconds / CLOB_RELIABLE_TTE)
+#   win_prob_eff    = clob_weight × win_prob_clob + (1−clob_weight) × win_prob_oracle
+#
+# EDGE_PREMIUM: our systematic alpha over the CLOB ask (calibrate from win rate data).
+# WIN_PROB_CAP: hard ceiling on win_prob_eff to prevent Kelly runaway.
+# CLOB_RELIABLE_TTE: TTE above which CLOB book is considered fully reliable.
+# ORACLE_SENSITIVITY: maps signal-strength multiples above threshold → win_prob slope.
+MOMENTUM_KELLY_EDGE_PREMIUM: float = 0.07        # alpha above CLOB ask price
+MOMENTUM_KELLY_WIN_PROB_CAP: float = 0.95        # hard cap on win_prob_eff
+MOMENTUM_KELLY_CLOB_RELIABLE_TTE: int = 60       # seconds; above this CLOB fully weighted
+MOMENTUM_KELLY_ORACLE_SENSITIVITY: float = 0.15  # slope: delta multiples → win_prob
+
 # Kelly Phase-A extension — persistence z-boost.
 
 # PERSISTENCE: rewards signals that have remained continuously valid (above
@@ -526,7 +552,7 @@ MOMENTUM_HEDGE_CONTRACTS_PCT: float = 1.0
 # Profit-safe hedge price cap: the bot will not pay more per hedge contract than
 # (projected_pnl - MOMENTUM_HEDGE_MIN_RETAIN_USD) / hedge_contracts.
 # Set to 0.0 to disable the cap (no floor on retained profit — old behaviour).
-MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.15
+MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.25
 
 # N-tick concession ladder: how many times to retry with price raised by 1 tick ($0.01).
 # 1 = single attempt at the configured price (closest to old behaviour).
@@ -548,8 +574,8 @@ MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS: int = 5
 # TTE aggression threshold (seconds).  When time-to-expiry is below this value the
 # bot forces a taker (FAK) order regardless of the book state.
 # 0 = disabled.  Recommended starting value if enabling: 30.
-MOMENTUM_HEDGE_AGGRESSIVE_TTE_S: int = 0
 
+MOMENTUM_HEDGE_AGGRESSIVE_TTE_S: int = 0
 # Global taker override.  True = always use taker for hedge regardless of TTE or book.
 # Useful for paper-mode testing.  Leave False in production.
 MOMENTUM_HEDGE_AGGRESSIVE_TAKER: bool = False

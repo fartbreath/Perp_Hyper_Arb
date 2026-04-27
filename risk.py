@@ -48,7 +48,7 @@ TRADES_HEADER = [
     "hedge_token_id",       # CLOB token_id of the opposite (hedged) token
     "hedge_price",          # limit price the hedge bid was placed at
     "hedge_size_usd",       # USD size of the hedge order
-    "hedge_status",         # "filled_won" | "filled_lost" | "unfilled" | "cancelled" | "filled_exited" | "" (main rows)
+    "hedge_status",         # "filled_won" | "filled_lost" | "unfilled" | "cancelled" | "filled_exited" | "rejected_price" | "" (main rows)
     "spot_resolve_price",   # oracle spot at market resolution (hedge rows only; 0.0 otherwise)
     "hedge_size_filled",    # contracts actually filled (empty for non-hedge rows)
     "hedge_avg_fill_price", # VWAP of all fills (empty for non-hedge rows)
@@ -152,6 +152,24 @@ class HedgeOrder:
     # price_cap: max bid price the hedge may be repriced to without eroding profit
     # below MOMENTUM_HEDGE_MIN_RETAIN_USD.  Set at placement; copied on each reprice.
     price_cap:          float          = 0.0
+    # projected_pnl_usd: expected win PnL of the main position at entry
+    # (entry_size × (1 − entry_price)).  Hard ceiling: reprice notional must
+    # never exceed this value.  Set at registration; copied on each reprice.
+    projected_pnl_usd:  float          = 0.0
+    # initial_notional_usd: the USD budget committed at first placement
+    # (order_price × order_size at registration).  Never mutated by replace_hedge_order.
+    # Used by the reprice loop to cap notional at each step: contracts ≤ initial_notional / new_bid.
+    # This scales correctly with position size — larger positions get proportionally
+    # more insurance budget; smaller positions are capped at their initial spend.
+    initial_notional_usd: float        = 0.0
+    # natural_contracts: position-matched contract count (entry_size × HEDGE_CONTRACTS_PCT)
+    # BEFORE any $1 PM-minimum floor is applied.  The floor may inflate order_size to
+    # 1.0/hedge_price (e.g. 50 at 2¢) when the natural size costs < $1.  The monitor
+    # reprice loop must use this field — not order_size — to recalculate sizing at each
+    # step:  max(natural_contracts, 1.0/new_price).  This keeps spend at exactly $1
+    # when natural coverage is cheap, but never wastes money on inflated carry-forward
+    # counts from the original placement price.  0.0 = unknown (pre-migration hedge).
+    natural_contracts:  float          = 0.0
     # last_clob_ask: best_ask from the previous monitor sweep, used to detect
     # whether the seller is coming toward us (ask falling → step up bid by $0.01).
     # Persisted so bot restarts don't lose the reference point.
@@ -218,6 +236,9 @@ class Position:
     hedge_token_id: str = ""
     hedge_price: float = 0.0
     hedge_size_usd: float = 0.0
+    # Hedge failure fields (populated when hedge placement was attempted but rejected)
+    hedge_fail_reason: str = ""     # e.g. "all_attempts_exhausted"
+    hedge_opp_best_ask: float = 0.0 # best ask of opposite token at time of failure
 
     # WS fill detection — set by live_fill_handler when a GTD hedge fills mid-trade
     hedge_fill_detected: bool = False
@@ -907,6 +928,30 @@ class RiskEngine:
                 ho.parent_side = side
                 self._save_hedge_orders()
 
+    def set_hedge_failed(
+        self,
+        market_id: str,
+        side: str,
+        reason: str,
+        opp_best_ask: float,
+        max_price: float = 0.0,
+    ) -> None:
+        """Record that a hedge placement was attempted but rejected (e.g. priced out).
+
+        This causes close_position() to write hedge_status='rejected_price' in
+        trades.csv so the webapp can surface the failure.
+        - hedge_price is repurposed to store max_price (what the bot was willing to pay).
+        - hedge_opp_best_ask stores the opposite-token best ask at failure time.
+        """
+        with self._lock:
+            pos = self._positions.get(self._pos_key(market_id, side))
+            if pos is None:
+                return
+            pos.hedge_fail_reason = reason
+            pos.hedge_opp_best_ask = opp_best_ask
+            if max_price > 0:
+                pos.hedge_price = max_price  # reuse field: max price the bot offered
+
     def get_position_by_hedge_token(self, hedge_token_id: str) -> Optional[Position]:
         """Return the position whose GTD hedge_token_id matches, or None."""
         with self._lock:
@@ -1118,6 +1163,8 @@ class RiskEngine:
         *,
         parent_side: str = "",
         price_cap: float = 0.0,
+        projected_pnl_usd: float = 0.0,
+        natural_contracts: float = 0.0,
     ) -> HedgeOrder:
         """Create and persist a new HedgeOrder in OPEN status."""
         with self._lock:
@@ -1135,6 +1182,9 @@ class RiskEngine:
                 size_remaining=order_size,
                 parent_side=parent_side,
                 price_cap=price_cap,
+                projected_pnl_usd=projected_pnl_usd,
+                initial_notional_usd=order_size_usd,
+                natural_contracts=natural_contracts,
             )
             self._hedge_orders[order_id] = ho
             self._save_hedge_orders()
@@ -1145,6 +1195,7 @@ class RiskEngine:
         old_order_id: str,
         new_order_id: str,
         new_price: float,
+        new_order_size: float = 0.0,
     ) -> Optional["HedgeOrder"]:
         """Cancel old hedge order and register a replacement at new_price.
 
@@ -1154,6 +1205,10 @@ class RiskEngine:
           3. Updates the parent Position's hedge_order_id to the new order.
           4. Persists.
 
+        new_order_size: the actual contracts placed in the reprice order.
+        If 0.0, falls back to old_ho.order_size (backward compat with callers
+        that don't compute the reprice size themselves).
+
         Returns the new HedgeOrder, or None if old_order_id is unknown.
         """
         with self._lock:
@@ -1162,6 +1217,7 @@ class RiskEngine:
                 log.warning("replace_hedge_order: unknown old order", order_id=old_order_id[:20])
                 return None
 
+            _actual_size = new_order_size if new_order_size > 0.0 else old_ho.order_size
             new_ho = HedgeOrder(
                 order_id=new_order_id,
                 market_id=old_ho.market_id,
@@ -1171,11 +1227,14 @@ class RiskEngine:
                 market_title=old_ho.market_title,
                 placed_at=datetime.now(timezone.utc).isoformat(),
                 order_price=new_price,
-                order_size=old_ho.order_size,
-                order_size_usd=round(old_ho.order_size * new_price, 6),
-                size_remaining=max(0.0, old_ho.order_size - old_ho.size_filled),
+                order_size=_actual_size,
+                order_size_usd=round(_actual_size * new_price, 6),
+                size_remaining=max(0.0, _actual_size - old_ho.size_filled),
                 parent_side=old_ho.parent_side,
                 price_cap=old_ho.price_cap,
+                projected_pnl_usd=old_ho.projected_pnl_usd,
+                initial_notional_usd=old_ho.initial_notional_usd,
+                natural_contracts=old_ho.natural_contracts,
                 pending_cancel_threshold=old_ho.pending_cancel_threshold,
                 pending_cancel_side=old_ho.pending_cancel_side,
                 pending_cancel_strike=old_ho.pending_cancel_strike,
@@ -1690,8 +1749,10 @@ class RiskEngine:
                 "hedge_token_id": pos.hedge_token_id,
                 "hedge_price": pos.hedge_price,
                 "hedge_size_usd": pos.hedge_size_usd,
-                "hedge_status": "",
-                "spot_resolve_price": 0.0,
+                "hedge_status": "rejected_price" if pos.hedge_fail_reason else "",
+                # For rejected_price rows: repurpose spot_resolve_price to store opp_best_ask
+                # so the UI can show "Max: Xc · Ask: Yc" tooltip.
+                "spot_resolve_price": pos.hedge_opp_best_ask if pos.hedge_fail_reason else 0.0,
                 "hedge_size_filled": "",
                 "hedge_avg_fill_price": "",
             }

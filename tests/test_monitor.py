@@ -2657,3 +2657,222 @@ class TestHedgeNearExpiryCancel:
         )
         _run(monitor._check_all_positions())
         pm.cancel_order.assert_called_once_with("ho_reprice")
+
+
+# ── TestHedgeRepriceSizing ─────────────────────────────────────────────────────
+
+class TestHedgeRepriceSizing:
+    """Tests for the reprice contract-sizing formula:
+
+    Rule 1: PM minimum order = $1 → always place at least 1.0 / new_bid contracts.
+    Rule 2: True hedge = match remaining contract count.
+    Rule 3: $1 buys MORE contracts than remaining → use $1 floor (PM minimum).
+    Rule 4: Matching contracts costs MORE than $1 → scale up (true coverage).
+    Rule 5 (overarching): notional ≤ projected_pnl_usd − MOMENTUM_HEDGE_MIN_RETAIN_USD.
+    """
+
+    def _setup_reprice(
+        self,
+        *,
+        order_price: float,
+        order_size: float,
+        size_filled: float = 0.0,
+        price_cap: float = 0.99,
+        projected_pnl_usd: float = 0.0,
+        prev_ask: float = 0.15,
+        curr_ask: float = 0.14,
+        new_order_id: str = "new_ho_001",
+    ):
+        """Build a monitor + linked hedge order, pre-loaded for one reprice sweep."""
+        monitor, pm, risk = _make_monitor()
+        pm.cancel_order = AsyncMock(return_value=True)
+        pm.place_limit = AsyncMock(return_value=new_order_id)
+        config.MOMENTUM_HEDGE_CLOB_LOG_ENABLED = False
+        config.MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS = 5
+
+        pos, ho = _open_pos_with_hedge(
+            risk,
+            order_price=order_price,
+            order_size=order_size,
+            price_cap=price_cap,
+        )
+        # Patch projected_pnl_usd and size_filled directly on the HedgeOrder.
+        ho.projected_pnl_usd = projected_pnl_usd
+        ho.size_filled = size_filled
+        ho.last_clob_ask = prev_ask
+
+        pm._books["tok_hedge"] = _make_book_ba(bid=order_price, ask=curr_ask)
+        return monitor, pm, risk, ho
+
+    def _placed_size(self, pm) -> float:
+        """Extract the 'size' kwarg from the place_limit call."""
+        assert pm.place_limit.called, "place_limit was never called"
+        return pm.place_limit.call_args.kwargs["size"]
+
+    def _placed_price(self, pm) -> float:
+        return pm.place_limit.call_args.kwargs["price"]
+
+    # ── Rule 3: $1 buys MORE contracts than remaining → use $1 floor ───────────
+
+    def test_pm_minimum_floor_small_position(self):
+        """Small position: remaining=1.0c, new_bid=0.10 → 1.0/0.10=10c > 1.0c → use 10c ($1.00)."""
+        monitor, pm, risk, ho = self._setup_reprice(
+            order_price=0.10, order_size=1.0,   # tiny: 1 contract
+            price_cap=0.99,
+            projected_pnl_usd=5.0,  # large enough not to interfere
+        )
+        # Ask falls 0.15→0.14 → new_bid = 0.10 + 0.01 = 0.11
+        _run(monitor._check_all_positions())
+        size = self._placed_size(pm)
+        new_bid = self._placed_price(pm)
+        # max(remaining=1.0, 1.0/0.11=9.09) → 9.09; PnL ceiling = (5.0-0.15)/0.11=44
+        assert abs(size - round(1.0 / new_bid, 6)) < 1e-5, (
+            f"Expected PM minimum floor (1.0/new_bid={1.0/new_bid:.4f}), got {size}"
+        )
+        notional = size * new_bid
+        assert abs(notional - 1.0) < 0.01, f"Notional should be ~$1, got {notional:.4f}"
+
+    # ── Rule 4: matching contracts costs MORE than $1 → scale up ───────────────
+
+    def test_large_position_scales_above_one_dollar(self):
+        """Large position: remaining=22.22c, new_bid=0.11 → 22.22c wins over 9.09c → $2.44."""
+        monitor, pm, risk, ho = self._setup_reprice(
+            order_price=0.045, order_size=22.22,
+            price_cap=0.99,
+            projected_pnl_usd=10.0,  # large enough not to interfere
+        )
+        # new_bid = 0.045 + 0.01 = 0.055
+        _run(monitor._check_all_positions())
+        size = self._placed_size(pm)
+        new_bid = self._placed_price(pm)
+        remaining = 22.22
+        expected = round(max(remaining, 1.0 / new_bid), 6)
+        assert abs(size - expected) < 1e-5, (
+            f"Expected {expected} (remaining={remaining}, 1/bid={1/new_bid:.4f}), got {size}"
+        )
+        notional = size * new_bid
+        assert notional > 1.0, f"Notional should exceed $1 for large position, got {notional:.4f}"
+
+    # ── Rule 5: PnL ceiling (overarching) ──────────────────────────────────────
+
+    def test_pnl_ceiling_caps_large_size(self):
+        """PnL ceiling fires: remaining=22.22c at new_bid=0.10 → notional=$2.22 > budget=$1.50."""
+        # projected_pnl=2.0, min_retain=0.15 → budget=1.85 → ceiling=1.85/0.10=18.5c
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.15
+        monitor, pm, risk, ho = self._setup_reprice(
+            order_price=0.09, order_size=22.22,
+            price_cap=0.99,
+            projected_pnl_usd=2.0,
+        )
+        # Ask falls 0.15→0.14 → new_bid = 0.09+0.01=0.10
+        _run(monitor._check_all_positions())
+        size = self._placed_size(pm)
+        new_bid = self._placed_price(pm)
+        budget = 2.0 - config.MOMENTUM_HEDGE_MIN_RETAIN_USD
+        expected_ceiling = budget / new_bid
+        # max(remaining=22.22, 1/0.10=10) → 22.22, then capped to 18.5
+        assert abs(size - round(expected_ceiling, 6)) < 1e-4, (
+            f"Expected PnL ceiling {expected_ceiling:.4f}, got {size}"
+        )
+        notional = size * new_bid
+        assert abs(notional - budget) < 0.01, (
+            f"Notional should equal budget {budget:.2f}, got {notional:.4f}"
+        )
+
+    def test_pnl_ceiling_not_triggered_when_pnl_large(self):
+        """When projected_pnl is large, PnL ceiling doesn't interfere with contract matching."""
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.15
+        monitor, pm, risk, ho = self._setup_reprice(
+            order_price=0.045, order_size=22.22,
+            price_cap=0.99,
+            projected_pnl_usd=20.0,  # very large — ceiling = 19.85/0.055=361c >> 22.22c
+        )
+        _run(monitor._check_all_positions())
+        size = self._placed_size(pm)
+        new_bid = self._placed_price(pm)
+        # remaining=22.22 > 1/0.055=18.18 → max gives 22.22
+        assert abs(size - round(22.22, 6)) < 1e-4, (
+            f"Expected 22.22 (contract match), got {size}"
+        )
+
+    def test_pnl_ceiling_disabled_when_zero(self):
+        """projected_pnl_usd=0.0 → ceiling check skipped entirely."""
+        monitor, pm, risk, ho = self._setup_reprice(
+            order_price=0.045, order_size=22.22,
+            price_cap=0.99,
+            projected_pnl_usd=0.0,  # disabled
+        )
+        _run(monitor._check_all_positions())
+        size = self._placed_size(pm)
+        new_bid = self._placed_price(pm)
+        # Without ceiling: max(22.22, 1/0.055=18.18) → 22.22
+        assert abs(size - round(22.22, 6)) < 1e-4
+
+    # ── Partial fill reduces remaining ─────────────────────────────────────────
+
+    def test_partial_fill_reduces_remaining(self):
+        """After partial fill: remaining = order_size - size_filled."""
+        monitor, pm, risk, ho = self._setup_reprice(
+            order_price=0.045, order_size=22.22,
+            size_filled=10.0,   # 10 already filled
+            price_cap=0.99,
+            projected_pnl_usd=20.0,
+        )
+        _run(monitor._check_all_positions())
+        size = self._placed_size(pm)
+        new_bid = self._placed_price(pm)
+        remaining = 22.22 - 10.0  # = 12.22
+        expected = round(max(remaining, 1.0 / new_bid), 6)
+        assert abs(size - expected) < 1e-4, (
+            f"Expected {expected} with remaining={remaining}, got {size}"
+        )
+
+    # ── PnL ceiling interacts with min_retain ──────────────────────────────────
+
+    def test_pnl_ceiling_accounts_for_min_retain(self):
+        """PnL ceiling = (projected_pnl - min_retain) / bid, not projected_pnl / bid."""
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.50
+        monitor, pm, risk, ho = self._setup_reprice(
+            order_price=0.09, order_size=30.0,
+            price_cap=0.99,
+            projected_pnl_usd=3.0,
+        )
+        # new_bid = 0.10; budget = 3.0 - 0.50 = 2.50; ceiling = 25.0c
+        # max(30.0, 1/0.10=10) → 30.0; capped to 25.0
+        _run(monitor._check_all_positions())
+        size = self._placed_size(pm)
+        new_bid = self._placed_price(pm)
+        budget = 3.0 - 0.50
+        expected = budget / new_bid
+        assert abs(size - round(expected, 6)) < 1e-4, (
+            f"Expected ceiling {expected:.4f} (budget={budget}), got {size}"
+        )
+        notional = size * new_bid
+        assert abs(notional - budget) < 0.01
+
+    # ── Regression: BTC 15m session bug scenario ───────────────────────────────
+
+    def test_btc_15m_reprice_scenario(self):
+        """Regression: BTC 15m (Apr 25 session) overpaid $2.22.
+
+        With the fix: remaining=22.22c, budget=projected_pnl-0.15.
+        At new_bid=0.055: max(22.22, 18.18)=22.22; notional=22.22×0.055=$1.22 ✓
+        At high new_bid (simulated at 0.095→0.105): ceiling fires if pnl is small.
+        """
+        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.15
+        # Session: entry=$3.42 projected_pnl; initial hedge 22.22c@0.045=$1.00
+        monitor, pm, risk, ho = self._setup_reprice(
+            order_price=0.045, order_size=22.22,
+            price_cap=0.99,
+            projected_pnl_usd=3.42,
+            prev_ask=0.24, curr_ask=0.18,   # first reprice step: ask 0.24→0.18
+        )
+        _run(monitor._check_all_positions())
+        size = self._placed_size(pm)
+        new_bid = self._placed_price(pm)
+
+        # Budget = 3.42 - 0.15 = 3.27; ceiling = 3.27/0.055 = 59.45c >> 22.22c
+        # So no ceiling yet: max(22.22, 1/0.055=18.18) = 22.22
+        assert abs(size - round(22.22, 6)) < 1e-4
+        notional = size * new_bid
+        assert notional < 3.27 + 0.01, f"Notional {notional:.4f} exceeds budget 3.27"
