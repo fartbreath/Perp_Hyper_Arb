@@ -133,14 +133,33 @@ def _compute_correction(trade_row: dict, pm_market_rows: list[dict]) -> Optional
         and r.get("outcome", "") in _opp_outcomes.get(side, [])
     ]
     if _opp_buy_rows and _all_redeem_rows:
-        _opp_buy_size = sum(float(r.get("size") or 0) for r in _opp_buy_rows)
-        _tot_redeem_size = sum(float(r.get("size") or 0) for r in _all_redeem_rows)
-        if _opp_buy_size > 0 and abs(_tot_redeem_size - _opp_buy_size) / _opp_buy_size < 0.05:
-            # REDEEM size matches hedge BUY size — REDEEMs belong to hedge token.
-            # Exclude from main position PnL; main expired worthless (LOSS).
-            redeem_rows: list[dict] = []
+        # Prefer precise token-id attribution over size heuristic.
+        # REDEEMs carry no outcome field, but PM activity rows DO have an
+        # `asset` field (the ERC-1155 tokenId that was redeemed).  When we know
+        # the hedge token_id from the trades.csv row, we can split REDEEMs
+        # exactly: asset == hedge_token_id → hedge REDEEM; otherwise → main.
+        _hedge_token_id = (trade_row.get("hedge_token_id") or "").strip()
+        if _hedge_token_id:
+            _hedge_redeems = [r for r in _all_redeem_rows if r.get("asset", "") == _hedge_token_id]
+            _main_redeems  = [r for r in _all_redeem_rows if r.get("asset", "") != _hedge_token_id]
+            if _hedge_redeems and not _main_redeems:
+                # All REDEEMs are from the hedge token — main expired worthless.
+                redeem_rows: list[dict] = []
+            else:
+                # Main-position REDEEMs present (may include unmatched rows when
+                # asset field is empty/absent — keep everything that isn't the hedge).
+                redeem_rows = _main_redeems if _main_redeems else _all_redeem_rows
         else:
-            redeem_rows = _all_redeem_rows
+            # No hedge_token_id recorded — fall back to size heuristic.
+            # Bug risk: hedge is sized to match main position so sizes always
+            # approximately match.  This path only triggers for very old rows
+            # written before hedge_token_id was stored.
+            _opp_buy_size = sum(float(r.get("size") or 0) for r in _opp_buy_rows)
+            _tot_redeem_size = sum(float(r.get("size") or 0) for r in _all_redeem_rows)
+            if _opp_buy_size > 0 and abs(_tot_redeem_size - _opp_buy_size) / _opp_buy_size < 0.05:
+                redeem_rows = []
+            else:
+                redeem_rows = _all_redeem_rows
     else:
         redeem_rows = _all_redeem_rows
 

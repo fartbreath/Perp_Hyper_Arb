@@ -5,7 +5,7 @@ import { useState } from "react";
 import {
   useHealth, usePnl, usePositions, useLauncherStatus,
   startBotProcess, stopBotProcess, usePerformance, useInventory, useConfig, updateConfig,
-  useMomentumSignals, useMomentumScanSummary,
+  useMomentumSignals, useMomentumScanSummary, useOpeningNeutralStatus,
 } from "../api/client";
 import type { Position } from "../api/client";
 
@@ -527,9 +527,10 @@ function timeUntilEnd(iso: string | null | undefined): { label: string; color: s
 }
 
 const STRATEGY_BADGE: Record<string, { label: string; color: string; bg: string }> = {
-  momentum:   { label: "MOM",  color: "#a78bfa", bg: "#2e1065" },
-  maker:      { label: "MKR",  color: "#60a5fa", bg: "#1e3a5f" },
-  mispricing: { label: "MIS",  color: "#34d399", bg: "#064e3b" },
+  momentum:        { label: "MOM",  color: "#a78bfa", bg: "#2e1065" },
+  opening_neutral: { label: "ONT",  color: "#38bdf8", bg: "#0c2a3d" },
+  maker:           { label: "MKR",  color: "#60a5fa", bg: "#1e3a5f" },
+  mispricing:      { label: "MIS",  color: "#34d399", bg: "#064e3b" },
 };
 
 function StrategyBadge({ strategy }: { strategy: string }) {
@@ -734,6 +735,111 @@ function MomentumCard() {
   );
 }
 
+function OpeningNeutralCard() {
+  const { data } = useOpeningNeutralStatus();
+  if (!data) return null;
+
+  const enabled = data.enabled;
+  const dryRun = data.dry_run;
+  const pairs = data.pairs ?? [];
+  const recentSigs = data.recent_signals ?? [];
+  const entryAttempts = recentSigs.filter(s => s.result === "entry_attempt").length;
+  const tooExpensive = recentSigs.filter(s => s.result === "too_expensive").length;
+
+  return (
+    <div className="card">
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginBottom: "0.6rem" }}>
+        <h3 style={{ margin: 0 }}>Opening Neutral</h3>
+        <span style={{
+          padding: "2px 8px", borderRadius: 999, fontSize: "0.72rem", fontWeight: 700,
+          background: enabled ? "#0c2a3d" : "#1f2937",
+          color: enabled ? "#38bdf8" : "#64748b",
+        }}>
+          {enabled ? "● Active" : "○ Disabled"}
+        </span>
+        {dryRun && (
+          <span style={{ padding: "2px 8px", borderRadius: 999, fontSize: "0.72rem",
+            fontWeight: 700, background: "#451a03", color: "#fb923c" }}>
+            DRY RUN
+          </span>
+        )}
+      </div>
+
+      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "0.75rem" }}>
+        <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 100 }}>
+          <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Active pairs</div>
+          <div style={{ fontFamily: "monospace", fontWeight: 600, color: data.active_pairs > 0 ? "#38bdf8" : "#94a3b8" }}>
+            {data.active_pairs}
+          </div>
+        </div>
+        <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 100 }}>
+          <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Entry attempts</div>
+          <div style={{ fontFamily: "monospace", fontWeight: 600, color: entryAttempts > 0 ? "#38bdf8" : "#94a3b8" }}>
+            {entryAttempts}
+          </div>
+        </div>
+        {tooExpensive > 0 && (
+          <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 120 }}>
+            <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Too expensive</div>
+            <div style={{ fontFamily: "monospace", fontWeight: 600, color: "#f59e0b" }}>{tooExpensive}</div>
+          </div>
+        )}
+      </div>
+
+      {/* Active pairs */}
+      {pairs.length > 0 && (
+        <div style={{ marginBottom: "0.75rem" }}>
+          <div style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.4rem" }}>Active pairs</div>
+          {pairs.map(pair => (
+            <div key={pair.pair_id} style={{
+              display: "flex", alignItems: "center", gap: "0.75rem",
+              background: "#1e293b", borderRadius: 6, padding: "0.4rem 0.75rem",
+              marginBottom: "0.3rem", fontSize: "0.8rem",
+            }}>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}
+                title={pair.market_title}>
+                {pair.market_title}
+              </span>
+              <span style={{ color: "#22c55e", fontFamily: "monospace" }}>
+                YES {pair.yes_entry != null ? pair.yes_entry.toFixed(2) : "—"}
+              </span>
+              <span style={{ color: "#f87171", fontFamily: "monospace" }}>
+                NO {pair.no_entry != null ? pair.no_entry.toFixed(2) : "—"}
+              </span>
+              {pair.yes_entry != null && pair.no_entry != null && (
+                <span style={{ color: "#38bdf8", fontFamily: "monospace" }}>
+                  Σ {(pair.yes_entry + pair.no_entry).toFixed(3)}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Recent scan signals */}
+      {recentSigs.slice(0, 5).map((sig, i) => (
+        <div key={i} style={{
+          display: "flex", alignItems: "center", gap: "0.5rem",
+          fontSize: "0.78rem", background: "#1e293b", borderRadius: 6,
+          padding: "0.3rem 0.6rem", marginBottom: "0.25rem",
+        }}>
+          <span style={{ color: sig.result === "entry_attempt" ? "#38bdf8" : "#64748b" }}>
+            {sig.result === "entry_attempt" ? "▶" : "✗"}
+          </span>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}
+            title={sig.market_title}>{sig.market_title}</span>
+          {sig.combined != null && (
+            <span style={{ fontFamily: "monospace", color: sig.combined <= sig.threshold ? "#22c55e" : "#ef4444" }}>
+              Σ{sig.combined.toFixed(3)}
+            </span>
+          )}
+          <span style={{ color: "#64748b", fontFamily: "monospace" }}>{sig.tte_secs}s TTE</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function Dashboard() {
   return (
     <div className="page">
@@ -744,6 +850,7 @@ export default function Dashboard() {
         <BucketPerformanceStrip />
       </div>
       <MomentumCard />
+      <OpeningNeutralCard />
       <PositionsCard />
       <HealthCard />
     </div>

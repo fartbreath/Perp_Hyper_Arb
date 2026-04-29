@@ -2,6 +2,68 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-29] - Strategy 5 (Opening Neutral); CLOB v2 migration; hedge SL fix; venv auto-detection
+
+### Feature — Strategy 5: Opening Neutral (`strategies/OpeningNeutral/scanner.py`, `strategies/OpeningNeutral/__init__.py`, `config.py`, `main.py`, `api_server.py`, `risk.py`)
+
+Simultaneously buys the YES and NO token of the same Up/Down bucket market within `OPENING_NEUTRAL_ENTRY_WINDOW_SECS` of market open. When both FAK legs fill at a combined cost ≤ $1.00 the pair is guaranteed-profitable at resolution. When only one leg fills the surviving leg is either promoted to a standard momentum position (`keep_as_momentum`) or immediately taker-exited (`exit_immediately`).
+
+**New config params (14):** `OPENING_NEUTRAL_ENABLED`, `OPENING_NEUTRAL_DRY_RUN`, `OPENING_NEUTRAL_MARKET_TYPES`, `OPENING_NEUTRAL_ENTRY_WINDOW_SECS`, `OPENING_NEUTRAL_COMBINED_COST_MAX`, `OPENING_NEUTRAL_SIZE_USD`, `OPENING_NEUTRAL_ORDER_TYPE`, `OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS`, `OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS` (5 s — short window so exchange-killed FAKs fail fast), `OPENING_NEUTRAL_ONE_LEG_FALLBACK`, `OPENING_NEUTRAL_LOSER_EXIT_PRICE`, `OPENING_NEUTRAL_MIN_SIDE_PRICE`, `OPENING_NEUTRAL_MAX_SIDE_PRICE`, `OPENING_NEUTRAL_MAX_CONCURRENT`.
+
+**Other changes:**
+- `risk.py`: `neutral_pair_id: str = ""` field on `Position` links both YES and NO legs; cleared on the winner when promoted to momentum.
+- `api_server.py`: `opening_neutral_ref` in `BotState`; `opening_neutral_enabled` / `opening_neutral_dry_run` exposed via `GET /config` and `PATCH /config`; `GET /opening_neutral/status` endpoint returns enabled state, dry_run, active pair count, pair details, and recent scan diagnostics.
+- `main.py`: `OpeningNeutralScanner` instantiated when `OPENING_NEUTRAL_ENABLED=True`; wired into the asyncio task graph; `neutral_pair_id` propagated in `state_sync_loop`.
+- `strategies/Momentum/scanner.py`: Opening-neutral conflict guard — skips any market where `opening_neutral` already has an open position, with `skip_reason="opening_neutral_active"` in diagnostics.
+- Event logging (4 types → `data/momentum_events.jsonl`): `OPENING_NEUTRAL_PAIR_REGISTERED`, `OPENING_NEUTRAL_ONE_LEG_PROMOTED`, `OPENING_NEUTRAL_ONE_LEG_EXITED`, `OPENING_NEUTRAL_NO_FILL`.
+- Concurrent entry guard counts both active pairs **and** in-flight entry attempts against `OPENING_NEUTRAL_MAX_CONCURRENT`.
+
+### Fix — CLOB v2 migration (`pm_client.py`, `monitor.py`, `api_server.py`, `tests/test_pm_client.py`)
+
+Fully migrated all production CLOB calls from `py_clob_client` → `py_clob_client_v2`.
+
+**`pm_client.py` changes:**
+- FAK (taker) limit path now uses `MarketOrderArgs` / `create_market_order` instead of `OrderArgs` / `create_order`. `MarketOrderArgs` uses the market-order signing path which rounds USDC amount to 2dp automatically, satisfying the API's maker_amount constraint.
+- `cancel` → `cancel_order(OrderPayload(orderID=order_id))`.
+- `get_orders` → `get_open_orders`.
+- `BalanceAllowanceParams`, `AssetType` imports updated to `py_clob_client_v2`.
+- Order `size` rounded to 2dp before all CLOB calls (API constraint: maker amount max 2dp).
+
+**`monitor.py`, `api_server.py` redeem fix:**
+- `pm._clob.get_conditional_address()` / `get_collateral_address()` don't exist in v2.
+- Replaced with `_POLY_CONTRACTS = _get_contract_config(137)` (pure/hardcoded — no network call); use `.conditional_tokens` and `.collateral` fields.
+
+**Tests (`tests/test_pm_client.py`):**
+- All `py_clob_client` imports → `py_clob_client_v2`.
+- FAK tests updated to mock `create_market_order` and assert `create_order.assert_not_called()`.
+- `cancel` tests updated to `cancel_order(OrderPayload(...))`.
+- Stale `get_conditional_address` / `get_collateral_address` mocks removed from `TestAutoRedeemDedup`.
+- `test_no_winner_flag_falls_back_to_yes_price` renamed to `test_no_winner_flag_returns_none_for_retry` (preamble rule: never infer WIN/LOSS from `price`).
+
+### Fix — Hedge SL suppression now requires actual fill (`monitor.py`)
+
+Previously, any position with a non-null `hedge_order_id` suppressed all stop-losses (oracle delta SL, near-expiry stop, prob-SL). If the hedge order was cancelled or expired unfilled, the position was left naked with no protection but stop-losses still disabled.
+
+**Fix:** `_hedge_active` now calls `self._risk.get_hedge_order(pos.hedge_order_id)` and checks `size_filled > 0`. An unfilled or cancelled hedge provides zero insurance — stop-losses run normally in that state.
+
+### Fix — Launcher and main.py venv auto-detection (`launcher.py`, `main.py`)
+
+**`launcher.py`:** Added `_find_venv_python()` which scans sibling `.venv` directories for the correct Python interpreter. `BOT_PYTHON` replaces `sys.executable` in `subprocess.Popen` — the bot always starts with the project venv regardless of how the launcher was invoked.
+
+**`main.py`:** Venv guard at the top of the file: if `py_clob_client_v2` is not importable, the script calls `os.execv()` to relaunch itself with the `.venv` Python. Falls back to a clear error message with activation instructions if no venv is found.
+
+### Fix — Gamma API per-slug error handling (`pm_client.py`)
+
+Previously, any exception during the Gamma slug fetch (most commonly `asyncio.TimeoutError` with an empty `str()`) aborted the entire market refresh, leaving `_markets` stale. Now exceptions are caught per-slug; the failed slug is logged as a `WARNING` and the loop continues to the next slug.
+
+### Feat — Multi-strategy WS token registration (`pm_client.py`)
+
+`register_for_book_updates(token_ids, owner="default")` now accepts an `owner` key. Registrations are stored in `_extra_tokens_by_owner: dict[str, set[str]]` and unioned in `_update_shards`. This prevents one strategy from overwriting another's WS subscriptions (e.g. momentum and opening_neutral can both register independently). Extra tokens are also ordered and appended to `new_tokens` in `_update_shards` so they actually get subscribed to shards.
+
+### Fix — `fetch_market_resolution` no price fallback (`pm_client.py`)
+
+When `closed=True` but no `winner` flags are present in the CLOB response, the method previously fell back to the YES token's `price` field. Per the preamble rule, `price` can briefly show ~1.0 for a losing token right after settlement. The fallback is removed: the method now returns `None` so the monitor retries later when winner flags are set.
+
 ## [2026-04-27] - GTD hedge reprice sizing fix; `natural_contracts` field; parametric sweep tests
 
 ### Bug fix — Hedge reprice used inflated contract count instead of position-matched count (`monitor.py`, `risk.py`, `strategies/Momentum/scanner.py`)

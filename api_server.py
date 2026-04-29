@@ -75,6 +75,9 @@ class BotState:
     momentum_signals: list = field(default_factory=list)
     momentum_ref: Any = None  # live MomentumScanner instance; set by main.py
 
+    # Opening neutral signals and live instance
+    opening_neutral_ref: Any = None  # live OpeningNeutralScanner instance; set by main.py
+
     # Agent shadow log (filled by agent)
     agent_shadow_log: list = field(default_factory=list)
 
@@ -565,6 +568,9 @@ _MUTABLE_CONFIG = {
     "chainlink_silence_watchdog_secs":     ("CHAINLINK_SILENCE_WATCHDOG_SECS",      int),
     # RESOLVED fast-path fallback timeout
     "momentum_resolved_force_close_sec":   ("MOMENTUM_RESOLVED_FORCE_CLOSE_SEC",    int),
+    # Strategy 5 — Opening Neutral
+    "opening_neutral_enabled":             ("OPENING_NEUTRAL_ENABLED",             bool),
+    "opening_neutral_dry_run":             ("OPENING_NEUTRAL_DRY_RUN",             bool),
 }
 
 
@@ -803,6 +809,9 @@ class ConfigPatch(BaseModel):
     chainlink_silence_watchdog_secs: int | None = None
     # RESOLVED fast-path fallback timeout
     momentum_resolved_force_close_sec: int | None = None
+    # Strategy 5 — Opening Neutral
+    opening_neutral_enabled: bool | None = None
+    opening_neutral_dry_run: bool | None = None
 
 
 @app.get("/config")
@@ -1043,6 +1052,9 @@ def get_config() -> dict:
         "chainlink_silence_watchdog_secs":     config.CHAINLINK_SILENCE_WATCHDOG_SECS,
         # RESOLVED fast-path fallback timeout
         "momentum_resolved_force_close_sec":   config.MOMENTUM_RESOLVED_FORCE_CLOSE_SEC,
+        # Strategy 5 — Opening Neutral
+        "opening_neutral_enabled":             config.OPENING_NEUTRAL_ENABLED,
+        "opening_neutral_dry_run":             config.OPENING_NEUTRAL_DRY_RUN,
         "timestamp":            time.time(),
     }
 
@@ -1966,6 +1978,8 @@ async def close_position_endpoint(market_id: str) -> dict:
 # Helpers live in ctf_utils.py so monitor.py can import them without creating
 # a circular dependency (api_server → monitor → api_server).
 from ctf_utils import _build_redeem_calldata, _redeem_ctf_via_safe  # noqa: E402
+from py_clob_client_v2.config import get_contract_config as _get_contract_config  # noqa: E402
+_POLY_CONTRACTS = _get_contract_config(137)  # Polygon mainnet — CTF + collateral addresses
 
 
 class RedeemRequest(BaseModel):
@@ -2050,9 +2064,8 @@ async def redeem_position_endpoint(req: RedeemRequest) -> dict:
         }
 
     try:
-        # ALWAYS READ OFFICIAL API SPECS — py-clob-client: https://github.com/Polymarket/py-clob-client
-        ctf_address = pm._clob.get_conditional_address()
-        collateral_address = pm._clob.get_collateral_address()
+        ctf_address = _POLY_CONTRACTS.conditional_tokens
+        collateral_address = _POLY_CONTRACTS.collateral
 
         # Redeem both outcome slots — CTF will pay the winning ones
         tx_hash = await _redeem_ctf_via_safe(
@@ -2613,6 +2626,36 @@ async def get_momentum_events(n: int = 200) -> dict:
     from strategies.Momentum.event_log import read_recent
     events = read_recent(n)
     return {"events": events, "count": len(events)}
+
+
+# ── Opening Neutral ───────────────────────────────────────────────────────────
+
+@app.get("/opening_neutral/status")
+def opening_neutral_status() -> dict:
+    """Strategy 5 (Opening Neutral) runtime status.
+
+    Returns:
+      enabled      — whether OPENING_NEUTRAL_ENABLED is True in config
+      dry_run      — whether OPENING_NEUTRAL_DRY_RUN is True (no real orders)
+      active_pairs — count of live YES+NO pairs currently tracked
+      pairs        — array of pair detail objects
+      recent_signals — last 20 scan-attempt diagnostics
+      timestamp    — unix epoch
+    """
+    if state.opening_neutral_ref is None:
+        return {
+            "enabled": config.OPENING_NEUTRAL_ENABLED,
+            "dry_run": config.OPENING_NEUTRAL_DRY_RUN,
+            "active_pairs": 0,
+            "pairs": [],
+            "recent_signals": [],
+            "scanner_running": False,
+            "timestamp": time.time(),
+        }
+    status = state.opening_neutral_ref.get_status()
+    status["scanner_running"] = getattr(state.opening_neutral_ref, "_running", False)
+    status["timestamp"] = time.time()
+    return status
 
 
 # ── Proxy ────────────────────────────────────────────────────────────────────

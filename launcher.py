@@ -34,6 +34,24 @@ LAUNCHER_PORT = 8081
 BOT_PORT = 8080
 BOT_SCRIPT = Path(__file__).parent / "main.py"
 
+# Resolve the venv Python — prefer the project venv over sys.executable so
+# the bot always runs with the correct interpreter regardless of how the
+# launcher itself was started (e.g. system Python, VS Code terminal, etc.).
+def _find_venv_python() -> str:
+    here = BOT_SCRIPT.parent
+    candidates = [
+        here.parent / ".venv" / "Scripts" / "python.exe",  # Windows
+        here.parent / ".venv" / "bin" / "python",           # Unix/macOS
+        here / ".venv" / "Scripts" / "python.exe",
+        here / ".venv" / "bin" / "python",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return sys.executable  # fallback: hope the current interpreter works
+
+BOT_PYTHON = _find_venv_python()
+
 app = FastAPI(title="Bot Launcher")
 app.add_middleware(
     CORSMiddleware,
@@ -78,7 +96,7 @@ def _spawn() -> subprocess.Popen:
     _kill_port(BOT_PORT)
     _port_free(BOT_PORT, timeout=5.0)
     return subprocess.Popen(
-        [sys.executable, str(BOT_SCRIPT)],
+        [BOT_PYTHON, str(BOT_SCRIPT)],
         cwd=str(BOT_SCRIPT.parent),
     )
 

@@ -297,6 +297,53 @@ STRATEGY_MISPRICING_ENABLED: bool = False   # Strategy 2: Deribit implied-prob m
 STRATEGY_MAKER_ENABLED: bool = False        # Strategy 1: PM market making + HL delta hedge
 STRATEGY_MOMENTUM_ENABLED: bool = False     # Strategy 3: Momentum / price-confirmation taker
 STRATEGY_SPREAD_ENABLED: bool = False       # Strategy 4: Calendar spread / relative-value
+OPENING_NEUTRAL_ENABLED: bool = False       # Strategy 5: Opening neutral (simultaneous YES+NO entry)
+
+# ── Strategy 5 — Opening Neutral ──────────────────────────────────────────
+# Market types the scanner watches for simultaneous YES+NO entry opportunities.
+# All bucket types are included — the _is_updown_market() filter ensures only
+# Up/Down direction markets are entered regardless of bucket size.
+OPENING_NEUTRAL_MARKET_TYPES: list = [
+    "bucket_5m", "bucket_15m", "bucket_1h", "bucket_4h"
+]
+# Entry window: only consider markets whose TTE is within this many seconds of opening.
+OPENING_NEUTRAL_ENTRY_WINDOW_SECS: int = 120
+# Maximum combined cost for YES + NO (≤ 1.0 = guaranteed profit at resolution;
+# ≤ 1.01 allows 1-tick slip / fee headroom).
+OPENING_NEUTRAL_COMBINED_COST_MAX: float = 1.02
+# USDC notional per leg (YES position = this; NO position = this).
+OPENING_NEUTRAL_SIZE_USD: float = 1.0
+# Order type for the entry BUY legs: "limit" (post-only at current ask — preferred)
+# or "market" (cross immediately; use when fills are hard to get at open).
+# The loser-exit SELL is always a resting limit order regardless of this setting.
+OPENING_NEUTRAL_ORDER_TYPE: str = "limit"
+# Seconds to wait for an entry fill before abandoning the attempt.
+OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS: int = 30
+# Seconds to wait for a WS fill confirmation on each FAK leg.
+# FAK orders are fill-or-kill at the exchange: if a fill WS event hasn't arrived
+# within this window the order was killed (no match) and the leg is treated as
+# unfilled.  Kept short so the one-leg decision is made in seconds, not 30s.
+OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS: int = 5
+# What to do when only one leg fills within the timeout.
+# "keep_as_momentum" — leave the filled leg running as a momentum position.
+# "exit_immediately" — taker-exit the filled leg at best bid.
+OPENING_NEUTRAL_ONE_LEG_FALLBACK: str = "keep_as_momentum"
+# Exit price for the losing leg: when either token's mid price drops to this
+# level a taker SELL is executed to recover partial value rather than riding
+# to $0.00 at resolution.  Net pair P&L = exit_price + $1.00 − 2×entry.
+OPENING_NEUTRAL_LOSER_EXIT_PRICE: float = 0.35
+# Per-side price band: both YES ask and NO ask must be within [MIN, MAX] for
+# an entry to qualify.  Keeps the strategy truly neutral (near 50/50) and
+# prevents entries into highly-skewed markets (e.g. YES=0.12 / NO=0.89)
+# where the exit logic breaks down and one leg is almost certain to lose.
+OPENING_NEUTRAL_MIN_SIDE_PRICE: float = 0.44
+OPENING_NEUTRAL_MAX_SIDE_PRICE: float = 0.56
+# Maximum simultaneous opening-neutral pairs.
+OPENING_NEUTRAL_MAX_CONCURRENT: int = 1
+# DRY_RUN: when True all order placements are skipped (no real orders sent).
+# Signals, pair tracking, and all logic run normally — only the pm_client calls
+# are suppressed.  Safe to deploy inactive; set False after validation.
+OPENING_NEUTRAL_DRY_RUN: bool = True
 
 # ── Strategy 3 — Momentum Scanner ─────────────────────────────────────────
 # Price band: scanner fires when held-side is in [LOW, HIGH].

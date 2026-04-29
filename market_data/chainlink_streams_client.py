@@ -248,7 +248,7 @@ class ChainlinkStreamsClient:
                 auth_headers = self._build_auth_headers()
                 async with websockets.connect(
                     url,
-                    extra_headers=auth_headers,
+                    additional_headers=auth_headers,
                     ping_interval=None,
                     open_timeout=15,
                 ) as ws:

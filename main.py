@@ -31,11 +31,33 @@ Signal flow (Strategy 2):
 from __future__ import annotations
 
 import asyncio
+import importlib.util as _iutil
 import os
 import signal
 import sys
 import time
 from pathlib import Path
+
+# ── Venv guard ────────────────────────────────────────────────────────────────
+# If invoked with system Python (e.g. `python main.py` without activating the
+# venv), py_clob_client_v2 will be missing.  Auto-relaunch with the project
+# venv so users don't need to manually activate it first.
+if _iutil.find_spec("py_clob_client_v2") is None:
+    _here = Path(__file__).resolve().parent
+    for _venv_py in [
+        _here.parent / ".venv" / "Scripts" / "python.exe",  # Windows
+        _here.parent / ".venv" / "bin" / "python",           # Unix/macOS
+        _here / ".venv" / "Scripts" / "python.exe",
+        _here / ".venv" / "bin" / "python",
+    ]:
+        if _venv_py.exists():
+            os.execv(str(_venv_py), [str(_venv_py)] + sys.argv)
+    sys.exit(
+        "ERROR: py_clob_client_v2 not found.\n"
+        "Activate the venv first:  C:\\GitHub\\.venv\\Scripts\\Activate.ps1\n"
+        "Or run directly:  C:\\GitHub\\.venv\\Scripts\\python.exe main.py"
+    )
+del _iutil
 
 # Load .env before importing anything that reads env vars
 try:
@@ -60,6 +82,7 @@ from strategies.mispricing.strategy import MispricingScanner
 from strategies.mispricing.signals import MispricingSignal
 from strategies.Momentum.scanner import MomentumScanner
 from strategies.Momentum.vol_fetcher import VolFetcher
+from strategies.OpeningNeutral import OpeningNeutralScanner
 from agent import AgentDecisionLayer, AgentDecision
 from monitor import PositionMonitor, compute_unrealised_pnl
 from fill_simulator import FillSimulator
@@ -450,6 +473,9 @@ async def state_sync_loop(
                     "signal_score": pos.signal_score,
                     # Legacy field — null for all new positions
                     "spread_id": pos.spread_id,
+                    # Opening neutral pair tracking — non-empty for strategy="opening_neutral"
+                    # positions before the loser exits; cleared on winner after promotion.
+                    "neutral_pair_id": pos.neutral_pair_id or None,
                     "strike": pos.strike if pos.strike else None,
                     # GTD hedge (momentum strategy only)
                     "hedge_order_id": pos.hedge_order_id or None,
@@ -697,6 +723,15 @@ async def main() -> None:
 
     momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, spot_client=spot_oracle, on_signal=_on_momentum_signal)
 
+    opening_neutral_scanner: OpeningNeutralScanner | None = None
+    if config.OPENING_NEUTRAL_ENABLED:
+        opening_neutral_scanner = OpeningNeutralScanner(
+            pm, risk_engine, spot_oracle, vol_fetcher,
+            momentum_scanner=momentum_scanner,
+            on_close_callback=None,  # patched after _on_position_close is defined
+            on_open_callback=notify_state_changed,
+        )
+
     def _on_position_close(market_id: str) -> None:
         """Notify both strategy scanners when any position closes.
 
@@ -710,6 +745,10 @@ async def main() -> None:
         scanner.record_trade_close(market_id)
         momentum_scanner.record_trade_close(market_id)
         notify_state_changed()
+
+    # Patch opening_neutral on_close_callback now that _on_position_close exists.
+    if opening_neutral_scanner is not None:
+        opening_neutral_scanner._on_close_callback = _on_position_close
 
     def _on_momentum_stop_loss(market_id: str, tte_remaining: float) -> None:
         """Block re-entry into a market for the rest of its window after a stop-loss.
@@ -734,6 +773,7 @@ async def main() -> None:
     api_state.pm_ref = pm
     api_state.risk_ref = risk_engine
     api_state.momentum_ref = momentum_scanner
+    api_state.opening_neutral_ref = opening_neutral_scanner
 
     # ── Connect clients ──────────────────────────────────────────────────────
     log.info("Connecting PM client…")
@@ -762,6 +802,8 @@ async def main() -> None:
         asyncio.create_task(maker.start(), name="maker"),
         asyncio.create_task(scanner.start(), name="scanner"),
         asyncio.create_task(momentum_scanner.start(), name="momentum"),
+        *([asyncio.create_task(opening_neutral_scanner.start(), name="opening_neutral")]
+          if opening_neutral_scanner is not None else []),
         asyncio.create_task(
             agent_loop(pm, agent, monitor, risk_engine),
             name="agent_loop",

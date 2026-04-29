@@ -720,6 +720,20 @@ class MomentumScanner(BaseStrategy):
                 scan_diags.append(_d)
                 continue
 
+            # ── Opening-neutral conflict guard ───────────────────────────────
+            # Skip if the opening_neutral scanner already has an active position
+            # in this market (both YES and NO legs are open or one is still live).
+            # Gate 20 (duplicate_position) below also catches post-fill conflicts,
+            # but this early check improves diagnostics before the CLOB lookup.
+            if any(
+                p.market_id == market.condition_id and p.strategy == "opening_neutral"
+                for p in self._risk.get_open_positions()
+            ):
+                skipped_duplicate += 1
+                _d["skip_reason"] = "opening_neutral_active"
+                scan_diags.append(_d)
+                continue
+
             # ── Oracle spot (source depends on market type) ───────────────────
             # 5m / 15m / 4h → Chainlink (matches Polymarket's resolution oracle).
             # 1h / daily / weekly → RTDS exchange-aggregated.

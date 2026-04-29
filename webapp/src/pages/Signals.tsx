@@ -3,7 +3,7 @@
  * open orders (deployed quotes), and Strategy 2 mispricing signal history.
  */
 import { useState } from "react";
-import { useSignals, useConfig, useMakerSignals, useCapital, useMomentumDiagnostics, deploySignal } from "../api/client";
+import { useSignals, useConfig, useMakerSignals, useCapital, useMomentumDiagnostics, deploySignal, useOpeningNeutralStatus } from "../api/client";
 import type { MomentumDiagnosticMarket } from "../api/client";
 import { usePolymarketEventSlugs } from "../utils/usePolymarketEventSlugs";
 
@@ -102,6 +102,7 @@ export default function Signals() {
   const { data: capital } = useCapital();
 
   const { data: diagData } = useMomentumDiagnostics();
+  const { data: onStatus } = useOpeningNeutralStatus();
   const slugMap = usePolymarketEventSlugs();
   const [actionPending, setActionPending] = useState<string | null>(null);
   const [momentumSort, setMomentumSort] = useState<{ col: string; dir: "asc" | "desc" }>({ col: "gap_pct", dir: "desc" });
@@ -547,6 +548,197 @@ export default function Signals() {
           );
         })()}
       </section>
+
+      {/* ── Strategy 5: Opening Neutral ─────────────────────────────────────── */}
+      {onStatus && (
+        <section style={{ marginTop: "2rem" }}>
+          <h3 style={{ marginBottom: "0.5rem" }}>
+            Strategy 5 — Opening Neutral
+            <span
+              className="tag"
+              style={{
+                marginLeft: "0.75rem",
+                background: onStatus.enabled ? "#0c2a3d" : "#1f2937",
+                color: onStatus.enabled ? "#38bdf8" : "#64748b",
+                fontSize: "0.75rem",
+              }}
+            >
+              {onStatus.enabled ? "ENABLED" : "DISABLED"}
+            </span>
+            {onStatus.dry_run && (
+              <span className="tag" style={{ marginLeft: "0.5rem", background: "#451a03", color: "#fb923c", fontSize: "0.75rem" }}>
+                DRY RUN
+              </span>
+            )}
+          </h3>
+          <p className="muted">
+            Buys YES + NO at open, then exits the loser leg after a σ_τ price move — converts winner to momentum.
+          </p>
+
+          {/* ── Live Tracking Table ─────────────────────────────────────────── */}
+          <h4 style={{ marginTop: "1.25rem", marginBottom: "0.4rem", color: "#94a3b8", fontWeight: 500, fontSize: "0.85rem" }}>
+            Tracking ({(onStatus.tracked_markets?.length ?? 0)} markets)
+            <span style={{ marginLeft: "0.5rem", color: "#4b5563", fontWeight: 400, fontSize: "0.78rem" }}>
+              — live CLOB prices, 1 s poll
+            </span>
+          </h4>
+          {(onStatus.tracked_markets?.length ?? 0) === 0 ? (
+            <p className="muted" style={{ marginTop: "0.25rem" }}>No markets in tracking window.</p>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table className="data-table" style={{ fontSize: "0.82rem" }}>
+                <thead>
+                  <tr>
+                    <th>Market</th>
+                    <th>Type</th>
+                    <th title="Current best ask for YES token">YES Ask</th>
+                    <th title="Current best ask for NO token">NO Ask</th>
+                    <th title="Combined cost = YES ask + NO ask">Σ Cost</th>
+                    <th title="Time remaining until market resolves">TTE</th>
+                    <th title="Time since market opened (entry window = first 120 s)">Window</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {onStatus.tracked_markets.map((m, i) => {
+                    const combined = m.combined;
+                    const threshold = 1.01; // OPENING_NEUTRAL_COMBINED_COST_MAX
+                    const overThreshold = combined != null && combined > threshold;
+                    const entryWindowSecs = onStatus.entry_window_secs ?? 120;
+                    const elapsed = m.elapsed_secs ?? 0;
+                    const windowPct = Math.min(100, Math.round((elapsed / entryWindowSecs) * 100));
+                    const tteSecs = m.tte_secs ?? 0;
+                    const tteLabel = tteSecs >= 3600
+                      ? `${Math.floor(tteSecs / 3600)}h ${Math.floor((tteSecs % 3600) / 60)}m`
+                      : tteSecs >= 60 ? `${Math.floor(tteSecs / 60)}m ${tteSecs % 60}s`
+                      : `${tteSecs}s`;
+                    return (
+                      <tr key={m.market_id} style={{ opacity: m.entered ? 0.55 : m.entering ? 0.75 : 1 }}>
+                        <td title={m.market_title} style={{ maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {m.market_title}
+                        </td>
+                        <td style={{ color: "#94a3b8", fontFamily: "monospace", fontSize: "0.75rem" }}>
+                          {m.market_type}
+                        </td>
+                        <td style={{ fontFamily: "monospace", color: "#22c55e" }}>
+                          {m.yes_ask != null ? `${(m.yes_ask * 100).toFixed(1)}¢` : "—"}
+                        </td>
+                        <td style={{ fontFamily: "monospace", color: "#f87171" }}>
+                          {m.no_ask != null ? `${(m.no_ask * 100).toFixed(1)}¢` : "—"}
+                        </td>
+                        <td style={{ fontFamily: "monospace", fontWeight: 600, color: overThreshold ? "#ef4444" : "#22c55e" }}>
+                          {combined != null ? combined.toFixed(3) : "—"}
+                        </td>
+                        <td style={{ fontFamily: "monospace", color: tteSecs < 60 ? "#f59e0b" : "#94a3b8" }}>
+                          {tteLabel}
+                        </td>
+                        <td style={{ minWidth: 110 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                            <div style={{ flex: 1, height: 4, borderRadius: 2, background: "#1f2937", overflow: "hidden" }}>
+                              <div style={{
+                                height: "100%",
+                                width: `${windowPct}%`,
+                                borderRadius: 2,
+                                background: windowPct >= 100 ? "#4b5563" : windowPct > 70 ? "#f59e0b" : "#38bdf8",
+                                transition: "width 0.3s",
+                              }} />
+                            </div>
+                            <span style={{ fontFamily: "monospace", fontSize: "0.72rem", color: "#6b7280", whiteSpace: "nowrap" }}>
+                              {elapsed}s / {entryWindowSecs}s
+                            </span>
+                          </div>
+                        </td>
+                        <td>
+                          {m.entered ? (
+                            <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: "0.75rem", fontWeight: 500, background: "#0c2a3d", color: "#38bdf8", border: "1px solid #38bdf844" }}>
+                              ✓ Entered
+                            </span>
+                          ) : m.entering ? (
+                            <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: "0.75rem", fontWeight: 500, background: "#1c1f2a", color: "#a78bfa", border: "1px solid #a78bfa44" }}>
+                              ⟳ Entering…
+                            </span>
+                          ) : overThreshold ? (
+                            <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: "0.75rem", fontWeight: 500, background: "#1f2937", color: "#64748b", border: "1px solid #ffffff11" }}>
+                              Too expensive
+                            </span>
+                          ) : (
+                            <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: "0.75rem", fontWeight: 500, background: "#0f2e1a", color: "#4ade80", border: "1px solid #4ade8033" }}>
+                              ✦ Qualifying
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* ── Signal Log ─────────────────────────────────────────────────── */}
+          {(onStatus.recent_signals?.length ?? 0) > 0 && (
+            <>
+              <h4 style={{ marginTop: "1.5rem", marginBottom: "0.4rem", color: "#6b7280", fontWeight: 500, fontSize: "0.82rem" }}>
+                Signal Log (entry attempts)
+              </h4>
+              <div style={{ overflowX: "auto" }}>
+                <table className="data-table" style={{ fontSize: "0.78rem", opacity: 0.8 }}>
+                  <thead>
+                    <tr>
+                      <th>Market</th>
+                      <th>YES Ask</th>
+                      <th>NO Ask</th>
+                      <th>Σ Cost</th>
+                      <th>TTE at scan</th>
+                      <th>Scanned at</th>
+                      <th>Result</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {onStatus.recent_signals.slice().reverse().map((sig, i) => {
+                      const combined = sig.combined;
+                      const overThreshold = combined != null && combined > sig.threshold;
+                      const isEntry = sig.result === "entry_attempt";
+                      const tteSecs = sig.tte_secs ?? 0;
+                      const tteLabel = tteSecs >= 60 ? `${Math.floor(tteSecs / 60)}m ${tteSecs % 60}s` : `${tteSecs}s`;
+                      const scannedAt = sig.ts ? new Date(sig.ts).toLocaleTimeString() : "—";
+                      return (
+                        <tr key={i}>
+                          <td title={sig.market_title} style={{ maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {sig.market_title}
+                          </td>
+                          <td style={{ fontFamily: "monospace", color: "#22c55e" }}>
+                            {sig.yes_ask != null ? `${(sig.yes_ask * 100).toFixed(1)}¢` : "—"}
+                          </td>
+                          <td style={{ fontFamily: "monospace", color: "#f87171" }}>
+                            {sig.no_ask != null ? `${(sig.no_ask * 100).toFixed(1)}¢` : "—"}
+                          </td>
+                          <td style={{ fontFamily: "monospace", fontWeight: 600, color: overThreshold ? "#ef4444" : "#22c55e" }}>
+                            {combined != null ? combined.toFixed(3) : "—"}
+                          </td>
+                          <td style={{ fontFamily: "monospace", color: "#64748b" }}>{tteLabel}</td>
+                          <td style={{ fontFamily: "monospace", color: "#4b5563", fontSize: "0.75rem" }}>{scannedAt}</td>
+                          <td>
+                            <span style={{
+                              padding: "2px 8px", borderRadius: 4, fontSize: "0.72rem", fontWeight: 500,
+                              background: isEntry ? "#0c2a3d" : "#1f2937",
+                              color: isEntry ? "#38bdf8" : "#64748b",
+                              border: `1px solid ${isEntry ? "#38bdf844" : "#ffffff11"}`,
+                              whiteSpace: "nowrap",
+                            }}>
+                              {isEntry ? (onStatus.dry_run ? "▶ Sim entry" : "▶ Entry attempt") : sig.result === "too_expensive" ? "✗ Too expensive" : sig.result}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </section>
+      )}
     </div>
   );
 }

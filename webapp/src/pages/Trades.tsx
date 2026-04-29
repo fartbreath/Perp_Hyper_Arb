@@ -103,6 +103,11 @@ function aggregateToMarkets(trades: Trade[], typeFilter: string): MarketGroup[] 
     // Separate GTD hedge fill rows from main position legs
     const legs        = allRows.filter(t => t.strategy !== "momentum_hedge");
     const hedgeTrades = allRows.filter(t => t.strategy === "momentum_hedge");
+
+    // If no main legs, the hedge belongs to a still-open position — skip for now.
+    // It will be grouped correctly once the main position closes and adds its row.
+    if (legs.length === 0) continue;
+
     // Use first main leg for market metadata; fall back to first row if only hedges exist
     const first = legs[0] ?? allRows[0];
     const mtype = first.market_type ?? "";
@@ -206,6 +211,24 @@ function TypeBadge({ t }: { t: string }) {
       color: "#fff", fontSize: "0.72em", fontWeight: 700,
       padding: "2px 6px", borderRadius: 4,
     }}>{t}</span>
+  );
+}
+
+function StrategyBadge({ s }: { s: string }) {
+  const map: Record<string, [string, string]> = {
+    momentum:         ["#2563eb", "Momentum"],
+    range:            ["#0d9488", "Range"],
+    mispricing:       ["#7c3aed", "Mispricing"],
+    maker:            ["#15803d", "Maker"],
+    opening_neutral:  ["#0284c7", "OpenNeutral"],
+  };
+  const key = s?.toLowerCase() ?? "";
+  const [bg, label] = map[key] ?? ["#475569", s || "—"];
+  return (
+    <span style={{
+      background: bg, color: "#fff", fontSize: "0.72em", fontWeight: 700,
+      padding: "2px 6px", borderRadius: 4, whiteSpace: "nowrap",
+    }}>{label}</span>
   );
 }
 
@@ -824,6 +847,7 @@ export default function Trades() {
                 <th style={{ width: 36 }}></th>
                 <th>Market</th>
                 <th>Type</th>
+                <th>Strategy</th>
                 <th>Underlying</th>
                 <th>Side(s)</th>
                 <th>Close Type</th>
@@ -855,12 +879,10 @@ export default function Trades() {
                       </td>
 
                       {/* type badge */}
-                      <td>
-                        <TypeBadge t={g.market_type} />
-                        {g.strategy === "range" && (
-                          <span style={{ marginLeft: 4, background: "#0d9488", color: "#fff", fontSize: "0.72em", fontWeight: 700, padding: "2px 6px", borderRadius: 4 }}>RANGE</span>
-                        )}
-                      </td>
+                      <td><TypeBadge t={g.market_type} /></td>
+
+                      {/* strategy badge */}
+                      <td><StrategyBadge s={g.strategy} /></td>
 
                       {/* underlying */}
                       <td style={{ fontWeight: 600 }}>{g.underlying}</td>

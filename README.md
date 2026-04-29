@@ -12,6 +12,8 @@ A semi-automated crypto trading bot that runs three complementary strategies: ma
 
 **Strategy 3 — Momentum Scanner:** Runs a price-confirmation taker strategy that enters high-probability contracts when Polymarket token prices and spot movement jointly confirm momentum. It supports volatility-aware thresholds, per-market cooldowns, fractional Kelly position sizing (with per-bucket dampeners and a negative-EV guard), stop-loss / take-profit exits with correct directional delta for both reach-market and dip-market NO positions, a near-expiry protective exit, and an optional range-market sub-strategy for "Will BTC be between $X and $Y?" markets.
 
+**Strategy 5 — Opening Neutral:** Simultaneously buys the YES and NO token of the same Up/Down bucket market within a short window of market open (default 120 s). When both FAK legs fill at a combined cost ≤ $1.00 the pair is guaranteed-profitable at resolution regardless of direction — the winning token pays out $1.00. When only one leg fills (the exchange killed the other FAK), the surviving leg is either promoted to a standard momentum position or immediately taker-exited. A price skew filter (`[0.44, 0.56]`) ensures both sides are priced near 50¢, keeping the strategy truly neutral. Full spec: [strategies/OpeningNeutral/PLAN.md](strategies/OpeningNeutral/PLAN.md).
+
 All strategies start in **paper trading mode** (no real funds). Switching to live is a single config change.
 
 ---
@@ -43,9 +45,11 @@ Perp_Hyper_Arb/
 ├── strategies/
 │   ├── maker/                # Strategy 1: quoting, repricing, inventory skew, hedge
 │   ├── mispricing/           # Strategy 2: signal generation, Kalshi + N(d₂) filters
-│   └── Momentum/             # Strategy 3: momentum scanner + taker execution
-│       ├── market_utils.py   #   shared market-classification + strike-extraction helpers
-│       └── ...
+│   ├── Momentum/             # Strategy 3: momentum scanner + taker execution
+│   │   ├── market_utils.py   #   shared market-classification + strike-extraction helpers
+│   │   └── ...
+│   └── OpeningNeutral/       # Strategy 5: simultaneous YES+NO FAK entry at market open
+│       └── scanner.py
 │
 ├── tests/                    # Pytest suite
 ├── data/                     # CSV trade logs, paper trade records, analysis scripts (data/_*.py)
@@ -64,6 +68,7 @@ rtds_client.start()       ← Polymarket RTDS WS (crypto_prices + crypto_prices_
                             + Polygon WSS on-chain Chainlink oracle (AggregatorV3 AnswerUpdated)
 maker_strategy.start()    ← quoting sweep + hedge debounce (reprice trigger = RTDS tick)
 momentum_scanner.start()  ← scan every 5-10 s + event-driven entry (PM ticks + RTDS/Chainlink ticks)
+opening_neutral_scanner.start() ← polls for market opens; simultaneous YES+NO FAK entry (if OPENING_NEUTRAL_ENABLED)
 mispricing_scanner.start()← scan every 60 s (spot price from RTDS)
 agent_loop()              ← consumes signal queue from scanner
 api_server                ← FastAPI REST for webapp
@@ -192,6 +197,10 @@ Key parameters:
 | `STRATEGY_MISPRICING_ENABLED` | `False` | Enable the mispricing scanner |
 | `STRATEGY_MOMENTUM_ENABLED` | `False` | Enable the momentum scanner |
 | `MOMENTUM_RANGE_ENABLED` | `False` | Include range ("between $X and $Y") markets in the momentum scan |
+| `OPENING_NEUTRAL_ENABLED` | `False` | Enable the opening neutral strategy (Strategy 5) |
+| `OPENING_NEUTRAL_DRY_RUN` | `True` | Signals and pair tracking run normally; no real orders placed |
+| `OPENING_NEUTRAL_SIZE_USD` | `1.0` | USDC notional per leg (YES and NO each get this amount) |
+| `OPENING_NEUTRAL_ONE_LEG_FALLBACK` | `"keep_as_momentum"` | Action when only one FAK leg fills: `"keep_as_momentum"` or `"exit_immediately"` |
 | `HEDGE_THRESHOLD_USD` | `100` | Net inventory before a perp hedge fires (USD) |
 | `MOMENTUM_SCAN_INTERVAL` | `10` | Seconds between momentum scan passes |
 | `MAX_QUOTE_AGE_SECONDS` | `30` | Backstop reprice interval |
@@ -202,6 +211,15 @@ Key parameters:
 ---
 
 ## Recent Changes
+
+### 2026-04-29 — Strategy 5 (Opening Neutral); CLOB v2 migration; hedge SL fix; venv auto-detection
+
+- **Strategy 5 — Opening Neutral** (`strategies/OpeningNeutral/scanner.py`, `config.py`, `main.py`, `api_server.py`): Simultaneous YES+NO FAK entry at bucket market open. Both legs combined cost ≤ $1.00 guarantees profit at resolution regardless of direction. One-leg fallback: promote to momentum or taker-exit. 14 new `OPENING_NEUTRAL_*` config params. `neutral_pair_id` on `Position`. `GET /opening_neutral/status` endpoint. Opening-neutral conflict guard added to Momentum scanner.
+- **CLOB v2 migration** (`pm_client.py`, `monitor.py`, `api_server.py`): Fully migrated to `py_clob_client_v2`. FAK path uses `MarketOrderArgs` / `create_market_order`. `cancel` → `cancel_order(OrderPayload(...))`. `get_orders` → `get_open_orders`. Redeem endpoints now use `_get_contract_config(137)` (removed broken `get_conditional_address()` / `get_collateral_address()` calls).
+- **Hedge SL suppression fix** (`monitor.py`): `_hedge_active` now checks `size_filled > 0`; an unfilled or cancelled hedge no longer suppresses stop-losses on a naked position.
+- **Launcher venv auto-detection** (`launcher.py`, `main.py`): `launcher.py` resolves the project `.venv` Python automatically; `main.py` venv guard auto-relaunches with the correct interpreter when `py_clob_client_v2` is missing.
+- **`pm_client.py` stability**: Gamma slug-fetch exceptions now skip the failed slug rather than aborting the full refresh. Multi-strategy token registration via `register_for_book_updates(owner=...)` prevents strategies from overwriting each other's WS subscriptions. Order size rounded to 2dp for CLOB API compliance. `fetch_market_resolution` returns `None` instead of falling back to the `price` field when winner flags are absent.
+- **Tests**: 1,569 collected; updated throughout for v2 (`py_clob_client_v2` imports, `create_market_order`, `cancel_order(OrderPayload(...))`, stale mocks removed).
 
 ### 2026-04-21 — HedgeOrder lifecycle entity; async CLOB I/O; market_pnl API; sortable Signals table
 
@@ -268,6 +286,7 @@ The API server runs on port 8080. Read-only endpoints are open; mutating endpoin
 | `GET /signals` | Mispricing signal history |
 | `GET /momentum/signals` | Momentum signal history |
 | `GET /momentum/diagnostics` | Momentum scanner diagnostics and skip reasons |
+| `GET /opening_neutral/status` | Opening Neutral strategy status: enabled, dry_run, active pairs, recent scan signals |
 | `GET /maker/quotes` | Active resting quotes |
 | `GET /maker/signals` | Maker signal evaluation history |
 | `GET /maker/capital` | Capital allocation per market |
@@ -328,7 +347,7 @@ pytest tests/test_maker.py -v
 pytest --cov=. --cov-report=term-missing
 ```
 
-**1,095 tests collected** (unit tests; live RTDS/on-chain tests excluded from default run) as of the current release.
+**1,569 tests collected** (unit tests; live RTDS/on-chain tests excluded from default run) as of the current release.
 
 Test files:
 - `tests/test_maker.py` — strategy quoting, repricing, inventory skew, edge filters
@@ -364,6 +383,7 @@ Test files:
 | [MAKER_STRATEGY.md](MAKER_STRATEGY.md) | Full market making strategy spec: quoting, repricing, hedging, fills, paper mode, config reference |
 | [MISPRICING_STRATEGY.md](MISPRICING_STRATEGY.md) | Mispricing strategy: Kalshi + N(d₂) signal layers, known flaws, config reference |
 | [strategies/Momentum/MomentumStrategy.md](strategies/Momentum/MomentumStrategy.md) | Momentum strategy spec: entry gates, volatility model, cooldowns, exits, diagnostics |
+| [strategies/OpeningNeutral/PLAN.md](strategies/OpeningNeutral/PLAN.md) | Opening Neutral strategy spec: entry logic, FAK fill handling, one-leg fallback, pair accounting |
 | [Plan.md](Plan.md) | Original project plan: fee analysis, architecture rationale, environment setup |
 | [webapp/README.md](webapp/README.md) | Webapp routes, API hooks, and local development notes |
 | [design.md](design.md) | UI/UX design spec for the webapp (founding document, March 2026) |

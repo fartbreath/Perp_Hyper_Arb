@@ -75,6 +75,8 @@ from market_data.pm_client import PMClient, _MARKET_TYPE_DURATION_SECS
 from market_data.rtds_client import RTDSClient
 from market_data.spot_oracle import SpotOracle
 from ctf_utils import _redeem_ctf_via_safe
+from py_clob_client_v2.config import get_contract_config as _get_contract_config
+_POLY_CONTRACTS = _get_contract_config(137)  # Polygon mainnet — CTF + collateral addresses
 from strategies.Momentum.event_log import emit as _emit_event
 
 log = get_bot_logger(__name__)
@@ -485,12 +487,18 @@ def should_exit(
         # previously blocked this block entirely — causing missed stop-losses).
         _oracle_delta_pct: Optional[float] = None  # captured below for prob-SL gate
         # Hedge suppression: when MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL is True and
-        # the position has a resting GTD hedge order, suppress ALL stop-losses
-        # (oracle delta SL, near-expiry stop, and prob-SL).  The hedge is the
-        # insurance leg — it bounds the downside, so any SL exit would lock in
-        # a loss before the hedge can pay off at resolution.
+        # the position has a GTD hedge order that has at least partially filled,
+        # suppress ALL stop-losses (oracle delta SL, near-expiry stop, and prob-SL).
+        # The hedge is the insurance leg — it bounds the downside, so any SL exit
+        # would lock in a loss before the hedge can pay off at resolution.
         # Take-profit remains active (winning path, hedge irrelevant).
-        _hedge_active = bool(pos.hedge_order_id)
+        # IMPORTANT: suppress ONLY if the hedge has actually filled (size_filled > 0).
+        # An unfilled/cancelled hedge provides zero insurance — suppressing SLs
+        # in that state leaves the position naked with no protection.
+        _hedge_active = False
+        if pos.hedge_order_id:
+            _ho = self._risk.get_hedge_order(pos.hedge_order_id)
+            _hedge_active = _ho is not None and _ho.size_filled > 0
         _suppress_all_sl = (
             config.MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL and _hedge_active
         )
@@ -1868,8 +1876,8 @@ class PositionMonitor:
             # Mark BEFORE the async call so a crash doesn't cause a double-submit.
             self._redeemed_tokens.add(token_id)
             try:
-                ctf_address = self._pm._clob.get_conditional_address()
-                collateral_address = self._pm._clob.get_collateral_address()
+                ctf_address = _POLY_CONTRACTS.conditional_tokens
+                collateral_address = _POLY_CONTRACTS.collateral
                 tx_hash = await _redeem_ctf_via_safe(
                     ctf_address=ctf_address,
                     collateral=collateral_address,

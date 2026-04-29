@@ -629,8 +629,6 @@ class TestAutoRedeemDedup:
         pm.fetch_token_side = AsyncMock(return_value="yes")
         pm.get_markets = MagicMock(return_value={})
         pm._clob = MagicMock()
-        pm._clob.get_conditional_address = MagicMock(return_value="0xCTF")
-        pm._clob.get_collateral_address = MagicMock(return_value="0xUSDC")
         risk = MagicMock()
         risk.get_positions = MagicMock(return_value={})
         risk.get_position_by_hedge_token = MagicMock(return_value=None)  # not a hedge token
@@ -755,16 +753,19 @@ class TestPlaceLimitToThread:
     # -- 2. Taker limit (post_only=False) uses FAK order type -------------------
 
     def test_place_limit_taker_uses_fak(self):
-        """post_only=False: post_order is called with OrderType.FAK."""
-        from py_clob_client.clob_types import OrderType as _OT
+        """post_only=False: uses MarketOrderArgs/create_market_order and posts with OrderType.FAK."""
+        from py_clob_client_v2.clob_types import OrderType as _OT
         client = self._make_client()
-        client._clob.create_order = MagicMock(return_value="signed")
+        client._clob.create_market_order = MagicMock(return_value="signed")
         client._clob.post_order = MagicMock(return_value={"orderID": "fak-001"})
 
         self._run(
             client.place_limit("tok", "BUY", 0.80, 10.0,
                                market=self._make_market(), post_only=False)
         )
+        # FAK path must use create_market_order, never create_order
+        client._clob.create_market_order.assert_called_once()
+        client._clob.create_order.assert_not_called()
         call_args = client._clob.post_order.call_args
         # Second positional arg is the order type
         assert call_args[0][1] == _OT.FAK
@@ -773,7 +774,7 @@ class TestPlaceLimitToThread:
 
     def test_place_limit_maker_uses_gtc(self):
         """post_only=True: post_order is called with OrderType.GTC."""
-        from py_clob_client.clob_types import OrderType as _OT
+        from py_clob_client_v2.clob_types import OrderType as _OT
         client = self._make_client()
         client._clob.create_order = MagicMock(return_value="signed")
         client._clob.post_order = MagicMock(return_value={"orderID": "gtc-001"})
@@ -855,7 +856,8 @@ class TestPlaceLimitToThread:
     def test_place_limit_taker_crosses_book_no_retry(self):
         """post_only=False: 'crosses book' is not retried (taker orders are valid crossings)."""
         client = self._make_client()
-        client._clob.create_order = MagicMock(return_value="signed")
+        # FAK path uses create_market_order, not create_order
+        client._clob.create_market_order = MagicMock(return_value="signed")
         client._clob.post_order = MagicMock(side_effect=Exception("crosses book"))
 
         result = self._run(
@@ -864,8 +866,9 @@ class TestPlaceLimitToThread:
         )
         # Taker: no retry, returns None
         assert result is None
-        # create_order called exactly once (no retry)
-        assert client._clob.create_order.call_count == 1
+        # create_market_order called exactly once (no retry); create_order never called
+        assert client._clob.create_market_order.call_count == 1
+        client._clob.create_order.assert_not_called()
 
     # -- 9. Event loop stays alive: concurrent coroutine progresses -------------
 
@@ -960,7 +963,7 @@ class TestPlaceMarketToThread:
 
     def test_place_market_uses_fak(self):
         """post_order is always called with OrderType.FAK for market orders."""
-        from py_clob_client.clob_types import OrderType as _OT
+        from py_clob_client_v2.clob_types import OrderType as _OT
         client = self._make_client()
         client._clob.create_market_order = MagicMock(return_value="signed")
         client._clob.post_order = MagicMock(return_value={"orderID": "fak-mkt-001"})
@@ -1043,18 +1046,19 @@ class TestCancelOrderToThread:
     # -- 1. cancel_order success -----------------------------------------------
 
     def test_cancel_order_returns_true_on_success(self):
+        from py_clob_client_v2.clob_types import OrderPayload
         client = self._make_client()
-        client._clob.cancel = MagicMock(return_value=None)
+        client._clob.cancel_order = MagicMock(return_value=None)
 
         result = self._run(client.cancel_order("order-abc"))
         assert result is True
-        client._clob.cancel.assert_called_once_with("order-abc")
+        client._clob.cancel_order.assert_called_once_with(OrderPayload(orderID="order-abc"))
 
     # -- 2. cancel_order 404 / exception → False (not a crash) -----------------
 
     def test_cancel_order_exception_returns_false(self):
         client = self._make_client()
-        client._clob.cancel = MagicMock(side_effect=Exception("404 not found"))
+        client._clob.cancel_order = MagicMock(side_effect=Exception("404 not found"))
 
         result = self._run(client.cancel_order("order-gone"))
         assert result is False
@@ -1086,10 +1090,10 @@ class TestCancelOrderToThread:
         client = self._make_client()
         progress = {"ran": False}
 
-        def _slow_cancel(order_id):
+        def _slow_cancel(payload):
             _time.sleep(0.01)
 
-        client._clob.cancel = MagicMock(side_effect=_slow_cancel)
+        client._clob.cancel_order = MagicMock(side_effect=_slow_cancel)
 
         async def _concurrent():
             await asyncio.sleep(0.005)
@@ -1112,7 +1116,7 @@ class TestCancelOrderToThread:
 
         result = self._run(client.cancel_order("order-paper"))
         assert result is True
-        client._clob.cancel.assert_not_called()
+        client._clob.cancel_order.assert_not_called()
 
     # -- 7. paper mode cancel_all ----------------------------------------------
 
@@ -1130,7 +1134,7 @@ class TestCancelOrderToThread:
 # Places an extremely tight (non-fillable) resting post-only order on a real
 # Polymarket market using authenticated CLOB credentials, then immediately
 # cancels it.  Verifies:
-#   - asyncio.to_thread wrapping works with the real py_clob_client SDK
+#   - asyncio.to_thread wrapping works with the real py_clob_client_v2 SDK
 #   - No event loop errors (SynchronousOnlyOperation, etc.)
 #   - cancel_order succeeds on the live order_id
 #
@@ -1323,8 +1327,13 @@ class TestFetchMarketResolution:
             "price field incorrectly took priority over winner flag"
         )
 
-    def test_no_winner_flag_falls_back_to_yes_price(self):
-        """When winner flag absent, falls back to YES token price."""
+    def test_no_winner_flag_returns_none_for_retry(self):
+        """When winner flag absent, returns None so caller can retry later.
+
+        The preamble rule forbids inferring WIN/LOSS from `price` because a
+        losing token can briefly show ~1.0 right after settlement.  The
+        correct behaviour is to return None and let the caller retry.
+        """
         payload = {
             "closed": True,
             "tokens": [
@@ -1335,7 +1344,7 @@ class TestFetchMarketResolution:
         client = self._make_client()
         with patch("aiohttp.ClientSession", self._mock_response(payload)):
             result = self._run(client.fetch_market_resolution("cid_004"))
-        assert result == 1.0
+        assert result is None, "Should return None (not infer from price) when winner flag absent"
 
     def test_not_closed_returns_none(self):
         """Market not yet closed → None (do not record a resolution)."""

@@ -430,6 +430,22 @@ export default function Settings() {
           value={momentumOn}
           onChange={(v) => apply({ strategy_momentum: v })}
         />
+
+        {GAP}
+
+        <Toggle
+          label="Opening Neutral (Strategy 5)"
+          description="Buy YES + NO at bucket open, exit loser after σ_τ move — converts winner to momentum. Restart required to activate/deactivate."
+          value={data.opening_neutral_enabled ?? false}
+          onChange={(v) => apply({ opening_neutral_enabled: v })}
+        />
+        {GAP}
+        <Toggle
+          label="Opening Neutral — Dry Run"
+          description="When ON, scanner runs and logs signals but places no real orders. Safe to disable once you've validated signals."
+          value={data.opening_neutral_dry_run ?? true}
+          onChange={(v) => apply({ opening_neutral_dry_run: v })}
+        />
       </div>
 
       {/* ── 3. Market Types ──────────────────────────────────────────── */}

@@ -31,16 +31,17 @@ import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
     ApiCreds,
     MarketOrderArgs,
     OpenOrderParams,
     OrderArgs,
+    OrderPayload,
     OrderType,
     TradeParams,
 )
-from py_clob_client.exceptions import PolyApiException
+from py_clob_client_v2.exceptions import PolyApiException
 
 import config
 from logger import get_bot_logger
@@ -474,7 +475,10 @@ class PMClient:
         self._markets: dict[str, PMMarket] = {}          # condition_id → PMMarket
         self._books: dict[str, OrderBookSnapshot] = {}   # token_id → snapshot
         self._pinned_tokens: set[str] = set()            # tokens that must stay WS-subscribed (open positions)
-        self._extra_tokens: set[str] = set()             # tokens registered by non-maker strategies (e.g. momentum)
+        # Tokens registered by non-maker strategies.  Keyed by owner so multiple
+        # strategies (e.g. momentum + opening_neutral) can register independently
+        # without overwriting each other.  All sets are unioned in _update_shards.
+        self._extra_tokens_by_owner: dict[str, set[str]] = {}
         self._price_callbacks: list[Callable] = []
         self._order_fill_callbacks: list[Callable] = []
         self._user_ws_reconnect_callbacks: list[Callable] = []  # A1: fired after user WS reconnects
@@ -754,9 +758,9 @@ class PMClient:
         total_events = 0
         total_markets_seen = 0
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                for tag_slug in _ALL_TAG_SLUGS:
+        async with aiohttp.ClientSession() as session:
+            for tag_slug in _ALL_TAG_SLUGS:
+                try:
                     for page in range(MAX_PAGES_PER_SLUG):
                         params: dict = {
                             "active": "true",
@@ -817,9 +821,16 @@ class PMClient:
                         if len(events_raw) < 100:
                             break   # last page for this slug
 
-        except Exception as exc:
-            log.error("Gamma API fetch failed", exc=str(exc))
-            return
+                except Exception as exc:
+                    # Per-slug failure (most commonly asyncio.TimeoutError whose str() is '').
+                    # Log and continue to the next slug rather than aborting the whole refresh.
+                    log.warning(
+                        "Gamma API: slug fetch failed — skipping",
+                        tag_slug=tag_slug,
+                        exc_type=type(exc).__name__,
+                        exc=str(exc) or type(exc).__name__,
+                    )
+                    continue
 
         log.info("Markets refreshed", total=len(self._markets), new=new_count,
                  events_fetched=total_events, markets_seen=total_markets_seen)
@@ -1095,7 +1106,8 @@ class PMClient:
             market_tokens.extend(mkt.token_ids())
         pinned = sorted(self._pinned_tokens)
         others = [t for t in market_tokens if t not in self._pinned_tokens]
-        tokens_wanted: set[str] = set(pinned + others) | self._extra_tokens
+        _all_extra: set[str] = set().union(*self._extra_tokens_by_owner.values()) if self._extra_tokens_by_owner else set()
+        tokens_wanted: set[str] = set(pinned + others) | _all_extra
 
         N = config.PM_WS_MAX_MARKETS_PER_WS
 
@@ -1119,7 +1131,11 @@ class PMClient:
 
         # ── Additions ─────────────────────────────────────────────────────────
         # Maintain pinned-first ordering for assignment priority.
-        new_tokens = [t for t in (pinned + others) if t not in self._token_shard_map]
+        # Extra tokens (from non-maker strategies e.g. momentum, opening_neutral)
+        # are appended after maker tokens so they get subscribed to shards too.
+        # Without this they would be protected from expiry but never added.
+        _extra_ordered = [t for t in sorted(_all_extra) if t not in set(pinned + others)]
+        new_tokens = [t for t in (pinned + others + _extra_ordered) if t not in self._token_shard_map]
         remaining = new_tokens
 
         while remaining:
@@ -1268,12 +1284,53 @@ class PMClient:
 
         tick = market.tick_size if market else 0.01
         rounded_price = self._round_to_tick(price, tick)
+        # API constraint: maker amount (size) max 2 decimal places;
+        # taker amount (size * price) max 4 decimal places.
+        # Rounding size to 2dp satisfies both — price is already at tick resolution.
+        rounded_size = round(size, 2)
 
         try:
+            if not post_only:
+                # FAK (taker) orders: the API classifies them as "market buy/sell orders"
+                # and requires maker_amount (USDC for BUY = contracts × price) to have
+                # ≤ 2 decimal places.  OrderArgs uses the limit-order signing path which
+                # allows up to 4dp for the USDC amount — causing 400 errors at runtime.
+                # MarketOrderArgs uses the market-order signing path which rounds the USDC
+                # amount to 2dp automatically, satisfying the API constraint.
+                #   BUY  → amount = USDC to spend  = contracts × price, rounded to 2dp
+                #   SELL → amount = shares to sell = rounded_size (already ≤ 2dp)
+                fak_amount = round(rounded_size * rounded_price, 2) if side == "BUY" else rounded_size
+                market_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=fak_amount,
+                    side=side,
+                    price=rounded_price,
+                    order_type=OrderType.FAK,
+                )
+                signed = await asyncio.to_thread(self._clob.create_market_order, market_args)
+                resp = await asyncio.to_thread(self._clob.post_order, signed, OrderType.FAK)
+                order_id = resp.get("orderID")
+                log.info("Limit order posted", token_id=token_id, side=side,
+                         price=rounded_price, size=rounded_size, post_only=False,
+                         order_type=OrderType.FAK, order_id=order_id,
+                         fak_usdc=fak_amount)
+                if order_id:
+                    _append_order_event(
+                        order_id=order_id,
+                        token_id=token_id,
+                        side=side,
+                        price=rounded_price,
+                        size=rounded_size,
+                        order_type="limit_taker_fak",
+                        action="placed",
+                        market_id=market.condition_id if market else "",
+                    )
+                return order_id
+
             order_args = OrderArgs(
                 token_id=token_id,
                 price=rounded_price,
-                size=size,
+                size=rounded_size,
                 side=side,
             )
             # NOTE: post_only goes to post_order(), NOT create_order() — passing a dict
@@ -1282,25 +1339,22 @@ class PMClient:
             # would stall the event loop, freezing WS book-cache updates during the
             # signing window.
             signed = await asyncio.to_thread(self._clob.create_order, order_args)
-            # Taker orders (post_only=False) use FAK so any unfilled remainder is
-            # immediately cancelled rather than resting as a passive maker bid.
-            order_type_enum = OrderType.GTC if post_only else OrderType.FAK
             # Post in a thread — post_order() is a blocking HTTP POST.
             resp = await asyncio.to_thread(
-                self._clob.post_order, signed, order_type_enum, post_only
+                self._clob.post_order, signed, OrderType.GTC, True
             )
             order_id = resp.get("orderID")
             log.info("Limit order posted", token_id=token_id, side=side,
-                     price=rounded_price, size=size, post_only=post_only,
-                     order_type=order_type_enum, order_id=order_id)
+                     price=rounded_price, size=rounded_size, post_only=True,
+                     order_type=OrderType.GTC, order_id=order_id)
             if order_id:
                 _append_order_event(
                     order_id=order_id,
                     token_id=token_id,
                     side=side,
                     price=rounded_price,
-                    size=size,
-                    order_type="limit_taker_fak" if not post_only else "limit",
+                    size=rounded_size,
+                    order_type="limit",
                     action="placed",
                     market_id=market.condition_id if market else "",
                 )
@@ -1318,7 +1372,7 @@ class PMClient:
                     try:
                         # PM requires ≥ $1 notional per GTC order.  If the price
                         # back-off reduces notional below $1, raise size to compensate.
-                        retry_size = size
+                        retry_size = rounded_size
                         retry_notional = retry_size * retry_price
                         if retry_notional < 1.0 and retry_price > 0:
                             retry_size = self._round_to_tick(
@@ -1329,6 +1383,7 @@ class PMClient:
                                 token_id=token_id, retry_price=retry_price,
                                 original_size=size, retry_size=retry_size,
                             )
+                        retry_size = round(retry_size, 2)
                         order_args2 = OrderArgs(
                             token_id=token_id, price=retry_price, size=retry_size, side=side
                         )
@@ -1520,7 +1575,7 @@ class PMClient:
         if self._clob is None:
             return False
         try:
-            await asyncio.to_thread(self._clob.cancel, order_id)
+            await asyncio.to_thread(self._clob.cancel_order, OrderPayload(orderID=order_id))
             log.debug("Order cancelled", order_id=order_id)
             return True
         except Exception as exc:
@@ -1627,7 +1682,7 @@ class PMClient:
         if self._clob is None:
             return []
         try:
-            orders = await asyncio.to_thread(self._clob.get_orders, OpenOrderParams())
+            orders = await asyncio.to_thread(self._clob.get_open_orders, OpenOrderParams())
             return orders if isinstance(orders, list) else []
         except Exception as exc:
             log.error("get_live_orders failed", exc=str(exc))
@@ -1645,7 +1700,7 @@ class PMClient:
         """
         if self._paper_mode or self._clob is None:
             return None
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
         try:
             resp = await asyncio.to_thread(
                 self._clob.get_balance_allowance,
@@ -1724,17 +1779,15 @@ class PMClient:
                             # This token won; determine if it's the YES/UP side.
                             is_yes = str(tok.get("outcome", "")).lower() not in ("no", "down")
                             return 1.0 if is_yes else 0.0
-                    # FALLBACK: winner flag absent — use the YES/Up token's settled price.
-                    # Only reached when the CLOB response omits the winner field entirely.
-                    for tok in tokens:
-                        if str(tok.get("outcome", "")).lower() in ("yes", "up"):
-                            yes_price = tok.get("price")
-                            if yes_price is not None:
-                                return float(yes_price)
-                    # Last resort: assume tokens[0] is YES/Up.
-                    yes_price = tokens[0].get("price")
-                    if yes_price is not None:
-                        return float(yes_price)
+                    # NO FALLBACK to price: the preamble rule is explicit —
+                    # "Never infer WIN/LOSS from `price`; it can show ~1.0 for a
+                    # losing token in the brief window right after settlement."
+                    # If winner flags are absent, the market hasn't finished
+                    # settling.  Return None so the caller retries later.
+                    log.debug(
+                        "fetch_market_resolution: closed=True but no winner flag yet — will retry",
+                        condition_id=condition_id[:16],
+                    )
         except Exception as exc:
             log.debug(
                 "fetch_market_resolution failed",
@@ -2044,13 +2097,13 @@ class PMClient:
         Call with the YES token IDs of all open positions."""
         self._pinned_tokens = token_ids
 
-    def register_for_book_updates(self, token_ids: set[str]) -> None:
+    def register_for_book_updates(self, token_ids: set[str], owner: str = "default") -> None:
         """Register additional tokens for WS book subscriptions, bypassing the maker
-        TTE/volume filters.  Used by non-maker strategies (e.g. momentum) to subscribe
-        to a broader set of bucket markets.  Replaces the previous set on each call;
-        triggers an immediate _update_shards pass so new tokens are subscribed within
-        one event-loop tick rather than waiting up to 60s for the market-refresh cycle."""
-        self._extra_tokens = token_ids
+        TTE/volume filters.  Multiple strategies can register independently using
+        different owner keys; all sets are unioned in _update_shards so one strategy
+        cannot overwrite another's registrations.  Triggers an immediate _update_shards
+        pass so new tokens are subscribed within one event-loop tick."""
+        self._extra_tokens_by_owner[owner] = token_ids
         if self._running:
             asyncio.ensure_future(self._update_shards())
 

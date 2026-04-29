@@ -268,6 +268,10 @@ class Position:
     # both legs share the same spread_id (uuid4().hex).  None for single-leg positions.
     spread_id: Optional[str] = None
 
+    # Opening neutral pair tracking: both YES and NO legs share this ID.
+    # Cleared on the winner when it converts to strategy='momentum'.
+    neutral_pair_id: str = ""
+
     @property
     def pm_delta_notional(self) -> float:
         """Signed notional exposure: positive = net long YES/UP (first token)."""

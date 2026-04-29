@@ -153,6 +153,8 @@ export interface Position {
   realized_pnl?: number | null;
   // Legacy field — null for all new positions
   spread_id?: string | null;
+  // Opening neutral pair tracking (strategy="opening_neutral" only)
+  neutral_pair_id?: string | null;
   strike?: number | null;
   // GTD hedge (momentum strategy only; null for maker/mispricing)
   hedge_order_id?: string | null;
@@ -599,6 +601,9 @@ export interface ConfigData {
   momentum_range_min_tte_seconds?: number;
   // RESOLVED fallback timeout
   momentum_resolved_force_close_sec?: number;
+  // Strategy 5 — Opening Neutral
+  opening_neutral_enabled?: boolean;
+  opening_neutral_dry_run?: boolean;
 }
 
 export interface InventoryData {
@@ -1107,3 +1112,72 @@ export const useErrorLogs = (
     10_000,  // poll every 10s — warnings/errors are low-frequency
   );
 };
+
+// ── Opening Neutral (Strategy 5) ──────────────────────────────────────────────
+
+export interface OpeningNeutralPair {
+  pair_id: string;
+  market_id: string;
+  market_title: string;
+  yes_entry: number | null;
+  no_entry: number | null;
+  yes_closed: boolean | null;
+  no_closed: boolean | null;
+}
+
+export interface OpeningNeutralClosedPair {
+  pair_id: string;
+  market_id: string;
+  market_title: string;
+  yes_entry: number | null;
+  no_entry: number | null;
+  closed_at: string;
+}
+
+export interface OpeningNeutralSignal {
+  ts: string;
+  market_id: string;
+  market_title: string;
+  market_type: string;
+  yes_ask: number | null;
+  no_ask: number | null;
+  combined: number | null;
+  threshold: number;
+  tte_secs: number;
+  elapsed_secs: number;
+  result: "entry_attempt" | "too_expensive" | string;
+}
+
+/** Live snapshot of a market being tracked for entry. Updated on every get_status() call. */
+export interface TrackedMarket {
+  market_id: string;
+  market_title: string;
+  market_type: string;
+  yes_ask: number | null;
+  no_ask: number | null;
+  combined: number | null;
+  tte_secs: number | null;
+  elapsed_secs: number | null;
+  /** True only when a confirmed fill/pair exists for this market (source of truth). */
+  entered: boolean;
+  /** True while an entry order is in-flight (placed but not yet confirmed). */
+  entering: boolean;
+}
+
+export interface OpeningNeutralStatus {
+  enabled: boolean;
+  dry_run: boolean;
+  active_pairs: number;
+  pairs: OpeningNeutralPair[];
+  closed_pairs: OpeningNeutralClosedPair[];
+  recent_signals: OpeningNeutralSignal[];
+  /** Live per-market tracking state: current prices, TTE, entry status. Updated every poll. */
+  tracked_markets: TrackedMarket[];
+  /** Config value: entry window in seconds (used to render window progress). */
+  entry_window_secs?: number;
+  scanner_running: boolean;
+  timestamp: number;
+}
+
+export const useOpeningNeutralStatus = () =>
+  usePolling<OpeningNeutralStatus>("/opening_neutral/status", 1_000);

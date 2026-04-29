@@ -501,7 +501,18 @@ export default function Positions() {
   const momentumPositions = pmPositions.filter((p) => p.strategy === "momentum" && !p.is_closed);
   const rangePositions = pmPositions.filter((p) => p.strategy === "range" && !p.is_closed);
   const hedgeFilledPositions = pmPositions.filter((p) => p.strategy === "momentum_hedge" && !p.is_closed);
+  const neutralPositions = pmPositions.filter((p) => p.strategy === "opening_neutral" && !p.is_closed);
   const unknownPositions = pmPositions.filter((p) => p.strategy === "unknown" && !p.is_closed);
+
+  // Group opening_neutral positions by neutral_pair_id (fall back to condition_id)
+  const neutralPairs = new Map<string, { yes?: Position; no?: Position }>();
+  for (const pos of neutralPositions) {
+    const key = pos.neutral_pair_id || pos.condition_id;
+    const existing = neutralPairs.get(key) ?? {};
+    if (pos.side === "YES") existing.yes = pos;
+    else existing.no = pos;
+    neutralPairs.set(key, existing);
+  }
 
   // Group maker positions by condition_id -> Map<condition_id, {yes?, no?}>
   // Open and recently-closed spreads are kept separate so closed ones render last.
@@ -525,6 +536,7 @@ export default function Positions() {
             {closedSpreads.size > 0 && ` · ${closedSpreads.size} recently closed`}
             {mispricingPositions.length > 0 && ` \u00B7 ${mispricingPositions.length} mispricing`}
             {momentumPositions.length > 0 && ` · ${momentumPositions.length} momentum`}
+            {neutralPositions.length > 0 && ` · ${neutralPairs.size} neutral pair${neutralPairs.size !== 1 ? "s" : ""}`}
             {rangePositions.length > 0 && ` · ${rangePositions.length} range`}
             {hedgeFilledPositions.length > 0 && ` · ${hedgeFilledPositions.length} hedge fill`}
             {unknownPositions.length > 0 && ` \u00B7 ${unknownPositions.length} unknown`}
@@ -745,6 +757,85 @@ export default function Positions() {
             })}
           </tbody>
         </table>
+      )}
+
+      {/* -- Opening Neutral pairs --------------------------------- */}
+      {neutralPairs.size > 0 && (
+        <>
+          <h3 style={{ marginTop: "2rem", marginBottom: "0.5rem", fontSize: "0.9rem", color: "#38bdf8" }}>
+            Opening Neutral Pairs
+            <span style={{ fontWeight: 400, marginLeft: "0.5rem", fontSize: "0.8rem", color: "#94a3b8" }}>
+              — YES + NO legs entered together; loser exits after sigma_tau move, winner converts to momentum
+            </span>
+          </h3>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>YES Entry</th>
+                <th>NO Entry</th>
+                <th title="Sum of YES+NO entry prices (cost to open)">Σ Cost</th>
+                <th title="Number of contracts bought per leg">Contracts</th>
+                <th>YES Current</th>
+                <th>NO Current</th>
+                <th title="Combined unrealised P&L for both legs">Unrealised P&amp;L</th>
+                <th>Opened</th>
+                <th>Ends</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...neutralPairs.entries()].map(([pairId, { yes, no }]) => {
+                const rep = yes ?? no!;
+                const yesEntry = yes ? yes.entry_price * 100 : null;
+                const noEntry  = no  ? no.entry_price * 100 : null;
+                const yesCurrent = yes?.token_current_price != null ? yes.token_current_price * 100
+                  : yes?.current_mid != null ? yes.current_mid * 100 : null;
+                const noCurrent  = no?.token_current_price != null ? no.token_current_price * 100
+                  : no?.current_mid != null ? no.current_mid * 100 : null;
+                const combinedPnl = (yes?.unrealised_pnl_usd ?? 0) + (no?.unrealised_pnl_usd ?? 0);
+                const sigma = yesEntry != null && noEntry != null ? (yesEntry + noEntry) / 100 : null;
+                const slug = rep.market_slug || slugMap[rep.condition_id];
+                const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+                return (
+                  <tr key={pairId}>
+                    <td title={rep.market_title} style={{ maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {marketUrl
+                        ? <a href={marketUrl} target="_blank" rel="noopener noreferrer">{rep.market_title}</a>
+                        : rep.market_title}
+                    </td>
+                    <td style={{ fontFamily: "monospace", color: "#22c55e" }}>
+                      {yesEntry != null ? `${yesEntry.toFixed(2)}¢` : <span style={{ color: "#64748b" }}>—</span>}
+                    </td>
+                    <td style={{ fontFamily: "monospace", color: "#f87171" }}>
+                      {noEntry != null ? `${noEntry.toFixed(2)}¢` : <span style={{ color: "#64748b" }}>—</span>}
+                    </td>
+                    <td style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 600 }}>
+                      {sigma != null ? sigma.toFixed(3) : "—"}
+                    </td>
+                    <td style={{ fontFamily: "monospace", color: "#94a3b8", fontSize: "0.8rem", whiteSpace: "nowrap" }}>
+                      {yes?.contracts != null ? <><span style={{ color: "#22c55e" }}>{yes.contracts}</span> YES</> : "—"}
+                      {" / "}
+                      {no?.contracts != null ? <><span style={{ color: "#f87171" }}>{no.contracts}</span> NO</> : "—"}
+                    </td>
+                    <td style={{ fontFamily: "monospace", color: "#94a3b8" }}>
+                      {yesCurrent != null ? `${yesCurrent.toFixed(1)}¢` : "—"}
+                    </td>
+                    <td style={{ fontFamily: "monospace", color: "#94a3b8" }}>
+                      {noCurrent != null ? `${noCurrent.toFixed(1)}¢` : "—"}
+                    </td>
+                    <td style={{ fontFamily: "monospace", fontWeight: 600, color: pnlColor(combinedPnl) }}>
+                      {pnlStr(combinedPnl)}
+                    </td>
+                    <td className="muted">{timeSince(rep.opened_at)}</td>
+                    <td style={{ fontFamily: "monospace", fontWeight: 600, color: timeUntilEnd(rep.end_date).color }}>
+                      {timeUntilEnd(rep.end_date).label}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </>
       )}
 
       {/* -- Range positions ----------------------------------- */}
