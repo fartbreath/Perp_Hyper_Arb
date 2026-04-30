@@ -2088,6 +2088,46 @@ class PMClient:
     def get_book(self, token_id: str) -> Optional[OrderBookSnapshot]:
         return self._books.get(token_id)
 
+    async def fetch_book_rest(self, token_id: str) -> Optional["OrderBookSnapshot"]:
+        """Fetch a fresh orderbook snapshot from the CLOB REST API.
+
+        Used by OpeningNeutral timer path as the authoritative source when the
+        WS book cache may be stale (e.g. pre-market tokens whose subscription
+        was only recently established).
+
+        GET https://clob.polymarket.com/book?token_id=<token_id>
+
+        Returns an OrderBookSnapshot on success, None on any error.
+        """
+        url = f"{config.POLY_HOST}/book"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    params={"token_id": token_id},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+            # Response shape: {"market": ..., "asset_id": ..., "bids": [...], "asks": [...]}
+            # Each entry: {"price": "0.51", "size": "12.3"}
+            bids = sorted(
+                [(float(e["price"]), float(e["size"])) for e in data.get("bids", [])],
+                key=lambda x: x[0], reverse=True,
+            )
+            asks = sorted(
+                [(float(e["price"]), float(e["size"])) for e in data.get("asks", [])],
+                key=lambda x: x[0],
+            )
+            snap = OrderBookSnapshot(token_id=token_id, bids=bids, asks=asks)
+            # Also update the local cache so subsequent get_book() calls are fresh.
+            self._books[token_id] = snap
+            return snap
+        except Exception as exc:  # pylint: disable=broad-except
+            log.debug("PMClient: fetch_book_rest failed", token_id=token_id[:20], exc=str(exc))
+            return None
+
     @property
     def _ws_connected(self) -> bool:
         """True if at least one WS shard is currently connected."""

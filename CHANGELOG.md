@@ -2,6 +2,40 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-30] - OpeningNeutral pre-market entry fixes; WS bid-monitoring exit; REST book source of truth
+
+### Fix — OpeningNeutral: pre-market entry failures (`strategies/OpeningNeutral/scanner.py`, `config.py`)
+
+Three root-cause fixes that together enable reliable pre-market entries:
+
+**Subscription loop speed (5 s):** `_subscription_loop` sleep reduced from 30 s to 5 s so that a market entering the presub window is registered within 5 s — well before T-10 s.  With the 30 s loop a late restart could miss the window entirely.
+
+**Presub window widened to -(TIMER_ADVANCE+30) s:** `_refresh_pending_markets` previously skipped markets with `elapsed < -30`.  With `TIMER_ADVANCE_SECS = 10`, this was too narrow — the earliest a market could be registered was T-30 s, leaving no room for the timer to sleep to T-10 s.  Now `presub_window = -(OPENING_NEUTRAL_TIMER_ADVANCE_SECS + 30) = -40 s`.
+
+**REST API as source of truth on timer path:** `_evaluate_entry` on the timer path now fetches both YES and NO books via `pm_client.fetch_book_rest()` (CLOB REST API) instead of the WS book cache.  The WS cache was stale for pre-market tokens whose subscription had only been established seconds earlier (observed: BTC 6:35 AM bucket showed 0.46/0.55 stale data while REST showed 0.50/0.51).  Root cause confirmed from live logs.
+
+**Entry restricted to pre-market timer path only:** WS path in `_evaluate_entry` now returns immediately (`_timer_fired` must be `True`).  Post-open asks are skewed by market movement and are no longer chased.  `elapsed_max = 0.0` enforces that the timer must still fire pre-market.
+
+**Config changes:** `OPENING_NEUTRAL_TIMER_ADVANCE_SECS = 10.0` (was 0.05); `OPENING_NEUTRAL_PREWARM_SECS = 10.2` (was 0.2); `OPENING_NEUTRAL_MIN_SIDE_PRICE = 0.48` (was 0.44); `OPENING_NEUTRAL_MAX_SIDE_PRICE = 0.52` (was 0.56); `OPENING_NEUTRAL_COMBINED_COST_MAX = 1.01` (was 1.02); `OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS = 10` (was 5); renamed `OPENING_NEUTRAL_ENTRY_WINDOW_SECS → OPENING_NEUTRAL_MARKET_WINDOW_SECS = 60`.
+
+**Silent rejection logging:** All `_evaluate_entry` rejection branches now emit `log.warning` with market name and reason (outside elapsed window, book not ready, book too thin, too expensive, price band).
+
+### Feature — OpeningNeutral: WS bid-monitoring exit (`strategies/OpeningNeutral/scanner.py`)
+
+Replaces resting GTC SELL exit orders with a WS-driven market sell:
+
+**Root cause of prior approach failure:** Resting post-only GTC SELLs placed immediately after entry at `$0.35` were rejected by the CLOB with "crosses book" — because the current bid (~$0.50) is above the sell price, making them immediate takers rather than makers.
+
+**New mechanism:** After both legs fill, `_register_pair` arms bid monitoring by writing both token IDs into `_token_to_pair: dict[str, str]`.  On every WS book update, `_on_price_event` checks the bid for monitored tokens.  When `best_bid ≤ OPENING_NEUTRAL_LOSER_EXIT_PRICE (0.35)`, it adds the token to `_exiting_legs` (duplicate-exit guard) and spawns `_execute_loser_exit` as an asyncio task.
+
+**`_execute_loser_exit`:** Fetches actual CLOB balance (`get_token_balance`), then calls `place_market(side="SELL", price=0.01, size=sell_size)` — a FAK taker that fills at the best available bid.  Confirmed working in live trading: NO leg sold at $0.30 (trigger bid 0.34).  Winner promoted to momentum via existing `_on_exit_fill` path.
+
+### Feature — `pm_client.fetch_book_rest()` (`pm_client.py`)
+
+New async method `fetch_book_rest(token_id: str) → Optional[OrderBookSnapshot]` that fetches a fresh book from `GET https://clob.polymarket.com/book?token_id=<token_id>`.  Normalises bids/asks to sorted `(price, size)` tuples matching `OrderBookSnapshot` format, updates `_books` cache so subsequent `get_book()` calls are fresh, and returns `None` on any error (with debug log).  Used by `_evaluate_entry` timer path as the authoritative source of truth when WS cache may be stale.
+
+---
+
 ## [2026-04-30] - OpeningNeutral entry latency; Chainlink HA mode; monitor & reconcile fixes
 
 ### Feature — OpeningNeutral entry latency reduction (`strategies/OpeningNeutral/scanner.py`, `config.py`)

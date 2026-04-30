@@ -304,13 +304,15 @@ OPENING_NEUTRAL_ENABLED: bool = False       # Strategy 5: Opening neutral (simul
 # All bucket types are included — the _is_updown_market() filter ensures only
 # Up/Down direction markets are entered regardless of bucket size.
 OPENING_NEUTRAL_MARKET_TYPES: list = [
-    "bucket_5m", "bucket_15m", "bucket_1h", "bucket_4h"
+    "bucket_5m", "bucket_15m" #, "bucket_1h", "bucket_4h"
 ]
-# Entry window: only consider markets whose TTE is within this many seconds of opening.
-OPENING_NEUTRAL_ENTRY_WINDOW_SECS: int = 120
+# How long after open to keep a market in pending state / LIMIT-mode fill timeout.
+# Not an entry gate — entries are pre-market only (timer path). This controls
+# how long stale markets stay in _pending_markets before being pruned.
+OPENING_NEUTRAL_MARKET_WINDOW_SECS: int = 60
 # Maximum combined cost for YES + NO (≤ 1.0 = guaranteed profit at resolution;
 # ≤ 1.01 allows 1-tick slip / fee headroom).
-OPENING_NEUTRAL_COMBINED_COST_MAX: float = 1.02
+OPENING_NEUTRAL_COMBINED_COST_MAX: float = 1.01
 # USDC notional per leg (YES position = this; NO position = this).
 OPENING_NEUTRAL_SIZE_USD: float = 1
 # Order type for the entry BUY legs: "limit" (post-only at current ask — preferred)
@@ -323,7 +325,7 @@ OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS: int = 30
 # FAK orders are fill-or-kill at the exchange: if a fill WS event hasn't arrived
 # within this window the order was killed (no match) and the leg is treated as
 # unfilled.  Kept short so the one-leg decision is made in seconds, not 30s.
-OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS: int = 5
+OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS: int = 10
 # What to do when only one leg fills within the timeout.
 # "keep_as_momentum" — leave the filled leg running as a momentum position.
 # "exit_immediately" — taker-exit the filled leg at best bid.
@@ -338,16 +340,18 @@ OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS: int = 300
 # Seconds before market open to pre-warm the CLOB HTTP connection pool (idea 5).
 # A lightweight GET is sent this many seconds before open so the TCP connection
 # is established before the BUY orders fire.
-OPENING_NEUTRAL_PREWARM_SECS: float = 0.2
+OPENING_NEUTRAL_PREWARM_SECS: float = 10.2
 # Seconds before market open to fire the scheduled entry timer (idea 1).
-# Slightly early to absorb asyncio event-loop scheduling jitter (~1-5ms).
-OPENING_NEUTRAL_TIMER_ADVANCE_SECS: float = 0.05
+# Pre-market books are live and fillable, so firing the FAK 10 s before open
+# catches the resting ask while it is undisturbed — eliminating the T=0 race
+# where other bots drain the ask in the same millisecond window.
+OPENING_NEUTRAL_TIMER_ADVANCE_SECS: float = 10.0
 # Per-side price band: both YES ask and NO ask must be within [MIN, MAX] for
 # an entry to qualify.  Keeps the strategy truly neutral (near 50/50) and
 # prevents entries into highly-skewed markets (e.g. YES=0.12 / NO=0.89)
 # where the exit logic breaks down and one leg is almost certain to lose.
-OPENING_NEUTRAL_MIN_SIDE_PRICE: float = 0.44
-OPENING_NEUTRAL_MAX_SIDE_PRICE: float = 0.56
+OPENING_NEUTRAL_MIN_SIDE_PRICE: float = 0.48
+OPENING_NEUTRAL_MAX_SIDE_PRICE: float = 0.52
 # Maximum simultaneous opening-neutral pairs.
 OPENING_NEUTRAL_MAX_CONCURRENT: int = 1
 # DRY_RUN: when True all order placements are skipped (no real orders sent).

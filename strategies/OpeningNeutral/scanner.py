@@ -105,6 +105,13 @@ class OpeningNeutralScanner(BaseStrategy):
         self._entered_market_ids: set[str] = set()
         # Ring buffer of recently closed/resolved pairs (kept for webapp display).
         self._closed_pairs: list[dict] = []
+        # Bid-monitoring exit state for active pairs.
+        # Maps token_id → pair_id for all tokens being watched for bid-threshold exit.
+        self._token_to_pair: dict[str, str] = {}
+        # Token IDs for which a loser market sell is currently in-flight.
+        # Guards against duplicate exit tasks when multiple WS ticks fire before
+        # the first _execute_loser_exit task completes.
+        self._exiting_legs: set[str] = set()
         # Market IDs where a one-leg fill was promoted to momentum.
         # These occupy a concurrent slot (counted against MAX_CONCURRENT) until the
         # market expires so sequential entries across multiple coins at the same
@@ -124,7 +131,7 @@ class OpeningNeutralScanner(BaseStrategy):
         log.info(
             "OpeningNeutralScanner started",
             market_types=config.OPENING_NEUTRAL_MARKET_TYPES,
-            window_secs=config.OPENING_NEUTRAL_ENTRY_WINDOW_SECS,
+            window_secs=config.OPENING_NEUTRAL_MARKET_WINDOW_SECS,
             combined_cost_max=config.OPENING_NEUTRAL_COMBINED_COST_MAX,
             dry_run=config.OPENING_NEUTRAL_DRY_RUN,
         )
@@ -177,8 +184,10 @@ class OpeningNeutralScanner(BaseStrategy):
             duration = _MARKET_TYPE_DURATION_SECS.get(market.market_type) or 0
             elapsed  = (duration - tte) if (duration and tte is not None) else None
             combined = round(yes_ask + no_ask, 4) if (yes_ask is not None and no_ask is not None) else None
-            # Skip markets that haven't opened yet (presub window; elapsed < 0)
-            if elapsed is not None and elapsed < 0:
+            # Skip markets deeper in the presub window than the entry timer advance.
+            # We show markets from TIMER_ADVANCE_SECS before open so the webapp
+            # displays the pre-market entry as it fires.
+            if elapsed is not None and elapsed < -(config.OPENING_NEUTRAL_TIMER_ADVANCE_SECS + 1.0):
                 continue
             # Source-of-truth for confirmed entry: an active pair exists for this market.
             # _entered_market_ids is set at intent time (before orders) and is used only
@@ -211,19 +220,24 @@ class OpeningNeutralScanner(BaseStrategy):
             "closed_pairs":    list(self._closed_pairs[-10:]),
             "recent_signals":  list(self._signals[-20:]),
             "tracked_markets": tracked,
-            "entry_window_secs": config.OPENING_NEUTRAL_ENTRY_WINDOW_SECS,
+            "entry_window_secs": config.OPENING_NEUTRAL_MARKET_WINDOW_SECS,
         }
 
     # ── WS subscription refresh loop ─────────────────────────────────────────
 
     async def _subscription_loop(self) -> None:
-        """Periodically re-sync the pending-market map as new buckets are listed."""
+        """Periodically re-sync the pending-market map as new buckets are listed.
+
+        Uses a short sleep (5 s) so that a market entering the presub window is
+        registered and its timer scheduled within 5 s — well before T-10 s.
+        pm.get_markets() is a local cache read so this is cheap.
+        """
         while self._running:
             try:
                 await self._refresh_pending_markets()
             except Exception as exc:  # pylint: disable=broad-except
                 log.error("OpeningNeutralScanner: subscription refresh error", exc=str(exc))
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
 
     async def _refresh_pending_markets(self) -> None:
         """
@@ -270,12 +284,16 @@ class OpeningNeutralScanner(BaseStrategy):
             duration = _MARKET_TYPE_DURATION_SECS.get(market_type) or 0
             if duration > 0:
                 elapsed_now = duration - tte_now
-                # Skip markets that haven't opened yet (allow 30 s presub window so
-                # book data is ready the moment the entry window opens).
-                if elapsed_now < -30:
+                # Skip markets that haven't opened yet.  Window must be wide enough
+                # that the timer is scheduled with time to sleep until T-10s.
+                # Hardcoded -30 was too narrow: on a T-98s restart the 30s loop
+                # wouldn't register the market until T-8s, leaving only 8s pre-market
+                # and no room for a clean timer sleep.  Use -(ADVANCE+30) = -40s.
+                presub_window = -(config.OPENING_NEUTRAL_TIMER_ADVANCE_SECS + 30)
+                if elapsed_now < presub_window:
                     continue
                 # Skip markets already past their entry window.
-                if elapsed_now > config.OPENING_NEUTRAL_ENTRY_WINDOW_SECS:
+                if elapsed_now > config.OPENING_NEUTRAL_MARKET_WINDOW_SECS:
                     continue
 
             self._pending_markets[cond_id] = market
@@ -334,7 +352,7 @@ class OpeningNeutralScanner(BaseStrategy):
             if cid not in self._entered_market_ids
             and mkt.end_date is not None
             and (lambda d=_MARKET_TYPE_DURATION_SECS.get(mkt.market_type) or 0,
-                      t=mkt.end_date.timestamp() - now: d > 0 and (d - t) > config.OPENING_NEUTRAL_ENTRY_WINDOW_SECS)()
+                      t=mkt.end_date.timestamp() - now: d > 0 and (d - t) > config.OPENING_NEUTRAL_MARKET_WINDOW_SECS)()
         ]
         for cid in past_window_cids:
             mkt = self._pending_markets.pop(cid)
@@ -501,9 +519,11 @@ class OpeningNeutralScanner(BaseStrategy):
         Entry path — token belongs to a pending (not-yet-entered) market:
             Evaluates all entry gates and spawns _enter_pair when qualifying.
 
-        Exit orders are resting GTC SELLs placed immediately after entry in
-        _register_pair.  Fill monitoring is handled by _monitor_exit_fills tasks,
-        not by price polling here.
+        Exit path — token belongs to an active pair:
+            Checks the current best bid.  When the bid drops to ≤
+            OPENING_NEUTRAL_LOSER_EXIT_PRICE, fires a market sell via
+            _execute_loser_exit — guaranteeing an exit at the best available
+            price rather than leaving the position to expire worthless.
 
         The book snapshot in pm.get_book() is already updated before this
         callback fires, so yes_ask / best_bid reads are always fresh.
@@ -523,6 +543,35 @@ class OpeningNeutralScanner(BaseStrategy):
                 market = self._pending_markets.get(cond_id)
                 if market is not None:
                     await self._evaluate_entry(market)
+
+        # ── Exit monitoring path ──────────────────────────────────────────────
+        # Fires on every WS book update for tokens in active pairs.  Active-pair
+        # tokens are subscribed in _refresh_pending_markets so this path gets
+        # fresh bid data on every tick without any polling.
+        pair_id = self._token_to_pair.get(token_id)
+        if pair_id is not None and token_id not in self._exiting_legs:
+            pair = self._active_pairs.get(pair_id)
+            if pair is not None:
+                yes_pos: Optional[Position] = pair.get("yes_pos")
+                no_pos:  Optional[Position] = pair.get("no_pos")
+                if yes_pos and not yes_pos.is_closed and getattr(yes_pos, "token_id", "") == token_id:
+                    mon_pos: Optional[Position] = yes_pos
+                    mon_side = "YES"
+                elif no_pos and not no_pos.is_closed and getattr(no_pos, "token_id", "") == token_id:
+                    mon_pos = no_pos
+                    mon_side = "NO"
+                else:
+                    mon_pos = None
+                    mon_side = None
+                if mon_pos is not None and mon_side is not None:
+                    book = self._pm.get_book(token_id)
+                    best_bid = book.best_bid if book is not None else None
+                    if best_bid is not None and best_bid <= config.OPENING_NEUTRAL_LOSER_EXIT_PRICE:
+                        self._exiting_legs.add(token_id)
+                        asyncio.create_task(
+                            self._execute_loser_exit(pair_id, mon_side, token_id, mon_pos, best_bid),
+                            name=f"loser_exit_{pair_id[:12]}",
+                        )
 
     async def _evaluate_entry(self, market: Any, _timer_fired: bool = False) -> None:
         """
@@ -567,10 +616,25 @@ class OpeningNeutralScanner(BaseStrategy):
             return
         duration = _MARKET_TYPE_DURATION_SECS.get(market.market_type) or tte_secs
         elapsed = duration - tte_secs
-        # Timer path fires ~50ms before open (elapsed ≈ -0.05).  Allow up to 1s
-        # negative elapsed so the entry is not rejected before the clock ticks over.
-        elapsed_min = -1.0 if _timer_fired else 0.0
-        if elapsed < elapsed_min or elapsed > config.OPENING_NEUTRAL_ENTRY_WINDOW_SECS:
+        # Entry is ONLY allowed pre-market (timer path).  The WS fallback path
+        # (elapsed >= 0, market already open) is blocked — post-open asks are
+        # skewed by market movement and we no longer want to chase them.
+        # Timer fires OPENING_NEUTRAL_TIMER_ADVANCE_SECS before open; allow that
+        # many seconds of negative elapsed plus 1 s jitter buffer.
+        if not _timer_fired:
+            # WS path: only allowed strictly before open (should not normally reach
+            # here for new markets, but acts as a safety net).
+            return
+        elapsed_min = -(config.OPENING_NEUTRAL_TIMER_ADVANCE_SECS + 1.0)
+        elapsed_max = 0.0  # must still be pre-market at execution time
+        if elapsed < elapsed_min or elapsed > elapsed_max:
+            log.warning(
+                "OpeningNeutral: entry skipped — outside elapsed window",
+                market=getattr(market, "title", "")[:60],
+                elapsed=round(elapsed, 2),
+                elapsed_min=elapsed_min,
+                elapsed_max=elapsed_max,
+            )
             return
 
         # Conflict guard: skip if another strategy has an open position here.
@@ -578,12 +642,44 @@ class OpeningNeutralScanner(BaseStrategy):
         if any(p.market_id == market_id for p in open_positions):
             return
 
-        # Fetch YES and NO best asks from the freshly-updated book cache.
-        _yes_book = self._pm.get_book(market.token_id_yes)
-        _no_book  = self._pm.get_book(market.token_id_no)
+        # Fetch YES and NO books.  On the timer path the WS cache may be stale
+        # (subscription only recently established for a pre-market bucket) so we
+        # always fetch from the CLOB REST API — the authoritative source of truth.
+        # On the WS path we use the cache as usual (already fresh from the event).
+        if _timer_fired:
+            _yes_book, _no_book = await asyncio.gather(
+                self._pm.fetch_book_rest(market.token_id_yes),
+                self._pm.fetch_book_rest(market.token_id_no),
+            )
+        else:
+            _yes_book = self._pm.get_book(market.token_id_yes)
+            _no_book  = self._pm.get_book(market.token_id_no)
         yes_ask = _yes_book.best_ask if _yes_book is not None else None
         no_ask  = _no_book.best_ask  if _no_book  is not None else None
         if yes_ask is None or no_ask is None:
+            log.warning(
+                "OpeningNeutral: entry skipped — book not ready (None ask)",
+                market=getattr(market, "title", "")[:60],
+                yes_ask=yes_ask,
+                no_ask=no_ask,
+            )
+            return
+
+        # FAK depth guard: both sides must have resting ask size ≥ entry size
+        # in the book cache.  A non-None best_ask only means someone has ever
+        # posted at that price — it doesn't mean that resting order still exists.
+        # If the cache shows zero size at the ask, the FAK will be killed instantly.
+        size_usd = config.OPENING_NEUTRAL_SIZE_USD
+        yes_ask_size = _yes_book.asks[0][1] if (_yes_book and _yes_book.asks) else 0.0
+        no_ask_size  = _no_book.asks[0][1]  if (_no_book  and _no_book.asks)  else 0.0
+        if yes_ask_size < size_usd or no_ask_size < size_usd:
+            log.warning(
+                "OpeningNeutral: entry skipped — book too thin",
+                market=getattr(market, "title", "")[:60],
+                yes_ask=yes_ask, yes_ask_size=round(yes_ask_size, 4),
+                no_ask=no_ask, no_ask_size=round(no_ask_size, 4),
+                size_usd=size_usd,
+            )
             return
 
         combined = round(yes_ask + no_ask, 6)
@@ -594,6 +690,8 @@ class OpeningNeutralScanner(BaseStrategy):
             "market_type": getattr(market, "market_type", ""),
             "yes_ask": yes_ask,
             "no_ask": no_ask,
+            "yes_ask_size": round(yes_ask_size, 4),
+            "no_ask_size": round(no_ask_size, 4),
             "combined": combined,
             "threshold": config.OPENING_NEUTRAL_COMBINED_COST_MAX,
             "tte_secs": round(tte_secs),
@@ -605,6 +703,12 @@ class OpeningNeutralScanner(BaseStrategy):
             self._signals.append(diag)
             if len(self._signals) > 200:
                 self._signals = self._signals[-100:]
+            log.warning(
+                "OpeningNeutral: entry skipped — too expensive",
+                market=getattr(market, "title", "")[:60],
+                combined=combined,
+                threshold=config.OPENING_NEUTRAL_COMBINED_COST_MAX,
+            )
             return
 
         # Per-side price band: both legs must be near 50/50.
@@ -617,6 +721,13 @@ class OpeningNeutralScanner(BaseStrategy):
             self._signals.append(diag)
             if len(self._signals) > 200:
                 self._signals = self._signals[-100:]
+            log.warning(
+                "OpeningNeutral: entry skipped — price band",
+                market=getattr(market, "title", "")[:60],
+                yes_ask=yes_ask,
+                no_ask=no_ask,
+                band=f"[{lo}, {hi}]",
+            )
             return
 
         # Entry qualifies — spawn entry task (non-blocking).
@@ -812,7 +923,7 @@ class OpeningNeutralScanner(BaseStrategy):
             # Wait for the FIRST leg to fill within the full entry window.
             done, _ = await asyncio.wait(
                 {yes_future, no_future},
-                timeout=config.OPENING_NEUTRAL_ENTRY_WINDOW_SECS,
+                timeout=config.OPENING_NEUTRAL_MARKET_WINDOW_SECS,
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
@@ -1172,73 +1283,23 @@ class OpeningNeutralScanner(BaseStrategy):
         if self._on_open_callback is not None:
             self._on_open_callback()
 
-        # ── Place resting exit SELLs on both legs immediately (PLAN.md §2) ──
-        # Per PLAN.md: both GTC SELL orders go into the book the moment entry fills.
-        # Whichever fills first is the loser; the other is cancelled and the winner
-        # transitions to momentum.  DRY_RUN and paper_mode skip real orders.
-        if config.OPENING_NEUTRAL_DRY_RUN:
-            log.debug(
-                "OpeningNeutral DRY_RUN: skipping exit SELL placement",
-                pair_id=pair_id[:12],
-            )
-        elif self._pm._paper_mode:
-            log.debug(
-                "OpeningNeutral paper_mode: skipping exit SELL placement",
-                pair_id=pair_id[:12],
-            )
-        else:
-            yes_exit_id, no_exit_id = await asyncio.gather(
-                self._pm.place_limit(
-                    token_id=yes_token_id,
-                    side="SELL",
-                    price=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
-                    size=yes_pos.size,
-                    market=None,
-                    post_only=True,
-                ),
-                self._pm.place_limit(
-                    token_id=no_token_id,
-                    side="SELL",
-                    price=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
-                    size=no_pos.size,
-                    market=None,
-                    post_only=True,
-                ),
-            )
-            pair_dict = self._active_pairs.get(pair_id)
-            if pair_dict is not None:
-                pair_dict["yes_exit_order_id"] = yes_exit_id or ""
-                pair_dict["no_exit_order_id"]  = no_exit_id  or ""
-
-            if yes_exit_id and no_exit_id:
-                log.info(
-                    "OpeningNeutral: resting exit SELLs placed on both legs",
-                    pair_id=pair_id[:12],
-                    price=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
-                    yes_exit_id=yes_exit_id,
-                    no_exit_id=no_exit_id,
-                )
-                asyncio.create_task(
-                    self._monitor_exit_fills(pair_id, yes_exit_id, no_exit_id),
-                    name=f"exit_monitor_{pair_id[:12]}",
-                )
-            elif yes_exit_id and not no_exit_id:
-                await self._pm.cancel_order(yes_exit_id)
-                log.error(
-                    "OpeningNeutral: NO exit SELL rejected — cancelling YES SELL; no exit orders in book",
-                    pair_id=pair_id[:12],
-                )
-            elif no_exit_id and not yes_exit_id:
-                await self._pm.cancel_order(no_exit_id)
-                log.error(
-                    "OpeningNeutral: YES exit SELL rejected — cancelling NO SELL; no exit orders in book",
-                    pair_id=pair_id[:12],
-                )
-            else:
-                log.error(
-                    "OpeningNeutral: both exit SELLs rejected — no exit orders in book, manual action required",
-                    pair_id=pair_id[:12],
-                )
+        # ── Arm bid-monitoring exit on both legs ─────────────────────────────
+        # Resting GTC SELLs cannot be placed immediately after entry because the
+        # current bid (~$0.44–$0.53) is above the exit threshold, causing the CLOB
+        # to reject the post-only order with "crosses book".
+        #
+        # Instead, register both tokens in _token_to_pair so that _on_price_event
+        # checks their bids on every WS tick.  When either bid drops to ≤
+        # OPENING_NEUTRAL_LOSER_EXIT_PRICE, _execute_loser_exit fires a taker
+        # market sell — guaranteeing an exit at whatever the best bid is rather
+        # than holding the position to $0.00 at resolution.
+        self._token_to_pair[yes_token_id] = pair_id
+        self._token_to_pair[no_token_id]  = pair_id
+        log.info(
+            "OpeningNeutral: bid-monitoring armed on both legs",
+            pair_id=pair_id[:12],
+            exit_threshold=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
+        )
 
     async def _handle_one_leg_fill(
         self,
@@ -1412,6 +1473,65 @@ class OpeningNeutralScanner(BaseStrategy):
 
         await self._on_exit_fill(pair_id, filled_side, exit_price=exit_price)
 
+    async def _execute_loser_exit(
+        self,
+        pair_id: str,
+        side: str,
+        token_id: str,
+        pos: Position,
+        trigger_bid: float,
+    ) -> None:
+        """
+        Market-sell the loser leg when its bid drops to ≤ OPENING_NEUTRAL_LOSER_EXIT_PRICE.
+
+        Uses place_market (taker) so the order fills immediately at whatever the
+        best bid is at execution time.  Accepts slippage below $0.35 because the
+        alternative — holding to expiry — yields $0.00.
+
+        On failure, removes the token from _exiting_legs so the next WS tick retries.
+        """
+        log.info(
+            "OpeningNeutral: loser bid crossed exit threshold — firing market sell",
+            pair_id=pair_id[:12],
+            side=side,
+            trigger_bid=trigger_bid,
+            threshold=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
+        )
+        # By this point Polygon token settlement is long complete (seconds have
+        # elapsed since entry).  Fetch the actual credited balance to guarantee
+        # we sell exactly what the CLOB holds.
+        bal = await self._pm.get_token_balance(token_id)
+        sell_size = min(pos.size, bal) if (bal is not None and bal > 0) else pos.size
+
+        order_id = await self._pm.place_market(
+            token_id=token_id,
+            side="SELL",
+            price=0.01,   # floor at $0.01 — accepts any non-zero bid
+            size=sell_size,
+        )
+
+        if order_id:
+            rest = await self._pm.get_order_fill_rest(order_id)
+            exit_price = rest["price"] if rest else trigger_bid
+            log.info(
+                "OpeningNeutral: loser market sell executed",
+                pair_id=pair_id[:12],
+                side=side,
+                exit_price=exit_price,
+                sell_size=sell_size,
+                order_id=order_id,
+            )
+            await self._on_exit_fill(pair_id, side, exit_price=exit_price)
+        else:
+            # Market sell failed — unblock so the next WS tick can retry.
+            self._exiting_legs.discard(token_id)
+            log.error(
+                "OpeningNeutral: loser market sell failed — will retry on next tick",
+                pair_id=pair_id[:12],
+                side=side,
+                trigger_bid=trigger_bid,
+            )
+
     async def _on_exit_fill(
         self,
         pair_id: str,
@@ -1479,8 +1599,12 @@ class OpeningNeutralScanner(BaseStrategy):
 
         # ── Stop monitoring this pair ────────────────────────────────────────
         # The winner is now owned by the momentum monitor.  Remove the pair from
-        # opening-neutral state so that _monitor_exit_fills (if still running for
-        # any reason) becomes a no-op on the next fill event.
+        # opening-neutral state and clean up bid-monitoring lookups for both tokens.
+        for _exit_pos in (loser_pos, winner_pos):
+            _tok = getattr(_exit_pos, "token_id", "")
+            if _tok:
+                self._token_to_pair.pop(_tok, None)
+                self._exiting_legs.discard(_tok)
         self._active_pairs.pop(pair_id, None)
 
         # Fire close callback so main.py can update cooldowns and emit
