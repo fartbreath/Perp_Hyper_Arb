@@ -88,8 +88,6 @@ class OpeningNeutralScanner(BaseStrategy):
         # O(1) reverse lookup: token_id → condition_id for pending markets.
         # Both YES and NO tokens map to the same condition_id.
         self._token_to_pending: dict[str, str] = {}         # token_id → condition_id
-        # O(1) reverse lookup: token_id → pair_id for active pairs.
-        self._token_to_pair: dict[str, str] = {}            # token_id → pair_id
         # Per-market entry debounce: rate-limits _evaluate_entry to at most
         # _ENTRY_EVAL_DEBOUNCE_SECS for "too_expensive" markets that would
         # otherwise spam a signal on every WS tick.
@@ -107,11 +105,17 @@ class OpeningNeutralScanner(BaseStrategy):
         self._entered_market_ids: set[str] = set()
         # Ring buffer of recently closed/resolved pairs (kept for webapp display).
         self._closed_pairs: list[dict] = []
-        # Per-pair debounce for loser-exit: "pair_id_SIDE" keys prevent the
-        # same leg from firing _execute_loser_exit twice if price oscillates
-        # around the threshold.  Cleaned up in _refresh_pending_markets when
-        # the pair is pruned.
-        self._pending_exits: set[str] = set()
+        # Market IDs where a one-leg fill was promoted to momentum.
+        # These occupy a concurrent slot (counted against MAX_CONCURRENT) until the
+        # market expires so sequential entries across multiple coins at the same
+        # bucket-open time are blocked just like truly-simultaneous ones.
+        # Pruned in _refresh_pending_markets when the market_id leaves the live set.
+        self._promoted_slots: set[str] = set()
+        # ── Scheduled-timer entry state (ideas 1, 2, 5) ─────────────────────
+        # condition_ids for which a _scheduled_entry_task is already running.
+        # Guards against duplicate timer tasks when _refresh_pending_markets fires
+        # multiple times before the market opens.
+        self._scheduled_entry_market_ids: set[str] = set()
 
     # ── BaseStrategy interface ────────────────────────────────────────────────
 
@@ -282,6 +286,28 @@ class OpeningNeutralScanner(BaseStrategy):
             # captured.  NO-token-only price movements are caught on the next
             # YES event (at most _ENTRY_EVAL_DEBOUNCE_SECS later).
             self._token_to_pending[market.token_id_yes] = cond_id
+
+            # ── Idea 1+2+5: schedule a timer to fire at market open ───────────
+            # If the market hasn't opened yet (elapsed_now < 0), schedule a task
+            # that sleeps until open_ts and fires _evaluate_entry directly.
+            # This removes the dependency on a WS tick arriving after open, cutting
+            # ~200-500ms of first-tick latency.  Pre-qualification (static gates)
+            # was already done above; only dynamic gates run at timer fire time.
+            if duration > 0 and elapsed_now < 0 and cond_id not in self._scheduled_entry_market_ids:
+                open_ts = market.end_date.timestamp() - duration
+                self._scheduled_entry_market_ids.add(cond_id)
+                task = asyncio.create_task(
+                    self._scheduled_entry_task(market, open_ts),
+                    name=f"on_timer_{cond_id[:20]}",
+                )
+                task.add_done_callback(
+                    lambda t, cid=cond_id: (
+                        log.error(
+                            "OpeningNeutral: scheduled entry task raised",
+                            market_id=cid[:22], exc=str(t.exception()),
+                        ) if t.exception() else None
+                    )
+                )
             log.debug(
                 "OpeningNeutral: registered pending market",
                 market=getattr(market, "title", "")[:60],
@@ -298,6 +324,7 @@ class OpeningNeutralScanner(BaseStrategy):
             mkt = self._pending_markets.pop(cid)
             # Only YES token was registered in _token_to_pending (see above).
             self._token_to_pending.pop(getattr(mkt, "token_id_yes", None), None)
+            self._scheduled_entry_market_ids.discard(cid)
 
         # Prune markets that have drifted past the entry window without being entered.
         # Once elapsed > ENTRY_WINDOW_SECS, _evaluate_entry will always exit early on
@@ -312,6 +339,7 @@ class OpeningNeutralScanner(BaseStrategy):
         for cid in past_window_cids:
             mkt = self._pending_markets.pop(cid)
             self._token_to_pending.pop(getattr(mkt, "token_id_yes", None), None)
+            self._scheduled_entry_market_ids.discard(cid)
             log.debug("OpeningNeutral: delisted past-window market", market_id=cid[:22])
 
         # Prune expired entries from the persistent entered-market set so that
@@ -320,6 +348,8 @@ class OpeningNeutralScanner(BaseStrategy):
         # proxy; also prune any condition_id not seen in the current market list.
         live_cids = {getattr(m, "condition_id", "") for m in markets.values()}
         self._entered_market_ids -= (self._entered_market_ids - live_cids)
+        # Promoted-slot IDs are freed when the underlying market expires/de-lists.
+        self._promoted_slots -= (self._promoted_slots - live_cids)
 
         # Prune active pairs where both legs are now closed (resolved by monitor.py or
         # manually exited).  _check_one_pair normally handles this, but it only runs
@@ -334,13 +364,6 @@ class OpeningNeutralScanner(BaseStrategy):
             pair = self._active_pairs.pop(pid, {})
             yes_p = pair.get("yes_pos")
             no_p  = pair.get("no_pos")
-            if yes_p:
-                self._token_to_pair.pop(getattr(yes_p, "token_id", ""), None)
-            if no_p:
-                self._token_to_pair.pop(getattr(no_p, "token_id", ""), None)
-            # Clean up loser-exit debounce keys for this pair.
-            self._pending_exits.discard(f"{pid}_YES")
-            self._pending_exits.discard(f"{pid}_NO")
             self._closed_pairs.append({
                 "pair_id":      pid,
                 "market_id":    pair.get("market_id", ""),
@@ -383,18 +406,104 @@ class OpeningNeutralScanner(BaseStrategy):
                     extra.add(t)
         self._pm.register_for_book_updates(extra, owner="opening_neutral")
 
+    # ── Scheduled-timer entry (ideas 1, 2, 5) ────────────────────────────────
+
+    async def _scheduled_entry_task(self, market: Any, open_ts: float) -> None:
+        """
+        Background task that fires _evaluate_entry at the known market-open time.
+
+        Idea 1 — Scheduled timer: replaces the dependency on a WS tick arriving
+            after open, cutting 200-500ms of first-tick latency.
+        Idea 2 — Pre-qualification: static gates (market type, direction,
+            entry window) were already checked in _refresh_pending_markets at
+            schedule time.  Only dynamic gates (combined cost, concurrent cap)
+            run at the hot moment.
+        Idea 5 — TCP pre-warm: fires a lightweight GET 200ms before open to
+            ensure the CLOB connection pool has an established TCP socket ready
+            for the BUY orders.
+
+        The task always discards cond_id from _scheduled_entry_market_ids on
+        exit so _refresh_pending_markets can re-schedule if needed.
+        """
+        cond_id = getattr(market, "condition_id", "")
+        try:
+            now = time.time()
+            prewarm_at = open_ts - config.OPENING_NEUTRAL_PREWARM_SECS
+            entry_at   = open_ts - config.OPENING_NEUTRAL_TIMER_ADVANCE_SECS
+
+            # ── Step A: pre-warm TCP connection ──────────────────────────────
+            if prewarm_at > now:
+                await asyncio.sleep(prewarm_at - now)
+            if not self._running:
+                return
+            asyncio.create_task(self._prewarm_clob(), name="on_prewarm_clob")
+
+            # ── Step B: wait until just before open ──────────────────────────
+            now2 = time.time()
+            if entry_at > now2:
+                await asyncio.sleep(entry_at - now2)
+            if not self._running:
+                return
+
+            # Bail early if already entered (WS path beat the timer).
+            if cond_id in self._entered_market_ids:
+                log.debug(
+                    "OpeningNeutral: timer skipped — already entered (WS beat timer)",
+                    market_id=cond_id[:22],
+                )
+                return
+
+            # Re-fetch from pending_markets in case it was pruned while sleeping.
+            live_market = self._pending_markets.get(cond_id)
+            if live_market is None:
+                log.debug(
+                    "OpeningNeutral: timer skipped — market no longer pending",
+                    market_id=cond_id[:22],
+                )
+                return
+
+            log.debug(
+                "OpeningNeutral: timer firing — evaluating entry",
+                market=getattr(live_market, "title", "")[:60],
+                market_type=getattr(live_market, "market_type", ""),
+                advance_ms=round((time.time() - open_ts) * 1000, 1),
+            )
+            await self._evaluate_entry(live_market, _timer_fired=True)
+
+        finally:
+            self._scheduled_entry_market_ids.discard(cond_id)
+
+    async def _prewarm_clob(self) -> None:
+        """
+        Idea 5 — TCP pre-warm.
+
+        Sends a lightweight authenticated GET to the CLOB API endpoint 200ms
+        before the entry fires.  This establishes a TCP connection in the
+        underlying requests session pool so the BUY order POSTs start with an
+        already-open socket, saving ~50-100ms of TCP handshake + TLS setup.
+
+        Non-fatal: if it fails for any reason, the entry proceeds normally.
+        """
+        if getattr(self._pm, "_paper_mode", True) or getattr(self._pm, "_clob", None) is None:
+            return
+        try:
+            await self._pm.get_live_orders()
+            log.debug("OpeningNeutral: CLOB connection pre-warmed")
+        except Exception as exc:  # pylint: disable=broad-except
+            log.debug("OpeningNeutral: pre-warm failed (non-fatal)", exc=str(exc))
+
     # ── WS price-event handler ────────────────────────────────────────────────
 
     async def _on_price_event(self, token_id: str, mid: float) -> None:  # noqa: ARG002
         """
         Handle a WS price-change event (fires for every book/price_change update).
 
-        Entry path  — token belongs to a pending (not-yet-entered) market:
+        Entry path — token belongs to a pending (not-yet-entered) market:
             Evaluates all entry gates and spawns _enter_pair when qualifying.
 
-        Loser-exit path — token belongs to an active neutral pair:
-            When the token's mid price falls to ≤ OPENING_NEUTRAL_LOSER_EXIT_PRICE,
-            a taker SELL is executed to recover partial value.
+        Exit orders are resting GTC SELLs placed immediately after entry in
+        _register_pair.  Fill monitoring is handled by _monitor_exit_fills tasks,
+        not by price polling here.
 
         The book snapshot in pm.get_book() is already updated before this
         callback fires, so yes_ask / best_bid reads are always fresh.
@@ -414,23 +523,17 @@ class OpeningNeutralScanner(BaseStrategy):
                 market = self._pending_markets.get(cond_id)
                 if market is not None:
                     await self._evaluate_entry(market)
-            return
 
-        # ── Loser-exit monitoring path ────────────────────────────────────────
-        # A token registered in _token_to_pair belongs to an active neutral pair.
-        # When its mid price drops to the loser-exit threshold we trigger a sell.
-        pair_id = self._token_to_pair.get(token_id)
-        if pair_id is not None:
-            pair = self._active_pairs.get(pair_id)
-            if pair is not None and not self._pair_is_resolved(pair):
-                await self._maybe_exit_loser(pair_id, pair, token_id, mid)
-
-    async def _evaluate_entry(self, market: Any) -> None:
+    async def _evaluate_entry(self, market: Any, _timer_fired: bool = False) -> None:
         """
         Check all entry gates for a pending market; spawn _enter_pair if all pass.
 
-        Called from _on_price_event — on the hot WS path.  Returns immediately
-        if any gate fails so the event loop is not held.
+        Called from _on_price_event (WS path) or _scheduled_entry_task (timer path).
+        Returns immediately if any gate fails so the event loop is not held.
+
+        _timer_fired=True relaxes the elapsed-window lower bound by 1 second so
+        that timer-fired entries (which arrive ~50ms before open) are not rejected
+        by the `elapsed < 0` gate.  All other gates are unchanged.
         """
         if not config.OPENING_NEUTRAL_ENABLED:
             return
@@ -451,7 +554,8 @@ class OpeningNeutralScanner(BaseStrategy):
             if not self._pair_is_resolved(p)
         )
         in_flight = len(self._entering_markets)
-        if open_pairs + in_flight >= config.OPENING_NEUTRAL_MAX_CONCURRENT:
+        promoted = len(self._promoted_slots)
+        if open_pairs + in_flight + promoted >= config.OPENING_NEUTRAL_MAX_CONCURRENT:
             return
 
         # TTE / entry-window gate.
@@ -463,7 +567,10 @@ class OpeningNeutralScanner(BaseStrategy):
             return
         duration = _MARKET_TYPE_DURATION_SECS.get(market.market_type) or tte_secs
         elapsed = duration - tte_secs
-        if elapsed < 0 or elapsed > config.OPENING_NEUTRAL_ENTRY_WINDOW_SECS:
+        # Timer path fires ~50ms before open (elapsed ≈ -0.05).  Allow up to 1s
+        # negative elapsed so the entry is not rejected before the clock ticks over.
+        elapsed_min = -1.0 if _timer_fired else 0.0
+        if elapsed < elapsed_min or elapsed > config.OPENING_NEUTRAL_ENTRY_WINDOW_SECS:
             return
 
         # Conflict guard: skip if another strategy has an open position here.
@@ -545,8 +652,26 @@ class OpeningNeutralScanner(BaseStrategy):
         """
         Attempt to simultaneously fill YES and NO legs.
 
-        Both orders are placed concurrently.  After ENTRY_TIMEOUT_SECS the
-        unfilled leg is abandoned and the fallback strategy applies.
+        DRY_RUN / FAK mode:
+            Both legs placed concurrently via _place_leg; results handled as
+            before (both filled → register pair, one filled → one-leg fallback,
+            neither → no-fill log).
+
+        LIMIT mode (default):
+            Both GTC post-only orders placed concurrently.  As soon as the
+            FIRST leg fills, the resting other-leg order is cancelled and a
+            market (FAK) order is placed for the other side immediately.
+
+            This eliminates the dangerous scenario where a filled leg stops out
+            while the opposite resting order remains in the book — previously
+            the bot could buy into the losing side for a total loss up to −$0.65.
+
+            Cancel race: if cancel_order returns False (other leg already filled
+            before the cancel arrived), a REST check confirms the fill and the
+            pair is registered as two maker fills — no market order needed.
+
+            Any market-fill failure falls back to _handle_one_leg_fill (Momentum
+            promotion) so a filled leg is never left untracked.
         """
         market_id: str = market.condition_id
         try:
@@ -570,56 +695,133 @@ class OpeningNeutralScanner(BaseStrategy):
                 log.warning("OpeningNeutral: cannot resolve token IDs", market_id=market_id[:22])
                 return
 
-            # Place both orders concurrently.
-            yes_order_task = asyncio.create_task(
-                self._place_leg(yes_token_id, "YES", yes_ask, size_usd, market)
+            is_fak = config.OPENING_NEUTRAL_ORDER_TYPE == "market"
+
+            # ── DRY_RUN / FAK: concurrent _place_leg path (unchanged) ────────
+            # _place_leg handles DRY_RUN simulation and FAK fill-wait internally.
+            # FAK orders are fire-and-forget; we just wait for both to settle.
+            if config.OPENING_NEUTRAL_DRY_RUN or is_fak:
+                yes_order_task = asyncio.create_task(
+                    self._place_leg(yes_token_id, "YES", yes_ask, size_usd, market)
+                )
+                no_order_task = asyncio.create_task(
+                    self._place_leg(no_token_id, "NO", no_ask, size_usd, market)
+                )
+
+                done, pending = await asyncio.wait(
+                    [yes_order_task, no_order_task],
+                    timeout=config.OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+
+                for t in pending:
+                    t.cancel()
+
+                try:
+                    yes_result = yes_order_task.result() if yes_order_task in done else None
+                except Exception as _exc:  # pylint: disable=broad-except
+                    log.warning("OpeningNeutral: YES leg task raised", exc=str(_exc))
+                    yes_result = None
+                try:
+                    no_result = no_order_task.result() if no_order_task in done else None
+                except Exception as _exc:  # pylint: disable=broad-except
+                    log.warning("OpeningNeutral: NO leg task raised", exc=str(_exc))
+                    no_result = None
+
+                yes_filled = yes_result and yes_result.get("filled")
+                no_filled = no_result and no_result.get("filled")
+
+                if yes_filled and no_filled:
+                    await self._register_pair(
+                        pair_id, market, yes_result, no_result,
+                        yes_token_id, no_token_id,
+                    )
+                elif yes_filled and not no_filled:
+                    await self._handle_one_leg_fill(
+                        pair_id, market, yes_result, "YES", yes_token_id
+                    )
+                elif no_filled and not yes_filled:
+                    await self._handle_one_leg_fill(
+                        pair_id, market, no_result, "NO", no_token_id
+                    )
+                else:
+                    log.info(
+                        "OpeningNeutral: neither leg filled — no position taken",
+                        market=market.title[:60],
+                    )
+                    _emit_event(
+                        "OPENING_NEUTRAL_NO_FILL",
+                        market_id=market_id,
+                        market_title=market.title[:80],
+                        market_type=getattr(market, "market_type", ""),
+                        underlying=getattr(market, "underlying", ""),
+                    )
+                return
+
+            # ── LIMIT mode: place both GTC → wait for FIRST fill → cancel + market ──
+            yes_place_price = round(min(yes_ask, 0.99), 2)
+            no_place_price  = round(min(no_ask,  0.99), 2)
+            yes_contracts = round(size_usd / yes_place_price, 6) if yes_place_price > 0 else 0.0
+            no_contracts  = round(size_usd / no_place_price,  6) if no_place_price  > 0 else 0.0
+
+            yes_order_id, no_order_id = await asyncio.gather(
+                self._pm.place_limit(
+                    token_id=yes_token_id, side="BUY",
+                    price=yes_place_price, size=yes_contracts,
+                    market=market, post_only=True,
+                ),
+                self._pm.place_limit(
+                    token_id=no_token_id, side="BUY",
+                    price=no_place_price, size=no_contracts,
+                    market=market, post_only=True,
+                ),
             )
-            no_order_task = asyncio.create_task(
-                self._place_leg(no_token_id, "NO", no_ask, size_usd, market)
-            )
 
-            done, pending = await asyncio.wait(
-                [yes_order_task, no_order_task],
-                timeout=config.OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS,
-                return_when=asyncio.ALL_COMPLETED,
-            )
+            if not yes_order_id or not no_order_id:
+                # One or both orders were rejected — clean up and abort.
+                if yes_order_id:
+                    await self._pm.cancel_order(yes_order_id)
+                if no_order_id:
+                    await self._pm.cancel_order(no_order_id)
+                log.warning(
+                    "OpeningNeutral: one or both limit orders rejected",
+                    yes_ok=bool(yes_order_id),
+                    no_ok=bool(no_order_id),
+                )
+                return
 
-            # Cancel any still-pending tasks.
-            for t in pending:
-                t.cancel()
-
-            # Guard: task.result() raises if _place_leg raised an exception.
-            # Treat a failed leg as unfilled so the fallback path handles it.
-            try:
-                yes_result = yes_order_task.result() if yes_order_task in done else None
-            except Exception as _exc:  # pylint: disable=broad-except
-                log.warning("OpeningNeutral: YES leg task raised", exc=str(_exc))
-                yes_result = None
-            try:
-                no_result = no_order_task.result() if no_order_task in done else None
-            except Exception as _exc:  # pylint: disable=broad-except
-                log.warning("OpeningNeutral: NO leg task raised", exc=str(_exc))
-                no_result = None
-
-            yes_filled = yes_result and yes_result.get("filled")
-            no_filled = no_result and no_result.get("filled")
-
-            if yes_filled and no_filled:
+            # Paper mode: both orders fill instantly (no real WS events).
+            if self._pm._paper_mode:
+                yes_size = round(size_usd / yes_place_price, 6)
+                no_size  = round(size_usd / no_place_price,  6)
                 await self._register_pair(
-                    pair_id, market, yes_result, no_result,
+                    pair_id, market,
+                    {"filled": True, "price": yes_place_price, "size": yes_size, "order_id": yes_order_id},
+                    {"filled": True, "price": no_place_price,  "size": no_size,  "order_id": no_order_id},
                     yes_token_id, no_token_id,
                 )
-            elif yes_filled and not no_filled:
-                await self._handle_one_leg_fill(
-                    pair_id, market, yes_result, "YES", yes_token_id
-                )
-            elif no_filled and not yes_filled:
-                await self._handle_one_leg_fill(
-                    pair_id, market, no_result, "NO", no_token_id
-                )
-            else:
+                return
+
+            # Register WS fill futures for both resting orders.
+            loop = asyncio.get_running_loop()
+            yes_future: asyncio.Future = loop.create_future()
+            no_future:  asyncio.Future = loop.create_future()
+            self._pm.register_fill_future(yes_order_id, yes_future)
+            self._pm.register_fill_future(no_order_id,  no_future)
+
+            # Wait for the FIRST leg to fill within the full entry window.
+            done, _ = await asyncio.wait(
+                {yes_future, no_future},
+                timeout=config.OPENING_NEUTRAL_ENTRY_WINDOW_SECS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if not done:
+                # Entry window expired — no fills on either leg.
+                await self._pm.cancel_order(yes_order_id)
+                await self._pm.cancel_order(no_order_id)
                 log.info(
-                    "OpeningNeutral: neither leg filled — no position taken",
+                    "OpeningNeutral: neither leg filled within entry window — no position taken",
                     market=market.title[:60],
                 )
                 _emit_event(
@@ -629,6 +831,167 @@ class OpeningNeutralScanner(BaseStrategy):
                     market_type=getattr(market, "market_type", ""),
                     underlying=getattr(market, "underlying", ""),
                 )
+                return
+
+            # Identify which leg filled first and set other-leg metadata.
+            if yes_future in done:
+                first_side  = "YES"
+                first_token = yes_token_id
+                first_order = yes_order_id
+                first_price = yes_place_price
+                other_side  = "NO"
+                other_token = no_token_id
+                other_order = no_order_id
+                other_price = no_place_price
+                first_event = yes_future.result()
+            else:
+                first_side  = "NO"
+                first_token = no_token_id
+                first_order = no_order_id
+                first_price = no_place_price
+                other_side  = "YES"
+                other_token = yes_token_id
+                other_order = yes_order_id
+                other_price = yes_place_price
+                first_event = no_future.result()
+
+            # Parse the first fill — prefer WS event fields, fall back to REST.
+            ws_price = float(first_event.get("price") or 0)
+            ws_size  = float(first_event.get("size_matched") or 0)
+            if ws_price > 0 and ws_size > 0:
+                first_result: dict = {
+                    "filled": True, "price": ws_price,
+                    "size": ws_size, "order_id": first_order,
+                }
+            else:
+                rest = await self._pm.get_order_fill_rest(first_order)
+                if rest:
+                    first_result = {
+                        "filled": True,
+                        "price": rest["price"],
+                        "size": rest["size_matched"],
+                        "order_id": first_order,
+                    }
+                else:
+                    # WS event fired but contained no price/size — abort safely.
+                    await self._pm.cancel_order(other_order)
+                    log.warning(
+                        "OpeningNeutral: first fill event empty (no price/size) — aborting",
+                        side=first_side,
+                    )
+                    return
+
+            log.info(
+                "OpeningNeutral: first leg filled — cancelling other and market-filling",
+                first_side=first_side,
+                first_price=first_result["price"],
+                other_side=other_side,
+            )
+
+            # Cancel the other resting order immediately.
+            cancelled_ok = await self._pm.cancel_order(other_order)
+
+            if not cancelled_ok:
+                # cancel_order returned False — the other order may have already
+                # filled (race condition: both legs became maker fills).
+                rest = await self._pm.get_order_fill_rest(other_order)
+                if rest and rest.get("size_matched", 0) > 0:
+                    # Both filled as makers — best possible outcome.
+                    other_result: dict = {
+                        "filled": True,
+                        "price": rest["price"],
+                        "size": rest["size_matched"],
+                        "order_id": other_order,
+                    }
+                    yes_r, no_r = (
+                        (first_result, other_result) if first_side == "YES"
+                        else (other_result, first_result)
+                    )
+                    log.info(
+                        "OpeningNeutral: both legs filled as makers",
+                        market=market.title[:60],
+                    )
+                    await self._register_pair(
+                        pair_id, market, yes_r, no_r, yes_token_id, no_token_id
+                    )
+                    return
+                # Cancel failed and other leg has no fill — one-leg fallback.
+                log.warning(
+                    "OpeningNeutral: cancel of other leg failed and no fill — one-leg fallback",
+                    other_side=other_side,
+                )
+                await self._handle_one_leg_fill(
+                    pair_id, market, first_result, first_side, first_token
+                )
+                return
+
+            # Cancel succeeded — market-fill the other side immediately.
+            mkt_price = round(min(other_price + 0.005, 0.99), 3)
+            other_order_id2 = await self._pm.place_market(
+                token_id=other_token, side="BUY", price=mkt_price, size=size_usd
+            )
+            if not other_order_id2:
+                log.warning(
+                    "OpeningNeutral: market fill of second leg rejected — one-leg fallback",
+                    other_side=other_side,
+                )
+                await self._handle_one_leg_fill(
+                    pair_id, market, first_result, first_side, first_token
+                )
+                return
+
+            # Wait for the market fill.
+            other_fill_future: asyncio.Future = loop.create_future()
+            self._pm.register_fill_future(other_order_id2, other_fill_future)
+            other_result_opt: Optional[dict] = None
+            try:
+                other_event = await asyncio.wait_for(
+                    other_fill_future,
+                    timeout=config.OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS,
+                )
+                ws_p = float(other_event.get("price") or 0)
+                ws_s = float(other_event.get("size_matched") or 0)
+                if ws_p > 0 and ws_s > 0:
+                    other_result_opt = {
+                        "filled": True, "price": ws_p,
+                        "size": ws_s, "order_id": other_order_id2,
+                    }
+                else:
+                    rest2 = await self._pm.get_order_fill_rest(other_order_id2)
+                    if rest2:
+                        other_result_opt = {
+                            "filled": True,
+                            "price": rest2["price"],
+                            "size": rest2["size_matched"],
+                            "order_id": other_order_id2,
+                        }
+            except asyncio.TimeoutError:
+                rest2 = await self._pm.get_order_fill_rest(other_order_id2)
+                if rest2:
+                    other_result_opt = {
+                        "filled": True,
+                        "price": rest2["price"],
+                        "size": rest2["size_matched"],
+                        "order_id": other_order_id2,
+                    }
+
+            if other_result_opt is None:
+                log.warning(
+                    "OpeningNeutral: market fill of second leg timed out — one-leg fallback",
+                    other_side=other_side,
+                )
+                await self._handle_one_leg_fill(
+                    pair_id, market, first_result, first_side, first_token
+                )
+                return
+
+            # Both legs filled — register the pair.
+            yes_r, no_r = (
+                (first_result, other_result_opt) if first_side == "YES"
+                else (other_result_opt, first_result)
+            )
+            await self._register_pair(pair_id, market, yes_r, no_r, yes_token_id, no_token_id)
+
         finally:
             self._entering_markets.discard(market_id)
 
@@ -659,23 +1022,29 @@ class OpeningNeutralScanner(BaseStrategy):
             )
             return {"filled": True, "price": ask_price, "size": sim_size, "order_id": f"dry_{uuid.uuid4().hex[:8]}"}
 
-        # Taker limit: cross spread by +0.5c.
-        place_price = round(min(ask_price + 0.005, 0.99), 3)
         # OrderArgs expects size in contracts (shares), not USD.
-        contracts = round(size_usd / place_price, 6) if place_price > 0 else 0.0
+        # "limit" — post-only GTC at the current ask; rests in the book.
+        # "market" — FAK taker at ask+0.5c; crosses the spread immediately.
+        is_fak = config.OPENING_NEUTRAL_ORDER_TYPE == "market"
 
-        if config.OPENING_NEUTRAL_ORDER_TYPE == "market":
+        if is_fak:
+            # FAK: cross spread by +0.5c to guarantee a fill.
+            place_price = round(min(ask_price + 0.005, 0.99), 3)
+            contracts = round(size_usd / place_price, 6) if place_price > 0 else 0.0
             order_id = await self._pm.place_market(
                 token_id=token_id, side="BUY", price=place_price, size=size_usd
             )
         else:
+            # GTC post-only: rest at the current ask price (no slippage above ask).
+            place_price = round(min(ask_price, 0.99), 2)
+            contracts = round(size_usd / place_price, 6) if place_price > 0 else 0.0
             order_id = await self._pm.place_limit(
                 token_id=token_id,
                 side="BUY",
                 price=place_price,
                 size=contracts,
                 market=market,
-                post_only=False,
+                post_only=True,
             )
 
         if not order_id:
@@ -688,15 +1057,19 @@ class OpeningNeutralScanner(BaseStrategy):
             return {"filled": True, "price": place_price, "size": entry_size, "order_id": order_id}
 
         # Wait for WS fill event.
-        # FAK orders are fill-or-kill: if the exchange matched them the trade WS
-        # event arrives within ~1-2s.  Use the short FAK timeout so a killed leg
-        # is detected in seconds rather than the full 30s entry timeout.
+        # FAK: fill-or-kill at the exchange — WS arrives in ~1-2s; use the short
+        #      FAK_FILL_TIMEOUT.  No cancel needed if it times out (already dead).
+        # GTC: resting post-only order — wait up to ENTRY_TIMEOUT_SECS.  If no
+        #      fill arrives in that window, cancel and treat the leg as unfilled.
+        fill_timeout = (
+            config.OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS
+            if is_fak
+            else config.OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS
+        )
         fill_future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pm.register_fill_future(order_id, fill_future)
         try:
-            fill_event = await asyncio.wait_for(
-                fill_future, timeout=config.OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS
-            )
+            fill_event = await asyncio.wait_for(fill_future, timeout=fill_timeout)
             ws_price = float(fill_event.get("price") or 0)
             ws_size = float(fill_event.get("size_matched") or 0)
             if ws_price > 0 and ws_size > 0:
@@ -711,8 +1084,14 @@ class OpeningNeutralScanner(BaseStrategy):
                     "order_id": order_id,
                 }
         except asyncio.TimeoutError:
-            # FAK is already dead at the exchange (fill-or-kill) — no cancel needed.
-            # Do a final REST check in case the WS event was delayed.
+            if is_fak:
+                # FAK already dead at the exchange — no cancel needed.
+                log.info("OpeningNeutral: FAK leg unfilled (killed at exchange)", side=side)
+            else:
+                # GTC resting order — cancel it before moving on.
+                log.info("OpeningNeutral: GTC leg timed out — cancelling", side=side)
+                await self._pm.cancel_order(order_id)
+            # Final REST check in case the WS event was delayed.
             rest = await self._pm.get_order_fill_rest(order_id)
             if rest:
                 return {
@@ -721,7 +1100,6 @@ class OpeningNeutralScanner(BaseStrategy):
                     "size": rest["size_matched"],
                     "order_id": order_id,
                 }
-            log.info("OpeningNeutral: FAK leg unfilled (killed at exchange)", side=side)
 
         return {"filled": False, "price": place_price, "size": 0.0, "order_id": order_id}
 
@@ -755,11 +1133,9 @@ class OpeningNeutralScanner(BaseStrategy):
             "market_title": market_title[:80],
             "yes_pos": yes_pos,
             "no_pos": no_pos,
+            "yes_exit_order_id": "",
+            "no_exit_order_id":  "",
         }
-
-        # Register token → pair reverse map so _on_price_event routes monitor events.
-        self._token_to_pair[yes_token_id] = pair_id
-        self._token_to_pair[no_token_id]  = pair_id
 
         # Remove from pending now that entry is registered.
         # Only the YES token was in _token_to_pending (NO was never registered
@@ -795,9 +1171,74 @@ class OpeningNeutralScanner(BaseStrategy):
         # webapp without waiting the 1-second backstop interval.
         if self._on_open_callback is not None:
             self._on_open_callback()
-        # Loser-exit monitoring starts automatically: _on_price_event watches
-        # both token_ids via _token_to_pair and calls _maybe_exit_loser when
-        # either token's mid price drops to ≤ OPENING_NEUTRAL_LOSER_EXIT_PRICE.
+
+        # ── Place resting exit SELLs on both legs immediately (PLAN.md §2) ──
+        # Per PLAN.md: both GTC SELL orders go into the book the moment entry fills.
+        # Whichever fills first is the loser; the other is cancelled and the winner
+        # transitions to momentum.  DRY_RUN and paper_mode skip real orders.
+        if config.OPENING_NEUTRAL_DRY_RUN:
+            log.debug(
+                "OpeningNeutral DRY_RUN: skipping exit SELL placement",
+                pair_id=pair_id[:12],
+            )
+        elif self._pm._paper_mode:
+            log.debug(
+                "OpeningNeutral paper_mode: skipping exit SELL placement",
+                pair_id=pair_id[:12],
+            )
+        else:
+            yes_exit_id, no_exit_id = await asyncio.gather(
+                self._pm.place_limit(
+                    token_id=yes_token_id,
+                    side="SELL",
+                    price=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
+                    size=yes_pos.size,
+                    market=None,
+                    post_only=True,
+                ),
+                self._pm.place_limit(
+                    token_id=no_token_id,
+                    side="SELL",
+                    price=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
+                    size=no_pos.size,
+                    market=None,
+                    post_only=True,
+                ),
+            )
+            pair_dict = self._active_pairs.get(pair_id)
+            if pair_dict is not None:
+                pair_dict["yes_exit_order_id"] = yes_exit_id or ""
+                pair_dict["no_exit_order_id"]  = no_exit_id  or ""
+
+            if yes_exit_id and no_exit_id:
+                log.info(
+                    "OpeningNeutral: resting exit SELLs placed on both legs",
+                    pair_id=pair_id[:12],
+                    price=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
+                    yes_exit_id=yes_exit_id,
+                    no_exit_id=no_exit_id,
+                )
+                asyncio.create_task(
+                    self._monitor_exit_fills(pair_id, yes_exit_id, no_exit_id),
+                    name=f"exit_monitor_{pair_id[:12]}",
+                )
+            elif yes_exit_id and not no_exit_id:
+                await self._pm.cancel_order(yes_exit_id)
+                log.error(
+                    "OpeningNeutral: NO exit SELL rejected — cancelling YES SELL; no exit orders in book",
+                    pair_id=pair_id[:12],
+                )
+            elif no_exit_id and not yes_exit_id:
+                await self._pm.cancel_order(no_exit_id)
+                log.error(
+                    "OpeningNeutral: YES exit SELL rejected — cancelling NO SELL; no exit orders in book",
+                    pair_id=pair_id[:12],
+                )
+            else:
+                log.error(
+                    "OpeningNeutral: both exit SELLs rejected — no exit orders in book, manual action required",
+                    pair_id=pair_id[:12],
+                )
 
     async def _handle_one_leg_fill(
         self,
@@ -828,6 +1269,9 @@ class OpeningNeutralScanner(BaseStrategy):
                     pos.entry_price * (1.0 - config.MOMENTUM_PROB_SL_PCT), 6
                 )
             self._risk.open_position(pos)
+            # Occupy the concurrent slot until this market expires so no
+            # additional markets enter on the same bucket-opening cycle.
+            self._promoted_slots.add(market_id)
             log.info(
                 "OpeningNeutral: one-leg fill — promoting to momentum",
                 market=market_title[:60],
@@ -900,151 +1344,73 @@ class OpeningNeutralScanner(BaseStrategy):
             strike=getattr(market, "strike", 0.0) or 0.0,
         )
 
-    # ── Loser-exit monitoring ─────────────────────────────────────────────────
+    # ── Loser-exit fill monitoring ────────────────────────────────────────────
 
-    async def _maybe_exit_loser(
+    async def _monitor_exit_fills(
         self,
         pair_id: str,
-        pair: dict,
-        token_id: str,
-        mid: float,
+        yes_exit_id: str,
+        no_exit_id: str,
     ) -> None:
         """
-        Called from _on_price_event for every price tick on an active-pair token.
+        Background task: wait for a WS fill on either resting loser-exit SELL.
 
-        Triggers a taker-exit SELL when the token's mid price drops to
-        ≤ OPENING_NEUTRAL_LOSER_EXIT_PRICE.  A per-pair debounce flag
-        (_pending_exits) prevents the same leg from firing twice if the
-        price oscillates around the threshold.
+        Both GTC SELL orders were placed immediately after entry (in _register_pair).
+        Whichever fills first is the loser.  The other resting SELL is immediately
+        cancelled and the winner transitions to momentum via _on_exit_fill.
+
+        Timeout: after OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS both orders are
+        cancelled.  The positions are left to the momentum / resolution handler
+        (market has likely expired; winner tracking continues normally).
         """
-        yes_pos: Position = pair["yes_pos"]
-        no_pos:  Position = pair["no_pos"]
+        loop = asyncio.get_running_loop()
+        yes_fut: asyncio.Future = loop.create_future()
+        no_fut:  asyncio.Future = loop.create_future()
+        self._pm.register_fill_future(yes_exit_id, yes_fut)
+        self._pm.register_fill_future(no_exit_id,  no_fut)
 
-        if token_id == yes_pos.token_id:
-            loser_pos  = yes_pos
+        done, _ = await asyncio.wait(
+            {yes_fut, no_fut},
+            timeout=config.OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if not done:
+            # Market expired without either SELL filling.  Cancel both orders.
+            await asyncio.gather(
+                self._pm.cancel_order(yes_exit_id),
+                self._pm.cancel_order(no_exit_id),
+                return_exceptions=True,
+            )
+            log.warning(
+                "OpeningNeutral: exit SELLs timed out — cancelling resting orders",
+                pair_id=pair_id[:12],
+            )
+            return
+
+        if yes_fut in done:
             filled_side = "YES"
+            other_order_id = no_exit_id
+            fill_event = yes_fut.result()
         else:
-            loser_pos  = no_pos
             filled_side = "NO"
+            other_order_id = yes_exit_id
+            fill_event = no_fut.result()
 
-        if loser_pos.is_closed:
-            return
-        if mid > config.OPENING_NEUTRAL_LOSER_EXIT_PRICE:
-            return
+        ws_price = float(fill_event.get("price") or 0)
+        exit_price = ws_price if ws_price > 0 else config.OPENING_NEUTRAL_LOSER_EXIT_PRICE
 
-        # Wide-spread false-positive guard.
-        # When a PM WS shard reconnects it delivers a fresh book snapshot that
-        # can have a very low bid (market-maker repositioning) while the ask
-        # stays near the entry price.  This creates an artificially low mid
-        # (≤ threshold) even though the token hasn't genuinely declined.
-        # A token at genuine fair-value 0.35 will have ask ≈ 0.36–0.38.
-        # Any ask still within 95 % of entry price means the ask hasn't moved
-        # and the mid is a wide-spread artefact — not a real price drop.
-        _book = self._pm.get_book(loser_pos.token_id)
-        _ask = _book.best_ask if _book else None
-        if _ask is None or _ask > loser_pos.entry_price * 0.95:
-            return  # no ask visible or ask near entry — reconnect artefact, not genuine decline
+        # Cancel the other resting SELL immediately.
+        await self._pm.cancel_order(other_order_id)
 
-        exit_key = f"{pair_id}_{filled_side}"
-        if exit_key in self._pending_exits:
-            return  # already in flight
-
-        self._pending_exits.add(exit_key)
-
-        def _on_done(task: asyncio.Task) -> None:
-            exc = task.exception()
-            if exc is not None:
-                log.error(
-                    "OpeningNeutral: _execute_loser_exit raised",
-                    pair_id=pair_id[:12],
-                    side=filled_side,
-                    exc=str(exc),
-                )
-
-        task = asyncio.create_task(
-            self._execute_loser_exit(pair_id, filled_side, loser_pos, mid),
-            name=f"loser_exit_{pair_id[:12]}_{filled_side}",
-        )
-        task.add_done_callback(_on_done)
-
-    async def _execute_loser_exit(
-        self,
-        pair_id: str,
-        filled_side: str,
-        loser_pos: "Position",
-        trigger_mid: float,
-    ) -> None:
-        """
-        Execute the loser-exit taker SELL and record the fill.
-
-        DRY_RUN: simulates the fill at trigger_mid and calls _on_exit_fill.
-        Paper/Live: places a FAK SELL, waits for the WS fill event, then
-        calls _on_exit_fill with the actual fill price.
-
-        On FAK rejection (empty book near expiry) falls back to a post_only
-        resting SELL at best bid per preamble exit-order-handling rules.
-        """
-        actual_price = trigger_mid  # fallback if fill event has no price
-
-        if config.OPENING_NEUTRAL_DRY_RUN:
-            log.debug(
-                "OpeningNeutral DRY_RUN: simulating loser exit",
-                pair_id=pair_id[:12],
-                side=filled_side,
-                price=trigger_mid,
-            )
-            # Simulate at the configured exit price (0.35), not trigger_mid.
-            # In live mode a FAK limit-sell is placed AT 0.35; if trigger_mid
-            # has already dipped below 0.35 the order would be rejected anyway.
-            await self._on_exit_fill(pair_id, filled_side,
-                                     exit_price=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE)
-            return
-
-        order_id = await self._pm.place_limit(
-            token_id=loser_pos.token_id,
-            side="SELL",
-            price=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
-            size=loser_pos.size,
-            market=None,
-            post_only=False,
+        log.info(
+            "OpeningNeutral: loser-exit SELL filled",
+            pair_id=pair_id[:12],
+            filled_side=filled_side,
+            exit_price=exit_price,
         )
 
-        if not order_id:
-            log.error(
-                "OpeningNeutral: loser exit FAK rejected — position left open, manual action required",
-                pair_id=pair_id[:12],
-                side=filled_side,
-            )
-            return
-
-        if self._pm._paper_mode:
-            await self._on_exit_fill(pair_id, filled_side, exit_price=trigger_mid)
-            return
-
-        fill_future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pm.register_fill_future(order_id, fill_future)
-        try:
-            fill_event = await asyncio.wait_for(
-                fill_future,
-                timeout=config.OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS,
-            )
-            ws_price = float(fill_event.get("price") or 0)
-            if ws_price > 0:
-                actual_price = ws_price
-        except asyncio.TimeoutError:
-            rest = await self._pm.get_order_fill_rest(order_id)
-            if rest:
-                actual_price = rest["price"]
-            else:
-                await self._pm.cancel_order(order_id)
-                log.error(
-                    "OpeningNeutral: loser exit fill timeout — position left open, manual action required",
-                    pair_id=pair_id[:12],
-                    side=filled_side,
-                )
-                return
-
-        await self._on_exit_fill(pair_id, filled_side, exit_price=actual_price)
+        await self._on_exit_fill(pair_id, filled_side, exit_price=exit_price)
 
     async def _on_exit_fill(
         self,
@@ -1112,15 +1478,10 @@ class OpeningNeutralScanner(BaseStrategy):
         )
 
         # ── Stop monitoring this pair ────────────────────────────────────────
-        # The winner is now owned by the momentum monitor.  Remove the pair
-        # and both token IDs from opening-neutral state so that subsequent
-        # price ticks for the winner token do NOT re-trigger _maybe_exit_loser
-        # (which would close the winner prematurely as a "second loser").
+        # The winner is now owned by the momentum monitor.  Remove the pair from
+        # opening-neutral state so that _monitor_exit_fills (if still running for
+        # any reason) becomes a no-op on the next fill event.
         self._active_pairs.pop(pair_id, None)
-        self._token_to_pair.pop(loser_pos.token_id, None)
-        self._token_to_pair.pop(winner_pos.token_id, None)
-        self._pending_exits.discard(f"{pair_id}_YES")
-        self._pending_exits.discard(f"{pair_id}_NO")
 
         # Fire close callback so main.py can update cooldowns and emit
         # notify_state_changed().

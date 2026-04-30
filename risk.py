@@ -1349,6 +1349,16 @@ class RiskEngine:
                 log.warning("finalize_hedge: unknown order_id", order_id=order_id[:20])
                 return None
 
+            # Guard against double-writes: if this order has already been finalized
+            # (status is terminal), skip the CSV write and return the existing record.
+            if ho.status in HedgeStatus.TERMINAL:
+                log.warning(
+                    "finalize_hedge: order already terminal — skipping duplicate write",
+                    order_id=order_id[:20],
+                    status=ho.status,
+                )
+                return ho
+
             fill_price = ho.avg_fill_price if ho.avg_fill_price else ho.order_price
             fill_size = ho.size_filled
             pnl = round((settled_price - fill_price) * fill_size, 6)

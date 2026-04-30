@@ -16,9 +16,11 @@ Coverage:
   - _handle_one_leg_fill with keep_as_momentum fallback -> strategy="momentum"
   - conflict guard: _evaluate_entry skips market with existing open position
   - _pair_is_resolved: True when both legs closed, False when either is open
-  - _maybe_exit_loser DRY_RUN: triggers _on_exit_fill at trigger_mid
-  - _maybe_exit_loser debounce: second price tick does NOT fire a second exit task
-  - _execute_loser_exit paper_mode: _on_exit_fill called without placing real order
+  - _register_pair places resting GTC SELL orders on both legs immediately after entry
+  - _monitor_exit_fills YES loser: YES SELL fills → cancel NO SELL, call _on_exit_fill
+  - _monitor_exit_fills NO loser: NO SELL fills → cancel YES SELL, call _on_exit_fill
+  - _monitor_exit_fills timeout: neither fills → cancel both orders, no _on_exit_fill
+  - regression: _on_exit_fill called twice does not double-close the position
   - _on_exit_fill YES loser: YES closed at exit_price, NO promoted to momentum
   - _on_exit_fill NO loser: NO closed at exit_price, YES promoted to momentum
   - _on_exit_fill uses actual fill price (exit_price param), not config constant
@@ -446,265 +448,190 @@ def test_evaluate_entry_skips_skewed_market():
     assert scanner._entering_markets == set()
 
 
-# ── test: _maybe_exit_loser DRY_RUN ─────────────────────────────────────────
+# ── test: _register_pair places resting exit SELLs immediately ───
 
-def test_maybe_exit_loser_dry_run():
+def test_register_pair_places_exit_sells_immediately():
     """
-    In DRY_RUN mode, _maybe_exit_loser must call _on_exit_fill at the trigger price.
-    No real orders must be placed.
+    After both BUY legs fill, _register_pair must place GTC resting SELL orders on
+    both YES and NO tokens at LOSER_EXIT_PRICE immediately, and spawn the
+    _monitor_exit_fills background task.  No price monitoring or deferred trigger.
+    Per PLAN.md §2: resting SELLs go into the book the moment entry fills.
     """
-    # yes_ask=0.36 simulates post-decline book (0.36 < 0.50*0.95=0.475 → guard allows)
-    scanner = _make_scanner(yes_ask=0.36)
-    pair_id = "pair_dry_exit"
-    yes_pos = _make_position("cond_dry_exit_001", "YES", 0.50, pair_id)
-    no_pos  = _make_position("cond_dry_exit_001", "NO",  0.50, pair_id)
-    pair = {
-        "market_id": "cond_dry_exit_001",
-        "market_title": "Test",
-        "yes_pos": yes_pos,
-        "no_pos": no_pos,
-    }
-    scanner._active_pairs[pair_id] = pair
-
-    exit_calls: list[tuple] = []
-
-    async def fake_on_exit_fill(pid, side, exit_price=None):
-        exit_calls.append((pid, side, exit_price))
-
-    with (
-        patch.object(config, "OPENING_NEUTRAL_DRY_RUN", True),
-        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
-    ):
-        scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
-        # trigger_mid = 0.34 (below threshold)
-        _run(scanner._maybe_exit_loser(pair_id, pair, yes_pos.token_id, 0.34))
-        # allow the created task to run
-        _run(asyncio.sleep(0.05))
-
-    scanner._pm.place_limit.assert_not_called()
-    assert len(exit_calls) == 1, f"Expected 1 exit call, got {len(exit_calls)}"
-    pid, side, price = exit_calls[0]
-    assert pid == pair_id
-    assert side == "YES"
-    # DRY_RUN must simulate at config exit price (0.35), not trigger_mid (0.34)
-    assert price == pytest.approx(0.35)
-
-
-def test_maybe_exit_loser_debounce():
-    """
-    Second price tick below threshold for the same pair/side must NOT fire a second
-    exit task (debounced by _pending_exits).
-    """
-    # yes_ask=0.36 simulates post-decline book (0.36 < 0.50*0.95=0.475 → guard allows)
-    scanner = _make_scanner(yes_ask=0.36)
-    pair_id = "pair_debounce"
-    yes_pos = _make_position("cond_debounce_001", "YES", 0.50, pair_id)
-    no_pos  = _make_position("cond_debounce_001", "NO",  0.50, pair_id)
-    pair = {
-        "market_id": "cond_debounce_001",
-        "market_title": "Test",
-        "yes_pos": yes_pos,
-        "no_pos": no_pos,
-    }
-    scanner._active_pairs[pair_id] = pair
-
-    exit_calls: list[tuple] = []
-
-    async def fake_on_exit_fill(pid, side, exit_price=None):
-        exit_calls.append((pid, side, exit_price))
-
-    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
-
-    with (
-        patch.object(config, "OPENING_NEUTRAL_DRY_RUN", True),
-        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
-    ):
-        _run(scanner._maybe_exit_loser(pair_id, pair, yes_pos.token_id, 0.34))
-        _run(asyncio.sleep(0.05))
-        # Second tick — must be debounced
-        _run(scanner._maybe_exit_loser(pair_id, pair, yes_pos.token_id, 0.33))
-        _run(asyncio.sleep(0.05))
-
-    assert len(exit_calls) == 1, (
-        f"Expected exactly 1 exit (debounce), got {len(exit_calls)}"
-    )
-
-
-def test_maybe_exit_loser_wide_spread_guard_blocks():
-    """
-    Wide-spread false-positive guard: when the ask is still near the entry price
-    (i.e. ≥ 95 % of entry), a low mid caused by a thin bid side must NOT fire the
-    loser exit.  This guards against PM WS shard reconnects that deliver a
-    partial book with a low bid while the ask stays unchanged.
-    """
-    # YES entry=0.47, ask still at 0.47 (unchanged) → mid=0.34 (bid=0.21) → false positive
-    scanner = _make_scanner(yes_ask=0.47)
-    pair_id = "pair_wide_spread"
-    yes_pos = _make_position("cond_wide_001", "YES", 0.47, pair_id)
-    no_pos  = _make_position("cond_wide_001", "NO",  0.53, pair_id)
-    pair = {"market_id": "cond_wide_001", "market_title": "Test",
-            "yes_pos": yes_pos, "no_pos": no_pos}
-    scanner._active_pairs[pair_id] = pair
-
-    exit_calls: list = []
-
-    async def fake_on_exit_fill(pid, side, exit_price=None):
-        exit_calls.append((pid, side, exit_price))
-
-    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
-
-    with (
-        patch.object(config, "OPENING_NEUTRAL_DRY_RUN", True),
-        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
-    ):
-        # mid=0.34 (below threshold) but ask=0.47 ≥ 0.47*0.95=0.4465 → guard must block
-        _run(scanner._maybe_exit_loser(pair_id, pair, yes_pos.token_id, 0.34))
-        _run(asyncio.sleep(0.05))
-
-    assert exit_calls == [], (
-        "Guard must block loser exit when ask is still near entry price (wide spread)"
-    )
-
-
-def test_maybe_exit_loser_genuine_decline_allowed():
-    """
-    Wide-spread guard must allow the exit when the ask has genuinely moved down
-    (below 95 % of entry price), confirming the token has really declined.
-    """
-    # YES entry=0.47, ask has moved to 0.38 (below 0.47*0.95=0.4465) → genuine
-    scanner = _make_scanner(yes_ask=0.38)
-    pair_id = "pair_genuine_decline"
-    yes_pos = _make_position("cond_genuine_001", "YES", 0.47, pair_id)
-    no_pos  = _make_position("cond_genuine_001", "NO",  0.53, pair_id)
-    pair = {"market_id": "cond_genuine_001", "market_title": "Test",
-            "yes_pos": yes_pos, "no_pos": no_pos}
-    scanner._active_pairs[pair_id] = pair
-
-    exit_calls: list = []
-
-    async def fake_on_exit_fill(pid, side, exit_price=None):
-        exit_calls.append((pid, side, exit_price))
-
-    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
-
-    with (
-        patch.object(config, "OPENING_NEUTRAL_DRY_RUN", True),
-        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
-    ):
-        # mid=0.34, ask=0.38 < 0.4465 → guard must allow
-        _run(scanner._maybe_exit_loser(pair_id, pair, yes_pos.token_id, 0.34))
-        _run(asyncio.sleep(0.05))
-
-    assert len(exit_calls) == 1, "Guard must allow exit when ask has genuinely declined"
-    assert exit_calls[0][1] == "YES"
-
-
-def test_maybe_exit_loser_ignores_above_threshold():
-    """Price above threshold must not trigger an exit."""
     scanner = _make_scanner()
-    pair_id = "pair_no_exit"
-    yes_pos = _make_position("cond_no_exit_001", "YES", 0.50, pair_id)
-    no_pos  = _make_position("cond_no_exit_001", "NO",  0.50, pair_id)
-    pair = {
-        "market_id": "cond_no_exit_001",
-        "market_title": "Test",
-        "yes_pos": yes_pos,
-        "no_pos": no_pos,
-    }
-    scanner._active_pairs[pair_id] = pair
+    scanner._pm._paper_mode = False
+    scanner._pm.place_limit = AsyncMock(side_effect=["yes_exit_oid", "no_exit_oid"])
+    market = _make_market("cond_reg_exit_001")
 
-    exit_calls: list = []
-
-    async def fake_on_exit_fill(pid, side, exit_price=None):
-        exit_calls.append(pid)  # pragma: no cover
-
-    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
-
-    with (
-        patch.object(config, "OPENING_NEUTRAL_DRY_RUN", True),
-        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
-    ):
-        _run(scanner._maybe_exit_loser(pair_id, pair, yes_pos.token_id, 0.40))
-        _run(asyncio.sleep(0.05))
-
-    assert exit_calls == [], "Price above threshold must not trigger exit"
-
-
-def test_maybe_exit_loser_no_ask_blocks():
-    """
-    Guard must block the loser exit when best_ask is None (no asks in the book).
-    This covers the PM WS reconnect scenario where the fresh book snapshot delivers
-    only bids (asks list is empty), so best_ask returns None and mid == best_bid which
-    can be ≤ LOSER_EXIT_PRICE even though the token hasn't genuinely declined.
-    """
-    # yes_ask=None causes the mocked get_book to return best_ask=None
-    scanner = _make_scanner(yes_ask=None)
-    pair_id = "pair_no_ask"
-    yes_pos = _make_position("cond_no_ask_001", "YES", 0.47, pair_id)
-    no_pos  = _make_position("cond_no_ask_001", "NO",  0.53, pair_id)
-    pair = {"market_id": "cond_no_ask_001", "market_title": "Test",
-            "yes_pos": yes_pos, "no_pos": no_pos}
-    scanner._active_pairs[pair_id] = pair
-
-    exit_calls: list = []
-
-    async def fake_on_exit_fill(pid, side, exit_price=None):
-        exit_calls.append((pid, side, exit_price))
-
-    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
-
-    with (
-        patch.object(config, "OPENING_NEUTRAL_DRY_RUN", True),
-        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
-    ):
-        # mid=0.19 (bid-only book after reconnect), ask=None → guard must block
-        _run(scanner._maybe_exit_loser(pair_id, pair, yes_pos.token_id, 0.19))
-        _run(asyncio.sleep(0.05))
-
-    assert exit_calls == [], (
-        "Guard must block loser exit when ask is missing (bids-only book after reconnect)"
-    )
-
-
-def test_execute_loser_exit_paper_mode():
-    """In paper_mode, _execute_loser_exit calls _on_exit_fill with trigger_mid."""
-    scanner = _make_scanner()
-    scanner._pm._paper_mode = True
-    pair_id = "pair_paper_exit"
-    yes_pos = _make_position("cond_paper_exit_001", "YES", 0.50, pair_id)
-    no_pos  = _make_position("cond_paper_exit_001", "NO",  0.50, pair_id)
-    scanner._active_pairs[pair_id] = {
-        "market_id": "cond_paper_exit_001",
-        "market_title": "Test",
-        "yes_pos": yes_pos,
-        "no_pos": no_pos,
-    }
-
-    exit_calls: list[tuple] = []
-
-    async def fake_on_exit_fill(pid, side, exit_price=None):
-        exit_calls.append((pid, side, exit_price))
-
-    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
+    yes_result = {"filled": True, "price": 0.50, "size": 2.0, "order_id": "yes_buy_oid"}
+    no_result  = {"filled": True, "price": 0.50, "size": 2.0, "order_id": "no_buy_oid"}
 
     with (
         patch.object(config, "OPENING_NEUTRAL_DRY_RUN", False),
         patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
-        patch.object(config, "OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS", 10),
+        patch.object(config, "OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS", 300),
     ):
-        _run(scanner._execute_loser_exit(pair_id, "YES", yes_pos, 0.34))
+        _run(scanner._register_pair(
+            "pair_reg_exit", market, yes_result, no_result,
+            market.token_id_yes, market.token_id_no,
+        ))
+        _run(asyncio.sleep(0.05))  # allow background task to start
 
-    # place_limit called once (the exit SELL)
-    assert scanner._pm.place_limit.call_count == 1
-    call_kwargs = scanner._pm.place_limit.call_args.kwargs
-    assert call_kwargs.get("side") == "SELL"
-    assert call_kwargs.get("price") == pytest.approx(0.35)
-    assert call_kwargs.get("size") == pytest.approx(yes_pos.size)
+    # Two place_limit calls: SELL YES and SELL NO at $0.35
+    assert scanner._pm.place_limit.call_count == 2, (
+        f"Expected 2 place_limit calls (exit SELLs), got {scanner._pm.place_limit.call_count}"
+    )
+    calls = scanner._pm.place_limit.call_args_list
+    sides = {c.kwargs.get("side") for c in calls}
+    assert sides == {"SELL"}, f"Both calls must be SELL, got: {sides}"
+    prices = {c.kwargs.get("price") for c in calls}
+    assert prices == {0.35}, f"Both SELLs must be at 0.35, got: {prices}"
 
-    assert len(exit_calls) == 1
+    # Order IDs stored in pair dict
+    pair = scanner._active_pairs.get("pair_reg_exit")
+    assert pair is not None
+    assert pair["yes_exit_order_id"] == "yes_exit_oid"
+    assert pair["no_exit_order_id"] == "no_exit_oid"
+
+
+# ── test: _monitor_exit_fills YES loser ───────────────────────────
+
+def test_monitor_exit_fills_yes_loser():
+    """
+    When the YES exit SELL fills first, _on_exit_fill is called with side=YES,
+    the NO resting SELL is cancelled, and the winner (NO) transitions to momentum.
+    """
+    scanner = _make_scanner()
+    scanner._pm._paper_mode = False
+    pair_id = "pair_mef_yes"
+    yes_pos = _make_position("cond_mef_yes_001", "YES", 0.50, pair_id)
+    no_pos  = _make_position("cond_mef_yes_001", "NO",  0.50, pair_id)
+    scanner._active_pairs[pair_id] = {
+        "market_id": "cond_mef_yes_001",
+        "market_title": "Test",
+        "yes_pos": yes_pos,
+        "no_pos": no_pos,
+    }
+
+    exit_calls: list[tuple] = []
+
+    async def fake_on_exit_fill(pid, side, exit_price=None):
+        exit_calls.append((pid, side, exit_price))
+
+    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
+
+    registered: dict = {}
+
+    def capture_register(order_id, future):
+        registered[order_id] = future
+
+    scanner._pm.register_fill_future = capture_register
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
+        patch.object(config, "OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS", 5),
+    ):
+        asyncio.get_event_loop().create_task(
+            scanner._monitor_exit_fills(pair_id, "yes_exit_oid", "no_exit_oid")
+        )
+        _run(asyncio.sleep(0))
+        yes_fut = registered["yes_exit_oid"]
+        yes_fut.set_result({"price": "0.35", "size_matched": "2.0"})
+        _run(asyncio.sleep(0.05))
+
+    assert len(exit_calls) == 1, f"Expected 1 exit call, got {len(exit_calls)}"
     assert exit_calls[0][0] == pair_id
     assert exit_calls[0][1] == "YES"
+    assert exit_calls[0][2] == pytest.approx(0.35)
+    scanner._pm.cancel_order.assert_called_once_with("no_exit_oid")
+
+
+# ── test: _monitor_exit_fills NO loser ────────────────────────────
+
+def test_monitor_exit_fills_no_loser():
+    """
+    When the NO exit SELL fills first, _on_exit_fill is called with side=NO,
+    the YES resting SELL is cancelled.
+    """
+    scanner = _make_scanner()
+    scanner._pm._paper_mode = False
+    pair_id = "pair_mef_no"
+    yes_pos = _make_position("cond_mef_no_001", "YES", 0.50, pair_id)
+    no_pos  = _make_position("cond_mef_no_001", "NO",  0.50, pair_id)
+    scanner._active_pairs[pair_id] = {
+        "market_id": "cond_mef_no_001",
+        "market_title": "Test",
+        "yes_pos": yes_pos,
+        "no_pos": no_pos,
+    }
+
+    exit_calls: list[tuple] = []
+
+    async def fake_on_exit_fill(pid, side, exit_price=None):
+        exit_calls.append((pid, side, exit_price))
+
+    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
+
+    registered: dict = {}
+
+    def capture_register(order_id, future):
+        registered[order_id] = future
+
+    scanner._pm.register_fill_future = capture_register
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
+        patch.object(config, "OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS", 5),
+    ):
+        asyncio.get_event_loop().create_task(
+            scanner._monitor_exit_fills(pair_id, "yes_exit_oid", "no_exit_oid")
+        )
+        _run(asyncio.sleep(0))
+        no_fut = registered["no_exit_oid"]
+        no_fut.set_result({"price": "0.34", "size_matched": "2.0"})
+        _run(asyncio.sleep(0.05))
+
+    assert len(exit_calls) == 1
+    assert exit_calls[0][1] == "NO"
     assert exit_calls[0][2] == pytest.approx(0.34)
+    scanner._pm.cancel_order.assert_called_once_with("yes_exit_oid")
+
+
+# ── test: _monitor_exit_fills timeout cancels both orders ────────────────
+
+def test_monitor_exit_fills_timeout_cancels_both():
+    """
+    When neither exit SELL fills within EXIT_ORDER_TIMEOUT_SECS, both resting
+    orders are cancelled and _on_exit_fill is NOT called.
+    """
+    scanner = _make_scanner()
+    scanner._pm._paper_mode = False
+    pair_id = "pair_mef_timeout"
+    yes_pos = _make_position("cond_mef_to_001", "YES", 0.50, pair_id)
+    no_pos  = _make_position("cond_mef_to_001", "NO",  0.50, pair_id)
+    scanner._active_pairs[pair_id] = {
+        "market_id": "cond_mef_to_001",
+        "market_title": "Test",
+        "yes_pos": yes_pos,
+        "no_pos": no_pos,
+    }
+
+    exit_calls: list = []
+
+    async def fake_on_exit_fill(pid, side, exit_price=None):
+        exit_calls.append((pid, side, exit_price))  # pragma: no cover
+
+    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
+        patch.object(config, "OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS", 0.01),
+    ):
+        _run(scanner._monitor_exit_fills(pair_id, "yes_exit_oid", "no_exit_oid"))
+
+    cancelled = {c.args[0] for c in scanner._pm.cancel_order.call_args_list}
+    assert "yes_exit_oid" in cancelled, "YES exit order must be cancelled on timeout"
+    assert "no_exit_oid" in cancelled, "NO exit order must be cancelled on timeout"
+    assert exit_calls == [], "_on_exit_fill must NOT be called on timeout"
 
 
 # ── test: _on_exit_fill YES loser ─────────────────────────────────────────────
@@ -741,13 +668,12 @@ def test_on_exit_fill_yes_loser():
     assert no_pos.neutral_pair_id == ""
     assert no_pos.prob_sl_threshold > 0
 
-    # No cancel_order calls — exit mechanism is price-monitoring, not CLOB resting orders
+    # cancel_order is NOT called by _on_exit_fill — it is called by
+    # _monitor_exit_fills before invoking _on_exit_fill.
     scanner._pm.cancel_order.assert_not_called()
 
-    # Pair and token mappings must be removed after first exit (prevents double-exit bug)
+    # Pair must be removed after exit
     assert pair_id not in scanner._active_pairs, "pair must be removed from _active_pairs after exit"
-    assert yes_pos.token_id not in scanner._token_to_pair, "YES token must be removed from _token_to_pair"
-    assert no_pos.token_id not in scanner._token_to_pair, "NO token must be removed from _token_to_pair"
 
 
 # ── test: _on_exit_fill NO loser ──────────────────────────────────────────────
@@ -782,13 +708,12 @@ def test_on_exit_fill_no_loser():
     assert yes_pos.neutral_pair_id == ""
     assert yes_pos.prob_sl_threshold > 0
 
-    # No cancel_order calls — exit mechanism is price-monitoring, not CLOB resting orders
+    # cancel_order is NOT called by _on_exit_fill — it is called by
+    # _monitor_exit_fills before invoking _on_exit_fill.
     scanner._pm.cancel_order.assert_not_called()
 
-    # Pair and token mappings must be removed after first exit (prevents double-exit bug)
+    # Pair must be removed after exit
     assert pair_id not in scanner._active_pairs, "pair must be removed from _active_pairs after exit"
-    assert yes_pos.token_id not in scanner._token_to_pair
-    assert no_pos.token_id not in scanner._token_to_pair
 
 
 # ── test: _on_exit_fill prob_sl set, winner strategy promoted ─────────────────
@@ -1088,7 +1013,8 @@ def test_e2e_loser_exit_records_trade_correctly(tmp_path, monkeypatch):
     assert yes_pos.neutral_pair_id == "", "Winner neutral_pair_id must be cleared"
     assert yes_pos.prob_sl_threshold > 0, "Winner prob_sl_threshold must be set"
 
-    # ── 3. No cancel_order calls — exit is price-monitoring, not CLOB resting orders ─
+    # ── 3. cancel_order is NOT called by _on_exit_fill — it is called by
+    #       _monitor_exit_fills before _on_exit_fill is invoked. ──────────
     pm.cancel_order.assert_not_called()
 
     # ── 4. Trade CSV row semantic checks ─────────────────────────────────────
@@ -1118,21 +1044,18 @@ def test_e2e_loser_exit_records_trade_correctly(tmp_path, monkeypatch):
     assert float(rows_on_disk[0]["pnl"]) < 0
 
 
-# ── regression: winner token must NOT be re-closed by opening_neutral monitor ─
+# ── regression: _on_exit_fill is idempotent (no double-exit) ─────────────────
 
 def test_no_double_exit_after_loser_promotes_winner():
     """
-    Regression test for the 'double-exit' bug:
+    Regression: calling _on_exit_fill twice for the same pair/side must NOT
+    close the position or call close_position a second time.
 
-    When the loser exits and the winner is promoted to momentum, subsequent
-    price events for the WINNER token must NOT trigger another loser-exit.
-
-    Without the fix (removing pair from _active_pairs and _token_to_pair),
-    the winner was still monitored and got closed a second time at 0.35,
-    producing a guaranteed double-loss on every pair.
+    In the proactive design, _monitor_exit_fills resolves exactly one fill future
+    and calls _on_exit_fill once.  But if somehow called twice (race or replay),
+    the idempotency guard (loser_pos.is_closed) must prevent a second close.
     """
-    # yes_ask=0.36 simulates post-decline book (0.36 < 0.50*0.95=0.475 → guard allows)
-    scanner = _make_scanner(yes_ask=0.36)
+    scanner = _make_scanner()
     pair_id = "pair_double_exit"
     yes_pos = _make_position("cond_double_001", "YES", 0.50, pair_id)
     no_pos  = _make_position("cond_double_001", "NO",  0.50, pair_id)
@@ -1143,51 +1066,18 @@ def test_no_double_exit_after_loser_promotes_winner():
         "yes_pos": yes_pos,
         "no_pos": no_pos,
     }
-    # Both tokens registered (as _register_pair would do)
-    scanner._token_to_pair[yes_pos.token_id] = pair_id
-    scanner._token_to_pair[no_pos.token_id]  = pair_id
-
-    exit_calls: list[tuple] = []
-
-    async def fake_on_exit_fill(pid, side, exit_price=None):
-        exit_calls.append((pid, side, exit_price))
-        # Simulate real _on_exit_fill: remove pair and tokens from monitoring
-        scanner._active_pairs.pop(pid, None)
-        scanner._token_to_pair.pop(yes_pos.token_id, None)
-        scanner._token_to_pair.pop(no_pos.token_id, None)
-
-    scanner._on_exit_fill = fake_on_exit_fill  # type: ignore[method-assign]
 
     with (
-        patch.object(config, "OPENING_NEUTRAL_DRY_RUN", True),
+        patch.object(config, "OPENING_NEUTRAL_DRY_RUN", False),
         patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
+        patch.object(config, "MOMENTUM_PROB_SL_ENABLED", False),
     ):
-        # Step 1: YES is the loser — price drops to 0.34
-        _run(scanner._maybe_exit_loser(pair_id, scanner._active_pairs.get(pair_id, {}),
-                                        yes_pos.token_id, 0.34))
-        _run(asyncio.sleep(0.05))
+        # First call — YES loser exit
+        _run(scanner._on_exit_fill(pair_id, "YES", exit_price=0.34))
+        # Second call — must be a no-op (pair already removed, loser already closed)
+        _run(scanner._on_exit_fill(pair_id, "YES", exit_price=0.34))
 
-        # Step 2: Now the winner (NO) token price also drops to 0.34.
-        # With the bug: the exit would fire AGAIN on NO.
-        # With the fix: _token_to_pair[no_pos.token_id] is already gone → no exit.
-        pair_after_first = scanner._active_pairs.get(pair_id, {})
-        if pair_after_first:  # only call if pair still exists (it shouldn't be)
-            _run(scanner._maybe_exit_loser(pair_id, pair_after_first,
-                                            no_pos.token_id, 0.34))
-        else:
-            # Simulate what _on_price_event does: look up pair_id from _token_to_pair
-            # If token not in _token_to_pair, nothing fires.
-            winner_pair_id = scanner._token_to_pair.get(no_pos.token_id)
-            if winner_pair_id is not None:
-                winner_pair = scanner._active_pairs.get(winner_pair_id, {})
-                _run(scanner._maybe_exit_loser(winner_pair_id, winner_pair,
-                                                no_pos.token_id, 0.34))
-        _run(asyncio.sleep(0.05))
-
-    # Only ONE exit must have fired — on the loser (YES), not on the winner (NO)
-    assert len(exit_calls) == 1, (
-        f"Double-exit bug: expected 1 exit (YES loser only), got {len(exit_calls)}. "
-        f"Calls: {exit_calls}"
+    # close_position called exactly once despite two _on_exit_fill calls
+    assert scanner._risk.close_position.call_count == 1, (
+        f"close_position must be called once; got {scanner._risk.close_position.call_count}"
     )
-    assert exit_calls[0][1] == "YES", f"Expected YES exit, got {exit_calls[0][1]}"
-

@@ -2,6 +2,58 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-04-30] - OpeningNeutral entry latency; Chainlink HA mode; monitor & reconcile fixes
+
+### Feature — OpeningNeutral entry latency reduction (`strategies/OpeningNeutral/scanner.py`, `config.py`)
+
+Three optimisations that together reduce entry latency from ~1 s post-open to ~50 ms:
+
+**Idea 1 — Scheduled timer entry (~200-400 ms saved):**  When `_refresh_pending_markets` registers a pre-open market, it spawns a `_scheduled_entry_task` that sleeps until `open_ts - TIMER_ADVANCE_SECS` (default 50 ms before open) and fires `_evaluate_entry` directly.  Entry no longer depends on a WS tick arriving after market open.  `_entered_market_ids` prevents the WS path from entering twice if both paths race.
+
+**Idea 2 — Pre-qualification (~100-150 ms saved):**  Static gates (market type, `_is_updown_market` direction, entry-window membership) are checked once in `_refresh_pending_markets` at registration time rather than on every WS tick.  At timer-fire time only dynamic gates (combined cost, concurrent cap, conflict guard) run.  The `elapsed_min` lower bound is relaxed to `-1.0 s` when `_timer_fired=True` so timer-fired calls arriving 50 ms before open are not rejected.
+
+**Idea 5 — TCP connection pre-warm (~50-100 ms saved):**  `_scheduled_entry_task` fires `_prewarm_clob()` at `open_ts - PREWARM_SECS` (default 200 ms before open), sending a lightweight authenticated GET (`get_live_orders`) to establish a TCP+TLS socket in the `requests` connection pool before the BUY order POSTs fire.  Non-fatal — entry proceeds normally if pre-warm fails.
+
+**New config params (2):** `OPENING_NEUTRAL_PREWARM_SECS = 0.2`, `OPENING_NEUTRAL_TIMER_ADVANCE_SECS = 0.05`.
+
+**New scanner state:** `_scheduled_entry_market_ids: set[str]` guards against duplicate timer scheduling across repeated `_refresh_pending_markets` sweeps; discarded in `finally` block of task.
+
+**`_evaluate_entry` signature change:** `async def _evaluate_entry(self, market, _timer_fired=False)` — new `_timer_fired` parameter; elapsed lower bound becomes `elapsed_min = -1.0 if _timer_fired else 0.0`.
+
+**Docs:** `strategies/OpeningNeutral/PLAN.md` updated with Entry Timing Architecture section (ideas 1, 2, 5), revised Order Flow (step 0 pre-open), Entry Conditions table with pre-qual column, Configuration section with new keys, Scanner State section.
+
+### Feature — Chainlink Data Streams HA mode (`market_data/chainlink_streams_client.py`)
+
+Migrates the Chainlink WS client from a single persistent connection to a multi-origin High-Availability architecture, mirroring the Chainlink Go SDK (`data-streams-sdk/go/stream.go`):
+
+- One persistent WebSocket per server origin (typically 2: origin 001 and 002) discovered from the `x-cll-available-origins` header on the initial HTTP GET.
+- Reports from all origins are deduplicated by `observationsTimestamp` watermark — the first copy wins, all duplicates are discarded.  No asyncio.Lock needed (check+set has no await between them).
+- Reconnect with exponential backoff (`_HA_RECONNECT_MIN_S = 1.0`, `_HA_RECONNECT_MAX_S = 10.0`, max 5 attempts) classified as partial (≥1 other connection alive) vs full (all down).
+- `StreamStats` dataclass (`accepted`, `deduplicated`, `partial_reconnects`, `full_reconnects`, `configured_connections`, `active_connections`) mirrors Go SDK Stats struct; accessible as `client.stats`.
+- `is_connected` now returns `True` when `stats.active_connections > 0` (was: `self._ws is not None`).
+
+### Fix — `should_exit` hedge-active parameter (`monitor.py`)
+
+`should_exit` is a free function; it previously accessed `self._risk` directly to determine hedge fill status. `hedge_active: bool` is now a parameter computed by `PositionMonitor._check_and_exit_position` before the call, keeping `should_exit` pure. Logic unchanged.
+
+### Fix — Momentum ticks dedup by composite key (`monitor.py`)
+
+`_last_tick_state: dict[str, tuple]` tracks the last `(spot, token_price)` written per `market_id`. A tick is skipped when both values are unchanged and `exit_flag=False`, eliminating sub-millisecond burst rows caused by multiple oracle sources (Chainlink Streams, RTDS Chainlink, RTDS, PM WS) firing on the same price update.
+
+### Fix — FAK order integer-k amount (`pm_client.py`)
+
+The CLOB API requires `takerAmount` to be a multiple of 10 000 (≤ 2 dp in USDC).  `round(contracts × price, 2)` produces 4 dp for most tick-aligned prices.  Fix: `fak_amount = k * price` where `k = max(1, round(contracts))`.  IEEE 754 guarantees `(k × x)` is exact for integer `k`, so `takerAmount = k × 10^6` is always an exact multiple.  Market order BUY `mkt_amount` clamped to `max(size, 1.0)` to satisfy the PM $1 minimum.
+
+### Fix — Reconcile: skip PnL patch when winner REDEEM not yet indexed (`pm_reconcile.py`)
+
+`correct_outcome = None` is now returned when only `$0`-value REDEEM entries exist — this is ambiguous between "loser redeemed for $0" and "winner REDEEM not indexed by PM yet".  `None` means "leave recorded value unchanged".  PnL correction is also gated on `_has_real_exit_proceeds` to prevent over-writing a valid PnL with `−buy_usdc` when exit proceeds are missing.
+
+### Fix — `finalize_hedge` double-write guard (`risk.py`)
+
+`finalize_hedge` now returns early with the existing record if the hedge order's status is already in `HedgeStatus.TERMINAL`, preventing duplicate CSV rows when the function is called more than once for the same order.
+
+---
+
 ## [2026-04-29] - Strategy 5 (Opening Neutral); CLOB v2 migration; hedge SL fix; venv auto-detection
 
 ### Feature — Strategy 5: Opening Neutral (`strategies/OpeningNeutral/scanner.py`, `strategies/OpeningNeutral/__init__.py`, `config.py`, `main.py`, `api_server.py`, `risk.py`)

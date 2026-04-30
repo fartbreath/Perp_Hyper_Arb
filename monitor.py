@@ -389,6 +389,7 @@ def should_exit(
     current_spot: Optional[float] = None,
     delta_sl_pct: Optional[float] = None,
     oracle_age_seconds: Optional[float] = None,
+    hedge_active: bool = False,
 ) -> tuple[bool, str, float]:
     """
     Decide whether a position should be exited.
@@ -495,12 +496,8 @@ def should_exit(
         # IMPORTANT: suppress ONLY if the hedge has actually filled (size_filled > 0).
         # An unfilled/cancelled hedge provides zero insurance — suppressing SLs
         # in that state leaves the position naked with no protection.
-        _hedge_active = False
-        if pos.hedge_order_id:
-            _ho = self._risk.get_hedge_order(pos.hedge_order_id)
-            _hedge_active = _ho is not None and _ho.size_filled > 0
         _suppress_all_sl = (
-            config.MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL and _hedge_active
+            config.MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL and hedge_active
         )
         if current_spot is not None and pos.strike > 0:
             if pos.side in ("YES", "BUY_YES", "UP"):
@@ -707,6 +704,15 @@ class PositionMonitor:
         # Tracks the monotonic timestamp of the last oracle tick per coin.
         # Used to compute oracle freshness for the prob-SL oracle-lag gate.
         self._last_oracle_tick_ts: dict[str, float] = {}  # coin → time.monotonic()
+        # Deduplication for momentum_ticks.csv writes: tracks the last (spot, token_price)
+        # state written per market_id.  A tick is skipped when the full market state
+        # (oracle spot + CLOB token price) hasn't changed since the last write and
+        # exit_flag is False — eliminates the sub-millisecond burst of identical rows
+        # caused by multiple oracle sources (chainlink_streams, rtds_chainlink, rtds,
+        # PM WS) firing on the same price update.  Using a composite key prevents the
+        # edge-case where one oracle source fires just before the cache is updated,
+        # producing a slightly stale spot value that bypasses the old spot-only check.
+        self._last_tick_state: dict[str, tuple] = {}  # market_id → (spot, token_price)
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -2423,6 +2429,13 @@ class PositionMonitor:
         oracle_age_secs = (
             time.monotonic() - _last_tick if _last_tick is not None else None
         )
+        # Determine hedge-active flag here (in the method, where self._risk is available)
+        # so the free function should_exit does not need to access self._risk directly.
+        _hedge_active = False
+        if pos.hedge_order_id:
+            _ho = self._risk.get_hedge_order(pos.hedge_order_id)
+            _hedge_active = _ho is not None and _ho.size_filled > 0
+
         exit_flag, reason, unrealised = should_exit(
             pos=pos,
             current_price=current_price,
@@ -2434,6 +2447,7 @@ class PositionMonitor:
             current_spot=current_spot,
             delta_sl_pct=coin_sl,
             oracle_age_seconds=oracle_age_secs,
+            hedge_active=_hedge_active,
         )
 
         # Hysteresis: suppress delta SL until it holds for MOMENTUM_DELTA_SL_MIN_TICKS
@@ -2461,40 +2475,54 @@ class PositionMonitor:
         # CSV is easy to filter and analyse for calibrating exit stop thresholds.
         # Guarded by MOMENTUM_TICKS_LOG_ENABLED so it can be disabled in production.
         if pos.strategy in ("momentum", "range") and getattr(config, "MOMENTUM_TICKS_LOG_ENABLED", True):
-            _tick_delta: Optional[float] = None
-            if current_spot is not None:
-                if pos.strategy == "range" and pos.range_lo > 0 and pos.range_hi > 0:
-                    # Range positions: delta = distance from nearest boundary (positive = inside range).
-                    _mid = pos.strike if pos.strike > 0 else (pos.range_lo + pos.range_hi) / 2
-                    if pos.side in ("YES", "BUY_YES", "UP"):
-                        if pos.range_lo <= current_spot <= pos.range_hi:
-                            _tick_delta = min(
-                                current_spot - pos.range_lo,
-                                pos.range_hi - current_spot,
-                            ) / _mid * 100
+            # Dedup: skip the write when the full market state (oracle spot + CLOB
+            # token price) hasn't changed since the last tick for this market.
+            # Multiple oracle sources (chainlink_streams, rtds_chainlink, rtds, PM WS)
+            # can fire within the same millisecond with identical prices, exploding the
+            # CSV with hundreds of identical rows per position hold.  Using a composite
+            # (spot, token_price) key prevents duplicates even when two oracle sources
+            # carry a slightly different cached price for the same underlying oracle round.
+            # Always write when exit_flag is True so SL/TP ticks are never suppressed.
+            _tick_state = (current_spot, current_token_price)
+            if not exit_flag and _tick_state == self._last_tick_state.get(pos.market_id):
+                pass  # identical market state — skip this tick
+            else:
+                _tick_delta: Optional[float] = None
+                if current_spot is not None:
+                    if pos.strategy == "range" and pos.range_lo > 0 and pos.range_hi > 0:
+                        # Range positions: delta = distance from nearest boundary (positive = inside range).
+                        _mid = pos.strike if pos.strike > 0 else (pos.range_lo + pos.range_hi) / 2
+                        if pos.side in ("YES", "BUY_YES", "UP"):
+                            if pos.range_lo <= current_spot <= pos.range_hi:
+                                _tick_delta = min(
+                                    current_spot - pos.range_lo,
+                                    pos.range_hi - current_spot,
+                                ) / _mid * 100
+                            else:
+                                _tick_delta = -1.0
                         else:
-                            _tick_delta = -1.0
-                    else:
-                        if current_spot > pos.range_hi:
-                            _tick_delta = (current_spot - pos.range_hi) / _mid * 100
-                        elif current_spot < pos.range_lo:
-                            _tick_delta = (pos.range_lo - current_spot) / _mid * 100
+                            if current_spot > pos.range_hi:
+                                _tick_delta = (current_spot - pos.range_hi) / _mid * 100
+                            elif current_spot < pos.range_lo:
+                                _tick_delta = (pos.range_lo - current_spot) / _mid * 100
+                            else:
+                                _tick_delta = -1.0
+                    elif pos.strike > 0:
+                        if pos.side in ("YES", "BUY_YES", "UP"):
+                            _tick_delta = (current_spot - pos.strike) / pos.strike * 100
                         else:
-                            _tick_delta = -1.0
-                elif pos.strike > 0:
-                    if pos.side in ("YES", "BUY_YES", "UP"):
-                        _tick_delta = (current_spot - pos.strike) / pos.strike * 100
-                    else:
-                        _tick_delta = (pos.strike - current_spot) / pos.strike * 100
-            _write_momentum_tick(
-                pos=pos,
-                tte_seconds=tte_seconds,
-                current_token_price=current_token_price,
-                current_spot=current_spot,
-                current_delta_pct=_tick_delta,
-                exit_flag=exit_flag,
-                reason=reason,
-            )
+                            _tick_delta = (pos.strike - current_spot) / pos.strike * 100
+                _write_momentum_tick(
+                    pos=pos,
+                    tte_seconds=tte_seconds,
+                    current_token_price=current_token_price,
+                    current_spot=current_spot,
+                    current_delta_pct=_tick_delta,
+                    exit_flag=exit_flag,
+                    reason=reason,
+                )
+                # Update dedup tracker so the next identical-state tick is skipped.
+                self._last_tick_state[pos.market_id] = _tick_state
         else:
             log.debug(
                 "Monitor: position check",

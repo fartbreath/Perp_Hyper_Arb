@@ -312,11 +312,11 @@ OPENING_NEUTRAL_ENTRY_WINDOW_SECS: int = 120
 # ≤ 1.01 allows 1-tick slip / fee headroom).
 OPENING_NEUTRAL_COMBINED_COST_MAX: float = 1.02
 # USDC notional per leg (YES position = this; NO position = this).
-OPENING_NEUTRAL_SIZE_USD: float = 1.0
+OPENING_NEUTRAL_SIZE_USD: float = 1
 # Order type for the entry BUY legs: "limit" (post-only at current ask — preferred)
 # or "market" (cross immediately; use when fills are hard to get at open).
 # The loser-exit SELL is always a resting limit order regardless of this setting.
-OPENING_NEUTRAL_ORDER_TYPE: str = "limit"
+OPENING_NEUTRAL_ORDER_TYPE: str = "market"
 # Seconds to wait for an entry fill before abandoning the attempt.
 OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS: int = 30
 # Seconds to wait for a WS fill confirmation on each FAK leg.
@@ -328,10 +328,20 @@ OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS: int = 5
 # "keep_as_momentum" — leave the filled leg running as a momentum position.
 # "exit_immediately" — taker-exit the filled leg at best bid.
 OPENING_NEUTRAL_ONE_LEG_FALLBACK: str = "keep_as_momentum"
-# Exit price for the losing leg: when either token's mid price drops to this
-# level a taker SELL is executed to recover partial value rather than riding
-# to $0.00 at resolution.  Net pair P&L = exit_price + $1.00 − 2×entry.
+# Exit price for the losing leg: resting GTC SELL placed on both sides immediately
+# after entry at this price.  Whichever fills first is the loser.
+# Net pair P&L = exit_price + $1.00 − 2×entry.
 OPENING_NEUTRAL_LOSER_EXIT_PRICE: float = 0.35
+# Seconds to wait for either resting exit SELL to fill before cancelling both orders.
+# Should cover the full market duration (5m market = 300 s).
+OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS: int = 300
+# Seconds before market open to pre-warm the CLOB HTTP connection pool (idea 5).
+# A lightweight GET is sent this many seconds before open so the TCP connection
+# is established before the BUY orders fire.
+OPENING_NEUTRAL_PREWARM_SECS: float = 0.2
+# Seconds before market open to fire the scheduled entry timer (idea 1).
+# Slightly early to absorb asyncio event-loop scheduling jitter (~1-5ms).
+OPENING_NEUTRAL_TIMER_ADVANCE_SECS: float = 0.05
 # Per-side price band: both YES ask and NO ask must be within [MIN, MAX] for
 # an entry to qualify.  Keeps the strategy truly neutral (near 50/50) and
 # prevents entries into highly-skewed markets (e.g. YES=0.12 / NO=0.89)

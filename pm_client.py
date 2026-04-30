@@ -1291,15 +1291,21 @@ class PMClient:
 
         try:
             if not post_only:
-                # FAK (taker) orders: the API classifies them as "market buy/sell orders"
-                # and requires maker_amount (USDC for BUY = contracts × price) to have
-                # ≤ 2 decimal places.  OrderArgs uses the limit-order signing path which
-                # allows up to 4dp for the USDC amount — causing 400 errors at runtime.
-                # MarketOrderArgs uses the market-order signing path which rounds the USDC
-                # amount to 2dp automatically, satisfying the API constraint.
-                #   BUY  → amount = USDC to spend  = contracts × price, rounded to 2dp
+                # FAK (taker) orders: the CLOB API requires takerAmount (USDC / price
+                # in 10^6-scaled integer form) to be a multiple of 10000 (≤ 2dp).  The
+                # naive approach (round(contracts * price, 2)) produces 4dp taker values
+                # for most tick-aligned prices, which the API rejects.
+                #
+                # Fix: set amount = k * price where k = round(contracts).  IEEE 754
+                # guarantees (k * x) / x == k exactly for any float x, so takerAmount
+                # = k * 10^6 (always a multiple of 10^6, satisfying the constraint).
+                #   BUY  → amount = k * price (USDC), k = nearest integer contracts
                 #   SELL → amount = shares to sell = rounded_size (already ≤ 2dp)
-                fak_amount = round(rounded_size * rounded_price, 2) if side == "BUY" else rounded_size
+                if side == "BUY":
+                    k = max(1, round(rounded_size))
+                    fak_amount = k * rounded_price
+                else:
+                    fak_amount = rounded_size
                 market_args = MarketOrderArgs(
                     token_id=token_id,
                     amount=fak_amount,
@@ -1438,9 +1444,18 @@ class PMClient:
         rounded_price = self._round_to_tick(price, tick) if price > 0 else 0.0
 
         try:
+            # Same integer-k fix as place_limit FAK: set amount = k * price for BUY
+            # so takerAmount = k (exact integer in 10^6 form), satisfying the API
+            # constraint that takerAmount must be a multiple of 10000 (≤ 2dp).
+            if side == "BUY" and rounded_price > 0:
+                # FAK market orders send a USD amount (fractional OK).
+                # PM enforces a $1 minimum; clamp up if size is below that.
+                mkt_amount = max(size, 1.0)
+            else:
+                mkt_amount = size  # SELL: amount is contracts, no constraint issue
             market_args = MarketOrderArgs(
                 token_id=token_id,
-                amount=size,   # for SELL: number of shares; for BUY: USD amount
+                amount=mkt_amount,
                 side=side,
                 price=rounded_price,
                 order_type=OrderType.FAK,
@@ -1453,7 +1468,7 @@ class PMClient:
             resp = await asyncio.to_thread(self._clob.post_order, signed, OrderType.FAK)
             order_id = resp.get("orderID")
             log.info("Market order posted (FAK)", token_id=token_id, side=side,
-                     price=rounded_price, size=size, order_id=order_id)
+                     price=rounded_price, size=mkt_amount, order_id=order_id)
             if order_id:
                 _append_order_event(
                     order_id=order_id,

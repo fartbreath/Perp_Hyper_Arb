@@ -56,7 +56,12 @@ import asyncio
 import hashlib
 import hmac
 import json
+import random
+import re
 import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
 from typing import Callable, Coroutine, Optional
 
 import websockets
@@ -74,47 +79,94 @@ _DS_WS_PATH_PREFIX = "/api/v1/ws"
 _DS_DECIMALS = 18
 
 # Seconds of WS silence before forcing a reconnect.
-_WS_SILENCE_TIMEOUT_S = 30.0   # Data Streams heartbeats are frequent; 30 s is conservative
+_WS_SILENCE_TIMEOUT_S = 30.0
+
+# HA reconnect parameters — mirrors Chainlink's Go SDK stream.go constants.
+_HA_RECONNECT_MIN_S    = 1.0
+_HA_RECONNECT_MAX_S    = 10.0
+_HA_MAX_RECONNECT_ATTEMPTS = 5
+
+# Header names used by the Chainlink data-streams infrastructure.
+_CLL_ORIGIN_HEADER          = "CLL-ORIGIN"
+_CLL_AVAILABLE_ORIGINS_HDR  = "x-cll-available-origins"
+
+
+@dataclass
+class StreamStats:
+    """
+    Mirrors Chainlink Go SDK Stats struct (stream.go).
+
+    accepted              — reports accepted and delivered to callbacks
+    deduplicated          — reports discarded because the other HA connection
+                            already delivered the same observationsTimestamp
+    partial_reconnects    — reconnects while ≥1 other connection was still live
+    full_reconnects       — reconnects with zero active connections (full gap)
+    configured_connections — number of origins the server advertised
+    active_connections    — connections currently open
+    """
+    accepted:               int = 0
+    deduplicated:           int = 0
+    partial_reconnects:     int = 0
+    full_reconnects:        int = 0
+    configured_connections: int = 0
+    active_connections:     int = 0
+
+    def __str__(self) -> str:
+        return (
+            f"accepted={self.accepted} dedup={self.deduplicated} "
+            f"partial_reconnects={self.partial_reconnects} "
+            f"full_reconnects={self.full_reconnects} "
+            f"configured={self.configured_connections} "
+            f"active={self.active_connections}"
+        )
 
 
 class ChainlinkStreamsClient:
     """
-    Direct Chainlink Data Streams WebSocket client for HYPE/USD.
+    Direct Chainlink Data Streams WebSocket client — HA mode.
 
-    Supports two authentication modes (first match wins):
-      1. Mercury Basic auth — set CHAINLINK_DS_USERNAME + CHAINLINK_DS_PASSWORD.
-         Host is taken from CHAINLINK_DS_HOST (default wss://ws.dataengine.chain.link).
-         Used for direct Mercury pipeline access (e.g. pipeline management endpoints).
-      2. Legacy HMAC — set CHAINLINK_DS_API_KEY + CHAINLINK_DS_API_SECRET.
-         Connects to the standard Data Streams consumer WS with HMAC-signed headers.
+    Maintains one persistent WebSocket connection per server origin
+    (typically 2: origin 001 and 002).  Reports arriving on both
+    connections are deduplicated by ``observationsTimestamp`` so each
+    oracle update is delivered to callbacks exactly once — the first
+    copy wins.  If one origin drops, the other continues without
+    interruption; the latency edge is never lost.
+
+    This is the same architecture as Chainlink's official Go SDK
+    (data-streams-sdk/go/stream.go): HA connections + dedup watermark.
+
+    Authentication modes (first match wins):
+      1. CHAINLINK_DS_USERNAME + CHAINLINK_DS_PASSWORD  (Mercury HMAC credentials).
+      2. CHAINLINK_DS_API_KEY  + CHAINLINK_DS_API_SECRET (alias for the same thing).
 
     If neither credential set is configured, start() logs guidance and returns
-    immediately.  SpotOracle degrades gracefully to the RTDS
-    crypto_prices_chainlink relay (which Polymarket pushes sub-second from the
-    same source).
-
-    Dual-feed operation (when both this client and RTDS chainlink relay are
-    running): SpotOracle picks the snapshot with the fresher timestamp, giving
-    natural failover and latency racing.
+    immediately.  SpotOracle degrades gracefully to the RTDS relay.
     """
 
     def __init__(self) -> None:
-        self._prices: dict[str, SpotPrice] = {}
+        self._prices:    dict[str, SpotPrice] = {}
         self._callbacks: list[Callable[[str, float], Coroutine]] = []
-        self._running = False
-        self._ws = None
-        self._enabled = False
+        self._running  = False
+        self._enabled  = False
         # Active feeds for this client instance (set in start())
-        self._active_feeds: dict[str, str] = {}
+        self._active_feeds:    dict[str, str] = {}
         # Reverse lookup: lowercase feed ID -> coin name (rebuilt in start())
-        self._feedid_to_coin: dict[str, str] = {}
+        self._feedid_to_coin:  dict[str, str] = {}
+        # HA: list of active ws handles so stop() can close them all
+        self._ws_handles: list = []
+        # HA dedup: feedID.lower() → latest observationsTimestamp delivered
+        # No asyncio.Lock needed — asyncio is cooperative; the check+set
+        # sequence in _handle_message has no await between them.
+        self._watermark: dict[str, int] = {}
+        # Stats
+        self.stats = StreamStats()
 
     # ── Public interface ──────────────────────────────────────────────────────
 
     def on_price_update(
         self, callback: Callable[[str, float], Coroutine]
     ) -> None:
-        """Register async callback(coin, price) fired on every Data Streams report."""
+        """Register async callback(coin, price) fired on every new Data Streams report."""
         self._callbacks.append(callback)
 
     def get_mid(self, coin: str) -> Optional[float]:
@@ -135,25 +187,27 @@ class ChainlinkStreamsClient:
 
     @property
     def is_connected(self) -> bool:
-        """True if the WebSocket is currently open and receiving messages."""
-        return self._running and self._ws is not None
+        """True if at least one HA WebSocket connection is currently open."""
+        return self._running and self.stats.active_connections > 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def _has_credentials(self) -> bool:
-        """Return True if at least one auth mode is fully configured."""
         has_basic = bool(config.CHAINLINK_DS_USERNAME and config.CHAINLINK_DS_PASSWORD)
-        has_hmac  = bool(config.CHAINLINK_DS_API_KEY and config.CHAINLINK_DS_API_SECRET)
+        has_hmac  = bool(config.CHAINLINK_DS_API_KEY  and config.CHAINLINK_DS_API_SECRET)
         return has_basic or has_hmac
+
+    def _api_key_secret(self) -> tuple[str, str]:
+        if config.CHAINLINK_DS_USERNAME:
+            return config.CHAINLINK_DS_USERNAME, config.CHAINLINK_DS_PASSWORD
+        return config.CHAINLINK_DS_API_KEY, config.CHAINLINK_DS_API_SECRET
 
     async def start(self, coin: Optional[str] = None) -> None:
         """Begin streaming.
 
         Args:
             coin: If provided, subscribe only to this coin's feed (e.g. "HYPE",
-                  "BTC").  Useful when the API account has a per-connection feed
-                  limit and you want one client per coin.  If omitted, all
-                  configured feeds are subscribed in a single connection.
+                  "BTC").  If omitted, all configured feeds are subscribed.
         """
         all_feeds = {c: fid for c, fid in config.CHAINLINK_DS_FEED_IDS.items() if fid}
         if coin is not None:
@@ -171,31 +225,91 @@ class ChainlinkStreamsClient:
             )
             return
 
-        # Build reverse lookup from the active subset.
         self._feedid_to_coin = {
             fid.lower(): c for c, fid in self._active_feeds.items()
         }
 
+        # Fetch available server origins for HA mode.
+        origins = await self._fetch_origins()
+        self.stats.configured_connections = len(origins) if origins else 1
+
         self._running = True
         self._enabled = True
-        asyncio.create_task(self._ws_loop())
-        log.info(
-            "ChainlinkStreamsClient: started",
-            coins=list(self._active_feeds.keys()),
-            num_feeds=len(self._active_feeds),
-            host=config.CHAINLINK_DS_HOST,
-            auth_mode="hmac",
-        )
+
+        if len(origins) > 1:
+            log.info(
+                "ChainlinkStreamsClient: HA mode — launching parallel connections",
+                origins=origins,
+                coins=list(self._active_feeds.keys()),
+            )
+            for origin in origins:
+                asyncio.create_task(self._conn_loop(origin))
+        else:
+            origin = origins[0] if origins else ""
+            log.info(
+                "ChainlinkStreamsClient: single-connection mode",
+                origin=origin or "default",
+                coins=list(self._active_feeds.keys()),
+            )
+            asyncio.create_task(self._conn_loop(origin))
 
     async def stop(self) -> None:
         self._running = False
-        if self._ws is not None:
-            await self._ws.close()
+        for ws in list(self._ws_handles):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        self._ws_handles.clear()
 
-    # ── WebSocket loop ────────────────────────────────────────────────────────
+    # ── Origin discovery ──────────────────────────────────────────────────────
 
-    def _build_auth_headers(self) -> dict[str, str]:
-        """Build HMAC authentication headers for the WebSocket upgrade request.
+    async def _fetch_origins(self) -> list[str]:
+        """Fetch CLL-AVAILABLE-ORIGINS from the server via a HEAD request.
+
+        The server responds with a header like::
+
+            x-cll-available-origins: {001,002}
+
+        which we parse into ["001", "002"].  Falls back to an empty list
+        (single-connection mode) if the request fails.
+        """
+        host = config.CHAINLINK_DS_HOST
+        host = host.replace("wss://", "https://").replace("ws://", "http://")
+        api_key, api_secret = self._api_key_secret()
+        ts         = int(time.time() * 1000)
+        body_hash  = hashlib.sha256(b"").hexdigest()
+        sts        = f"GET / {body_hash} {api_key} {ts}"
+        sig        = hmac.new(api_secret.encode(), sts.encode(), hashlib.sha256).hexdigest()
+        req = urllib.request.Request(
+            host + "/",
+            method="HEAD",
+            headers={
+                "Authorization":                    api_key,
+                "X-Authorization-Timestamp":        str(ts),
+                "X-Authorization-Signature-SHA256": sig,
+            },
+        )
+        origins_hdr = ""
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                origins_hdr = r.headers.get(_CLL_AVAILABLE_ORIGINS_HDR, "")
+        except urllib.error.HTTPError as e:
+            origins_hdr = e.headers.get(_CLL_AVAILABLE_ORIGINS_HDR, "")
+        except Exception as exc:
+            log.warning("ChainlinkStreamsClient: could not fetch origins", exc=str(exc))
+            return []
+
+        if origins_hdr:
+            origins = re.findall(r"\w+", origins_hdr)
+            if origins:
+                return origins
+        return []
+
+    # ── Authentication ────────────────────────────────────────────────────────
+
+    def _build_auth_headers(self, origin: str = "") -> dict[str, str]:
+        """Build HMAC authentication headers.
 
         Chainlink Data Streams HMAC auth (per official spec):
           Authorization:                    <api_key>
@@ -203,91 +317,144 @@ class ChainlinkStreamsClient:
           X-Authorization-Signature-SHA256: hex(HMAC-SHA256(secret,
               "GET {path} {sha256_empty_body} {api_key} {unix_ms}"))
 
-        Credentials: CHAINLINK_DS_USERNAME + CHAINLINK_DS_PASSWORD are treated
-        as api_key + api_secret (they are HMAC credentials, not Basic auth).
-        CHAINLINK_DS_API_KEY + CHAINLINK_DS_API_SECRET are an alternative name
-        for the same values.
+        The optional ``origin`` value is added as ``CLL-ORIGIN`` so the server
+        routes this connection to the requested instance (HA mode).
         """
-        if config.CHAINLINK_DS_USERNAME:
-            api_key    = config.CHAINLINK_DS_USERNAME
-            api_secret = config.CHAINLINK_DS_PASSWORD
-        else:
-            api_key    = config.CHAINLINK_DS_API_KEY
-            api_secret = config.CHAINLINK_DS_API_SECRET
-
-        feed_ids_str = ",".join(fid for fid in self._active_feeds.values() if fid)
-        path         = f"{_DS_WS_PATH_PREFIX}?feedIDs={feed_ids_str}"
-        timestamp_ms = int(time.time() * 1000)
-        body_hash    = hashlib.sha256(b"").hexdigest()
+        api_key, api_secret = self._api_key_secret()
+        feed_ids_str   = ",".join(fid for fid in self._active_feeds.values() if fid)
+        path           = f"{_DS_WS_PATH_PREFIX}?feedIDs={feed_ids_str}"
+        timestamp_ms   = int(time.time() * 1000)
+        body_hash      = hashlib.sha256(b"").hexdigest()
         string_to_sign = f"GET {path} {body_hash} {api_key} {timestamp_ms}"
         signature = hmac.new(
             api_secret.encode("utf-8"),
             string_to_sign.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
-        return {
-            "Authorization": api_key,
-            "X-Authorization-Timestamp": str(timestamp_ms),
+        headers = {
+            "Authorization":                    api_key,
+            "X-Authorization-Timestamp":        str(timestamp_ms),
             "X-Authorization-Signature-SHA256": signature,
         }
+        if origin:
+            headers[_CLL_ORIGIN_HEADER] = origin
+        return headers
 
-    async def _ws_loop(self) -> None:
-        """Persistent WebSocket loop with exponential backoff reconnect."""
-        backoff = 1.0
+    # ── Per-origin connection loop ────────────────────────────────────────────
+
+    async def _conn_loop(self, origin: str) -> None:
+        """Persistent reconnect loop for one server origin.
+
+        Mirrors the newWSconnWithRetry / monitorConn pattern from the Go SDK.
+        Gives up only when attempts exceed _HA_MAX_RECONNECT_ATTEMPTS AND
+        no other connection is currently active (same condition as the SDK).
+        """
         feed_ids_str = ",".join(fid for fid in self._active_feeds.values() if fid)
-        # Strip a trailing http(s):// scheme from the host if the user set an https:// URL.
         host = config.CHAINLINK_DS_HOST
         if host.startswith("http://"):
             host = "ws://" + host[len("http://"):]
         elif host.startswith("https://"):
             host = "wss://" + host[len("https://"):]
-        url = f"{host}{_DS_WS_PATH_PREFIX}?feedIDs={feed_ids_str}"
+        url         = f"{host}{_DS_WS_PATH_PREFIX}?feedIDs={feed_ids_str}"
+        origin_label = origin or "default"
+        backoff      = _HA_RECONNECT_MIN_S
+        attempts     = 0
 
         while self._running:
+            # Give up only if exceeded attempts AND no other live connection.
+            if (attempts >= _HA_MAX_RECONNECT_ATTEMPTS
+                    and self.stats.active_connections == 0):
+                log.error(
+                    "ChainlinkStreamsClient: max reconnect attempts exhausted "
+                    "with no active connections — giving up",
+                    origin=origin_label,
+                    attempts=attempts,
+                )
+                break
+
             try:
-                auth_headers = self._build_auth_headers()
+                auth_headers = self._build_auth_headers(origin)
                 async with websockets.connect(
                     url,
                     additional_headers=auth_headers,
-                    ping_interval=None,
+                    ping_interval=2,   # matches Chainlink SDK's 2s ping cadence
+                    ping_timeout=20,
                     open_timeout=15,
                 ) as ws:
-                    self._ws = ws
-                    backoff = 1.0
+                    self._ws_handles.append(ws)
+                    self.stats.active_connections += 1
+                    backoff  = _HA_RECONNECT_MIN_S
+                    attempts = 0
                     log.info(
-                        "ChainlinkStreamsClient: connected to Data Streams",
-                        feeds=feed_ids_str[:80],
+                        "ChainlinkStreamsClient: connected",
+                        origin=origin_label,
+                        active_connections=self.stats.active_connections,
                     )
 
-                    while True:
+                    try:
+                        while True:
+                            try:
+                                raw = await asyncio.wait_for(
+                                    ws.recv(), timeout=_WS_SILENCE_TIMEOUT_S
+                                )
+                            except asyncio.TimeoutError:
+                                log.warning(
+                                    "ChainlinkStreamsClient: silence timeout — reconnecting",
+                                    origin=origin_label,
+                                    silence_s=_WS_SILENCE_TIMEOUT_S,
+                                )
+                                break
+                            except AttributeError:
+                                # asyncio.wait_for cancel races with websockets
+                                # calling transport.resume_reading() on a torn-
+                                # down transport → treat as ConnectionClosed.
+                                break
+                            await self._handle_message(json.loads(raw))
+                    finally:
                         try:
-                            raw = await asyncio.wait_for(
-                                ws.recv(), timeout=_WS_SILENCE_TIMEOUT_S
-                            )
-                        except asyncio.TimeoutError:
-                            log.warning(
-                                "ChainlinkStreamsClient: silence — forcing reconnect",
-                                silence_s=_WS_SILENCE_TIMEOUT_S,
-                            )
-                            break
-                        await self._handle_message(json.loads(raw))
+                            self._ws_handles.remove(ws)
+                        except ValueError:
+                            pass
+                        self.stats.active_connections -= 1
+                        log.info(
+                            "ChainlinkStreamsClient: disconnected",
+                            origin=origin_label,
+                            active_connections=self.stats.active_connections,
+                        )
 
             except ConnectionClosed as exc:
-                log.warning("ChainlinkStreamsClient: WS disconnected", code=exc.code if hasattr(exc, 'code') else exc)
+                code = getattr(exc, "code", exc)
+                log.warning("ChainlinkStreamsClient: WS closed", origin=origin_label, code=code)
             except asyncio.TimeoutError:
-                log.warning("ChainlinkStreamsClient: WS open timeout")
+                log.warning("ChainlinkStreamsClient: WS open timeout", origin=origin_label)
             except Exception as exc:
-                log.error("ChainlinkStreamsClient: WS error", exc=str(exc))
-            finally:
-                self._ws = None
+                log.error("ChainlinkStreamsClient: WS error", origin=origin_label, exc=str(exc))
 
-            if self._running:
-                log.info("ChainlinkStreamsClient: reconnecting", backoff_s=backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+            if not self._running:
+                break
+
+            attempts += 1
+            # Mirror SDK stats: partial if another connection is still alive.
+            if self.stats.active_connections > 0:
+                self.stats.partial_reconnects += 1
+            else:
+                self.stats.full_reconnects += 1
+
+            jitter = random.uniform(0.0, backoff * 0.3)
+            wait   = backoff + jitter
+            log.info(
+                "ChainlinkStreamsClient: reconnecting",
+                origin=origin_label,
+                backoff_s=round(wait, 2),
+                stats=str(self.stats),
+            )
+            await asyncio.sleep(wait)
+            backoff = min(backoff * 2, _HA_RECONNECT_MAX_S)
+
+    # ── Message handling ──────────────────────────────────────────────────────
 
     async def _handle_message(self, msg: dict) -> None:
-        """Decode one Data Streams V3 report message.
+        """Decode one Data Streams V3 report with HA deduplication.
 
         Chainlink Data Streams WebSocket pushes JSON with this shape::
 
@@ -300,9 +467,11 @@ class ChainlinkStreamsClient:
                 }
             }
 
-        The ``fullReport`` is an ABI-encoded V3 report containing the
-        benchmarkPrice at slot [6] (bytes 192–223 after the 32-byte context
-        prefix) with 18 decimal places.
+        HA dedup: ``observationsTimestamp`` in the JSON header is the oracle
+        consensus timestamp.  When two connections carry the same report the
+        first one wins; the duplicate is counted and silently discarded.
+        No lock needed — asyncio is cooperative and the check+set has no
+        ``await`` between them.
         """
         report = msg.get("report")
         if not isinstance(report, dict):
@@ -312,12 +481,20 @@ class ChainlinkStreamsClient:
         if not full_report_hex:
             return
 
-        # Determine which coin this report is for via the feedID field.
         raw_feed_id = report.get("feedID", "").lower()
         coin = self._feedid_to_coin.get(raw_feed_id)
         if coin is None:
             log.debug("ChainlinkStreamsClient: unknown feedID", feed_id=raw_feed_id[:20])
             return
+
+        # ── HA dedup ──────────────────────────────────────────────────────────
+        obs_ts = report.get("observationsTimestamp", 0)
+        if obs_ts <= self._watermark.get(raw_feed_id, 0):
+            self.stats.deduplicated += 1
+            log.debug("ChainlinkStreamsClient: dedup", coin=coin, obs_ts=obs_ts)
+            return
+        self._watermark[raw_feed_id] = obs_ts
+        # ─────────────────────────────────────────────────────────────────────
 
         result = decode_streams_report(full_report_hex)
         if result is None:
@@ -331,6 +508,7 @@ class ChainlinkStreamsClient:
         price, _ = result
         snap = SpotPrice(coin=coin, price=price, timestamp=time.time())
         self._prices[coin] = snap
+        self.stats.accepted += 1
         log.debug("ChainlinkStreamsClient: report", coin=coin, price=round(price, 6))
 
         for cb in self._callbacks:

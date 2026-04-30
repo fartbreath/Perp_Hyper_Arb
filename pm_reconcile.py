@@ -184,15 +184,26 @@ def _compute_correction(trade_row: dict, pm_market_rows: list[dict]) -> Optional
     total_redeem_usdc = sum(float(r.get("usdcSize") or 0) for r in redeem_rows)
     actual_pnl = (total_sell_usdc + total_redeem_usdc) - total_buy_usdc
 
+    # Whether we have non-zero real exit proceeds (SELL or REDEEM with actual USDC).
+    # When only $0-REDEEM entries exist (usdcSize=0), the winner REDEEM may not
+    # have been indexed by PM yet — skip PnL patching in that case.
+    _has_real_exit_proceeds = total_sell_usdc > 0 or total_redeem_usdc > 0
+
     # ── Determine resolved_outcome ────────────────────────────────────────────
+    # Use Optional[str]: None = indeterminate (don't change), "" = taker exit,
+    # "WIN"/"LOSS" = determined from real REDEEM data.
+    correct_outcome: Optional[str]
     if redeem_rows:
         total_redeem_size = sum(float(r.get("size") or 0) for r in redeem_rows)
         if total_redeem_size > 0:
             rate = total_redeem_usdc / total_redeem_size
             correct_outcome = "WIN" if rate > 0.5 else "LOSS"
         else:
-            # size=0 REDEEM = loser tokens redeemed for $0
-            correct_outcome = "LOSS"
+            # $0-only REDEEM entries — either the loser token was redeemed for
+            # nothing, OR the winner REDEEM hasn't been indexed by PM yet.
+            # We cannot distinguish these cases, so leave the recorded outcome
+            # unchanged rather than risk a false LOSS patch.
+            correct_outcome = None
     elif _all_redeem_rows:
         # REDEEMs exist but were attributed to the hedge token (excluded above).
         # Main position's token expired worthless — unambiguous LOSS.
@@ -217,16 +228,21 @@ def _compute_correction(trade_row: dict, pm_market_rows: list[dict]) -> Optional
     if abs(actual_entry_price - current_price) > 0.005:
         corrections["price"] = round(actual_entry_price, 8)
 
-    # PnL: correct if off by more than 1¢.
+    # PnL: only correct when real USDC exit proceeds exist.
+    # If only $0-REDEEM entries are present (winner REDEEM not indexed yet),
+    # actual_pnl would incorrectly equal −buy_usdc — skip in that case.
     # When PnL changes, also zero fees/rebates — PM USDC flows already include
     # taker fees, so separate fee fields would double-count them.
-    if abs(actual_pnl - current_pnl) > 0.01:
+    if _has_real_exit_proceeds and abs(actual_pnl - current_pnl) > 0.01:
         corrections["pnl"]              = round(actual_pnl, 10)
         corrections["fees_paid"]         = "0.0"
         corrections["rebates_earned"]    = "0.0"
 
-    # resolved_outcome: fix incorrect WIN/LOSS for taker exits, or wrong resolution label
-    if correct_outcome and current_outcome != correct_outcome:
+    # resolved_outcome: fix incorrect WIN/LOSS for taker exits, or wrong resolution label.
+    # correct_outcome=None means indeterminate — leave the recorded value unchanged.
+    if correct_outcome is None:
+        pass  # Cannot determine outcome from $0-only REDEEMs; preserve current value.
+    elif correct_outcome and current_outcome != correct_outcome:
         corrections["resolved_outcome"] = correct_outcome
     elif correct_outcome == "" and current_outcome not in _blank:
         # Taker exit incorrectly labelled WIN or LOSS — clear it
