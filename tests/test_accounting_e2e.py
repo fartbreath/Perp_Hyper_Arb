@@ -387,6 +387,33 @@ class TestExitFillMechanics:
         assert len(sells) == 1
         assert sells[0]["fill_price"] == pytest.approx(0.60)
 
+    def test_exit_fill_on_terminal_position_is_noop(self, ledger):
+        """
+        If the accounting reconciler already finalized a position (moved it to
+        RESOLVED_WIN) before the risk engine calls on_exit_fill, the late fill
+        must be silently ignored.  It must not overwrite exit_vwap / exit_contracts
+        on the terminal record that was already written to the ledger.
+
+        Scenario: reconciler wins the race, sets exit_vwap=1.0 (settlement).
+        Risk engine then calls on_exit_fill with exit_vwap=0.82 (taker fill).
+        The terminal record must preserve 1.0, not 0.82.
+        """
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.52, contracts=100.0, side="YES")
+        # Simulate reconciler finalizing the position directly (market resolved)
+        ledger.on_resolved(cid, resolved_yes_price=1.0)
+        pos = ledger.get_position(pid)
+        assert pos.status == PositionStatus.RESOLVED_WIN
+        assert pos.exit_vwap == pytest.approx(1.0)
+
+        # Late on_exit_fill from risk engine must be a no-op
+        result = _exit(ledger, tok, fill_price=0.82, contracts=100.0)
+        pos_after = ledger.get_position(pid)
+        assert result == pid                           # returns pos_id (not None)
+        assert pos_after.status == PositionStatus.RESOLVED_WIN   # status unchanged
+        assert pos_after.exit_vwap == pytest.approx(1.0)          # not overwritten with 0.82
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # C  Gross P&L arithmetic

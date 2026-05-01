@@ -1919,6 +1919,30 @@ class RiskEngine:
                 log.warning("acct: close_position hook failed", exc=str(_acct_err))
         return _closed_pos
 
+    def promote_position_strategy(self, market_id: str, side: str, new_strategy: str) -> None:
+        """
+        Update a position's strategy label, persist to token_strategy, and
+        notify accounting.  Call after an OpeningNeutral winner is promoted
+        to momentum so all three layers (memory, disk, accounting) stay in sync.
+        """
+        _token_id: Optional[str] = None
+        with self._lock:
+            pos = self._positions.get(self._pos_key(market_id, side))
+            if pos is None or pos.is_closed:
+                return
+            pos.strategy = new_strategy
+            if pos.token_id:
+                self._token_strategy[pos.token_id] = new_strategy
+                self._save_token_strategy()
+                _token_id = pos.token_id
+        # Accounting hook (outside lock to avoid deadlock with accounting's own lock)
+        if _token_id:
+            try:
+                from accounting import get_ledger
+                get_ledger().on_pair_promoted(_token_id, new_fill_type="WINNER")
+            except Exception as _err:
+                log.warning("acct: promote_position_strategy hook failed", exc=str(_err))
+
     # ── HL hedge accounting ──────────────────────────────────────────────────
 
     def record_hl_hedge_trade(

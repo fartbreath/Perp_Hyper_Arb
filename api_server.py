@@ -576,6 +576,7 @@ _MUTABLE_CONFIG = {
     "opening_neutral_dry_run":             ("OPENING_NEUTRAL_DRY_RUN",             bool),
     "opening_neutral_tp_enabled":          ("OPENING_NEUTRAL_TP_ENABLED",           bool),
     "opening_neutral_tp_profit_pct":       ("OPENING_NEUTRAL_TP_PROFIT_PCT",        float),
+    "opening_neutral_promote_to_momentum": ("OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM",  bool),
 }
 
 
@@ -819,6 +820,7 @@ class ConfigPatch(BaseModel):
     opening_neutral_dry_run: bool | None = None
     opening_neutral_tp_enabled: bool | None = None
     opening_neutral_tp_profit_pct: float | None = None
+    opening_neutral_promote_to_momentum: bool | None = None
 
 
 @app.get("/config")
@@ -1064,6 +1066,7 @@ def get_config() -> dict:
         "opening_neutral_dry_run":             config.OPENING_NEUTRAL_DRY_RUN,
         "opening_neutral_tp_enabled":          config.OPENING_NEUTRAL_TP_ENABLED,
         "opening_neutral_tp_profit_pct":       config.OPENING_NEUTRAL_TP_PROFIT_PCT,
+        "opening_neutral_promote_to_momentum": config.OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM,
         "timestamp":            time.time(),
     }
 

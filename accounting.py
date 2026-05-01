@@ -483,6 +483,20 @@ class _Ledger:
                 return None
 
             pos = self._positions[pos_id]
+
+            # Guard: if the reconciler already finalized this position (moved to
+            # terminal), ignore a late exit fill from the risk engine.  The ledger
+            # record was already written correctly; a late on_exit_fill would
+            # corrupt the exit_vwap and exit_contracts on the terminal entry.
+            if pos.status in PositionStatus.TERMINAL:
+                log.debug(
+                    "acct: on_exit_fill skipped — position already terminal",
+                    pos_id=pos_id[:12],
+                    status=pos.status,
+                    token_id=token_id[:16],
+                )
+                return pos_id
+
             fill.condition_id = pos.market_id
 
             _append_fill(fill)

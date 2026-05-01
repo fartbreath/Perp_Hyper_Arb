@@ -1631,82 +1631,99 @@ class OpeningNeutralScanner(BaseStrategy):
             side=filled_side,
         )
 
-        # ── Set strike for delta-SL ───────────────────────────────────────────
-        # Fetch priceToBeat from Gamma and populate the Momentum scanner's
-        # open-spot cache so Momentum already has the strike when it next scans.
-        _strike: float | None = None
-        if self._momentum is not None:
-            _strike = self._momentum._market_open_spot.get(market_id)
-        if _strike is None:
-            _pm_market = self._pm.get_markets().get(market_id)
-            if _pm_market is not None:
-                _strike = await self._pm.fetch_price_to_beat(_pm_market.market_slug)
-            if _strike and self._momentum is not None:
-                self._momentum._market_open_spot[market_id] = _strike
-        if _strike:
-            winner_pos.strike = _strike
-            log.info(
-                "OpeningNeutral: set winner strike for delta-SL",
-                pair_id=pair_id[:12],
-                strike=_strike,
-                side=winner_pos.side,
-            )
-        else:
-            log.warning(
-                "OpeningNeutral: could not obtain strike for promoted winner — delta-SL inactive",
-                pair_id=pair_id[:12],
-                market_id=market_id[:16],
-            )
-
-        # Promote winner to momentum and arm its prob-SL threshold.
-        if config.MOMENTUM_PROB_SL_ENABLED:
-            winner_pos.prob_sl_threshold = round(
-                winner_pos.entry_price * (1.0 - config.MOMENTUM_PROB_SL_PCT), 6
-            )
-        winner_pos.strategy = "momentum"
-        winner_pos.neutral_pair_id = ""  # clear so it is treated as a plain momentum pos
-
-        log.info(
-            "OpeningNeutral: winner promoted to momentum",
-            pair_id=pair_id[:12],
-            side=winner_pos.side,
-            entry=winner_pos.entry_price,
-            prob_sl_threshold=winner_pos.prob_sl_threshold,
-        )
-
-        # ── Arm take-profit price for the promoted winner ─────────────────────
-        # Rather than a resting SELL order (which would create orphan-position
-        # issues if the TP fills before a subsequent SL is detected), we store
-        # the target TP price on the position so the monitor's should_exit()
-        # fires a clean taker exit when the price is reached.
-        # Formula: combined_cost × (1 + TP_PROFIT_PCT) − loser_exit_price
-        # capped at 0.99 (highest meaningful PM price before resolution).
-        if config.OPENING_NEUTRAL_TP_ENABLED:
-            _combined_cost = round(loser_pos.entry_price + winner_pos.entry_price, 6)
-            _raw_tp = _combined_cost * (1.0 + config.OPENING_NEUTRAL_TP_PROFIT_PCT) - exit_price
-            _tp_price = round(min(_raw_tp, 0.99), 2)
-            if _tp_price >= 0.02:
-                winner_pos.take_profit_price = _tp_price
+        if config.OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM:
+            # ── Set strike for delta-SL ───────────────────────────────────────
+            # Fetch priceToBeat from Gamma and populate the Momentum scanner's
+            # open-spot cache so Momentum already has the strike when it next scans.
+            _strike: float | None = None
+            if self._momentum is not None:
+                _strike = self._momentum._market_open_spot.get(market_id)
+            if _strike is None:
+                _pm_market = self._pm.get_markets().get(market_id)
+                if _pm_market is not None:
+                    _strike = await self._pm.fetch_price_to_beat(_pm_market.market_slug)
+                if _strike and self._momentum is not None:
+                    self._momentum._market_open_spot[market_id] = _strike
+            if _strike:
+                winner_pos.strike = _strike
                 log.info(
-                    "OpeningNeutral: winner TP price armed",
+                    "OpeningNeutral: set winner strike for delta-SL",
                     pair_id=pair_id[:12],
+                    strike=_strike,
                     side=winner_pos.side,
-                    combined_cost=_combined_cost,
-                    loser_exit=exit_price,
-                    tp_price=_tp_price,
                 )
             else:
                 log.warning(
-                    "OpeningNeutral: calculated TP price too low — monitor TP inactive",
+                    "OpeningNeutral: could not obtain strike for promoted winner — delta-SL inactive",
                     pair_id=pair_id[:12],
-                    tp_price=round(_tp_price, 4),
-                    combined_cost=_combined_cost,
-                    loser_exit=exit_price,
+                    market_id=market_id[:16],
                 )
 
+            # Promote winner to momentum and arm its prob-SL threshold.
+            if config.MOMENTUM_PROB_SL_ENABLED:
+                winner_pos.prob_sl_threshold = round(
+                    winner_pos.entry_price * (1.0 - config.MOMENTUM_PROB_SL_PCT), 6
+                )
+            # promote_position_strategy updates: in-memory strategy, _token_strategy
+            # file (for correct restart restore), and accounting (on_pair_promoted).
+            self._risk.promote_position_strategy(market_id, winner_pos.side, "momentum")
+            winner_pos.neutral_pair_id = ""  # clear so it is treated as a plain momentum pos
+
+            log.info(
+                "OpeningNeutral: winner promoted to momentum",
+                pair_id=pair_id[:12],
+                side=winner_pos.side,
+                entry=winner_pos.entry_price,
+                prob_sl_threshold=winner_pos.prob_sl_threshold,
+            )
+
+            # ── Arm take-profit price for the promoted winner ─────────────────
+            # Rather than a resting SELL order (which would create orphan-position
+            # issues if the TP fills before a subsequent SL is detected), we store
+            # the target TP price on the position so the monitor's should_exit()
+            # fires a clean taker exit when the price is reached.
+            # Formula: combined_cost × (1 + TP_PROFIT_PCT) − loser_exit_price
+            # capped at 0.99 (highest meaningful PM price before resolution).
+            if config.OPENING_NEUTRAL_TP_ENABLED:
+                _combined_cost = round(loser_pos.entry_price + winner_pos.entry_price, 6)
+                _raw_tp = _combined_cost * (1.0 + config.OPENING_NEUTRAL_TP_PROFIT_PCT) - exit_price
+                _tp_price = round(min(_raw_tp, 0.99), 2)
+                if _tp_price >= 0.02:
+                    winner_pos.take_profit_price = _tp_price
+                    log.info(
+                        "OpeningNeutral: winner TP price armed",
+                        pair_id=pair_id[:12],
+                        side=winner_pos.side,
+                        combined_cost=_combined_cost,
+                        loser_exit=exit_price,
+                        tp_price=_tp_price,
+                    )
+                else:
+                    log.warning(
+                        "OpeningNeutral: calculated TP price too low — monitor TP inactive",
+                        pair_id=pair_id[:12],
+                        tp_price=round(_tp_price, 4),
+                        combined_cost=_combined_cost,
+                        loser_exit=exit_price,
+                    )
+        else:
+            # No promotion: winner stays as strategy="opening_neutral".
+            # The monitor's catch-all ("any other strategy label") holds it with
+            # no SL / TP until the market resolves.  Clear neutral_pair_id since
+            # the pair structure is dissolved (loser already closed).
+            winner_pos.neutral_pair_id = ""
+            log.info(
+                "OpeningNeutral: winner held to resolution (PROMOTE_TO_MOMENTUM=False)",
+                pair_id=pair_id[:12],
+                side=winner_pos.side,
+                entry=winner_pos.entry_price,
+            )
+
         # ── Stop monitoring this pair ────────────────────────────────────────
-        # The winner is now owned by the momentum monitor.  Remove the pair from
-        # opening-neutral state and clean up bid-monitoring lookups for both tokens.
+        # Remove the pair from opening-neutral state and clean up bid-monitoring
+        # lookups for both tokens.  When PROMOTE_TO_MOMENTUM=True the winner is
+        # now owned by the momentum monitor; when False it is held by the risk
+        # engine until RESOLVED.
         for _exit_pos in (loser_pos, winner_pos):
             _tok = getattr(_exit_pos, "token_id", "")
             if _tok:

@@ -347,7 +347,11 @@ function GroupRows({ group }: { group: LedgerGroup }) {
           {fmtUsd(net)}
         </td>
         <td style={{ padding: "8px 8px" }}>
-          <OutcomeBadge outcome={group.rows.find(r => r.resolved_outcome)?.resolved_outcome ?? ""} />
+          <OutcomeBadge outcome={
+            group.rows.length > 1
+              ? (net > 0 ? "WIN" : net < 0 ? "LOSS" : "")
+              : (group.rows.find(r => r.resolved_outcome)?.resolved_outcome ?? "")
+          } />
         </td>
         <td style={{ padding: "8px 8px", fontSize: 11, color: "#64748b", whiteSpace: "nowrap" }}>
           {relTime(group.lastTime)}
@@ -376,7 +380,6 @@ export default function Trades() {
 
   const filtered = useMemo(() => {
     let r = rows;
-    if (outcome) r = r.filter(x => (x.resolved_outcome ?? "").toUpperCase() === outcome.toUpperCase());
     if (search.trim()) {
       const q = search.trim().toLowerCase();
       r = r.filter(x =>
@@ -386,9 +389,21 @@ export default function Trades() {
       );
     }
     return r;
-  }, [rows, outcome, search]);
+  }, [rows, search]);
 
-  const groups = useMemo(() => buildGroups(filtered), [filtered]);
+  const groups = useMemo(() => {
+    let g = buildGroups(filtered);
+    if (outcome) {
+      const want = outcome.toUpperCase();
+      g = g.filter(group => {
+        const groupOutcome = group.rows.length > 1
+          ? (group.totalNetPnl > 0 ? "WIN" : group.totalNetPnl < 0 ? "LOSS" : "")
+          : (group.rows.find(r => r.resolved_outcome)?.resolved_outcome ?? "").toUpperCase();
+        return groupOutcome === want;
+      });
+    }
+    return g;
+  }, [filtered, outcome]);
 
   const sel = (value: string, onChange: (v: string) => void, options: { value: string; label: string }[]) => (
     <select value={value} onChange={e => onChange(e.target.value)} style={{

@@ -368,7 +368,12 @@ OPENING_NEUTRAL_DRY_RUN: bool = True
 # there and the position will settle at resolution instead.
 # Prob-SL and delta-SL remain active and fire before the TP if spot reverses.
 OPENING_NEUTRAL_TP_ENABLED: bool = True
-OPENING_NEUTRAL_TP_PROFIT_PCT: float = 0.10  # 10% profit on combined cost
+OPENING_NEUTRAL_TP_PROFIT_PCT: float = 0.30  # 30% profit on combined cost
+# When True (default), the winner leg is promoted to the Momentum strategy after
+# the loser exits; momentum SL / TP / delta-SL / prob-SL all apply from that
+# point.  When False the winner stays as strategy="opening_neutral" and is held
+# until the market resolves — no stop-loss or take-profit is applied.
+OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM: bool = False
 
 # ── Strategy 3 — Momentum Scanner ─────────────────────────────────────────
 # Price band: scanner fires when held-side is in [LOW, HIGH].
