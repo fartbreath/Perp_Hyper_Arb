@@ -358,6 +358,17 @@ OPENING_NEUTRAL_MAX_CONCURRENT: int = 1
 # Signals, pair tracking, and all logic run normally — only the pm_client calls
 # are suppressed.  Safe to deploy inactive; set False after validation.
 OPENING_NEUTRAL_DRY_RUN: bool = True
+# Take-profit for the promoted winner leg.
+# When enabled, after the loser exits the bot places a resting SELL limit on
+# the winner at a price calculated to earn OPENING_NEUTRAL_TP_PROFIT_PCT on
+# the total combined cost of both legs (net of the loser proceeds already
+# received).  Formula:
+#   tp_price = combined_cost * (1 + TP_PROFIT_PCT) - loser_exit_price
+# If the calculated price exceeds the tick-adjusted max (0.99), it is capped
+# there and the position will settle at resolution instead.
+# Prob-SL and delta-SL remain active and fire before the TP if spot reverses.
+OPENING_NEUTRAL_TP_ENABLED: bool = True
+OPENING_NEUTRAL_TP_PROFIT_PCT: float = 0.10  # 10% profit on combined cost
 
 # ── Strategy 3 — Momentum Scanner ─────────────────────────────────────────
 # Price band: scanner fires when held-side is in [LOW, HIGH].
@@ -793,7 +804,7 @@ MOMENTUM_PROB_SL_PCT: float = 0.25        # SL fires when token drops 25% below 
 # to the tick floor (0.01) while the best_ask remains near 1.0, making the mid an
 # unreliable price signal.  The oracle-delta SL remains active and is the correct
 # primary stop near expiry.  Set to 0 to disable the guard.
-MOMENTUM_PROB_SL_MIN_TTE_SECS: int = 300  # suppress prob-SL in final 5 minutes
+MOMENTUM_PROB_SL_MIN_TTE_SECS: int = 30  # suppress prob-SL in final 30 seconds
 MOMENTUM_PROB_SL_ORACLE_STALE_SECS: float = 10.0  # suppress prob-SL when oracle ticked within this many seconds (0 = disabled)
 
 # ── Chainlink watchdog (Item 5) ──────────────────────────────────────────────

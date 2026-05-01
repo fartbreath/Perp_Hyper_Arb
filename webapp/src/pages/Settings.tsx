@@ -446,6 +446,26 @@ export default function Settings() {
           value={data.opening_neutral_dry_run ?? true}
           onChange={(v) => apply({ opening_neutral_dry_run: v })}
         />
+        {GAP}
+        <Toggle
+          label="Opening Neutral — Take Profit"
+          description="After the loser leg exits, place a resting SELL on the winner at a price that earns the target % profit on the combined entry cost."
+          value={data.opening_neutral_tp_enabled ?? true}
+          onChange={(v) => apply({ opening_neutral_tp_enabled: v })}
+        />
+        {data.opening_neutral_tp_enabled !== false && (
+          <>
+            {GAP}
+            <FloatInput
+              label="Opening Neutral — TP Target %"
+              description="Target profit as a % of combined entry cost. Formula: combined_cost × (1 + pct) − loser_exit_price."
+              value={+((data.opening_neutral_tp_profit_pct ?? 0.10) * 100).toFixed(1)}
+              step={1}
+              unit="%"
+              onSubmit={(v) => apply({ opening_neutral_tp_profit_pct: v / 100 })}
+            />
+          </>
+        )}
       </div>
 
       {/* ── 3. Market Types ──────────────────────────────────────────── */}

@@ -521,7 +521,19 @@ def should_exit(
             # crosses and Polymarket resolves against the position.
             _sl = delta_sl_pct if delta_sl_pct is not None else config.MOMENTUM_DELTA_STOP_LOSS_PCT
             _oracle_delta_pct = current_delta_pct  # capture for prob-SL gate below
-            if not _suppress_all_sl and current_delta_pct < _sl:
+            # Suppress delta SL until the Momentum entry window opens for this bucket.
+            # OpeningNeutral-promoted positions are handed over at T+15s of a fresh
+            # bucket — spot barely above/below strike → delta is tiny → delta SL
+            # fires immediately on every promotion.  Gate: delta SL is meaningless
+            # before the near-expiry window where momentum positions are calibrated.
+            # Prob-SL (prob_sl_threshold) still fires during this window.
+            _min_tte = config.MOMENTUM_MIN_TTE_SECONDS.get(
+                pos.market_type, config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
+            ) if isinstance(config.MOMENTUM_MIN_TTE_SECONDS, dict) else config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
+            _outside_entry_window = (
+                tte_seconds is not None and tte_seconds > _min_tte
+            )
+            if not _suppress_all_sl and not _outside_entry_window and current_delta_pct < _sl:
                 return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
             # Near-expiry: only exit if spot has already crossed the strike
             # (delta < 0).  Avoids premature exits from CLOB price collapse.
@@ -589,7 +601,14 @@ def should_exit(
             return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
 
         # Take-profit: still CLOB-based (converging to 1.0 at resolution).
-        if token_price >= config.MOMENTUM_TAKE_PROFIT:
+        # Opening Neutral promoted positions carry a per-position TP price
+        # (pos.take_profit_price > 0) that fires before the global 0.999 threshold.
+        _tp_threshold = (
+            pos.take_profit_price
+            if pos.take_profit_price > 0.0
+            else config.MOMENTUM_TAKE_PROFIT
+        )
+        if token_price >= _tp_threshold:
             return True, ExitReason.MOMENTUM_TAKE_PROFIT, unrealised
         return False, "", unrealised
 

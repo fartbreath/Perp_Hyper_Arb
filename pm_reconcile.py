@@ -47,8 +47,11 @@ _TRADES_CSV = _DATA_DIR / "trades.csv"
 _SIDE_TO_PM_OUTCOMES: dict[str, list[str]] = {
     "UP":   ["Up"],
     "DOWN": ["Down"],
-    "YES":  ["Yes"],
-    "NO":   ["No"],
+    # YES/NO are used internally for both Yes/No AND Up/Down markets.
+    # PM activity uses "Yes"/"No" for binary markets and "Up"/"Down" for
+    # price-direction markets — include both so reconcile matches either.
+    "YES":  ["Yes", "Up"],
+    "NO":   ["No", "Down"],
 }
 
 
@@ -257,7 +260,7 @@ async def reconcile_trades_csv(
     funder: str,
     *,
     csv_path: Path = _TRADES_CSV,
-    pm_limit: int = 500,
+    pm_limit: int = 2000,
 ) -> dict:
     """Fetch PM activity and patch trades.csv with actual fill prices and PnL.
 

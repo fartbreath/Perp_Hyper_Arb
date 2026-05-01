@@ -526,6 +526,15 @@ export default function Positions() {
     target.set(pos.condition_id, existing);
   }
 
+  // ── Aggregate stats for summary bar ─────────────────────────────────────
+  const allOpenPm = [...makerPositions.filter(p => !p.is_closed), ...mispricingPositions, ...momentumPositions, ...rangePositions, ...hedgeFilledPositions, ...neutralPositions];
+  const totalDeployed     = allOpenPm.reduce((s, p) => s + (p.entry_cost_usd ?? 0), 0);
+  const totalUnrealized   = allOpenPm.reduce((s, p) => s + (p.unrealised_pnl_usd ?? 0), 0);
+  const totalRebates      = allOpenPm.reduce((s, p) => s + (p.pm_rebates_earned ?? 0), 0);
+  const estMakerPnl       = Array.from(makerSpreads.values()).reduce((s, { yes, no }) => {
+    return s + (yes?.est_close_pnl ?? 0) + (no?.est_close_pnl ?? 0);
+  }, 0);
+
   return (
     <div className="page">
       <h2>
@@ -547,6 +556,31 @@ export default function Positions() {
 
       {error && <div className="error">Failed to load positions: {error}</div>}
       {loading && !data && <div className="skeleton" style={{ height: 200 }} />}
+
+      {/* ── Aggregate Summary Bar ─────────────────────────────── */}
+      {data && (
+        <div style={{
+          display: "flex", gap: 20, flexWrap: "wrap",
+          background: "#111827", borderRadius: 8, padding: "10px 18px",
+          marginBottom: 20, border: "1px solid #1f2937",
+        }}>
+          {[
+            { label: "Open PM Positions", value: String(allOpenPm.length), color: "#e2e8f0" },
+            { label: "HL Hedges",         value: String(hlHedges.length),  color: "#e2e8f0" },
+            { label: "Capital Deployed",  value: `$${totalDeployed.toFixed(2)}`,  color: "#f59e0b" },
+            { label: "Unrealised P&L",    value: `${totalUnrealized >= 0 ? "+" : ""}$${totalUnrealized.toFixed(2)}`,
+              color: totalUnrealized >= 0 ? "#22c55e" : "#ef4444" },
+            { label: "Est. Maker P&L",    value: `${estMakerPnl >= 0 ? "+" : ""}$${estMakerPnl.toFixed(2)}`,
+              color: estMakerPnl >= 0 ? "#22c55e" : "#ef4444" },
+            { label: "Rebates Earned",    value: `+$${totalRebates.toFixed(3)}`, color: "#a78bfa" },
+          ].map(({ label, value, color }) => (
+            <div key={label} style={{ minWidth: 110 }}>
+              <div style={{ fontSize: 10, color: "#64748b", marginBottom: 2 }}>{label}</div>
+              <div style={{ fontSize: 15, fontWeight: 700, color }}>{value}</div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* -- Maker spreads ------------------------------------- */}
       <h3 style={{ marginTop: "1.5rem", marginBottom: "0.5rem", fontSize: "0.9rem", color: "#9ca3af" }}>

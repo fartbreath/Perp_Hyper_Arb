@@ -961,6 +961,110 @@ export interface MarketPnlResponse {
 export const useMarketPnl = () =>
   usePolling<MarketPnlResponse>("/market_pnl", 10_000);
 
+// ── Accounting module types ────────────────────────────────────────────────────
+
+/** One finalized record from acct_ledger.csv — written once per closed position. */
+export interface AcctLedgerRow {
+  pos_id:              string;
+  strategy:            string;
+  fill_type:           string;   // MAIN | HEDGE | LOSER_EXIT | WINNER
+  pair_id:             string;
+  parent_pos_id:       string;
+  market_id:           string;
+  market_title:        string;
+  market_type:         string;
+  underlying:          string;
+  side:                string;
+  token_id:            string;
+  entry_vwap:          string;
+  entry_contracts:     string;
+  entry_cost_usd:      string;
+  entry_time:          string;
+  pm_entry_confirmed:  string;
+  spot_entry:          string;
+  strike:              string;
+  tte_seconds:         string;
+  signal_source:       string;
+  signal_score:        string;
+  exit_vwap:           string;
+  exit_contracts:      string;
+  exit_time:           string;
+  exit_type:           string;
+  spot_exit:           string;
+  resolve_price:       string;
+  resolved_outcome:    string;
+  fees_usd:            string;
+  rebates_usd:         string;
+  gross_pnl:           string;
+  net_pnl:             string;
+  status:              string;
+  pm_exit_confirmed:   string;
+  reconciliation_notes: string;
+}
+
+/** Live AccountingPosition from acct_positions.json — may be in any status. */
+export interface AcctPosition {
+  pos_id:              string;
+  strategy:            string;
+  fill_type:           string;
+  pair_id:             string;
+  parent_pos_id:       string;
+  market_id:           string;
+  market_title:        string;
+  market_type:         string;
+  underlying:          string;
+  side:                string;
+  token_id:            string;
+  entry_vwap:          number;
+  entry_contracts:     number;
+  entry_cost_usd:      number;
+  entry_time:          string;
+  pm_entry_confirmed:  boolean;
+  spot_entry:          number;
+  strike:              number;
+  tte_seconds:         number;
+  signal_source:       string;
+  signal_score:        number;
+  exit_vwap:           number;
+  exit_contracts:      number;
+  exit_time:           string;
+  exit_type:           string;
+  closing_since:       string;
+  spot_exit:           number;
+  resolve_price:       number;
+  resolved_outcome:    string;
+  fees_usd:            number;
+  rebates_usd:         number;
+  status:              string;
+  pm_exit_confirmed:   boolean;
+}
+
+export const useAcctLedger = (
+  limit = 200,
+  offset = 0,
+  strategy?: string,
+  underlying?: string,
+) => {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (strategy)   params.set("strategy", strategy);
+  if (underlying) params.set("underlying", underlying);
+  return usePolling<{ rows: AcctLedgerRow[]; total: number }>(
+    `/acct/ledger?${params}`,
+    30_000,
+  );
+};
+
+export const useAcctPositions = (status?: string, strategy?: string) => {
+  const params = new URLSearchParams();
+  if (status)   params.set("status", status);
+  if (strategy) params.set("strategy", strategy);
+  const qs = params.toString();
+  return usePolling<{ positions: AcctPosition[] }>(`/acct/positions${qs ? `?${qs}` : ""}`, 15_000);
+};
+
+export const useAcctPending = () =>
+  usePolling<{ positions: AcctPosition[] }>("/acct/pending", 15_000);
+
 export async function toggleBot(active: boolean): Promise<{ active: boolean }> {
   const res = await fetch(`${BASE_URL}/bot`, {
     method: "POST",

@@ -346,6 +346,9 @@ def build_live_state() -> dict:
 
 # Path to trades CSV — use absolute path like risk.py to avoid CWD issues
 TRADES_CSV = Path(__file__).parent / "data" / "trades.csv"
+# Accounting module data files (written by accounting.py)
+ACCT_LEDGER_CSV = Path(__file__).parent / "data" / "acct_ledger.csv"
+ACCT_POSITIONS_JSON = Path(__file__).parent / "data" / "acct_positions.json"
 # Path to paper-fill log CSV written by fill_simulator.py
 FILLS_CSV = Path(__file__).parent / "data" / "fills.csv"
 # Path to order event log written by pm_client.py
@@ -571,6 +574,8 @@ _MUTABLE_CONFIG = {
     # Strategy 5 — Opening Neutral
     "opening_neutral_enabled":             ("OPENING_NEUTRAL_ENABLED",             bool),
     "opening_neutral_dry_run":             ("OPENING_NEUTRAL_DRY_RUN",             bool),
+    "opening_neutral_tp_enabled":          ("OPENING_NEUTRAL_TP_ENABLED",           bool),
+    "opening_neutral_tp_profit_pct":       ("OPENING_NEUTRAL_TP_PROFIT_PCT",        float),
 }
 
 
@@ -812,6 +817,8 @@ class ConfigPatch(BaseModel):
     # Strategy 5 — Opening Neutral
     opening_neutral_enabled: bool | None = None
     opening_neutral_dry_run: bool | None = None
+    opening_neutral_tp_enabled: bool | None = None
+    opening_neutral_tp_profit_pct: float | None = None
 
 
 @app.get("/config")
@@ -1055,6 +1062,8 @@ def get_config() -> dict:
         # Strategy 5 — Opening Neutral
         "opening_neutral_enabled":             config.OPENING_NEUTRAL_ENABLED,
         "opening_neutral_dry_run":             config.OPENING_NEUTRAL_DRY_RUN,
+        "opening_neutral_tp_enabled":          config.OPENING_NEUTRAL_TP_ENABLED,
+        "opening_neutral_tp_profit_pct":       config.OPENING_NEUTRAL_TP_PROFIT_PCT,
         "timestamp":            time.time(),
     }
 
@@ -2138,6 +2147,92 @@ def trades(
         "offset": offset,
         "timestamp": time.time(),
     }
+
+
+# ── Accounting endpoints (accounting.py / acct_ledger.csv / acct_positions.json) ──
+
+@app.get("/acct/ledger")
+def acct_ledger(
+    limit: int = Query(default=200, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+    strategy: Optional[str] = Query(default=None),
+    underlying: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    fill_type: Optional[str] = Query(default=None),
+) -> dict:
+    """Paginated finalized ledger records from data/acct_ledger.csv."""
+    if not ACCT_LEDGER_CSV.exists():
+        return {"rows": [], "total": 0, "limit": limit, "offset": offset, "timestamp": time.time()}
+    try:
+        with ACCT_LEDGER_CSV.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as exc:
+        log.error("Failed to read acct_ledger.csv", exc=str(exc))
+        return {"rows": [], "total": 0, "limit": limit, "offset": offset, "timestamp": time.time()}
+
+    if strategy:
+        rows = [r for r in rows if r.get("strategy", "").lower() == strategy.lower()]
+    if underlying:
+        rows = [r for r in rows if r.get("underlying", "").upper() == underlying.upper()]
+    if status:
+        rows = [r for r in rows if r.get("status", "").upper() == status.upper()]
+    if fill_type:
+        rows = [r for r in rows if r.get("fill_type", "").upper() == fill_type.upper()]
+
+    rows = list(reversed(rows))  # most recent first
+    total = len(rows)
+    return {
+        "rows": rows[offset: offset + limit],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/acct/positions")
+def acct_positions(
+    status: Optional[str] = Query(default=None),
+    strategy: Optional[str] = Query(default=None),
+    underlying: Optional[str] = Query(default=None),
+) -> dict:
+    """All AccountingPosition objects from data/acct_positions.json."""
+    if not ACCT_POSITIONS_JSON.exists():
+        return {"positions": [], "timestamp": time.time()}
+    try:
+        raw = json.loads(ACCT_POSITIONS_JSON.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.error("Failed to read acct_positions.json", exc=str(exc))
+        return {"positions": [], "timestamp": time.time()}
+
+    positions = list(raw.values()) if isinstance(raw, dict) else raw
+    if status:
+        statuses = {s.strip().lower() for s in status.split(",")}
+        positions = [p for p in positions if p.get("status", "").lower() in statuses]
+    if strategy:
+        positions = [p for p in positions if p.get("strategy", "").lower() == strategy.lower()]
+    if underlying:
+        positions = [p for p in positions if p.get("underlying", "").upper() == underlying.upper()]
+
+    return {"positions": positions, "timestamp": time.time()}
+
+
+@app.get("/acct/pending")
+def acct_pending() -> dict:
+    """Positions in non-terminal, non-LIVE status (CLOSING, PENDING_RESOLVE, etc.)."""
+    _pending_statuses = {"closing", "pending_resolve"}
+    if not ACCT_POSITIONS_JSON.exists():
+        return {"positions": [], "timestamp": time.time()}
+    try:
+        raw = json.loads(ACCT_POSITIONS_JSON.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.error("Failed to read acct_positions.json for pending", exc=str(exc))
+        return {"positions": [], "timestamp": time.time()}
+
+    positions = list(raw.values()) if isinstance(raw, dict) else raw
+    pending = [p for p in positions if p.get("status", "").lower() in _pending_statuses]
+    pending.sort(key=lambda p: p.get("closing_since") or p.get("entry_time") or "", reverse=True)
+    return {"positions": pending, "timestamp": time.time()}
 
 
 @app.get("/market_outcomes")

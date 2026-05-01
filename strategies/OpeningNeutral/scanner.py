@@ -616,25 +616,23 @@ class OpeningNeutralScanner(BaseStrategy):
             return
         duration = _MARKET_TYPE_DURATION_SECS.get(market.market_type) or tte_secs
         elapsed = duration - tte_secs
-        # Entry is ONLY allowed pre-market (timer path).  The WS fallback path
-        # (elapsed >= 0, market already open) is blocked — post-open asks are
-        # skewed by market movement and we no longer want to chase them.
-        # Timer fires OPENING_NEUTRAL_TIMER_ADVANCE_SECS before open; allow that
-        # many seconds of negative elapsed plus 1 s jitter buffer.
-        if not _timer_fired:
-            # WS path: only allowed strictly before open (should not normally reach
-            # here for new markets, but acts as a safety net).
-            return
+        # Entry is ONLY allowed in the pre-market window: from TIMER_ADVANCE_SECS
+        # before open up to (but not including) market open.  Both the timer path
+        # and WS tick path enforce this gate — WS ticks during the window
+        # re-evaluate on every book change (debounced at _ENTRY_EVAL_DEBOUNCE_SECS)
+        # so a brief improvement in spread is caught immediately rather than
+        # relying on a single REST snapshot at T-10s.
         elapsed_min = -(config.OPENING_NEUTRAL_TIMER_ADVANCE_SECS + 1.0)
         elapsed_max = 0.0  # must still be pre-market at execution time
         if elapsed < elapsed_min or elapsed > elapsed_max:
-            log.warning(
-                "OpeningNeutral: entry skipped — outside elapsed window",
-                market=getattr(market, "title", "")[:60],
-                elapsed=round(elapsed, 2),
-                elapsed_min=elapsed_min,
-                elapsed_max=elapsed_max,
-            )
+            if _timer_fired:
+                log.warning(
+                    "OpeningNeutral: entry skipped — outside elapsed window",
+                    market=getattr(market, "title", "")[:60],
+                    elapsed=round(elapsed, 2),
+                    elapsed_min=elapsed_min,
+                    elapsed_max=elapsed_max,
+                )
             return
 
         # Conflict guard: skip if another strategy has an open position here.
@@ -1399,6 +1397,7 @@ class OpeningNeutralScanner(BaseStrategy):
             token_id=token_id,
             market_title=getattr(market, "title", ""),
             order_id=result.get("order_id", ""),
+            spread_id=pair_id,
             neutral_pair_id=pair_id,
             tte_years=getattr(market, "tte_seconds", 0) / (365.25 * 86400),
             spot_price=self._spot.get_mid(getattr(market, "underlying", ""), getattr(market, "market_type", "")) or 0.0,
@@ -1459,6 +1458,21 @@ class OpeningNeutralScanner(BaseStrategy):
             fill_event = no_fut.result()
 
         ws_price = float(fill_event.get("price") or 0)
+        # Guard: a GTC limit SELL at the loser threshold should never fill above
+        # ~0.65.  A ws_price > 0.65 most likely means a resolution/redemption WS
+        # event was mis-routed to this future (order_id collision or PM WS quirk).
+        # In that case fall back to the threshold so the loser is recorded at a
+        # sane price rather than $1.00, which would silently invert winner/loser.
+        _max_loser_price = config.OPENING_NEUTRAL_LOSER_EXIT_PRICE + 0.30
+        if ws_price > _max_loser_price:
+            log.warning(
+                "OpeningNeutral: loser-exit fill price anomalously high — discarding WS price",
+                pair_id=pair_id[:12],
+                filled_side=filled_side,
+                ws_price=ws_price,
+                max_expected=_max_loser_price,
+            )
+            ws_price = 0.0
         exit_price = ws_price if ws_price > 0 else config.OPENING_NEUTRAL_LOSER_EXIT_PRICE
 
         # Cancel the other resting SELL immediately.
@@ -1511,8 +1525,44 @@ class OpeningNeutralScanner(BaseStrategy):
         )
 
         if order_id:
-            rest = await self._pm.get_order_fill_rest(order_id)
-            exit_price = rest["price"] if rest else trigger_bid
+            # Confirm actual fill price via WS event (then REST fallback).
+            # place_market uses price=0.01 as the floor — get_order_fill_rest's
+            # path-3 fallback returns that floor price, not the real fill.
+            # Replicate the monitor's pattern: register a fill future, await
+            # with a 10 s timeout, fall back to REST, then to trigger_bid.
+            _confirmed_price: Optional[float] = None
+            if not config.PAPER_TRADING:
+                _fill_future: "asyncio.Future[dict]" = (
+                    asyncio.get_running_loop().create_future()
+                )
+                self._pm.register_fill_future(order_id, _fill_future)
+                try:
+                    _fill_evt = await asyncio.wait_for(_fill_future, timeout=10.0)
+                    _ws_price = float(_fill_evt.get("price") or 0)
+                    _ws_size  = float(_fill_evt.get("size_matched") or 0)
+                    if _ws_price > 0 and _ws_size > 0:
+                        _confirmed_price = _ws_price
+                        log.info(
+                            "OpeningNeutral: loser exit fill confirmed via WS",
+                            order_id=order_id[:20],
+                            trigger_bid=trigger_bid,
+                            actual_fill=round(_ws_price, 4),
+                        )
+                    else:
+                        _rest = await self._pm.get_order_fill_rest(order_id)
+                        if _rest and _rest["price"] > 0.01:
+                            _confirmed_price = _rest["price"]
+                except asyncio.TimeoutError:
+                    _rest = await self._pm.get_order_fill_rest(order_id)
+                    if _rest and _rest["price"] > 0.01:
+                        _confirmed_price = _rest["price"]
+                        log.info(
+                            "OpeningNeutral: loser exit fill confirmed via REST (WS timeout)",
+                            order_id=order_id[:20],
+                            trigger_bid=trigger_bid,
+                            actual_fill=round(_confirmed_price, 4),
+                        )
+            exit_price = _confirmed_price if _confirmed_price is not None else trigger_bid
             log.info(
                 "OpeningNeutral: loser market sell executed",
                 pair_id=pair_id[:12],
@@ -1581,6 +1631,33 @@ class OpeningNeutralScanner(BaseStrategy):
             side=filled_side,
         )
 
+        # ── Set strike for delta-SL ───────────────────────────────────────────
+        # Fetch priceToBeat from Gamma and populate the Momentum scanner's
+        # open-spot cache so Momentum already has the strike when it next scans.
+        _strike: float | None = None
+        if self._momentum is not None:
+            _strike = self._momentum._market_open_spot.get(market_id)
+        if _strike is None:
+            _pm_market = self._pm.get_markets().get(market_id)
+            if _pm_market is not None:
+                _strike = await self._pm.fetch_price_to_beat(_pm_market.market_slug)
+            if _strike and self._momentum is not None:
+                self._momentum._market_open_spot[market_id] = _strike
+        if _strike:
+            winner_pos.strike = _strike
+            log.info(
+                "OpeningNeutral: set winner strike for delta-SL",
+                pair_id=pair_id[:12],
+                strike=_strike,
+                side=winner_pos.side,
+            )
+        else:
+            log.warning(
+                "OpeningNeutral: could not obtain strike for promoted winner — delta-SL inactive",
+                pair_id=pair_id[:12],
+                market_id=market_id[:16],
+            )
+
         # Promote winner to momentum and arm its prob-SL threshold.
         if config.MOMENTUM_PROB_SL_ENABLED:
             winner_pos.prob_sl_threshold = round(
@@ -1596,6 +1673,36 @@ class OpeningNeutralScanner(BaseStrategy):
             entry=winner_pos.entry_price,
             prob_sl_threshold=winner_pos.prob_sl_threshold,
         )
+
+        # ── Arm take-profit price for the promoted winner ─────────────────────
+        # Rather than a resting SELL order (which would create orphan-position
+        # issues if the TP fills before a subsequent SL is detected), we store
+        # the target TP price on the position so the monitor's should_exit()
+        # fires a clean taker exit when the price is reached.
+        # Formula: combined_cost × (1 + TP_PROFIT_PCT) − loser_exit_price
+        # capped at 0.99 (highest meaningful PM price before resolution).
+        if config.OPENING_NEUTRAL_TP_ENABLED:
+            _combined_cost = round(loser_pos.entry_price + winner_pos.entry_price, 6)
+            _raw_tp = _combined_cost * (1.0 + config.OPENING_NEUTRAL_TP_PROFIT_PCT) - exit_price
+            _tp_price = round(min(_raw_tp, 0.99), 2)
+            if _tp_price >= 0.02:
+                winner_pos.take_profit_price = _tp_price
+                log.info(
+                    "OpeningNeutral: winner TP price armed",
+                    pair_id=pair_id[:12],
+                    side=winner_pos.side,
+                    combined_cost=_combined_cost,
+                    loser_exit=exit_price,
+                    tp_price=_tp_price,
+                )
+            else:
+                log.warning(
+                    "OpeningNeutral: calculated TP price too low — monitor TP inactive",
+                    pair_id=pair_id[:12],
+                    tp_price=round(_tp_price, 4),
+                    combined_cost=_combined_cost,
+                    loser_exit=exit_price,
+                )
 
         # ── Stop monitoring this pair ────────────────────────────────────────
         # The winner is now owned by the momentum monitor.  Remove the pair from

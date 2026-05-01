@@ -2,6 +2,131 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-01] - Accounting ledger; OpeningNeutral TP + fill-price confirmation + delta-SL fix; test overhaul
+
+### Feature — Standalone accounting ledger (`accounting.py`, `risk.py`, `api_server.py`)
+
+New module `accounting.py` replaces the old `RiskEngine`/`trades.csv` pipeline for tracking
+position outcomes.  It maintains a `_Ledger` singleton backed by three files in `data/`:
+`acct_fills.jsonl` (raw fill journal), `acct_positions.json` (live position state), and
+`acct_ledger.csv` (finalized P&L records).
+
+**API:**
+- `on_entry_fill(...)` — opens a new position row, VWAP-accumulates on add-ons.
+- `on_exit_fill(...)` — records partial/full exit, advances to `CLOSING` or `PENDING_RESOLVE`.
+- `on_resolved(condition_id, resolved_yes_price)` — settles all positions for the market.
+  YES/UP wins on `resolved_yes_price ≥ 0.99`; NO/DOWN wins on `resolved_yes_price ≤ 0.01`
+  (preamble-compliant; `resolved_yes_price` always expresses the YES token price).
+- `on_pair_promoted(token_id, new_fill_type)` — relabels loser/winner on OpeningNeutral promotion.
+- `add_fees(...)` — accumulates fees/rebates without an exit fill.
+- `get_ledger()` — singleton accessor for use across modules.
+
+**Hooks in `risk.py`:** `open_position()` now calls `get_ledger().on_entry_fill(...)` as a
+fire-and-forget hook.  Old `RiskEngine.mark_resolved()`, `mark_spot_exit()`, and
+`mark_hedge_spot_exit()` now return 0 immediately (stub) — accounting is owned by
+`accounting.py`.  `Position` gains `take_profit_price: float = 0.0` for per-position TP.
+Hedge `spread_id` now inherits from the parent momentum position.
+
+**Bug fix:** `on_resolved()` was writing duplicate CSV rows on repeated calls.  The
+`_write_ledger_record` loop is now gated on `if changed:` so it only fires when
+positions actually transition.
+
+**REST endpoints in `api_server.py`:**
+- `GET /acct/ledger` — paginated finalized ledger rows from `acct_ledger.csv`.
+  Filterable by `strategy`, `underlying`, `status`, `fill_type`.
+- `GET /acct/positions` — all positions from `acct_positions.json` (optional `status` filter).
+- `GET /acct/pending` — live `CLOSING` and `PENDING_RESOLVE` positions.
+
+### Feature — OpeningNeutral: take-profit for promoted winner (`scanner.py`, `monitor.py`, `config.py`, `api_server.py`)
+
+After the loser leg exits, the scanner arms a per-position TP price on the promoted winner:
+
+```
+tp_price = combined_cost × (1 + OPENING_NEUTRAL_TP_PROFIT_PCT) − loser_exit_price
+```
+
+Capped at 0.99.  Stored in `pos.take_profit_price`; `monitor.should_exit()` uses this
+threshold in place of the global `MOMENTUM_TAKE_PROFIT` when > 0.
+
+**Config keys added:** `OPENING_NEUTRAL_TP_ENABLED = True`, `OPENING_NEUTRAL_TP_PROFIT_PCT = 0.10`.
+Both are hot-patachable via `/config` PATCH.
+
+### Fix — OpeningNeutral: loser exit fill price confirmation (`scanner.py`)
+
+`_execute_loser_exit` previously called `get_order_fill_rest()` to confirm the fill price —
+but that method's path-3 fallback returns the floor price `0.01` (the FAK placeholder),
+not the real fill.  Now replicates the monitor's WS pattern: registers a fill future,
+awaits with a 10 s timeout, falls back to REST only when the WS event is missing or
+returns `price=0`.  REST fallback also rejects `price ≤ 0.01`.
+
+Also adds a sanity guard: a fill price > `OPENING_NEUTRAL_LOSER_EXIT_PRICE + 0.30` is
+treated as a mis-routed WS event (resolution/redemption event with order_id collision)
+and discarded rather than used as the exit price.
+
+### Fix — OpeningNeutral: WS entry path restored for pre-market window (`scanner.py`)
+
+The WS entry path was unconditionally blocked (`if not _timer_fired: return`).  It is
+now restored for the pre-market window: both the timer path and WS tick path evaluate
+entry when `elapsed ∈ [elapsed_min, 0.0]`.  WS ticks re-evaluate on every book change
+(debounced at `_ENTRY_EVAL_DEBOUNCE_SECS`) so a brief spread improvement is caught
+immediately rather than relying on a single REST snapshot at T-10 s.  Warning log is
+now only emitted on the timer path to avoid spam from out-of-window WS ticks.
+
+### Fix — OpeningNeutral: spread_id propagated to position at entry (`scanner.py`)
+
+`open_position()` call now passes `spread_id=pair_id` so accounting and monitor can
+trace the position back to its pair without relying solely on `neutral_pair_id`.
+
+### Fix — OpeningNeutral: strike set on promoted winner for delta-SL (`scanner.py`)
+
+After promotion, the scanner now fetches `priceToBeat` from the Gamma API and writes it
+to `winner_pos.strike`.  Also pre-populates `momentum._market_open_spot[market_id]`.
+If the fetch fails a warning is logged and delta-SL remains inactive (safe default).
+
+### Fix — monitor: delta-SL suppressed outside momentum entry window (`monitor.py`)
+
+OpeningNeutral-promoted positions are handed over at ~T+15 s of a fresh bucket — spot
+barely above/below strike → delta is tiny → delta-SL fired immediately on every
+promotion.  `should_exit()` now gates delta-SL: if `tte_seconds > MOMENTUM_MIN_TTE_SECONDS`
+(i.e., outside the entry window) the delta check is skipped.  Prob-SL remains active
+throughout.
+
+### Config change — `MOMENTUM_PROB_SL_MIN_TTE_SECS` reduced to 30 s (`config.py`)
+
+Was 300 s (5 minutes).  Reduced to 30 s — prob-SL is now suppressed only in the final
+30 seconds of a market rather than the final 5 minutes.
+
+### Webapp — Accounting UI (`webapp/src/`)
+
+New pages and hooks to display accounting data:
+
+- **`Trades.tsx`** (rewrite) — finalized ledger grouped by pair; per-group collapsible rows
+  showing gross P&L, net P&L, fees, fill type (MAIN/HEDGE/MOMENTUM), WIN/LOSS badges.
+  Outcome filter, text search, and pagination.
+- **`Pending.tsx`** (new) — live `CLOSING` and `PENDING_RESOLVE` positions with urgency
+  colouring, unrealized P&L, market type badge, and PM confirmation link.
+- **`Positions.tsx`** — aggregate summary bar: open count, today's net P&L, total net P&L.
+- **`App.tsx`** — Pending route and nav item added.
+- **`client.ts`** — `AcctLedgerRow`, `AcctPosition` types; `useAcctLedger`,
+  `useAcctPositions`, `useAcctPending` hooks wired to the new `/acct/*` endpoints.
+- **`Settings.tsx`** — `opening_neutral_tp_enabled` and `opening_neutral_tp_profit_pct`
+  controls added.
+
+### Tests — full overhaul (`tests/test_accounting_e2e.py`, `webapp/src/pages/*.test.tsx`)
+
+Old `test_accounting_e2e.py` (1164 lines targeting obsolete `RiskEngine`/`trades.csv`)
+replaced with 93 tests targeting `accounting.py`'s `_Ledger` API directly.  Sections:
+A entry-fill mechanics, B exit-fill mechanics, C gross-P&L arithmetic, D net-P&L,
+E YES/NO/UP/DOWN resolution (preamble rules), F resolution state machine,
+G ledger-CSV integrity, H two-sided maker pair tracking, I pair/hedge relationships,
+J position query helpers, K VWAP helper, L token-space independence.
+
+Vitest 4.1.5 + `@testing-library/react` + jsdom installed in `webapp/`.
+New UI test files: `Trades.test.tsx` (50 tests), `Pending.test.tsx` (26 tests).
+Pure helpers exported from `Trades.tsx` and `Pending.tsx` for direct unit testing.
+
+---
+
 ## [2026-04-30] - OpeningNeutral pre-market entry fixes; WS bid-monitoring exit; REST book source of truth
 
 ### Fix — OpeningNeutral: pre-market entry failures (`strategies/OpeningNeutral/scanner.py`, `config.py`)

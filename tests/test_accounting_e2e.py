@@ -1,37 +1,49 @@
 """
-tests/test_accounting_e2e.py — End-to-end accounting tests.
+tests/test_accounting_e2e.py — End-to-end tests for accounting.py.
 
-Written from a trader / accountant perspective: *given these fills at these
-prices, what exact dollar amounts appear in the ledger?*  No internal mocks.
-All assertions derive from arithmetic that can be verified on a calculator.
+Written from a trader / accountant perspective:
+  *Given these fills at these prices, what exact state and dollar amounts
+  appear in the ledger?*
+
+Every assertion is independently verifiable by hand calculation.
+No implementation details are mirrored — tests assert BUSINESS OUTCOMES.
 
 Sections
 ────────
-  A  Entry cost arithmetic         — what you pay to open
-  B  Unrealised P&L (MTM)          — current mark-to-market value
-  C  Realised P&L after close      — what actually hits the ledger
-  D  Fees and rebate accounting    — effect on realised P&L
-  E  Partial-fill accumulation     — multiple fills → one position
-  F  Two-sided market making       — YES + NO on same market coexist
-  G  Market resolution payoffs     — YES→1.0 and YES→0.0 outcomes
-  H  Session P&L accumulation      — running total and hard stop
-  I  CSV ledger integrity          — what gets written on close
-  J  Exit trigger arithmetic       — profit-target and stop-loss thresholds
+  A  Entry fill mechanics            — single and multi-fill VWAP accumulation
+  B  Exit fill mechanics             — VWAP, status transitions, exit_type
+  C  Gross P&L arithmetic            — (exit_vwap - entry_vwap) × exit_contracts
+  D  Net P&L = gross − fees + rebates
+  E  YES / NO / UP / DOWN resolution — preamble rules for resolved_yes_price
+  F  Market resolution state machine — on_resolved() outcome mapping
+  G  Ledger CSV integrity            — on_resolved() writes a correct CSV row
+  H  Two-sided (maker) pair tracking — YES + NO on same market, independent
+  I  Pair / hedge relationships       — pair_id, parent_pos_id, on_pair_promoted
+  J  Position query helpers          — get_position_by_token, get_positions_for_pair
+  K  add_fees accumulation           — post-fill fee/rebate adjustments
+  L  Token-space independence        — YES and NO have separate books (preamble)
 
 Key formulas
 ────────────
-  entry_cost_usd  YES = entry_price × contracts
-  entry_cost_usd  NO  = (1 − entry_price) × contracts
-  unrealised_pnl  YES = (current_price − entry_price) × contracts
-  unrealised_pnl  NO  = (entry_price − current_price) × contracts
-  realised_pnl        = price_pnl − fees_paid + rebates_earned
-  pm_fee (per ctr)    = PM_FEE_COEFF × price × (1 − price)
+  entry_cost_usd  = sum(fill_price × contracts) over all entry fills
+  entry_vwap      = VWAP of all entry fills
+  exit_vwap       = VWAP of all exit fills
+  gross_pnl       = (exit_vwap − entry_vwap) × exit_contracts
+  net_pnl         = gross_pnl − fees_usd + rebates_usd
+
+Preamble rules enforced
+───────────────────────
+  resolved_yes_price = 1.0  → YES/UP token WON  (NO/DOWN token LOST)
+  resolved_yes_price = 0.0  → NO/DOWN token WON  (YES/UP token LOST)
+  YES and NO have SEPARATE order books — never derive one from the other.
 """
 from __future__ import annotations
 
 import csv
+import json
 import sys
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -39,1126 +51,1016 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import config
+config.PAPER_TRADING = True   # no real network calls
 
-# Force paper mode — no real network calls can happen.
-config.PAPER_TRADING = True
+import accounting as _acct_mod
+from accounting import (
+    AccountingPosition,
+    PositionStatus,
+    _Ledger,
+    _vwap,
+    _gross_pnl,
+    LEDGER_HEADER,
+)
 
-import risk as _risk_module
-from risk import RiskEngine, Position
-from monitor import compute_unrealised_pnl, should_exit, ExitReason
+
+# ── Isolation fixture ──────────────────────────────────────────────────────────
+# Each test gets a fresh _Ledger whose files live in a private tmp directory.
+# The module-level singleton is patched so any lazy get_ledger() calls within
+# accounting.py itself also see the isolated instance.
+
+@pytest.fixture
+def ledger(tmp_path: Path) -> _Ledger:
+    """Fresh _Ledger backed by per-test tmp files."""
+    fills_path    = tmp_path / "acct_fills.jsonl"
+    positions_path = tmp_path / "acct_positions.json"
+    ledger_path   = tmp_path / "acct_ledger.csv"
+
+    orig_fills    = _acct_mod.FILLS_JSONL
+    orig_pos      = _acct_mod.POSITIONS_JSON
+    orig_ledger   = _acct_mod.LEDGER_CSV
+    orig_singleton = _acct_mod._ledger
+
+    _acct_mod.FILLS_JSONL    = fills_path
+    _acct_mod.POSITIONS_JSON = positions_path
+    _acct_mod.LEDGER_CSV     = ledger_path
+
+    inst = _Ledger()
+    _acct_mod._ledger = inst
+
+    yield inst
+
+    _acct_mod.FILLS_JSONL    = orig_fills
+    _acct_mod.POSITIONS_JSON = orig_pos
+    _acct_mod.LEDGER_CSV     = orig_ledger
+    _acct_mod._ledger        = orig_singleton
 
 
-# ── Shared helpers ─────────────────────────────────────────────────────────────
+# ── Shared builders ─────────────────────────────────────────────────────────────
 
-def _yes(
-    market_id: str = "mkt",
-    entry_price: float = 0.50,
-    size: float = 100.0,
+def _new_token() -> str:
+    return "tok_" + uuid.uuid4().hex[:12]
+
+
+def _new_condition() -> str:
+    return "0x" + uuid.uuid4().hex[:40]
+
+
+def _entry(
+    ledger: _Ledger,
+    token_id: str,
+    condition_id: str,
+    *,
+    fill_price: float,
+    contracts: float,
+    side: str = "YES",
+    strategy: str = "momentum",
+    fill_type: str = "MAIN",
+    pair_id: str = "",
+    parent_pos_id: str = "",
+    market_title: str = "BTC > $50000 on 2025-06-01?",
+    market_type: str = "bucket_daily",
     underlying: str = "BTC",
-    strategy: str = "maker",
-    seconds_ago: int = 120,
-) -> Position:
-    """YES position helper.  entry_cost_usd = entry_price × size."""
-    opened = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
-    return Position(
-        market_id=market_id,
-        market_type="bucket_daily",
-        underlying=underlying,
-        side="YES",
-        size=size,
-        entry_price=entry_price,
+    spot_entry: float = 50_000.0,
+    strike: float = 50_000.0,
+    tte_seconds: float = 86_400.0,
+    signal_source: str = "chainlink",
+    signal_score: float = 75.0,
+    fees_usd: float = 0.0,
+    rebates_usd: float = 0.0,
+) -> str:
+    return ledger.on_entry_fill(
+        token_id=token_id,
+        condition_id=condition_id,
+        order_id="ord_" + uuid.uuid4().hex[:8],
+        fill_price=fill_price,
+        contracts=contracts,
+        source="ws",
         strategy=strategy,
-        opened_at=opened,
-        entry_cost_usd=round(entry_price * size, 6),
+        fill_type=fill_type,
+        pair_id=pair_id,
+        parent_pos_id=parent_pos_id,
+        market_title=market_title,
+        market_type=market_type,
+        underlying=underlying,
+        side=side,
+        spot_entry=spot_entry,
+        strike=strike,
+        tte_seconds=tte_seconds,
+        signal_source=signal_source,
+        signal_score=signal_score,
+        fees_usd=fees_usd,
+        rebates_usd=rebates_usd,
     )
 
 
-def _no(
-    market_id: str = "mkt",
-    entry_price: float = 0.50,  # actual NO token price at fill
-    size: float = 100.0,
-    underlying: str = "BTC",
-    strategy: str = "maker",
-    seconds_ago: int = 120,
-) -> Position:
-    """NO position helper.  entry_price = actual NO token price.
-    entry_cost_usd = entry_price × size."""
-    opened = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
-    return Position(
-        market_id=market_id,
-        market_type="bucket_daily",
-        underlying=underlying,
-        side="NO",
-        size=size,
-        entry_price=entry_price,
-        strategy=strategy,
-        opened_at=opened,
-        entry_cost_usd=round(entry_price * size, 6),
+def _exit(
+    ledger: _Ledger,
+    token_id: str,
+    *,
+    fill_price: float,
+    contracts: float,
+    exit_type: str = "TAKER",
+    spot_exit: float = 0.0,
+    fees_usd: float = 0.0,
+    rebates_usd: float = 0.0,
+) -> str | None:
+    return ledger.on_exit_fill(
+        token_id=token_id,
+        order_id="ord_" + uuid.uuid4().hex[:8],
+        fill_price=fill_price,
+        contracts=contracts,
+        exit_type=exit_type,
+        source="ws",
+        spot_exit=spot_exit,
+        fees_usd=fees_usd,
+        rebates_usd=rebates_usd,
     )
 
 
-def _fresh_engine(tmp_path: Path | None = None) -> RiskEngine:
-    """Return a RiskEngine with an isolated trades.csv so tests don't share file state."""
-    engine = RiskEngine()
-    if tmp_path is not None:
-        _risk_module.TRADES_CSV = tmp_path / "trades.csv"
-        engine._ensure_csv()
-    return engine
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# A  Entry cost arithmetic
+# A  Entry fill mechanics
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestEntryCost:
-    """What you actually pay (USDC) to open a position, not the face value."""
+class TestEntryFillMechanics:
+    """on_entry_fill() creates and accumulates positions correctly."""
 
-    # ── YES positions ──────────────────────────────────────────────────────────
+    def test_single_fill_creates_position(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pos_id = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        pos = ledger.get_position(pos_id)
+        assert pos is not None
+        assert pos.entry_contracts == pytest.approx(100.0)
+        assert pos.entry_vwap      == pytest.approx(0.40)
+        assert pos.entry_cost_usd  == pytest.approx(40.0)   # 0.40 × 100
 
-    def test_yes_at_10_cents(self):
-        # 100 contracts at $0.10 per contract = $10 deployed.
-        pos = _yes(entry_price=0.10, size=100.0)
-        assert pos.entry_cost_usd == pytest.approx(10.0)
+    def test_entry_status_is_live(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pos_id = _entry(ledger, tok, cid, fill_price=0.50, contracts=50.0)
+        assert ledger.get_position(pos_id).status == PositionStatus.LIVE
 
-    def test_yes_at_50_cents(self):
-        pos = _yes(entry_price=0.50, size=100.0)
-        assert pos.entry_cost_usd == pytest.approx(50.0)
+    def test_returns_stable_pos_id_on_second_fill(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        id1 = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        id2 = _entry(ledger, tok, cid, fill_price=0.40, contracts=50.0)
+        assert id1 == id2  # same position for same token_id
 
-    def test_yes_at_90_cents(self):
-        pos = _yes(entry_price=0.90, size=100.0)
-        assert pos.entry_cost_usd == pytest.approx(90.0)
+    def test_two_fills_same_price_accumulate_contracts(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=60.0)
+        pos = ledger.get_position(pid)
+        assert pos.entry_contracts == pytest.approx(160.0)
+        assert pos.entry_cost_usd  == pytest.approx(64.0)   # 40 + 24
 
-    def test_yes_face_value_differs_from_cost(self):
-        # 1000 contracts at $0.10 costs $100, NOT $1000.
-        pos = _yes(entry_price=0.10, size=1000.0)
-        assert pos.size == 1000.0
-        assert pos.entry_cost_usd == pytest.approx(100.0)
-        assert pos.entry_cost_usd != pos.size
+    def test_two_fills_different_prices_vwap(self, ledger):
+        # 100 × 0.40 + 100 × 0.60 = $100 total, VWAP = 0.50
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        pid = _entry(ledger, tok, cid, fill_price=0.60, contracts=100.0)
+        pos = ledger.get_position(pid)
+        assert pos.entry_vwap      == pytest.approx(0.50)
+        assert pos.entry_cost_usd  == pytest.approx(100.0)
 
-    # ── NO positions ──────────────────────────────────────────────────────────
-    # Buying NO = selling YES at entry_price.  The NO token price = 1 − YES price.
+    def test_three_fills_weighted_vwap(self, ledger):
+        # 200 × 0.30 + 100 × 0.60 = 60 + 60 = $120, 300 contracts, VWAP = 0.40
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.30, contracts=200.0)
+        _entry(ledger, tok, cid, fill_price=0.60, contracts=100.0)
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=0.0)
+        pos = ledger.get_position(pid)
+        assert pos.entry_vwap      == pytest.approx(0.40)
+        assert pos.entry_contracts == pytest.approx(300.0)
 
-    def test_no_when_yes_is_10_cents(self):
-        # YES at $0.10 → NO at $0.90 → 100 NO contracts costs $90.
-        pos = _no(entry_price=0.90, size=100.0)
-        assert pos.entry_cost_usd == pytest.approx(90.0)
+    def test_different_tokens_create_separate_positions(self, ledger):
+        tok_yes = _new_token()
+        tok_no  = _new_token()
+        cid = _new_condition()
+        id_yes = _entry(ledger, tok_yes, cid, fill_price=0.40, contracts=100.0, side="YES")
+        id_no  = _entry(ledger, tok_no,  cid, fill_price=0.60, contracts=100.0, side="NO")
+        assert id_yes != id_no
+        assert ledger.get_position(id_yes).side == "YES"
+        assert ledger.get_position(id_no).side  == "NO"
 
-    def test_no_when_yes_is_50_cents(self):
-        pos = _no(entry_price=0.50, size=100.0)
-        assert pos.entry_cost_usd == pytest.approx(50.0)
-
-    def test_no_when_yes_is_90_cents(self):
-        # YES at $0.90 → NO at $0.10 → 100 NO contracts costs $10.
-        pos = _no(entry_price=0.10, size=100.0)
-        assert pos.entry_cost_usd == pytest.approx(10.0)
-
-    def test_yes_no_cost_complement_at_midpoint(self):
-        # At 50¢ YES = 50¢ NO; the costs are equal.
-        yes = _yes(entry_price=0.50, size=100.0)
-        no  = _no(entry_price=0.50, size=100.0)
-        assert yes.entry_cost_usd == pytest.approx(no.entry_cost_usd)
-
-    def test_yes_no_costs_sum_to_face_value(self):
-        # YES cost + NO cost = size (a complete binary market exhausts the notional).
-        p, s = 0.30, 200.0
-        assert _yes(entry_price=p, size=s).entry_cost_usd + \
-               _no(entry_price=1.0 - p, size=s).entry_cost_usd == pytest.approx(s)
-
-    def test_leverage_ratio_deep_otm_yes(self):
-        # Deep OTM YES at 5¢: $5 deployed on 100 contracts → 19× payout if YES wins.
-        pos = _yes(entry_price=0.05, size=100.0)
-        max_proceeds = 1.0 * pos.size  # resolves to $1 per contract
-        leverage = max_proceeds / pos.entry_cost_usd
-        assert leverage == pytest.approx(20.0)
-
-    def test_leverage_ratio_deep_itm_no(self):
-        # Deep OTM NO (YES=0.95) at 5¢: $5 deployed, 20× payout if NO wins.
-        pos = _no(entry_price=0.05, size=100.0)
-        max_proceeds = 1.0 * pos.size   # NO token resolves to $1 if YES fails
-        leverage = max_proceeds / pos.entry_cost_usd
-        assert leverage == pytest.approx(20.0)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# B  Unrealised P&L (mark-to-market)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestUnrealisedPnl:
-    """compute_unrealised_pnl in isolation — no engine needed."""
-
-    def test_yes_price_rises_profit(self):
-        pos = _yes(entry_price=0.40, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.65) == pytest.approx(25.0)
-
-    def test_yes_price_falls_loss(self):
-        pos = _yes(entry_price=0.40, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.25) == pytest.approx(-15.0)
-
-    def test_yes_unchanged_zero_pnl(self):
-        pos = _yes(entry_price=0.40, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.40) == pytest.approx(0.0)
-
-    def test_no_price_falls_profit(self):
-        # Bought NO at 0.30 (YES was 0.70). YES falls to 0.50 → actual NO rises to 0.50 → profit.
-        pos = _no(entry_price=0.30, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.50) == pytest.approx(20.0)
-
-    def test_no_price_rises_loss(self):
-        # Bought NO at 0.70 (YES was 0.30). YES rises to 0.45 → actual NO falls to 0.55 → loss.
-        pos = _no(entry_price=0.70, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.55) == pytest.approx(-15.0)
-
-    def test_no_unchanged_zero_pnl(self):
-        pos = _no(entry_price=0.40, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.40) == pytest.approx(0.0)
-
-    def test_pnl_scales_linearly_with_size(self):
-        # Same price move on 10× the contracts → 10× the P&L.
-        small = _yes(entry_price=0.40, size=100.0)
-        large = _yes(entry_price=0.40, size=1000.0)
-        assert compute_unrealised_pnl(large, 0.60) == pytest.approx(
-            compute_unrealised_pnl(small, 0.60) * 10
+    def test_metadata_stored_on_first_fill(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(
+            ledger, tok, cid,
+            fill_price=0.50, contracts=100.0,
+            side="YES", strategy="momentum", fill_type="MAIN",
+            market_title="BTC > $60k?", market_type="bucket_5m",
+            underlying="BTC", strike=60_000.0, tte_seconds=300.0,
+            signal_source="chainlink", signal_score=88.5,
         )
+        pos = ledger.get_position(pid)
+        assert pos.side          == "YES"
+        assert pos.strategy      == "momentum"
+        assert pos.fill_type     == "MAIN"
+        assert pos.market_title  == "BTC > $60k?"
+        assert pos.market_type   == "bucket_5m"
+        assert pos.underlying    == "BTC"
+        assert pos.strike        == pytest.approx(60_000.0)
+        assert pos.tte_seconds   == pytest.approx(300.0)
+        assert pos.signal_source == "chainlink"
+        assert pos.signal_score  == pytest.approx(88.5)
 
-    def test_yes_maximum_gain_at_resolution_to_one(self):
-        # YES resolves YES: full notional realised, minus cost.
-        pos = _yes(entry_price=0.40, size=100.0)
-        assert compute_unrealised_pnl(pos, 1.00) == pytest.approx(60.0)
+    def test_entry_time_is_iso_utc(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.50, contracts=10.0)
+        pos = ledger.get_position(pid)
+        dt = datetime.fromisoformat(pos.entry_time)
+        assert dt.tzinfo is not None
 
-    def test_yes_maximum_loss_at_resolution_to_zero(self):
-        # YES resolves NO: total cost lost.
-        pos = _yes(entry_price=0.40, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.00) == pytest.approx(-40.0)
+    def test_entry_fees_and_rebates_accumulated(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.50, contracts=100.0, fees_usd=1.20, rebates_usd=0.40)
+        pid = _entry(ledger, tok, cid, fill_price=0.50, contracts=50.0, fees_usd=0.60, rebates_usd=0.20)
+        pos = ledger.get_position(pid)
+        assert pos.fees_usd    == pytest.approx(1.80)
+        assert pos.rebates_usd == pytest.approx(0.60)
 
-    def test_no_maximum_gain_at_yes_resolution_to_zero(self):
-        # Bought NO at 0.60 (YES was 0.40). YES→0: actual NO→1.0, full gain.
-        pos = _no(entry_price=0.60, size=100.0)
-        assert compute_unrealised_pnl(pos, 1.00) == pytest.approx(40.0)
-
-    def test_no_maximum_loss_at_yes_resolution_to_one(self):
-        # Bought NO at 0.60 (YES was 0.40). YES→1: actual NO→0.0, full loss.
-        pos = _no(entry_price=0.60, size=100.0)
-        assert compute_unrealised_pnl(pos, 0.00) == pytest.approx(-60.0)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# C  Realised P&L after close
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestRealisedPnl:
-    """Verify the ledger entry created by close_position."""
-
-    def setup_method(self):
-        self.engine = RiskEngine()
-
-    def test_yes_win(self):
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.65)
-        assert closed.realized_pnl == pytest.approx(25.0)
-
-    def test_yes_loss(self):
-        self.engine.open_position(_yes("m", entry_price=0.70, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.20)
-        assert closed.realized_pnl == pytest.approx(-50.0)
-
-    def test_yes_breakeven(self):
-        self.engine.open_position(_yes("m", entry_price=0.50, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.50)
-        assert closed.realized_pnl == pytest.approx(0.0)
-
-    def test_no_win(self):
-        # Bought NO at 0.30 (YES was 0.70). YES falls to 0.50 → actual NO rises to 0.50 → profit.
-        self.engine.open_position(_no("m", entry_price=0.30, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.50, side="NO")
-        assert closed.realized_pnl == pytest.approx(20.0)
-
-    def test_no_loss(self):
-        # Bought NO at 0.70 (YES was 0.30). YES rises to 0.55 → actual NO falls to 0.45 → loss.
-        self.engine.open_position(_no("m", entry_price=0.70, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.45, side="NO")
-        assert closed.realized_pnl == pytest.approx(-25.0)
-
-    def test_yes_full_resolution_win(self):
-        # YES resolves to 1: maximum gain = proceeds − cost.
-        self.engine.open_position(_yes("m", entry_price=0.40, size=500.0))
-        closed = self.engine.close_position("m", exit_price=1.00)
-        assert closed.realized_pnl == pytest.approx(300.0)  # (1.0-0.40)×500
-
-    def test_yes_full_resolution_loss(self):
-        # YES resolves to 0: total loss of entry cost.
-        self.engine.open_position(_yes("m", entry_price=0.40, size=500.0))
-        closed = self.engine.close_position("m", exit_price=0.00)
-        assert closed.realized_pnl == pytest.approx(-200.0)  # (0-0.40)×500
-
-    def test_no_resolution_yes_wins(self):
-        # Bought NO at 0.70 (YES was 0.30). YES resolves to 1 → actual NO=0.0 → maximum NO loss.
-        self.engine.open_position(_no("m", entry_price=0.70, size=200.0))
-        closed = self.engine.close_position("m", exit_price=0.00, side="NO")
-        assert closed.realized_pnl == pytest.approx(-140.0)  # (0.0-0.70)×200
-
-    def test_no_resolution_no_wins(self):
-        # Bought NO at 0.70 (YES was 0.30). YES resolves to 0 → actual NO=1.0 → maximum NO gain.
-        self.engine.open_position(_no("m", entry_price=0.70, size=200.0))
-        closed = self.engine.close_position("m", exit_price=1.00, side="NO")
-        assert closed.realized_pnl == pytest.approx(60.0)  # (1.0-0.70)×200
-
-    def test_pnl_is_set_on_position_object(self):
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.60)
-        assert closed is not None
-        assert closed.is_closed
-        assert closed.realized_pnl == pytest.approx(20.0)
-
-    def test_close_twice_idempotent(self):
-        # Second close returns None; P&L is only counted once.
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        first  = self.engine.close_position("m", exit_price=0.60)
-        second = self.engine.close_position("m", exit_price=0.60)
-        assert first  is not None
-        assert second is None
-        assert self.engine.realized_pnl == pytest.approx(first.realized_pnl)
-
-    def test_closed_position_excluded_from_open_positions(self):
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.close_position("m", exit_price=0.60)
-        assert len(self.engine.get_open_positions()) == 0
+    def test_fills_appended_to_jsonl(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        _entry(ledger, tok, cid, fill_price=0.60, contracts=50.0)
+        lines = [json.loads(l) for l in _acct_mod.FILLS_JSONL.read_text().splitlines() if l.strip()]
+        assert len(lines) == 2
+        assert all(l["token_id"] == tok for l in lines)
+        assert lines[0]["side"] == "BUY"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# D  Fees and rebate accounting
+# B  Exit fill mechanics
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestFeeAndRebateAccounting:
-    """Fees reduce and rebates increase the realised P&L line."""
+class TestExitFillMechanics:
+    """on_exit_fill() updates exit VWAP, status, and returns the pos_id."""
 
-    def setup_method(self):
-        self.engine = RiskEngine()
+    def test_exit_fill_returns_pos_id(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        returned = _exit(ledger, tok, fill_price=0.60, contracts=100.0)
+        assert returned == pid
 
-    def test_fees_paid_reduce_pnl(self):
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.65, fees_paid=3.50)
-        # price_pnl = 25.0; minus fees = 21.50
-        assert closed.realized_pnl == pytest.approx(21.50)
+    def test_exit_fill_sets_exit_vwap(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        _exit(ledger, tok, fill_price=0.65, contracts=100.0)
+        pos = ledger.get_position(pid)
+        assert pos.exit_vwap      == pytest.approx(0.65)
+        assert pos.exit_contracts == pytest.approx(100.0)
 
-    def test_rebates_earned_increase_pnl(self):
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.65, rebates_earned=1.20)
-        # price_pnl = 25.0; plus rebate = 26.20
-        assert closed.realized_pnl == pytest.approx(26.20)
+    def test_exit_fill_moves_status_to_closing(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        _exit(ledger, tok, fill_price=0.60, contracts=100.0)
+        assert ledger.get_position(pid).status == PositionStatus.CLOSING
 
-    def test_fees_and_rebates_combine(self):
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        closed = self.engine.close_position(
-            "m", exit_price=0.65, fees_paid=4.00, rebates_earned=1.50
-        )
-        # price_pnl = 25.0 − 4.0 + 1.5 = 22.50
-        assert closed.realized_pnl == pytest.approx(22.50)
+    def test_exit_fill_records_exit_type(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        _exit(ledger, tok, fill_price=0.60, contracts=100.0, exit_type="SL")
+        assert ledger.get_position(pid).exit_type == "SL"
 
-    def test_fees_stored_on_position_object(self):
-        self.engine.open_position(_yes("m", entry_price=0.50, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.70, fees_paid=2.00)
-        assert closed.pm_fees_paid == pytest.approx(2.00)
+    def test_exit_fill_records_closing_since(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        _exit(ledger, tok, fill_price=0.60, contracts=100.0)
+        pos = ledger.get_position(pid)
+        assert pos.closing_since != ""
+        dt = datetime.fromisoformat(pos.closing_since)
+        assert dt.tzinfo is not None
 
-    def test_rebates_stored_on_position_object(self):
-        self.engine.open_position(_yes("m", entry_price=0.50, size=100.0))
-        closed = self.engine.close_position(
-            "m", exit_price=0.70, rebates_earned=0.80
-        )
-        assert closed.pm_rebates_earned == pytest.approx(0.80)
+    def test_exit_fill_unknown_token_returns_none(self, ledger):
+        result = _exit(ledger, "nonexistent_token", fill_price=0.50, contracts=10.0)
+        assert result is None
 
-    def test_record_rebate_accumulates_before_close(self):
-        # Maker earns a non-zero rebate at fill time via record_rebate().
-        # That rebate should be included in the final realized_pnl.
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.record_rebate("m", 0.50)          # first partial fill rebate
-        self.engine.record_rebate("m", 0.30)          # second partial fill rebate
-        pos = self.engine.get_open_positions()[0]
-        assert pos.pm_rebates_earned == pytest.approx(0.80)
+    def test_multiple_exit_fills_accumulate_via_vwap(self, ledger):
+        # Exit 1: 60 @ 0.65.  Exit 2: 40 @ 0.75.
+        # VWAP = (60×0.65 + 40×0.75) / 100 = (39 + 30) / 100 = 0.69
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        _exit(ledger, tok, fill_price=0.65, contracts=60.0)
+        _exit(ledger, tok, fill_price=0.75, contracts=40.0)
+        pos = ledger.get_position(pid)
+        assert pos.exit_vwap      == pytest.approx(0.69)
+        assert pos.exit_contracts == pytest.approx(100.0)
 
-    def test_record_rebate_included_in_realised_pnl(self):
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.record_rebate("m", 1.00)
-        # Entry rebate (1.00) credited via record_rebate; no additional exit rebate.
-        # realized_pnl must include the entry rebate: price_pnl + rebate = 10.0 + 1.0 = 11.0
-        closed = self.engine.close_position("m", exit_price=0.50)
-        assert closed.pm_rebates_earned == pytest.approx(1.00)
-        assert closed.realized_pnl == pytest.approx(11.0)
+    def test_exit_spot_stored(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        _exit(ledger, tok, fill_price=0.60, contracts=100.0, spot_exit=62_000.0)
+        assert ledger.get_position(pid).spot_exit == pytest.approx(62_000.0)
 
-    def test_pm_fee_formula_at_50_cents(self):
-        # PM fee per contract at p=0.50: PM_FEE_COEFF × 0.50 × 0.50
-        fee_per_contract = config.PM_FEE_COEFF * 0.50 * 0.50
-        assert fee_per_contract == pytest.approx(0.004375, rel=1e-4)
+    def test_exit_fees_add_to_entry_fees(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, fees_usd=0.50)
+        pid = _exit(ledger, tok, fill_price=0.60, contracts=100.0, fees_usd=1.50)
+        pos = ledger.get_position(pid)
+        assert pos.fees_usd == pytest.approx(2.00)   # 0.50 entry + 1.50 exit
 
-    def test_pm_fee_formula_is_symmetric(self):
-        # fee(p) = fee(1-p) because p*(1-p) is symmetric around 0.50.
-        for p in [0.10, 0.25, 0.40]:
-            assert (config.PM_FEE_COEFF * p * (1 - p) ==
-                    pytest.approx(config.PM_FEE_COEFF * (1 - p) * p))
-
-    def test_pm_fee_highest_at_midpoint(self):
-        fee_at_mid    = config.PM_FEE_COEFF * 0.50 * 0.50
-        fee_at_extreme = config.PM_FEE_COEFF * 0.10 * 0.90
-        assert fee_at_mid > fee_at_extreme
-
-    def test_round_trip_fee_on_winning_trade(self):
-        # A winning trade must overcome the round-trip fee to be net profitable.
-        # With fees < price_pnl, realized_pnl is still positive.
-        price = 0.50
-        size  = 100.0
-        fee_per_leg = config.PM_FEE_COEFF * price * (1 - price) * size
-        round_trip  = 2 * fee_per_leg            # entry + exit taker fees
-
-        self.engine.open_position(_yes("m", entry_price=price, size=size))
-        # Edge = 5¢ move on 100 contracts = $5; roundtrip fee ≈ $0.875 → net positive
-        closed = self.engine.close_position(
-            "m", exit_price=0.55, fees_paid=round_trip
-        )
-        assert closed.realized_pnl > 0, "Trade profitable even after fees"
-        assert closed.pm_fees_paid == pytest.approx(round_trip)
+    def test_exit_appends_sell_fill_to_jsonl(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        _exit(ledger, tok, fill_price=0.60, contracts=100.0)
+        lines = [json.loads(l) for l in _acct_mod.FILLS_JSONL.read_text().splitlines() if l.strip()]
+        sells = [l for l in lines if l["side"] == "SELL"]
+        assert len(sells) == 1
+        assert sells[0]["fill_price"] == pytest.approx(0.60)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# E  Partial-fill accumulation
+# C  Gross P&L arithmetic
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestPartialFillAccumulation:
-    """Multiple fill slices on the same order merge into a single position."""
-
-    def setup_method(self):
-        self.engine = RiskEngine()
-
-    def test_two_fills_same_price_merge(self):
-        # Fill 1: 100 YES at 0.40 = $40.  Fill 2: 60 YES at 0.40 = $24.
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_yes("m", entry_price=0.40, size=60.0))
-        positions = self.engine.get_open_positions()
-        assert len(positions) == 1
-        merged = positions[0]
-        assert merged.size           == pytest.approx(160.0)
-        assert merged.entry_cost_usd == pytest.approx(64.0)   # 40 + 24
-
-    def test_three_fills_same_price_merge(self):
-        for _ in range(3):
-            self.engine.open_position(_yes("m", entry_price=0.50, size=50.0))
-        pos = self.engine.get_open_positions()[0]
-        assert pos.size           == pytest.approx(150.0)
-        assert pos.entry_cost_usd == pytest.approx(75.0)
-
-    def test_opened_at_not_reset_on_merge(self):
-        # The timestamp of the FIRST fill is preserved across merges.
-        t0 = datetime.now(timezone.utc) - timedelta(seconds=300)
-        pos1 = _yes("m", entry_price=0.40, size=100.0)
-        pos1.opened_at = t0
-        self.engine.open_position(pos1)
-
-        pos2 = _yes("m", entry_price=0.40, size=50.0)
-        pos2.opened_at = datetime.now(timezone.utc)   # later fill
-        self.engine.open_position(pos2)
-
-        merged = self.engine.get_open_positions()[0]
-        assert merged.opened_at == t0
-
-    def test_merged_position_pnl_on_close(self):
-        # 100 + 60 = 160 YES at 0.40; close at 0.55 → (0.15 × 160) = $24.
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_yes("m", entry_price=0.40, size=60.0))
-        closed = self.engine.close_position("m", exit_price=0.55)
-        assert closed.realized_pnl == pytest.approx(24.0)
-
-    def test_merged_cost_equals_sum_of_fills(self):
-        # entry_cost_usd must equal the arithmetic sum of all individual fill costs.
-        fills = [(100.0, 0.40), (80.0, 0.40), (40.0, 0.40)]  # same price
-        expected_cost = sum(s * p for s, p in fills)
-        for size, price in fills:
-            self.engine.open_position(_yes("m", entry_price=price, size=size))
-        pos = self.engine.get_open_positions()[0]
-        assert pos.entry_cost_usd == pytest.approx(expected_cost)
-
-    def test_reopen_after_close_creates_fresh_position(self):
-        # Closing and then refilling the same market should create a NEW position,
-        # not contaminate the closed one.
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.close_position("m", exit_price=0.50)          # P&L = $10
-
-        self.engine.open_position(_yes("m", entry_price=0.60, size=50.0))
-        positions = self.engine.get_open_positions()
-        assert len(positions) == 1
-        reopened = positions[0]
-        assert reopened.size           == pytest.approx(50.0)
-        assert reopened.entry_cost_usd == pytest.approx(30.0)
-        assert reopened.entry_price    == pytest.approx(0.60)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# F  Two-sided market making — YES and NO coexist on the same market
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestTwoSidedMaking:
+class TestGrossPnlArithmetic:
     """
-    A market maker posts both a BID (→ YES fill) and an ASK (→ NO fill) on the
-    same market.  The composite position key (market_id:side) ensures they are
-    tracked independently so neither position pollutes the other's P&L.
+    gross_pnl = (exit_vwap - entry_vwap) × exit_contracts
+
+    This formula is token-agnostic — YES, NO, UP, DOWN all use actual prices.
     """
 
-    def setup_method(self):
-        self.engine = RiskEngine()
+    def _pos(
+        self,
+        entry_vwap: float,
+        entry_contracts: float,
+        exit_vwap: float,
+        exit_contracts: float,
+    ) -> AccountingPosition:
+        p = AccountingPosition(pos_id=str(uuid.uuid4()), strategy="m", fill_type="MAIN")
+        p.entry_vwap      = entry_vwap
+        p.entry_contracts = entry_contracts
+        p.exit_vwap       = exit_vwap
+        p.exit_contracts  = exit_contracts
+        return p
 
-    def test_yes_and_no_are_separate_positions(self):
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
-        assert len(self.engine.get_open_positions()) == 2
+    def test_profitable_long(self):
+        # Bought 100 @ 0.40, sold 100 @ 0.65 → gross = (0.65-0.40)×100 = $25
+        pos = self._pos(0.40, 100.0, 0.65, 100.0)
+        assert _gross_pnl(pos) == pytest.approx(25.0)
 
-    def test_yes_fill_does_not_corrupt_no_position(self):
-        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
-        self.engine.open_position(_yes("m", entry_price=0.40, size=200.0))  # different size
-        yes_pos = next(p for p in self.engine.get_open_positions() if p.side == "YES")
-        no_pos  = next(p for p in self.engine.get_open_positions() if p.side == "NO")
-        assert yes_pos.size == pytest.approx(200.0)
-        assert no_pos.size  == pytest.approx(100.0)
+    def test_losing_long(self):
+        # Bought 100 @ 0.70, sold 100 @ 0.30 → gross = −$40
+        pos = self._pos(0.70, 100.0, 0.30, 100.0)
+        assert _gross_pnl(pos) == pytest.approx(-40.0)
 
-    def test_spread_capture_both_sides_profitable(self):
-        # The market maker quotes BID=0.40 on YES, and fills NO at 0.40 (complement of ASK=0.60).
-        # Both sides fill.  At any final price between 0.40 and 0.60, both
-        # positions are profitable.  Here we close at mid = 0.50:
-        #   YES pnl = (0.50 − 0.40) × 100 = +$10
-        #   NO  pnl = (0.50 − 0.40) × 100 = +$10
-        #   Total   = +$20 = spread × size = 0.20 × 100
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
+    def test_breakeven(self):
+        pos = self._pos(0.50, 100.0, 0.50, 100.0)
+        assert _gross_pnl(pos) == pytest.approx(0.0)
 
-        yes_closed = self.engine.close_position("m", exit_price=0.50, side="YES")
-        no_closed  = self.engine.close_position("m", exit_price=0.50, side="NO")
+    def test_scales_linearly_with_contracts(self):
+        pos_small = self._pos(0.40, 100.0, 0.60, 100.0)
+        pos_large = self._pos(0.40, 1000.0, 0.60, 1000.0)
+        assert _gross_pnl(pos_large) == pytest.approx(_gross_pnl(pos_small) * 10)
 
-        assert yes_closed.realized_pnl == pytest.approx(10.0)
-        assert no_closed.realized_pnl  == pytest.approx(10.0)
-        assert yes_closed.realized_pnl + no_closed.realized_pnl == pytest.approx(20.0)
+    def test_yes_resolves_win(self):
+        # YES token bought at 0.40, settles at 1.0 → gross = $60
+        pos = self._pos(0.40, 100.0, 1.00, 100.0)
+        assert _gross_pnl(pos) == pytest.approx(60.0)
 
-    def test_spread_capture_is_direction_independent(self):
-        # The 20¢ spread is locked in regardless of which way the market resolves.
-        # YES resolves to 1.0:
-        # YES pnl = (1.0 − 0.40) × 100 = +$60
-        # NO  pnl = (0.0 − 0.40) × 100 = −$40  (actual NO=0.0 when YES=1.0)
-        # Net     = +$20 = spread capture ✓
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
+    def test_yes_resolves_loss(self):
+        # YES token bought at 0.40, settles at 0.0 → gross = −$40
+        pos = self._pos(0.40, 100.0, 0.00, 100.0)
+        assert _gross_pnl(pos) == pytest.approx(-40.0)
 
-        yes_r1 = self.engine.close_position("m", exit_price=1.00, side="YES")
-        no_r1  = self.engine.close_position("m", exit_price=0.00, side="NO")
-        assert yes_r1.realized_pnl + no_r1.realized_pnl == pytest.approx(20.0)
+    def test_no_token_win(self):
+        # NO token bought at 0.60 (independently priced), settles at 1.0 → gross = $40
+        pos = self._pos(0.60, 100.0, 1.00, 100.0)
+        assert _gross_pnl(pos) == pytest.approx(40.0)
 
-    def test_spread_capture_yes_resolves_to_zero(self):
-        # YES resolves to 0.0:
-        # YES pnl = (0.0 − 0.40) × 100 = −$40
-        # NO  pnl = (1.0 − 0.40) × 100 = +$60  (actual NO=1.0 when YES=0.0)
-        # Net     = +$20 ✓
-        engine2 = RiskEngine()
-        engine2.open_position(_yes("m", entry_price=0.40, size=100.0))
-        engine2.open_position(_no("m",  entry_price=0.40, size=100.0))
+    def test_no_token_loss(self):
+        # NO token bought at 0.60, settles at 0.0 → gross = −$60
+        pos = self._pos(0.60, 100.0, 0.00, 100.0)
+        assert _gross_pnl(pos) == pytest.approx(-60.0)
 
-        yes_r0 = engine2.close_position("m", exit_price=0.00, side="YES")
-        no_r0  = engine2.close_position("m", exit_price=1.00, side="NO")
-        assert yes_r0.realized_pnl + no_r0.realized_pnl == pytest.approx(20.0)
+    def test_partial_exit_only_on_exited_portion(self):
+        # Entered 100 contracts, only 60 exited so far.
+        # gross = (0.65 − 0.40) × 60 = $15
+        pos = self._pos(0.40, 100.0, 0.65, 60.0)
+        assert _gross_pnl(pos) == pytest.approx(15.0)
 
-    def test_independent_close_yes_only(self):
-        # Closing YES side does not close NO side.
-        self.engine.open_position(_yes("m", entry_price=0.40, size=100.0))
-        self.engine.open_position(_no("m",  entry_price=0.40, size=100.0))
-        self.engine.close_position("m", exit_price=0.50, side="YES")
-        assert len(self.engine.get_open_positions()) == 1
-        assert self.engine.get_open_positions()[0].side == "NO"
-
-    def test_different_sizes_tracked_independently(self):
-        # YES: 300 contracts.  NO: 150 contracts.  Separate positions, no bleed.
-        self.engine.open_position(_yes("m", entry_price=0.45, size=300.0))
-        self.engine.open_position(_no("m",  entry_price=0.45, size=150.0))
-        yes_pos = next(p for p in self.engine.get_open_positions() if p.side == "YES")
-        no_pos  = next(p for p in self.engine.get_open_positions() if p.side == "NO")
-        assert yes_pos.entry_cost_usd == pytest.approx(0.45 * 300)   # $135
-        assert no_pos.entry_cost_usd  == pytest.approx(0.45 * 150)   # $67.50 (NO token at $0.45)
+    def test_zero_exit_contracts_is_zero(self):
+        pos = self._pos(0.40, 100.0, 0.0, 0.0)
+        assert _gross_pnl(pos) == pytest.approx(0.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# G  Market resolution payoffs — all YES/NO × 0/1 combinations
+# D  Net P&L = gross − fees + rebates
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestResolutionPayoffs:
+class TestNetPnlCalculation:
+    """Ledger net_pnl verified via on_resolved() writing the CSV row."""
+
+    def _setup_and_resolve(
+        self,
+        ledger,
+        side: str,
+        resolved_yes_price: float,
+        entry_price: float = 0.40,
+        contracts: float = 100.0,
+        entry_fees: float = 0.0,
+        entry_rebates: float = 0.0,
+        exit_fees: float = 0.0,
+        exit_rebates: float = 0.0,
+    ) -> dict:
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=entry_price, contracts=contracts,
+               side=side, fees_usd=entry_fees, rebates_usd=entry_rebates)
+        if side in ("YES", "UP"):
+            exit_price = 1.0 if resolved_yes_price >= 0.99 else 0.0
+        else:
+            exit_price = 1.0 if resolved_yes_price <= 0.01 else 0.0
+        _exit(ledger, tok, fill_price=exit_price, contracts=contracts,
+              exit_type="RESOLVED", fees_usd=exit_fees, rebates_usd=exit_rebates)
+        ledger.on_resolved(cid, resolved_yes_price)
+        rows = list(csv.DictReader(_acct_mod.LEDGER_CSV.open(encoding="utf-8")))
+        return rows[-1]
+
+    def test_net_pnl_win_with_fees_and_rebates(self, ledger):
+        # gross = $60; fees=1.50; rebates=0.50 → net = 60 - 1.50 + 0.50 = $59
+        row = self._setup_and_resolve(
+            ledger, "YES", 1.0, entry_fees=0.50, entry_rebates=0.20,
+            exit_fees=1.00, exit_rebates=0.30,
+        )
+        assert float(row["gross_pnl"])    == pytest.approx(60.0)
+        assert float(row["fees_usd"])     == pytest.approx(1.50)
+        assert float(row["rebates_usd"])  == pytest.approx(0.50)
+        assert float(row["net_pnl"])      == pytest.approx(59.0)
+
+    def test_net_pnl_loss_with_fees_and_rebates(self, ledger):
+        # NO loses (YES wins): gross = (0.0 - 0.40)×100 = −$40; fees=1.50; rebates=0.50 → net=−$41
+        row = self._setup_and_resolve(
+            ledger, "NO", 1.0, entry_fees=0.50, entry_rebates=0.20,
+            exit_fees=1.00, exit_rebates=0.30,
+        )
+        assert float(row["gross_pnl"]) == pytest.approx(-40.0)
+        assert float(row["net_pnl"])   == pytest.approx(-41.0)
+
+    def test_fees_reduce_net_pnl(self, ledger):
+        row = self._setup_and_resolve(ledger, "YES", 1.0, exit_fees=3.00)
+        assert float(row["net_pnl"]) == pytest.approx(57.0)   # 60 - 3 + 0
+
+    def test_rebates_increase_net_pnl(self, ledger):
+        row = self._setup_and_resolve(ledger, "YES", 1.0, exit_rebates=2.00)
+        assert float(row["net_pnl"]) == pytest.approx(62.0)   # 60 + 0 + 2
+
+    def test_net_pnl_no_fees_no_rebates(self, ledger):
+        row = self._setup_and_resolve(ledger, "YES", 1.0)
+        assert float(row["net_pnl"]) == pytest.approx(float(row["gross_pnl"]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# E  YES / NO / UP / DOWN resolution — preamble token-side rules
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestResolutionTokenRules:
     """
-    Binary market resolves to exactly 0.0 or 1.0.
-    The four combinations fully determine the payout tables.
+    PREAMBLE RULES (must not be inverted):
+      resolved_yes_price = 1.0  → YES / UP token won
+      resolved_yes_price = 0.0  → NO / DOWN token won
+
+    Any regression here indicates a catastrophic accounting inversion.
     """
 
-    ENTRY_PRICES = [0.10, 0.25, 0.50, 0.75, 0.90]
+    def _resolve_position(
+        self, ledger: _Ledger, side: str, resolved_yes_price: float
+    ) -> AccountingPosition:
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side=side)
+        _exit(ledger, tok, fill_price=0.60, contracts=100.0, exit_type="TAKER")
+        ledger.on_resolved(cid, resolved_yes_price)
+        return ledger.get_position_by_token(tok)
 
-    def setup_method(self):
-        self.engine = RiskEngine()
+    # ── YES token ──────────────────────────────────────────────────────────────
 
-    @pytest.mark.parametrize("entry_price", ENTRY_PRICES)
-    def test_yes_wins_all_entry_prices(self, entry_price: float):
-        # YES at any entry price; market resolves to 1.0 → profit = (1 - entry) × size
-        self.engine = RiskEngine()
-        self.engine.open_position(_yes("m", entry_price=entry_price, size=100.0))
-        closed = self.engine.close_position("m", exit_price=1.0)
-        expected = (1.0 - entry_price) * 100.0
-        assert closed.realized_pnl == pytest.approx(expected, rel=1e-6)
+    def test_yes_side_price_one_is_win(self, ledger):
+        pos = self._resolve_position(ledger, "YES", 1.0)
+        assert pos.resolved_outcome == "WIN"
+        assert pos.status == PositionStatus.RESOLVED_WIN
 
-    @pytest.mark.parametrize("entry_price", ENTRY_PRICES)
-    def test_yes_loses_all_entry_prices(self, entry_price: float):
-        # YES at any entry price; market resolves to 0.0 → loss = entry × size
-        self.engine = RiskEngine()
-        self.engine.open_position(_yes("m", entry_price=entry_price, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.0)
-        expected = -entry_price * 100.0
-        assert closed.realized_pnl == pytest.approx(expected, rel=1e-6)
+    def test_yes_side_price_zero_is_loss(self, ledger):
+        pos = self._resolve_position(ledger, "YES", 0.0)
+        assert pos.resolved_outcome == "LOSS"
+        assert pos.status == PositionStatus.RESOLVED_LOSS
 
-    @pytest.mark.parametrize("entry_price", ENTRY_PRICES)
-    def test_no_wins_all_entry_prices(self, entry_price: float):
-        # NO at actual token price entry_price; YES resolves to 0 → actual NO goes to 1.0.
-        self.engine = RiskEngine()
-        self.engine.open_position(_no("m", entry_price=entry_price, size=100.0))
-        closed = self.engine.close_position("m", exit_price=1.0, side="NO")
-        expected = (1.0 - entry_price) * 100.0
-        assert closed.realized_pnl == pytest.approx(expected, rel=1e-6)
+    # ── NO token — MUST be INVERTED relative to resolved_yes_price ─────────────
 
-    @pytest.mark.parametrize("entry_price", ENTRY_PRICES)
-    def test_no_loses_all_entry_prices(self, entry_price: float):
-        # NO at actual token price entry_price; YES resolves to 1 → actual NO goes to 0.0.
-        self.engine = RiskEngine()
-        self.engine.open_position(_no("m", entry_price=entry_price, size=100.0))
-        closed = self.engine.close_position("m", exit_price=0.0, side="NO")
-        expected = -entry_price * 100.0
-        assert closed.realized_pnl == pytest.approx(expected, rel=1e-6)
+    def test_no_side_price_zero_is_win(self, ledger):
+        """
+        resolved_yes_price=0.0 means YES failed → NO token WINS.
+        This is the critical preamble rule.
+        """
+        pos = self._resolve_position(ledger, "NO", 0.0)
+        assert pos.resolved_outcome == "WIN", (
+            "NO side MUST win when resolved_yes_price=0.0"
+        )
+        assert pos.status == PositionStatus.RESOLVED_WIN
 
-    def test_yes_and_no_at_same_entry_are_complements(self):
-        # YES at p and NO at (1-p) are economic complements: at any resolution
-        # the combined P&L is always zero (they exactly cancel).
-        eng_yes = RiskEngine()
-        eng_no  = RiskEngine()
-        p, s = 0.40, 100.0
+    def test_no_side_price_one_is_loss(self, ledger):
+        """
+        resolved_yes_price=1.0 means YES succeeded → NO token LOSES.
+        """
+        pos = self._resolve_position(ledger, "NO", 1.0)
+        assert pos.resolved_outcome == "LOSS", (
+            "NO side MUST lose when resolved_yes_price=1.0"
+        )
+        assert pos.status == PositionStatus.RESOLVED_LOSS
 
-        eng_yes.open_position(_yes("m", entry_price=p, size=s))
-        eng_no.open_position(_no("m",   entry_price=1.0 - p, size=s))
+    # ── UP / DOWN directional buckets ─────────────────────────────────────────
 
-        for exit_price in [0.0, 1.0]:
-            pnl_yes = (exit_price - p) * s
-            pnl_no  = (p - exit_price) * s
-            assert pnl_yes + pnl_no == pytest.approx(0.0)
+    def test_up_side_price_one_is_win(self, ledger):
+        pos = self._resolve_position(ledger, "UP", 1.0)
+        assert pos.resolved_outcome == "WIN"
 
+    def test_up_side_price_zero_is_loss(self, ledger):
+        pos = self._resolve_position(ledger, "UP", 0.0)
+        assert pos.resolved_outcome == "LOSS"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# H  Session P&L accumulation and hard stop
-# ══════════════════════════════════════════════════════════════════════════════
+    def test_down_side_price_zero_is_win(self, ledger):
+        pos = self._resolve_position(ledger, "DOWN", 0.0)
+        assert pos.resolved_outcome == "WIN"
 
-class TestSessionPnl:
-    """engine.realized_pnl accumulates across trades; hard stop fires on threshold."""
+    def test_down_side_price_one_is_loss(self, ledger):
+        pos = self._resolve_position(ledger, "DOWN", 1.0)
+        assert pos.resolved_outcome == "LOSS"
 
-    def setup_method(self):
-        self.engine = RiskEngine()
+    def test_resolve_price_stored_on_position(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        _exit(ledger, tok, fill_price=1.0, contracts=100.0, exit_type="RESOLVED")
+        ledger.on_resolved(cid, 1.0)
+        pos = ledger.get_position_by_token(tok)
+        assert pos.resolve_price == pytest.approx(1.0)
 
-    def test_single_trade_pnl(self):
-        self.engine.open_position(_yes("m1", entry_price=0.40, size=100.0))
-        self.engine.close_position("m1", exit_price=0.65)
-        assert self.engine.realized_pnl == pytest.approx(25.0)
-
-    def test_multiple_trades_accumulate(self):
-        # Trade 1: +$25.  Trade 2: −$15.  Trade 3: +$30.  Net: +$40.
-        self.engine.open_position(_yes("m1", entry_price=0.40, size=100.0))
-        self.engine.close_position("m1", exit_price=0.65)   # +25
-
-        self.engine.open_position(_yes("m2", entry_price=0.60, size=100.0))
-        self.engine.close_position("m2", exit_price=0.45)   # -15
-
-        self.engine.open_position(_yes("m3", entry_price=0.20, size=100.0))
-        self.engine.close_position("m3", exit_price=0.50)   # +30
-
-        assert self.engine.realized_pnl == pytest.approx(40.0)
-
-    def test_closed_position_not_in_open_list(self):
-        self.engine.open_position(_yes("m1", entry_price=0.40, size=100.0))
-        self.engine.open_position(_yes("m2", entry_price=0.50, size=100.0))
-        self.engine.close_position("m1", exit_price=0.60)
-        open_ids = {p.market_id for p in self.engine.get_open_positions()}
-        assert "m1" not in open_ids
-        assert "m2" in open_ids
-
-    def test_hard_stop_triggers_when_drawdown_exceeded(self):
-        # Lose more than HARD_STOP_DRAWDOWN in one trade → hard stop fires.
-        loss = config.HARD_STOP_DRAWDOWN + 100.0
-        size = loss  # entry_price=1.0, exit_price=0.0 → loss = size
-        self.engine.open_position(_yes("m", entry_price=1.0, size=size))
-        self.engine.close_position("m", exit_price=0.0)
-        assert self.engine.hard_stop_triggered
-
-    def test_hard_stop_blocks_new_opens(self):
-        loss = config.HARD_STOP_DRAWDOWN + 100.0
-        self.engine.open_position(_yes("m", entry_price=1.0, size=loss))
-        self.engine.close_position("m", exit_price=0.0)
-        ok, reason = self.engine.can_open("m2", 10.0)
-        assert not ok
-        assert "hard stop" in reason
-
-    def test_no_hard_stop_on_small_loss(self):
-        # Loss well below threshold → no hard stop.
-        self.engine.open_position(_yes("m", entry_price=0.50, size=10.0))
-        self.engine.close_position("m", exit_price=0.40)   # −$1
-        assert not self.engine.hard_stop_triggered
-
-    def test_running_total_is_sum_of_realized_pnl_fields(self):
-        trades = [("m1", 0.40, 0.60), ("m2", 0.70, 0.50), ("m3", 0.30, 0.45)]
-        expected = sum((exit - entry) * 100.0 for _, entry, exit in trades)
-        for mid, entry, exit in trades:
-            self.engine.open_position(_yes(mid, entry_price=entry, size=100.0))
-            self.engine.close_position(mid, exit_price=exit)
-        assert self.engine.realized_pnl == pytest.approx(expected)
+    def test_resolve_price_zero_stored(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        _exit(ledger, tok, fill_price=0.0, contracts=100.0, exit_type="RESOLVED")
+        ledger.on_resolved(cid, 0.0)
+        pos = ledger.get_position_by_token(tok)
+        assert pos.resolve_price == pytest.approx(0.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# I  CSV ledger integrity
+# F  Market resolution state machine
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestCsvLedger:
-    """Each close_position() call must write exactly one correctly-populated row."""
+class TestResolutionStateMachine:
+    """on_resolved() transitions, multi-position markets, idempotency."""
 
-    def test_single_trade_writes_one_row(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        engine.open_position(_yes("m1", underlying="BTC", entry_price=0.40, size=100.0))
-        engine.close_position("m1", exit_price=0.60)
-        rows = list(csv.DictReader((tmp_path / "trades.csv").open()))
-        assert len(rows) == 1
+    def test_position_is_terminal_after_resolve(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        _exit(ledger, tok, fill_price=1.0, contracts=100.0, exit_type="RESOLVED")
+        ledger.on_resolved(cid, 1.0)
+        pos = ledger.get_position_by_token(tok)
+        assert pos.status in PositionStatus.TERMINAL
 
-    def test_csv_row_has_correct_pnl(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        engine.open_position(_yes("m1", entry_price=0.40, size=100.0))
-        engine.close_position("m1", exit_price=0.65)
-        row = list(csv.DictReader((tmp_path / "trades.csv").open()))[0]
-        assert float(row["pnl"]) == pytest.approx(25.0)
+    def test_resolve_without_prior_exit_sets_exit_vwap_win(self, ledger):
+        """No explicit exit fill — resolution auto-sets exit_vwap to 1.0 (win)."""
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        ledger.on_resolved(cid, 1.0)
+        pos = ledger.get_position_by_token(tok)
+        assert pos.exit_vwap      == pytest.approx(1.0)
+        assert pos.exit_contracts == pytest.approx(100.0)
+        assert pos.exit_type      == "RESOLVED"
 
-    def test_csv_row_has_correct_side(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        engine.open_position(_no("m1", entry_price=0.60))
-        engine.close_position("m1", exit_price=0.40, side="NO")
-        row = list(csv.DictReader((tmp_path / "trades.csv").open()))[0]
+    def test_resolve_without_prior_exit_sets_exit_vwap_zero_for_loss(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        ledger.on_resolved(cid, 0.0)
+        pos = ledger.get_position_by_token(tok)
+        assert pos.exit_vwap == pytest.approx(0.0)
+
+    def test_two_positions_same_condition_both_resolved(self, ledger):
+        """YES and NO legs on same condition_id are both resolved in one call."""
+        cid     = _new_condition()
+        tok_yes = _new_token()
+        tok_no  = _new_token()
+        _entry(ledger, tok_yes, cid, fill_price=0.40, contracts=100.0, side="YES")
+        _entry(ledger, tok_no,  cid, fill_price=0.60, contracts=100.0, side="NO")
+        ledger.on_resolved(cid, 1.0)   # YES wins, NO loses
+        yes_pos = ledger.get_position_by_token(tok_yes)
+        no_pos  = ledger.get_position_by_token(tok_no)
+        assert yes_pos.resolved_outcome == "WIN"
+        assert no_pos.resolved_outcome  == "LOSS"
+
+    def test_terminal_position_not_re_resolved(self, ledger):
+        """Second on_resolved() call must not change the outcome."""
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        ledger.on_resolved(cid, 1.0)
+        ledger.on_resolved(cid, 0.0)   # attempt to flip — must be ignored
+        pos = ledger.get_position_by_token(tok)
+        assert pos.resolved_outcome == "WIN"
+
+    def test_sl_exit_type_maps_to_sl_status(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        _exit(ledger, tok, fill_price=0.20, contracts=100.0, exit_type="SL")
+        ledger.on_resolved(cid, 0.0)
+        pos = ledger.get_position_by_token(tok)
+        assert pos.status == PositionStatus.SL
+
+    def test_tp_exit_type_maps_to_tp_status(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        _exit(ledger, tok, fill_price=0.90, contracts=100.0, exit_type="TP")
+        ledger.on_resolved(cid, 1.0)
+        pos = ledger.get_position_by_token(tok)
+        assert pos.status == PositionStatus.TP
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# G  Ledger CSV integrity
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLedgerCsvIntegrity:
+    """on_resolved() must write exactly one CSV row with all fields populated."""
+
+    def _setup_and_resolve(
+        self,
+        ledger: _Ledger,
+        *,
+        side: str = "YES",
+        entry_price: float = 0.40,
+        contracts: float = 100.0,
+        resolved_yes_price: float = 1.0,
+        fees: float = 0.0,
+        rebates: float = 0.0,
+        underlying: str = "BTC",
+        strategy: str = "momentum",
+        market_title: str = "BTC > $50k?",
+    ) -> dict:
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=entry_price, contracts=contracts,
+               side=side, underlying=underlying, strategy=strategy,
+               market_title=market_title)
+        if side in ("YES", "UP"):
+            exit_price = 1.0 if resolved_yes_price >= 0.99 else 0.0
+        else:
+            exit_price = 1.0 if resolved_yes_price <= 0.01 else 0.0
+        _exit(ledger, tok, fill_price=exit_price, contracts=contracts,
+              exit_type="RESOLVED", fees_usd=fees, rebates_usd=rebates)
+        ledger.on_resolved(cid, resolved_yes_price)
+        rows = list(csv.DictReader(_acct_mod.LEDGER_CSV.open(encoding="utf-8")))
+        assert len(rows) >= 1
+        return rows[-1]
+
+    def test_all_header_columns_present(self, ledger):
+        row = self._setup_and_resolve(ledger)
+        for col in LEDGER_HEADER:
+            assert col in row, f"Missing column: {col}"
+
+    def test_pos_id_is_uuid(self, ledger):
+        row = self._setup_and_resolve(ledger)
+        uuid.UUID(row["pos_id"])
+
+    def test_correct_gross_pnl_win(self, ledger):
+        row = self._setup_and_resolve(ledger, side="YES", entry_price=0.40, contracts=100.0, resolved_yes_price=1.0)
+        assert float(row["gross_pnl"]) == pytest.approx(60.0)
+
+    def test_correct_gross_pnl_loss(self, ledger):
+        row = self._setup_and_resolve(ledger, side="YES", entry_price=0.40, contracts=100.0, resolved_yes_price=0.0)
+        assert float(row["gross_pnl"]) == pytest.approx(-40.0)
+
+    def test_net_pnl_with_fees_and_rebates(self, ledger):
+        # gross = $60; fees=$3; rebates=$1 → net=$58
+        row = self._setup_and_resolve(ledger, fees=3.00, rebates=1.00)
+        assert float(row["net_pnl"]) == pytest.approx(58.0)
+
+    def test_resolved_outcome_win_in_csv(self, ledger):
+        row = self._setup_and_resolve(ledger, side="YES", resolved_yes_price=1.0)
+        assert row["resolved_outcome"] == "WIN"
+
+    def test_resolved_outcome_loss_in_csv(self, ledger):
+        row = self._setup_and_resolve(ledger, side="YES", resolved_yes_price=0.0)
+        assert row["resolved_outcome"] == "LOSS"
+
+    def test_side_stored_correctly(self, ledger):
+        row = self._setup_and_resolve(ledger, side="NO", resolved_yes_price=0.0)
         assert row["side"] == "NO"
 
-    def test_csv_row_has_correct_underlying(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        engine.open_position(_yes("m1", underlying="ETH", entry_price=0.50, size=200.0))
-        engine.close_position("m1", exit_price=0.55)
-        row = list(csv.DictReader((tmp_path / "trades.csv").open()))[0]
+    def test_underlying_stored_correctly(self, ledger):
+        row = self._setup_and_resolve(ledger, underlying="ETH")
         assert row["underlying"] == "ETH"
 
-    def test_csv_row_fees_and_rebates(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        engine.open_position(_yes("m1", entry_price=0.50, size=100.0))
-        engine.close_position("m1", exit_price=0.60, fees_paid=2.50, rebates_earned=1.00)
-        row = list(csv.DictReader((tmp_path / "trades.csv").open()))[0]
-        assert float(row["fees_paid"])       == pytest.approx(2.50)
-        assert float(row["rebates_earned"])  == pytest.approx(1.00)
+    def test_strategy_stored_correctly(self, ledger):
+        row = self._setup_and_resolve(ledger, strategy="maker")
+        assert row["strategy"] == "maker"
 
-    def test_csv_row_pnl_net_of_fees_rebates(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        engine.open_position(_yes("m1", entry_price=0.40, size=100.0))
-        engine.close_position("m1", exit_price=0.65, fees_paid=3.00, rebates_earned=1.50)
-        row = list(csv.DictReader((tmp_path / "trades.csv").open()))[0]
-        # price_pnl=25; net = 25 - 3 + 1.5 = 23.5
-        assert float(row["pnl"]) == pytest.approx(23.50)
+    def test_entry_vwap_in_csv(self, ledger):
+        row = self._setup_and_resolve(ledger, entry_price=0.35)
+        assert float(row["entry_vwap"]) == pytest.approx(0.35)
 
-    def test_csv_row_entry_price_and_size(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        engine.open_position(_yes("m1", entry_price=0.35, size=250.0))
-        engine.close_position("m1", exit_price=0.50)
-        row = list(csv.DictReader((tmp_path / "trades.csv").open()))[0]
-        assert float(row["price"]) == pytest.approx(0.35)
-        assert float(row["size"])  == pytest.approx(250.0)
+    def test_entry_contracts_in_csv(self, ledger):
+        row = self._setup_and_resolve(ledger, contracts=250.0)
+        assert float(row["entry_contracts"]) == pytest.approx(250.0)
 
-    def test_multiple_trades_produce_multiple_rows(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        for i in range(5):
-            engine.open_position(_yes(f"m{i}", entry_price=0.50, size=100.0))
-            engine.close_position(f"m{i}", exit_price=0.55)
-        rows = list(csv.DictReader((tmp_path / "trades.csv").open()))
-        assert len(rows) == 5
+    def test_four_resolutions_produce_four_rows(self, ledger):
+        for _ in range(4):
+            tok = _new_token()
+            cid = _new_condition()
+            _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+            _exit(ledger, tok, fill_price=1.0, contracts=100.0, exit_type="RESOLVED")
+            ledger.on_resolved(cid, 1.0)
+        rows = list(csv.DictReader(_acct_mod.LEDGER_CSV.open(encoding="utf-8")))
+        assert len(rows) == 4
 
-    def test_csv_row_market_id_correct(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        market_id = "0x" + "a" * 60   # realistic hex condition ID
-        engine.open_position(_yes(market_id, entry_price=0.50, size=100.0))
-        engine.close_position(market_id, exit_price=0.60)
-        row = list(csv.DictReader((tmp_path / "trades.csv").open()))[0]
-        assert row["market_id"] == market_id
-
-    def test_closed_position_not_written_twice(self, tmp_path):
-        engine = _fresh_engine(tmp_path)
-        engine.open_position(_yes("m1", entry_price=0.50, size=100.0))
-        engine.close_position("m1", exit_price=0.60)
-        engine.close_position("m1", exit_price=0.60)   # second call → None, no write
-        rows = list(csv.DictReader((tmp_path / "trades.csv").open()))
+    def test_duplicate_resolve_call_does_not_add_row(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        _exit(ledger, tok, fill_price=1.0, contracts=100.0, exit_type="RESOLVED")
+        ledger.on_resolved(cid, 1.0)
+        ledger.on_resolved(cid, 1.0)   # duplicate
+        rows = list(csv.DictReader(_acct_mod.LEDGER_CSV.open(encoding="utf-8")))
         assert len(rows) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# J  Exit trigger arithmetic
+# H  Two-sided market making — YES and NO are independent
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestExitTriggers:
+class TestTwoSidedMakerPairTracking:
     """
-    should_exit() is a pure function — no engine needed.
-    All values are exact floats; assertions use the same formula as the code.
+    PREAMBLE: YES and NO tokens have separate order books.
+    They must never share a pos_id or contaminate each other's VWAP.
     """
 
-    # Use a fixed "now" far in the future so markets are never near expiry
-    # unless we explicitly construct one.
-    FAR_FUTURE = datetime(2099, 1, 1, 12, 0, tzinfo=timezone.utc)
+    def test_yes_and_no_legs_have_different_pos_ids(self, ledger):
+        cid     = _new_condition()
+        tok_yes = _new_token()
+        tok_no  = _new_token()
+        id_yes = _entry(ledger, tok_yes, cid, fill_price=0.40, contracts=100.0, side="YES")
+        id_no  = _entry(ledger, tok_no,  cid, fill_price=0.60, contracts=100.0, side="NO")
+        assert id_yes != id_no
 
-    def _pos(self, **kwargs) -> Position:
-        return _yes(seconds_ago=120, **kwargs)
+    def test_yes_fill_does_not_contaminate_no_vwap(self, ledger):
+        cid     = _new_condition()
+        tok_yes = _new_token()
+        tok_no  = _new_token()
+        _entry(ledger, tok_yes, cid, fill_price=0.40, contracts=200.0, side="YES")
+        id_no  = _entry(ledger, tok_no,  cid, fill_price=0.60, contracts=100.0, side="NO")
+        no_pos = ledger.get_position(id_no)
+        assert no_pos.entry_vwap      == pytest.approx(0.60)
+        assert no_pos.entry_contracts == pytest.approx(100.0)
 
-    # ── Profit target ──────────────────────────────────────────────────────────
+    def test_maker_spread_captured_regardless_of_resolution_direction(self):
+        """
+        Both YES and NO entered at 0.40. On resolution, one side pays 1.0,
+        the other pays 0.0. Net P&L for both legs combined = $20 (= spread × size).
+        """
+        def _make_pos(entry: float, exit_p: float, contracts: float) -> AccountingPosition:
+            p = AccountingPosition(pos_id=str(uuid.uuid4()), strategy="maker", fill_type="MAIN")
+            p.entry_vwap      = entry
+            p.entry_contracts = contracts
+            p.exit_vwap       = exit_p
+            p.exit_contracts  = contracts
+            return p
 
-    def test_profit_target_fires_exactly_at_threshold(self):
-        config.PROFIT_TARGET_PCT  = 0.60
-        config.MIN_HOLD_SECONDS   = 60
-        # deviation=0.10, PCT=0.60, size=100 → target = $6.00
-        pos = _yes("m", entry_price=0.40, size=100.0, strategy="mispricing")
-        # current_price that gives exactly $6.01 unrealised
-        trigger_price = pos.entry_price + (6.01 / pos.size)
-        flag, reason, _ = should_exit(
-            pos, trigger_price, initial_deviation=0.10,
-            market_end_date=None, now=self.FAR_FUTURE
-        )
-        assert flag and reason == ExitReason.PROFIT_TARGET
+        # YES wins → YES exits at 1.0, NO exits at 0.0
+        yes_win  = _make_pos(0.40, 1.00, 100.0)
+        no_loss  = _make_pos(0.40, 0.00, 100.0)
+        assert _gross_pnl(yes_win) + _gross_pnl(no_loss) == pytest.approx(20.0)
 
-    def test_profit_target_does_not_fire_just_below(self):
-        config.PROFIT_TARGET_PCT = 0.60
-        config.MIN_HOLD_SECONDS  = 60
-        pos = _yes("m", entry_price=0.40, size=100.0, strategy="mispricing")
-        # unrealised = $5.99 < $6.00 target → no exit
-        price = pos.entry_price + (5.99 / pos.size)
-        flag, _, _ = should_exit(
-            pos, price, initial_deviation=0.10,
-            market_end_date=None, now=self.FAR_FUTURE
-        )
-        assert not flag
+        # NO wins → YES exits at 0.0, NO exits at 1.0
+        yes_loss = _make_pos(0.40, 0.00, 100.0)
+        no_win   = _make_pos(0.40, 1.00, 100.0)
+        assert _gross_pnl(yes_loss) + _gross_pnl(no_win) == pytest.approx(20.0)
 
-    def test_profit_target_threshold_formula(self):
-        # Verify the formula: target_usd = deviation × PCT × size
-        config.PROFIT_TARGET_PCT = 0.60
-        deviation, size = 0.08, 200.0
-        expected_target = 0.08 * 0.60 * 200.0   # = $9.60
-        assert expected_target == pytest.approx(9.60)
-
-    def test_profit_target_scales_with_deviation(self):
-        config.PROFIT_TARGET_PCT = 0.60
-        config.MIN_HOLD_SECONDS  = 60
-        # Larger deviation → higher threshold → same price move doesn't trigger.
-        pos = _yes("m", entry_price=0.40, size=100.0, strategy="mispricing")
-        # +$6 unrealised → triggers at deviation=0.10 but not at deviation=0.20
-        price = pos.entry_price + (6.01 / pos.size)
-        flag_small_dev, _, _ = should_exit(
-            pos, price, initial_deviation=0.10,
-            market_end_date=None, now=self.FAR_FUTURE
-        )
-        flag_large_dev, _, _ = should_exit(
-            pos, price, initial_deviation=0.20,
-            market_end_date=None, now=self.FAR_FUTURE
-        )
-        assert flag_small_dev
-        assert not flag_large_dev
-
-    # ── Stop-loss ─────────────────────────────────────────────────────────────
-
-    def test_stop_loss_fires_at_threshold(self):
-        config.STOP_LOSS_USD     = 25.0
-        config.MIN_HOLD_SECONDS  = 60
-        pos = _yes("m", entry_price=0.60, size=100.0, strategy="mispricing")
-        # Loss of $25.01 → stop
-        price = pos.entry_price - (25.01 / pos.size)
-        flag, reason, _ = should_exit(
-            pos, price, initial_deviation=0.10,
-            market_end_date=None, now=self.FAR_FUTURE
-        )
-        assert flag and reason == ExitReason.STOP_LOSS
-
-    def test_stop_loss_does_not_fire_just_above(self):
-        config.STOP_LOSS_USD     = 25.0
-        config.MIN_HOLD_SECONDS  = 60
-        pos = _yes("m", entry_price=0.60, size=100.0, strategy="mispricing")
-        price = pos.entry_price - (24.99 / pos.size)
-        flag, _, _ = should_exit(
-            pos, price, initial_deviation=0.10,
-            market_end_date=None, now=self.FAR_FUTURE
-        )
-        assert not flag
-
-    def test_maker_has_no_profit_target_or_stop_loss(self):
-        # Maker positions exit only on time-stop or coin-level loss limit (outside
-        # should_exit).  Profit target and stop-loss must never fire for maker.
-        config.MIN_HOLD_SECONDS = 60
-        pos = _yes("m", entry_price=0.40, size=100.0, strategy="maker")
-        # Price collapsed to near-zero: unrealised loss = −$39 (well past $25 stop)
-        flag, reason, _ = should_exit(
-            pos, 0.01, initial_deviation=0.10,
-            market_end_date=None, now=self.FAR_FUTURE
-        )
-        assert not flag
-
-    def test_maker_has_no_profit_target(self):
-        config.MIN_HOLD_SECONDS = 60
-        pos = _yes("m", entry_price=0.10, size=100.0, strategy="maker")
-        # Huge profit: +$80 (8× the default STOP_LOSS_USD) — must not trigger
-        flag, reason, _ = should_exit(
-            pos, 0.90, initial_deviation=0.10,
-            market_end_date=None, now=self.FAR_FUTURE
-        )
-        assert not flag
-
-    # ── Minimum hold time ───────────────────────────────────────────────────
-
-    def test_min_hold_blocks_exit_when_too_young(self):
-        config.MIN_HOLD_SECONDS  = 60
-        # Opened only 10 seconds ago.
-        pos = _yes("m", entry_price=0.40, size=100.0, strategy="mispricing",
-                   seconds_ago=10)
-        flag, _, _ = should_exit(
-            pos, 0.90, initial_deviation=0.10,
-            market_end_date=None, now=datetime.now(timezone.utc)
-        )
-        assert not flag
-
-    # ── Time stop ─────────────────────────────────────────────────────────────
-
-    def test_time_stop_fires_for_mispricing_near_expiry(self):
-        config.EXIT_DAYS_BEFORE_RESOLUTION = 3
-        config.MIN_HOLD_SECONDS = 60
-        now = self.FAR_FUTURE
-        end_date = now + timedelta(days=2)   # 2 days left < 3-day threshold
-        pos = _yes("m", entry_price=0.50, size=100.0, strategy="mispricing")
-        flag, reason, _ = should_exit(
-            pos, 0.50, initial_deviation=0.10,
-            market_end_date=end_date, now=now
-        )
-        assert flag and reason == ExitReason.TIME_STOP
-
-    def test_time_stop_does_not_fire_for_mispricing_far_from_expiry(self):
-        config.EXIT_DAYS_BEFORE_RESOLUTION = 3
-        config.MIN_HOLD_SECONDS = 60
-        now = self.FAR_FUTURE
-        end_date = now + timedelta(days=5)   # 5 days left > 3-day threshold
-        pos = _yes("m", entry_price=0.50, size=100.0, strategy="mispricing")
-        flag, _, _ = should_exit(
-            pos, 0.50, initial_deviation=0.10,
-            market_end_date=end_date, now=now
-        )
-        assert not flag
-
-    def test_time_stop_fires_for_maker_within_maker_exit_hours(self):
-        """MAKER_EXIT_HOURS time stop fires for non-bucket (milestone) maker positions."""
-        config.MAKER_EXIT_HOURS    = 6.0
-        config.MIN_HOLD_SECONDS    = 60
-        now = self.FAR_FUTURE
-        end_date = now + timedelta(hours=4)   # 4h left < 6h threshold
-        pos = _yes("m", entry_price=0.50, size=100.0, strategy="maker")
-        pos.market_type = "milestone"  # non-bucket — MAKER_EXIT_HOURS applies
-        flag, reason, _ = should_exit(
-            pos, 0.50, initial_deviation=0.01,
-            market_end_date=end_date, now=now
-        )
-        assert flag and reason == ExitReason.TIME_STOP
-
-    def test_time_stop_does_not_fire_for_bucket_maker_exit_hours(self):
-        """Bucket market positions are NOT time-stopped by MAKER_EXIT_HOURS — held to RESOLVED."""
-        config.MAKER_EXIT_HOURS    = 6.0
-        config.MIN_HOLD_SECONDS    = 60
-        now = self.FAR_FUTURE
-        # bucket_5m — entire lifespan is 5min, always within 6h threshold
-        end_date = now + timedelta(minutes=3)
-        pos = _yes("m", entry_price=0.50, size=100.0, strategy="maker")
-        pos.market_type = "bucket_5m"  # bucket — should NOT fire time stop
-        flag, reason, _ = should_exit(
-            pos, 0.50, initial_deviation=0.01,
-            market_end_date=end_date, now=now
-        )
-        assert not flag, "bucket_5m must not be time-stopped by MAKER_EXIT_HOURS"
-
-    def test_time_stop_does_not_fire_for_maker_far_from_expiry(self):
-        config.MAKER_EXIT_HOURS = 6.0
-        config.MIN_HOLD_SECONDS = 60
-        now = self.FAR_FUTURE
-        end_date = now + timedelta(hours=10)  # 10h > 6h threshold
-        pos = _yes("m", entry_price=0.50, size=100.0, strategy="maker")
-        flag, _, _ = should_exit(
-            pos, 0.50, initial_deviation=0.01,
-            market_end_date=end_date, now=now
-        )
-        assert not flag
-
-    def test_resolved_stop_fires_when_past_end_date(self):
-        config.MIN_HOLD_SECONDS = 60
-        now = self.FAR_FUTURE
-        end_date = now - timedelta(seconds=1)  # already resolved
-        pos = _yes("m", entry_price=0.50, size=100.0, strategy="mispricing")
-        flag, reason, _ = should_exit(
-            pos, 0.50, initial_deviation=0.10,
-            market_end_date=end_date, now=now
-        )
-        assert flag and reason == ExitReason.RESOLVED
-
-    # ── Unknown strategy ──────────────────────────────────────────────────────
-
-    def test_unknown_strategy_no_triggers_near_expiry_large_loss(self):
-        """'unknown' positions fire no triggers regardless of P&L or proximity to expiry."""
-        config.MIN_HOLD_SECONDS = 60
-        config.STOP_LOSS_USD = 25.0
-        config.EXIT_DAYS_BEFORE_RESOLUTION = 3
-        now = self.FAR_FUTURE
-        end_date = now + timedelta(days=1)   # 1 day left — would fire mispricing TIME_STOP
-        pos = _yes("m", entry_price=0.80, size=100.0, strategy="unknown")
-        # Unrealised loss of $79 — well past stop-loss threshold
-        flag, _, _ = should_exit(
-            pos, 0.01, initial_deviation=0.10,
-            market_end_date=end_date, now=now
-        )
-        assert not flag, "'unknown' must not trigger TIME_STOP or STOP_LOSS"
-
-    def test_unknown_strategy_resolved_global_fires(self):
-        """RESOLVED fires for 'unknown' positions — it is the only permitted exit."""
-        config.MIN_HOLD_SECONDS = 60
-        now = self.FAR_FUTURE
-        end_date = now - timedelta(seconds=1)  # market already resolved
-        pos = _yes("m", entry_price=0.50, size=100.0, strategy="unknown")
-        flag, reason, _ = should_exit(
-            pos, 0.50, initial_deviation=0.10,
-            market_end_date=end_date, now=now
-        )
-        assert flag and reason == ExitReason.RESOLVED
-
-    def test_unrecognised_strategy_label_no_triggers(self):
-        """Any label that isn't a known strategy behaves like 'unknown' — no triggers."""
-        config.MIN_HOLD_SECONDS = 60
-        config.STOP_LOSS_USD = 25.0
-        now = self.FAR_FUTURE
-        end_date = now + timedelta(days=1)
-        pos = _yes("m", entry_price=0.80, size=100.0, strategy="legacy_arb")
-        flag, _, _ = should_exit(
-            pos, 0.01, initial_deviation=0.10,
-            market_end_date=end_date, now=now
-        )
-        assert not flag, "unrecognised strategy label must not trigger exits"
+    def test_different_sizes_tracked_independently(self, ledger):
+        cid     = _new_condition()
+        tok_yes = _new_token()
+        tok_no  = _new_token()
+        id_yes = _entry(ledger, tok_yes, cid, fill_price=0.45, contracts=300.0, side="YES")
+        id_no  = _entry(ledger, tok_no,  cid, fill_price=0.55, contracts=150.0, side="NO")
+        yes_pos = ledger.get_position(id_yes)
+        no_pos  = ledger.get_position(id_no)
+        assert yes_pos.entry_contracts == pytest.approx(300.0)
+        assert no_pos.entry_contracts  == pytest.approx(150.0)
+        assert yes_pos.entry_cost_usd  == pytest.approx(0.45 * 300)
+        assert no_pos.entry_cost_usd   == pytest.approx(0.55 * 150)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# K  Exit fee model — three distinct regimes
+# I  Pair / hedge relationships and on_pair_promoted
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestExitFeeModel:
-    """
-    Verify the three exit-fee regimes in monitor._exit_position.
+class TestPairAndHedgeRelationships:
+    """pair_id groups ON legs; parent_pos_id links hedge to main."""
 
-    1. RESOLVED     — PM auto-distributes. No trade, no fee, no rebate.
-                      exit_price snaps to exact 0.0 or 1.0.
-    2. Post-only    — we are the maker on exit: earn rebate, pay zero taker fee.
-    3. Force-taker  — market order: pay full taker fee, earn no rebate.
+    def test_pair_id_groups_two_legs(self, ledger):
+        cid     = _new_condition()
+        tok_yes = _new_token()
+        tok_no  = _new_token()
+        pair    = "pair_" + uuid.uuid4().hex[:8]
+        id_yes = _entry(ledger, tok_yes, cid, fill_price=0.40, contracts=100.0,
+                        side="YES", pair_id=pair)
+        id_no  = _entry(ledger, tok_no,  cid, fill_price=0.60, contracts=100.0,
+                        side="NO",  pair_id=pair)
+        positions = ledger.get_positions_for_pair(pair)
+        assert len(positions) == 2
+        ids = {p.pos_id for p in positions}
+        assert id_yes in ids
+        assert id_no  in ids
 
-    These tests call risk.close_position() directly with the expected fee/rebate
-    values so we can verify the P&L arithmetic without needing to spin up a full
-    Monitor object.
-    """
+    def test_parent_pos_id_links_hedge_to_main(self, ledger):
+        cid_main  = _new_condition()
+        tok_main  = _new_token()
+        tok_hedge = _new_token()
+        main_pid = _entry(ledger, tok_main, cid_main, fill_price=0.40, contracts=100.0,
+                          side="YES", strategy="momentum", fill_type="MAIN")
+        _entry(ledger, tok_hedge, cid_main, fill_price=0.60, contracts=100.0,
+               side="NO", strategy="momentum_hedge", fill_type="HEDGE",
+               parent_pos_id=main_pid)
+        hedge_pos = ledger.get_position_by_token(tok_hedge)
+        assert hedge_pos.parent_pos_id == main_pid
+        assert hedge_pos.fill_type     == "HEDGE"
 
-    def setup_method(self):
-        self.engine = RiskEngine()
-        config.PM_FEE_COEFF = 0.0175
+    def test_on_pair_promoted_changes_fill_type_to_main(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0,
+                     side="YES", strategy="opening_neutral", fill_type="WINNER")
+        ledger.on_pair_promoted(tok, new_fill_type="MAIN")
+        pos = ledger.get_position(pid)
+        assert pos.fill_type == "MAIN"
+        assert pos.strategy  == "momentum"
 
-    # ── helper ────────────────────────────────────────────────────────────────
+    def test_on_pair_promoted_unknown_token_does_not_raise(self, ledger):
+        ledger.on_pair_promoted("nonexistent_token", "MAIN")  # must not raise
 
-    @staticmethod
-    def _fee(size: float, token_price: float) -> float:
-        return size * token_price * config.PM_FEE_COEFF * (1.0 - token_price)
+    def test_add_fees_accumulates_on_existing_position(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0)
+        ledger.add_fees(tok, fees_usd=1.00, rebates_usd=0.30)
+        ledger.add_fees(tok, fees_usd=0.50, rebates_usd=0.10)
+        pos = ledger.get_position(pid)
+        assert pos.fees_usd    == pytest.approx(1.50)
+        assert pos.rebates_usd == pytest.approx(0.40)
 
-    # ── RESOLVED: zero fees, exact settlement, exact P&L ──────────────────────
+    def test_add_fees_unknown_token_does_not_raise(self, ledger):
+        ledger.add_fees("nonexistent_token", fees_usd=5.00)
 
-    def test_resolved_yes_loses_no_fee(self):
-        # YES position: market resolved NO → settlement 0.0, fee = 0.
-        # entry 0.62, exit 0.0 → pnl = (0.0 - 0.62) × 25 = -15.50 exactly.
-        self.engine.open_position(_yes("m", entry_price=0.62, size=25.0))
-        exit_price = 0.0   # true settlement
-        closed = self.engine.close_position("m", exit_price=exit_price,
-                                            fees_paid=0.0, rebates_earned=0.0)
-        assert closed.pm_fees_paid     == pytest.approx(0.0)
-        assert closed.pm_rebates_earned == pytest.approx(0.0)
-        assert closed.realized_pnl     == pytest.approx((0.0 - 0.62) * 25.0)
 
-    def test_resolved_yes_wins_no_fee(self):
-        # YES position: market resolved YES → settlement 1.0, fee = 0.
-        self.engine.open_position(_yes("m", entry_price=0.37, size=25.0))
-        closed = self.engine.close_position("m", exit_price=1.0,
-                                            fees_paid=0.0, rebates_earned=0.0)
-        assert closed.pm_fees_paid      == pytest.approx(0.0)
-        assert closed.realized_pnl      == pytest.approx((1.0 - 0.37) * 25.0)
+# ══════════════════════════════════════════════════════════════════════════════
+# J  Position query helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def test_resolved_no_side_wins_no_fee(self):
-        # NO position: market resolved NO (YES→0) → actual NO token goes to 1.0.
-        # NO was bought at actual token price 0.58 (YES was 0.42 at buy time).
-        # P&L = (1.0 - 0.58) × 20 = $8.40
-        self.engine.open_position(_no("m", entry_price=0.58, size=20.0))
-        closed = self.engine.close_position("m", exit_price=1.0, side="NO",
-                                            fees_paid=0.0, rebates_earned=0.0)
-        assert closed.pm_fees_paid  == pytest.approx(0.0)
-        assert closed.realized_pnl  == pytest.approx((1.0 - 0.58) * 20.0)
+class TestPositionQueryHelpers:
+    def test_get_position_returns_none_for_unknown(self, ledger):
+        assert ledger.get_position("nonexistent_id") is None
 
-    # ── Post-only exit (maker on exit): zero fee, earn rebate ─────────────────
+    def test_get_position_by_token_returns_none_for_unknown(self, ledger):
+        assert ledger.get_position_by_token("nonexistent_token") is None
 
-    def test_postonly_exit_zero_fee(self):
-        # Closing YES at mid p=0.55 via post-only limit: no taker fee charged.
-        size, exit_price, rebate_pct = 100.0, 0.55, 0.20
-        expected_rebate = self._fee(size, exit_price) * rebate_pct
-        self.engine.open_position(_yes("m", entry_price=0.45, size=size))
-        closed = self.engine.close_position("m", exit_price=exit_price,
-                                            fees_paid=0.0,
-                                            rebates_earned=expected_rebate)
-        assert closed.pm_fees_paid      == pytest.approx(0.0)
-        assert closed.pm_rebates_earned == pytest.approx(expected_rebate)
-        # P&L = price_pnl + rebate
-        assert closed.realized_pnl      == pytest.approx(
-            (exit_price - 0.45) * size + expected_rebate
-        )
+    def test_get_position_by_token_finds_existing(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.50, contracts=100.0)
+        pos = ledger.get_position_by_token(tok)
+        assert pos is not None
+        assert pos.pos_id == pid
 
-    def test_postonly_rebate_reduces_net_cost_vs_old_model(self):
-        # Old (buggy) model charged taker_fee − rebate on post-only exits.
-        # New model: fee=0, earn=rebate → net is BETTER by the taker fee amount.
-        size, exit_price, rebate_pct = 100.0, 0.50, 0.20
-        taker_fee   = self._fee(size, exit_price)
-        maker_rebate = taker_fee * rebate_pct
+    def test_get_all_positions_includes_live_and_terminal(self, ledger):
+        tok1 = _new_token()
+        tok2 = _new_token()
+        cid1 = _new_condition()
+        cid2 = _new_condition()
+        _entry(ledger, tok1, cid1, fill_price=0.40, contracts=100.0)
+        _entry(ledger, tok2, cid2, fill_price=0.40, contracts=100.0)
+        ledger.on_resolved(cid2, 1.0)
+        assert len(ledger.get_all_positions()) == 2
 
-        # Old-model net drag: taker_fee - maker_rebate
-        old_net_drag = taker_fee - maker_rebate   # 80% of taker fee
-        # New-model net effect: 0 fee, +rebate (positive)
-        new_net_effect = maker_rebate              # positive
+    def test_get_open_positions_excludes_terminal(self, ledger):
+        tok1 = _new_token()
+        tok2 = _new_token()
+        cid1 = _new_condition()
+        cid2 = _new_condition()
+        _entry(ledger, tok1, cid1, fill_price=0.40, contracts=100.0)
+        _entry(ledger, tok2, cid2, fill_price=0.40, contracts=100.0)
+        ledger.on_resolved(cid2, 1.0)
+        open_pos = ledger.get_open_positions()
+        open_ids = {p.pos_id for p in open_pos}
+        tok1_pos = ledger.get_position_by_token(tok1)
+        tok2_pos = ledger.get_position_by_token(tok2)
+        assert tok1_pos.pos_id     in open_ids
+        assert tok2_pos.pos_id not in open_ids
 
-        # The two accounting treatments differ by the full taker fee
-        assert new_net_effect - (-old_net_drag) == pytest.approx(taker_fee)
+    def test_get_positions_for_pair_empty_when_missing(self, ledger):
+        assert ledger.get_positions_for_pair("nonexistent_pair") == []
 
-    # ── Force-taker exit (market order): pay full fee, no rebate ─────────────
 
-    def test_force_taker_pays_full_fee(self):
-        # Market-order exit: we are the taker → pay full PM taker fee.
-        size, exit_price = 100.0, 0.55
-        taker_fee = self._fee(size, exit_price)
-        self.engine.open_position(_yes("m", entry_price=0.45, size=size))
-        closed = self.engine.close_position("m", exit_price=exit_price,
-                                            fees_paid=taker_fee,
-                                            rebates_earned=0.0)
-        assert closed.pm_fees_paid      == pytest.approx(taker_fee)
-        assert closed.pm_rebates_earned == pytest.approx(0.0)
-        assert closed.realized_pnl      == pytest.approx(
-            (exit_price - 0.45) * size - taker_fee
-        )
+# ══════════════════════════════════════════════════════════════════════════════
+# K  _vwap helper
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def test_force_taker_no_rebate(self):
-        # As a taker we do not earn a rebate — the other side's maker earns it.
-        size, exit_price = 50.0, 0.60
-        taker_fee = self._fee(size, exit_price)
-        self.engine.open_position(_yes("m", entry_price=0.40, size=size))
-        closed = self.engine.close_position("m", exit_price=exit_price,
-                                            fees_paid=taker_fee,
-                                            rebates_earned=0.0)
-        assert closed.pm_rebates_earned == pytest.approx(0.0)
+class TestVwapHelper:
+    """_vwap() is the core accumulation primitive — tested independently."""
 
+    def test_first_fill(self):
+        assert _vwap(0.0, 0.0, 0.50, 100.0) == pytest.approx(0.50)
+
+    def test_two_equal_fills(self):
+        v = _vwap(0.0,  0.0,   0.40, 100.0)
+        v = _vwap(v,    100.0, 0.40, 100.0)
+        assert v == pytest.approx(0.40)
+
+    def test_two_different_fills(self):
+        v = _vwap(0.0,  0.0,   0.40, 100.0)
+        v = _vwap(v,    100.0, 0.60, 100.0)
+        assert v == pytest.approx(0.50)
+
+    def test_size_weighted_not_simple_average(self):
+        # 200 @ 0.30 and 100 @ 0.60 → VWAP = 0.40, NOT (0.30+0.60)/2 = 0.45
+        v = _vwap(0.0,  0.0,   0.30, 200.0)
+        v = _vwap(v,    200.0, 0.60, 100.0)
+        assert v == pytest.approx(0.40)
+        assert v != pytest.approx(0.45)
+
+    def test_zero_total_qty_returns_zero(self):
+        assert _vwap(0.50, 0.0, 0.60, 0.0) == pytest.approx(0.0)
+
+    def test_commutative_order_of_fills(self):
+        """Final VWAP must be the same regardless of fill order."""
+        v_ab = _vwap(_vwap(0.0, 0.0, 0.30, 100.0), 100.0, 0.70, 300.0)
+        v_ba = _vwap(_vwap(0.0, 0.0, 0.70, 300.0), 300.0, 0.30, 100.0)
+        assert v_ab == pytest.approx(v_ba)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# L  Token-space independence (preamble rule: separate order books)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTokenSpaceIndependence:
+    """YES and NO have their own prices — no cross-contamination."""
+
+    def test_yes_fill_does_not_create_position_for_untraded_no_token(self, ledger):
+        cid     = _new_condition()
+        tok_yes = _new_token()
+        _entry(ledger, tok_yes, cid, fill_price=0.40, contracts=100.0, side="YES")
+        tok_no_untraded = _new_token()
+        assert ledger.get_position_by_token(tok_no_untraded) is None
+
+    def test_resolving_one_market_does_not_affect_other_markets(self, ledger):
+        cid_a = _new_condition()
+        cid_b = _new_condition()
+        tok_a = _new_token()
+        tok_b = _new_token()
+        _entry(ledger, tok_a, cid_a, fill_price=0.40, contracts=100.0, side="YES")
+        _entry(ledger, tok_b, cid_b, fill_price=0.40, contracts=100.0, side="YES")
+        ledger.on_resolved(cid_a, 1.0)
+        pos_b = ledger.get_position_by_token(tok_b)
+        assert pos_b.status == PositionStatus.LIVE
+
+    def test_no_entry_cost_uses_no_token_price_not_yes_complement(self, ledger):
+        """
+        NO token cost = NO fill_price × contracts.
+        It is NOT derived from 1 - YES price.
+        We record the actual market price paid.
+        """
+        tok_no = _new_token()
+        cid    = _new_condition()
+        pid = _entry(ledger, tok_no, cid, fill_price=0.55, contracts=100.0, side="NO")
+        pos = ledger.get_position(pid)
+        assert pos.entry_cost_usd == pytest.approx(55.0)   # 0.55 × 100, NOT (1-0.55)×100
+
+    def test_yes_entry_cost_is_yes_price_times_contracts(self, ledger):
+        tok = _new_token()
+        cid = _new_condition()
+        pid = _entry(ledger, tok, cid, fill_price=0.70, contracts=100.0, side="YES")
+        pos = ledger.get_position(pid)
+        assert pos.entry_cost_usd == pytest.approx(70.0)

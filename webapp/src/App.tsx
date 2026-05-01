@@ -8,6 +8,7 @@ import Markets from "./pages/Markets";
 import Settings from "./pages/Settings";
 import Logs from "./pages/Logs";
 import Positions from "./pages/Positions";
+import Pending from "./pages/Pending";
 import Fills from "./pages/Fills";
 import Events from "./pages/Events";
 import "./App.css";
@@ -15,6 +16,7 @@ import "./App.css";
 const NAV_LINKS = [
   { to: "/", label: "Dashboard" },
   { to: "/trades", label: "Trades" },
+  { to: "/pending", label: "Pending" },
   { to: "/positions", label: "Positions" },
   { to: "/performance", label: "Performance" },
   { to: "/signals", label: "Signals" },
@@ -49,6 +51,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/trades" element={<Trades />} />
+          <Route path="/pending" element={<Pending />} />
           <Route path="/positions" element={<Positions />} />
           <Route path="/performance" element={<Performance />} />
           <Route path="/signals" element={<Signals />} />

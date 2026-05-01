@@ -249,6 +249,12 @@ class Position:
     # at the take-profit price.  Cancelled automatically on any non-TP exit.
     tp_order_id: str = ""
 
+    # Opening Neutral take-profit price: when > 0, the monitor's should_exit()
+    # triggers MOMENTUM_TAKE_PROFIT when the token price reaches this level.
+    # Calculated as: combined_cost × (1 + TP_PROFIT_PCT) − loser_exit_price.
+    # 0.0 = disabled (standard momentum positions use the global MOMENTUM_TAKE_PROFIT).
+    take_profit_price: float = 0.0
+
     # Probability-based SL threshold (Item 7): CLOB token price below which the
     # prob-based SL fires.  Set to entry_price * (1 - MOMENTUM_PROB_SL_PCT) when
     # the position is opened.  0.0 = disabled (non-momentum positions).
@@ -409,6 +415,7 @@ class RiskEngine:
 
         Returns the number of records changed.
         """
+        return 0  # stub – accounting.py tracks outcomes in acct_positions.json / acct_ledger.csv
         _blank = {"", "nan", "None", "none"}
         _yes_sides = {"YES", "UP", "BUY_YES"}
 
@@ -558,7 +565,8 @@ class RiskEngine:
         price that was recorded at exit time.
         Returns the number of records changed.
         """
-        if spot_price <= 0:
+        return 0  # stub – accounting.py tracks spot_exit in acct_positions.json
+        if spot_price <= 0:  # noqa: unreachable
             return 0
         with self._csv_write_lock:
             if not TRADES_CSV.exists():
@@ -614,7 +622,8 @@ class RiskEngine:
         that was recorded at the time the hedge was settled.
         Returns the number of records changed.
         """
-        if spot_price <= 0:
+        return 0  # stub – accounting.py tracks spot_exit on hedge positions
+        if spot_price <= 0:  # noqa: unreachable
             return 0
         with self._csv_write_lock:
             if not TRADES_CSV.exists():
@@ -899,6 +908,34 @@ class RiskEngine:
             if position.token_id:
                 self._token_strategy[position.token_id] = position.strategy
                 self._save_token_strategy()
+
+        # Accounting hook – fire-and-forget, never blocks strategy execution
+        if position.token_id:
+            try:
+                from accounting import get_ledger  # local import avoids circular dep
+                _source = "paper" if config.PAPER_TRADING else "ws"
+                get_ledger().on_entry_fill(
+                    token_id=position.token_id,
+                    condition_id=position.market_id,
+                    order_id=position.order_id or "",
+                    fill_price=position.entry_price,
+                    contracts=position.size,
+                    source=_source,
+                    strategy=position.strategy,
+                    fill_type="MAIN",
+                    pair_id=position.neutral_pair_id or position.spread_id or "",
+                    market_title=position.market_title,
+                    market_type=position.market_type,
+                    underlying=position.underlying,
+                    side=position.side,
+                    spot_entry=position.spot_price,
+                    strike=position.strike,
+                    tte_seconds=round(position.tte_years * 365.25 * 24 * 3600),
+                    signal_source=position.signal_source,
+                    signal_score=position.signal_score,
+                )
+            except Exception as _acct_err:
+                log.warning("acct: open_position hook failed", exc=str(_acct_err))
 
     def update_gtd_hedge(
         self,
@@ -1375,6 +1412,13 @@ class RiskEngine:
                 del self._paper_hedge_fills[ho.token_id]
                 self._save_paper_hedge_fills()
 
+            # Inherit spread_id from the parent momentum position so hedge rows
+            # can be traced back to the trade they were protecting.
+            _parent_pos = self._positions.get(
+                self._pos_key(ho.market_id, ho.parent_side)
+            ) if ho.parent_side else None
+            _hedge_spread_id = (_parent_pos.spread_id or "") if _parent_pos else ""
+
             _csv_row = {
                 "timestamp":            datetime.now(timezone.utc).isoformat(),
                 "entry_timestamp":      "",
@@ -1390,7 +1434,7 @@ class RiskEngine:
                 "hl_hedge_size":        0.0,
                 "hl_entry_price":       0.0,
                 "strategy":             "momentum_hedge",
-                "spread_id":            "",
+                "spread_id":            _hedge_spread_id,
                 "pnl":                  pnl,
                 "entry_deviation":      0.0,
                 "implied_prob":         0.0,
@@ -1422,7 +1466,45 @@ class RiskEngine:
                 pnl=pnl,
                 status=hedge_status,
             )
-        self._append_csv(_csv_row)
+        # Accounting hook – replaces the old trades.csv write for hedge rows
+        if ho is not None and ho.token_id and fill_size > 0:
+            try:
+                from accounting import get_ledger
+                _ledger = get_ledger()
+                _source = "paper" if config.PAPER_TRADING else "ws"
+                _parent_yes = ("YES", "UP")
+                _hedge_side = "NO" if (ho.parent_side or "") in _parent_yes else "YES"
+                _ledger.on_entry_fill(
+                    token_id=ho.token_id,
+                    condition_id=ho.market_id,
+                    order_id=order_id,
+                    fill_price=fill_price,
+                    contracts=fill_size,
+                    source=_source,
+                    strategy="momentum_hedge",
+                    fill_type="HEDGE",
+                    market_title=(ho.market_title or "")[:60],
+                    market_type="momentum_hedge",
+                    underlying=ho.underlying,
+                    side=_hedge_side,
+                    spot_entry=spot_at_resolution,
+                )
+                _ledger.on_exit_fill(
+                    token_id=ho.token_id,
+                    order_id=order_id,
+                    fill_price=settled_price,
+                    contracts=fill_size,
+                    exit_type="RESOLVED",
+                    source=_source,
+                    spot_exit=spot_at_resolution,
+                )
+                if ho.parent_side:
+                    _rp = (0.0 if settled_price >= 0.5 else 1.0) if ho.parent_side in _parent_yes else (
+                        1.0 if settled_price >= 0.5 else 0.0
+                    )
+                    _ledger.on_resolved(ho.market_id, _rp, spot_at_resolution)
+            except Exception as _acct_err:
+                log.warning("acct: finalize_hedge hook failed", exc=str(_acct_err))
         return ho
 
     def get_hedge_order(self, order_id: str) -> Optional[HedgeOrder]:
@@ -1520,19 +1602,7 @@ class RiskEngine:
             for ho in self._hedge_orders.values():
                 if ho.market_id == market_id and ho.status in _FINALIZED:
                     return True
-        # Fallback: scan trades.csv for legacy rows written before the HedgeOrder model
-        try:
-            if not TRADES_CSV.exists():
-                return False
-            with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f, fieldnames=TRADES_HEADER)
-                next(reader, None)  # skip header row
-                for row in reader:
-                    if (row.get("market_id") == market_id
-                            and row.get("strategy") == "momentum_hedge"):
-                        return True
-        except Exception:
-            pass
+        # trades.csv fallback removed — hedge outcomes are now tracked in accounting.py
         return False
 
     def record_hedge_fill(
@@ -1568,6 +1638,18 @@ class RiskEngine:
         _csv_row: dict = {}
         with self._lock:
             self._realized_pnl += pnl
+            # Inherit spread_id from the parent momentum position.  Search by
+            # market_id because this path doesn't receive parent_side.
+            _parent_spread_id = ""
+            for _p in self._positions.values():
+                if _p.market_id == parent_market_id and not _p.is_closed:
+                    _parent_spread_id = _p.spread_id or ""
+                    break
+            if not _parent_spread_id:
+                for _p in self._positions.values():
+                    if _p.market_id == parent_market_id and _p.spread_id:
+                        _parent_spread_id = _p.spread_id
+                        break
             _csv_row = {
                 "timestamp":        datetime.now(timezone.utc).isoformat(),
                 "entry_timestamp":  "",
@@ -1583,7 +1665,7 @@ class RiskEngine:
                 "hl_hedge_size":    0.0,
                 "hl_entry_price":   0.0,
                 "strategy":         "momentum_hedge",
-                "spread_id":        "",
+                "spread_id":        _parent_spread_id,
                 "pnl":              pnl,
                 "entry_deviation":  0.0,
                 "implied_prob":     0.0,
@@ -1615,11 +1697,44 @@ class RiskEngine:
                 pnl=pnl,
             )
             # Clean up persisted paper-mode fill entry now that the outcome is
-            # written to trades.csv — prevents stale entries after restart.
+            # recorded — prevents stale entries after restart.
             if hedge_token_id in self._paper_hedge_fills:
                 del self._paper_hedge_fills[hedge_token_id]
                 self._save_paper_hedge_fills()
-        self._append_csv(_csv_row)
+
+        # Accounting hook – replaces the old trades.csv write for legacy hedge rows
+        if fill_size > 0 and hedge_token_id:
+            try:
+                from accounting import get_ledger
+                _ledger = get_ledger()
+                _source = "paper" if config.PAPER_TRADING else "ws"
+                _ledger.on_entry_fill(
+                    token_id=hedge_token_id,
+                    condition_id=parent_market_id,
+                    order_id="",
+                    fill_price=fill_price,
+                    contracts=fill_size,
+                    source=_source,
+                    strategy="momentum_hedge",
+                    fill_type="HEDGE",
+                    market_title=(parent_market_title or "")[:60],
+                    market_type="momentum_hedge",
+                    underlying=underlying,
+                    side="",
+                    spot_entry=spot_resolve_price,
+                )
+                _ledger.on_exit_fill(
+                    token_id=hedge_token_id,
+                    order_id="",
+                    fill_price=settled_price,
+                    contracts=fill_size,
+                    exit_type="RESOLVED",
+                    source=_source,
+                    spot_exit=spot_resolve_price,
+                )
+                # parent_side unknown here — background reconciler finalises via PM CLOB winner flag
+            except Exception as _acct_err:
+                log.warning("acct: record_hedge_fill hook failed", exc=str(_acct_err))
 
     def update_hedge(
         self,
@@ -1777,10 +1892,31 @@ class RiskEngine:
                 pnl=round(pnl, 4),
                 total_realized=round(self._realized_pnl, 4),
             )
-        # Write CSV outside the lock so file I/O does not extend lock-hold time.
-        # _append_csv schedules this on the thread pool when an event loop is running.
-        if _csv_row is not None:
-            self._append_csv(_csv_row)
+        # Accounting hook – replaces the old trades.csv write
+        if _closed_pos is not None and _closed_pos.token_id:
+            try:
+                from accounting import get_ledger
+                _ledger = get_ledger()
+                _source = "paper" if config.PAPER_TRADING else "ws"
+                _ledger.on_exit_fill(
+                    token_id=_closed_pos.token_id,
+                    order_id=_closed_pos.order_id or "",
+                    fill_price=exit_price,
+                    contracts=_closed_pos.size,
+                    exit_type=resolved_outcome if resolved_outcome else "TAKER",
+                    source=_source,
+                    spot_exit=exit_spot_price,
+                    fees_usd=fees_paid,
+                    rebates_usd=rebates_earned,
+                )
+                if resolved_outcome in ("WIN", "LOSS"):
+                    _yes_sides = ("YES", "UP")
+                    _rp = (1.0 if resolved_outcome == "WIN" else 0.0) if _closed_pos.side in _yes_sides else (
+                        0.0 if resolved_outcome == "WIN" else 1.0
+                    )
+                    _ledger.on_resolved(_closed_pos.market_id, _rp, exit_spot_price)
+            except Exception as _acct_err:
+                log.warning("acct: close_position hook failed", exc=str(_acct_err))
         return _closed_pos
 
     # ── HL hedge accounting ──────────────────────────────────────────────────
@@ -1844,8 +1980,7 @@ class RiskEngine:
                 open_price=open_price, close_price=close_price,
                 size_coins=size_coins, fees=total_fees, pnl=pnl,
             )
-        # Write CSV outside the lock — off-loaded to thread pool by _append_csv.
-        self._append_csv(_csv_row)
+        # HL hedge trades are tracked on Hyperliquid directly; no PM accounting entry created.
 
     # ── Snapshots ──────────────────────────────────────────────────────────────
 
