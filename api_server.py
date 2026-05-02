@@ -91,6 +91,8 @@ class BotState:
     monitor_ref: Any = None   # PositionMonitor — used by manual-close endpoint
     pm_ref: Any = None        # PMClient — used by manual-close endpoint
     risk_ref: Any = None      # RiskEngine — used by manual-close endpoint
+    funding_cache_ref: Any = None   # FundingRateCache — set once at startup by main.py
+    oracle_tracker_ref: Any = None  # OracleTickTracker — set once at startup by main.py
 
 
 # Module-level singleton — main.py populates this
@@ -302,10 +304,10 @@ def build_live_state() -> dict:
     # ── Funding ───────────────────────────────────────────────────────────────
     funding_bundle = {"funding": state.funding, "timestamp": now_t}
 
-    # ── P&L (cached — recomputed every 30 s from trades CSV) ─────────────────
+    # ── P&L (cached — recomputed every 30 s from acct_ledger) ─────────────────
     if now_t - _pnl_cache_ts > 30.0:
         try:
-            rows = _load_trades_csv()
+            rows = _load_acct_ledger_trades()
             _dt_now = datetime.now(timezone.utc)
             today_rows = [r for r in rows if _row_age_days(r, _dt_now) < 1]
             week_rows  = [r for r in rows if _row_age_days(r, _dt_now) < 7]
@@ -526,23 +528,10 @@ _MUTABLE_CONFIG = {
     "monitor_interval":               ("MONITOR_INTERVAL",                 int),
     # Phase B — resolution oracle near expiry
     "momentum_use_resolution_oracle_near_expiry": ("MOMENTUM_USE_RESOLUTION_ORACLE_NEAR_EXPIRY", bool),
-    # Phase D — hedge
-    "momentum_hedge_enabled":              ("MOMENTUM_HEDGE_ENABLED",               bool),
-    "momentum_hedge_price":                ("MOMENTUM_HEDGE_PRICE",                 float),
-    "momentum_hedge_contracts_pct":        ("MOMENTUM_HEDGE_CONTRACTS_PCT",         float),
-    "momentum_hedge_cancel_recovery_pct": ("MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT",   float),
-    "momentum_hedge_suppresses_delta_sl": ("MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL",   bool),
     # Logging toggles (post-trade analysis files)
-    "momentum_hedge_clob_log_enabled":     ("MOMENTUM_HEDGE_CLOB_LOG_ENABLED",      bool),
     "momentum_ticks_log_enabled":          ("MOMENTUM_TICKS_LOG_ENABLED",           bool),
-    # Phase E — empirical win-rate gate
-    "momentum_win_rate_gate_enabled":  ("MOMENTUM_WIN_RATE_GATE_ENABLED",   bool),
-    "momentum_win_rate_gate_min_factor": ("MOMENTUM_WIN_RATE_GATE_MIN_FACTOR", float),
-    "momentum_win_rate_gate_min_samples": ("MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES", int),
     # Kelly extensions
     "momentum_kelly_min_tte_seconds":         ("MOMENTUM_KELLY_MIN_TTE_SECONDS",         int),
-    "momentum_kelly_persistence_enabled":    ("MOMENTUM_KELLY_PERSISTENCE_ENABLED",    bool),
-    "momentum_kelly_persistence_z_boost_max": ("MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX", float),
     # Range markets (sub-strategy of Momentum)
     "momentum_range_enabled":              ("MOMENTUM_RANGE_ENABLED",              bool),
     "momentum_range_price_band_low":       ("MOMENTUM_RANGE_PRICE_BAND_LOW",       float),
@@ -749,38 +738,10 @@ class ConfigPatch(BaseModel):
     momentum_phase_c_min_tte_daily: int | None = None
     momentum_phase_c_min_tte_weekly: int | None = None
     momentum_phase_c_min_tte_milestone: int | None = None
-    # Phase D — hedge
-    momentum_hedge_enabled: bool | None = None
-    momentum_hedge_price: float | None = None
-    momentum_hedge_contracts_pct: float | None = None
-    momentum_hedge_cancel_recovery_pct: float | None = None
-    momentum_hedge_suppresses_delta_sl: bool | None = None
-    momentum_hedge_price_5m: float | None = None
-    momentum_hedge_price_15m: float | None = None
-    momentum_hedge_price_1h: float | None = None
-    momentum_hedge_price_4h: float | None = None
-    momentum_hedge_price_daily: float | None = None
-    momentum_hedge_price_weekly: float | None = None
-    momentum_hedge_price_milestone: float | None = None
-    # Per-bucket hedge on/off
-    momentum_hedge_enabled_5m: bool | None = None
-    momentum_hedge_enabled_15m: bool | None = None
-    momentum_hedge_enabled_1h: bool | None = None
-    momentum_hedge_enabled_4h: bool | None = None
-    momentum_hedge_enabled_daily: bool | None = None
-    momentum_hedge_enabled_weekly: bool | None = None
-    momentum_hedge_enabled_milestone: bool | None = None
     # Logging toggles (post-trade analysis files)
-    momentum_hedge_clob_log_enabled: bool | None = None
     momentum_ticks_log_enabled: bool | None = None
-    # Phase E — empirical win-rate gate
-    momentum_win_rate_gate_enabled: bool | None = None
-    momentum_win_rate_gate_min_factor: float | None = None
-    momentum_win_rate_gate_min_samples: int | None = None
     # Kelly extensions
     momentum_kelly_min_tte_seconds: int | None = None
-    momentum_kelly_persistence_enabled: bool | None = None
-    momentum_kelly_persistence_z_boost_max: float | None = None
     momentum_kelly_multiplier_5m: float | None = None
     momentum_kelly_multiplier_15m: float | None = None
     momentum_kelly_multiplier_1h: float | None = None
@@ -995,38 +956,10 @@ def get_config() -> dict:
         "momentum_phase_c_min_tte_daily":     config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("bucket_daily", 0),
         "momentum_phase_c_min_tte_weekly":    config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("bucket_weekly",0),
         "momentum_phase_c_min_tte_milestone": config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get("milestone",    0),
-        # Phase D — hedge
-        "momentum_hedge_enabled":              config.MOMENTUM_HEDGE_ENABLED,
-        "momentum_hedge_price":                config.MOMENTUM_HEDGE_PRICE,
-        "momentum_hedge_contracts_pct":        config.MOMENTUM_HEDGE_CONTRACTS_PCT,
-        "momentum_hedge_cancel_recovery_pct": config.MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT,
-        "momentum_hedge_suppresses_delta_sl": config.MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL,
         # Logging toggles (post-trade analysis files)
-        "momentum_hedge_clob_log_enabled":     config.MOMENTUM_HEDGE_CLOB_LOG_ENABLED,
         "momentum_ticks_log_enabled":          config.MOMENTUM_TICKS_LOG_ENABLED,
-        "momentum_hedge_price_5m":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_5m",    config.MOMENTUM_HEDGE_PRICE),
-        "momentum_hedge_price_15m":       config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_15m",   config.MOMENTUM_HEDGE_PRICE),
-        "momentum_hedge_price_1h":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_1h",    config.MOMENTUM_HEDGE_PRICE),
-        "momentum_hedge_price_4h":        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_4h",    config.MOMENTUM_HEDGE_PRICE),
-        "momentum_hedge_price_daily":     config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_daily",  config.MOMENTUM_HEDGE_PRICE),
-        "momentum_hedge_price_weekly":    config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("bucket_weekly", config.MOMENTUM_HEDGE_PRICE),
-        "momentum_hedge_price_milestone": config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get("milestone",     config.MOMENTUM_HEDGE_PRICE),
-        # Per-bucket hedge on/off
-        "momentum_hedge_enabled_5m":        config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_5m",    False),
-        "momentum_hedge_enabled_15m":       config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_15m",   False),
-        "momentum_hedge_enabled_1h":        config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_1h",    True),
-        "momentum_hedge_enabled_4h":        config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_4h",    True),
-        "momentum_hedge_enabled_daily":     config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_daily",  True),
-        "momentum_hedge_enabled_weekly":    config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("bucket_weekly", True),
-        "momentum_hedge_enabled_milestone": config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get("milestone",     True),
-        # Phase E — empirical win-rate gate
-        "momentum_win_rate_gate_enabled":     config.MOMENTUM_WIN_RATE_GATE_ENABLED,
-        "momentum_win_rate_gate_min_factor":  config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR,
-        "momentum_win_rate_gate_min_samples": config.MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES,
         # Kelly extensions
         "momentum_kelly_min_tte_seconds":         config.MOMENTUM_KELLY_MIN_TTE_SECONDS,
-        "momentum_kelly_persistence_enabled":    config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
-        "momentum_kelly_persistence_z_boost_max": config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX,
         "momentum_kelly_multiplier_5m":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_5m",    1.0),
         "momentum_kelly_multiplier_15m":          config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_15m",   1.0),
         "momentum_kelly_multiplier_1h":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_1h",    1.0),
@@ -1152,37 +1085,6 @@ def patch_config(patch: ConfigPatch) -> dict:
             config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE[bucket_key] = float(v)
             updated[field] = float(v)
             log.info("Config updated via API", key=f"MOMENTUM_KELLY_MULTIPLIER_BY_TYPE[{bucket_key}]", value=float(v))
-    # Phase D — per-bucket hedge price overrides
-    _hedge_price_map = {        "momentum_hedge_price_5m":       "bucket_5m",
-        "momentum_hedge_price_15m":      "bucket_15m",
-        "momentum_hedge_price_1h":       "bucket_1h",
-        "momentum_hedge_price_4h":       "bucket_4h",
-        "momentum_hedge_price_daily":    "bucket_daily",
-        "momentum_hedge_price_weekly":   "bucket_weekly",
-        "momentum_hedge_price_milestone":"milestone",
-    }
-    for field, bucket_key in _hedge_price_map.items():
-        v = getattr(patch, field)
-        if v is not None:
-            config.MOMENTUM_HEDGE_PRICE_BY_TYPE[bucket_key] = float(v)
-            updated[field] = float(v)
-            log.info("Config updated via API", key=f"MOMENTUM_HEDGE_PRICE_BY_TYPE[{bucket_key}]", value=float(v))
-    # Phase D — per-bucket hedge enabled overrides
-    _hedge_enabled_map = {
-        "momentum_hedge_enabled_5m":        "bucket_5m",
-        "momentum_hedge_enabled_15m":       "bucket_15m",
-        "momentum_hedge_enabled_1h":        "bucket_1h",
-        "momentum_hedge_enabled_4h":        "bucket_4h",
-        "momentum_hedge_enabled_daily":     "bucket_daily",
-        "momentum_hedge_enabled_weekly":    "bucket_weekly",
-        "momentum_hedge_enabled_milestone": "milestone",
-    }
-    for field, bucket_key in _hedge_enabled_map.items():
-        v = getattr(patch, field)
-        if v is not None:
-            config.MOMENTUM_HEDGE_ENABLED_BY_TYPE[bucket_key] = bool(v)
-            updated[field] = bool(v)
-            log.info("Config updated via API", key=f"MOMENTUM_HEDGE_ENABLED_BY_TYPE[{bucket_key}]", value=bool(v))
     # Per-coin delta stop-loss overrides — written directly into the dict
     _delta_sl_coin_map = {
         "momentum_delta_sl_pct_btc":  "BTC",
@@ -1251,10 +1153,6 @@ def patch_config(patch: ConfigPatch) -> dict:
             attr_changes["MOMENTUM_MIN_DELTA_PCT_BY_COIN"] = dict(config.MOMENTUM_MIN_DELTA_PCT_BY_COIN)
         if any(f in updated for f in _min_delta_type_map):
             attr_changes["MOMENTUM_MIN_DELTA_PCT_BY_TYPE"] = dict(config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE)
-        if any(f in updated for f in _hedge_price_map):
-            attr_changes["MOMENTUM_HEDGE_PRICE_BY_TYPE"] = dict(config.MOMENTUM_HEDGE_PRICE_BY_TYPE)
-        if any(f in updated for f in _hedge_enabled_map):
-            attr_changes["MOMENTUM_HEDGE_ENABLED_BY_TYPE"] = dict(config.MOMENTUM_HEDGE_ENABLED_BY_TYPE)
         _save_overrides(attr_changes)
     return {
         "updated": updated,
@@ -1544,6 +1442,82 @@ def health() -> dict:
         "hl_max_move_pct_session": fill_stats["hl_max_move_pct_session"],
         "timestamp": time.time(),
     }
+
+
+@app.get("/health/pipelines")
+def health_pipelines() -> dict:
+    """Pipeline liveness: FundingRateCache, OracleTickTracker, PMClobWS."""
+    now = time.time()
+    pipelines: list[dict] = []
+
+    # ── FundingRateCache ──────────────────────────────────────────────────────
+    fc = state.funding_cache_ref
+    if fc is None:
+        pipelines.append({
+            "name": "FundingRateCache",
+            "status": "NOT_STARTED",
+            "last_update_ts": None,
+            "detail": "not initialised",
+        })
+    else:
+        lu = fc.last_update_ts()
+        age = (now - lu) if lu is not None else None
+        if lu is None:
+            fc_status = "NOT_STARTED"
+        elif age < 15:
+            fc_status = "LIVE"
+        elif age < 120:
+            fc_status = "STALE"
+        else:
+            fc_status = "ERROR"
+        coins = list(getattr(config, "HL_PERP_COINS", []))
+        detail = f"{fc.fresh_count(coins)}/{len(coins)} coins fresh" if coins else None
+        pipelines.append({
+            "name": "FundingRateCache",
+            "status": fc_status,
+            "last_update_ts": lu,
+            "detail": detail,
+        })
+
+    # ── OracleTickTracker ─────────────────────────────────────────────────────
+    ot = state.oracle_tracker_ref
+    if ot is None:
+        pipelines.append({
+            "name": "OracleTickTracker",
+            "status": "NOT_STARTED",
+            "last_update_ts": None,
+            "detail": "not initialised",
+        })
+    else:
+        tracked = sum(1 for state in ot._coins.values() if state.tick_count > 0)
+        ot_status = "LIVE" if tracked > 0 else "NOT_STARTED"
+        pipelines.append({
+            "name": "OracleTickTracker",
+            "status": ot_status,
+            "last_update_ts": None,
+            "detail": f"{tracked} coins with ticks",
+        })
+
+    # ── PMClobWS ──────────────────────────────────────────────────────────────
+    hb_age = (now - state.last_heartbeat_ts) if state.last_heartbeat_ts > 0 else None
+    if not state.pm_ws_connected:
+        pm_status = "ERROR"
+    elif hb_age is None:
+        pm_status = "NOT_STARTED"
+    elif hb_age < 15:
+        pm_status = "LIVE"
+    elif hb_age < 120:
+        pm_status = "STALE"
+    else:
+        pm_status = "ERROR"
+    pipelines.append({
+        "name": "PMClobWS",
+        "status": pm_status,
+        "last_update_ts": state.last_heartbeat_ts if state.last_heartbeat_ts > 0 else None,
+        "detail": f"heartbeat_age={round(hb_age, 1)}s" if hb_age is not None else None,
+    })
+
+    return {"pipelines": pipelines, "timestamp": now}
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
@@ -2357,7 +2331,7 @@ def orders_endpoint(
 @app.get("/pnl")
 def pnl() -> dict:
     """Daily / weekly / all-time P&L summary."""
-    rows = _load_trades_csv()
+    rows = _load_acct_ledger_trades()
     now = datetime.now(timezone.utc)
 
     def _sum_pnl(rows_subset: list[dict]) -> float:
@@ -2383,9 +2357,9 @@ def pnl() -> dict:
 def performance(period: str = Query(default="all", pattern="^(7d|30d|all)$")) -> dict:
     """
     Full analytics: win rate, Sharpe, equity curve, rebates, breakdowns.
-    Recomputed fresh on each request from data/trades.csv.
+    Recomputed fresh on each request from data/acct_ledger.csv.
     """
-    rows = _load_trades_csv()
+    rows = _load_acct_ledger_trades()
     now = datetime.now(timezone.utc)
 
     # Filter by period
@@ -2971,6 +2945,95 @@ def fills(
 
 
 # ── Analytics helpers ─────────────────────────────────────────────────────────
+
+def _load_acct_ledger_trades() -> list[dict]:
+    """
+    Load acct_ledger.csv and return a list of logical trades suitable for the
+    P&L / performance endpoints.
+
+    Key transformations:
+      - Column names are normalized to match what the analytics code expects:
+          recorded_at  → timestamp
+          net_pnl      → pnl
+          fees_usd     → fees_paid
+          rebates_usd  → rebates_earned
+      - ON-pair rows (same pair_id) are merged into a single logical trade:
+          pnl            = sum of both legs' net_pnl
+          fees_paid      = sum of both legs' fees_usd
+          rebates_earned = sum of both legs' rebates_usd
+          timestamp      = latest recorded_at (when the pair fully resolved)
+          strategy       = representative leg's strategy
+          underlying     = representative leg's underlying
+          market_type    = representative leg's market_type
+          resolved_outcome = "WIN" if combined pnl > 0, "LOSS" if < 0, else ""
+    """
+    if not ACCT_LEDGER_CSV.exists():
+        return []
+    try:
+        with ACCT_LEDGER_CSV.open(newline="", encoding="utf-8") as f:
+            raw_rows = list(csv.DictReader(f))
+    except Exception as exc:
+        log.error("Failed to read acct_ledger.csv for analytics", exc=str(exc))
+        return []
+
+    # Separate paired rows from standalone rows
+    paired: dict[str, list[dict]] = defaultdict(list)
+    standalone: list[dict] = []
+    for r in raw_rows:
+        pair_id = r.get("pair_id", "").strip()
+        if pair_id:
+            paired[pair_id].append(r)
+        else:
+            standalone.append(r)
+
+    def _normalize(r: dict, override_pnl: float | None = None,
+                   override_ts: str | None = None,
+                   override_outcome: str | None = None) -> dict:
+        pnl_v = override_pnl if override_pnl is not None else float(r.get("net_pnl") or 0)
+        outcome = override_outcome if override_outcome is not None else r.get("resolved_outcome", "")
+        return {
+            "timestamp":        override_ts if override_ts is not None else r.get("recorded_at", ""),
+            "pnl":              pnl_v,
+            "fees_paid":        float(r.get("fees_usd") or 0),
+            "rebates_earned":   float(r.get("rebates_usd") or 0),
+            "strategy":         r.get("strategy", "unknown"),
+            "underlying":       r.get("underlying", "unknown"),
+            "market_type":      r.get("market_type", "unknown"),
+            "resolved_outcome": outcome,
+        }
+
+    trades: list[dict] = []
+
+    # Standalone rows — one logical trade each
+    for r in standalone:
+        trades.append(_normalize(r))
+
+    # Paired rows — merge into one logical trade per pair
+    for pair_id, legs in paired.items():
+        combined_pnl      = sum(float(r.get("net_pnl")      or 0) for r in legs)
+        combined_fees     = sum(float(r.get("fees_usd")      or 0) for r in legs)
+        combined_rebates  = sum(float(r.get("rebates_usd")   or 0) for r in legs)
+        # Timestamp = latest recorded_at across all legs (pair is done when all legs resolve)
+        latest_ts = max((r.get("recorded_at", "") for r in legs), default="")
+        # Representative leg for metadata (prefer WINNER/MAIN over LOSER)
+        rep = next(
+            (r for r in legs if r.get("fill_type", "").upper() in ("MAIN", "WINNER")),
+            legs[0],
+        )
+        outcome = "WIN" if combined_pnl > 0 else ("LOSS" if combined_pnl < 0 else "")
+        trades.append({
+            "timestamp":        latest_ts,
+            "pnl":              combined_pnl,
+            "fees_paid":        combined_fees,
+            "rebates_earned":   combined_rebates,
+            "strategy":         rep.get("strategy", "unknown"),
+            "underlying":       rep.get("underlying", "unknown"),
+            "market_type":      rep.get("market_type", "unknown"),
+            "resolved_outcome": outcome,
+        })
+
+    return trades
+
 
 def _load_trades_csv() -> list[dict]:
     """Load all rows from data/trades.csv. Returns [] if missing."""

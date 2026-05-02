@@ -185,7 +185,7 @@ class TestPnl:
         _reset_state()
 
     def test_empty_returns_zeros(self):
-        with patch("api_server._load_trades_csv", return_value=[]):
+        with patch("api_server._load_acct_ledger_trades", return_value=[]):
             r = client.get("/pnl")
         data = r.json()
         assert data["all_time"] == 0.0
@@ -194,12 +194,12 @@ class TestPnl:
     def test_all_time_sum(self):
         rows = _make_trade_rows(n=3, base_pnl=10.0)
         # pnl values: 10, 11, 12 → sum=33
-        with patch("api_server._load_trades_csv", return_value=rows):
+        with patch("api_server._load_acct_ledger_trades", return_value=rows):
             r = client.get("/pnl")
         assert r.json()["all_time"] == pytest.approx(33.0)
 
     def test_response_has_all_keys(self):
-        with patch("api_server._load_trades_csv", return_value=[]):
+        with patch("api_server._load_acct_ledger_trades", return_value=[]):
             r = client.get("/pnl")
         keys = r.json().keys()
         for k in ("today", "week", "all_time", "trade_count_all"):
@@ -213,19 +213,19 @@ class TestPerformance:
         _reset_state()
 
     def test_no_data_when_empty(self):
-        with patch("api_server._load_trades_csv", return_value=[]):
+        with patch("api_server._load_acct_ledger_trades", return_value=[]):
             r = client.get("/performance")
         assert r.json()["no_data"] is True
 
     def test_win_rate_computed(self):
         rows = _make_trade_rows(n=4, base_pnl=5.0)  # all pnl > 0
-        with patch("api_server._load_trades_csv", return_value=rows):
+        with patch("api_server._load_acct_ledger_trades", return_value=rows):
             r = client.get("/performance")
         assert r.json()["summary"]["win_rate"] == pytest.approx(1.0)
 
     def test_equity_curve_ascending(self):
         rows = _make_trade_rows(n=5, base_pnl=10.0)
-        with patch("api_server._load_trades_csv", return_value=rows):
+        with patch("api_server._load_acct_ledger_trades", return_value=rows):
             r = client.get("/performance")
         curve = r.json()["equity_curve"]
         assert len(curve) == 5
@@ -238,14 +238,14 @@ class TestPerformance:
         old_row["timestamp"] = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         new_row = _make_trade_rows(n=1, base_pnl=5.0)[0]
         new_row["timestamp"] = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        with patch("api_server._load_trades_csv", return_value=[old_row, new_row]):
+        with patch("api_server._load_acct_ledger_trades", return_value=[old_row, new_row]):
             r = client.get("/performance?period=7d")
         assert r.json()["summary"]["total_trades"] == 1
 
     def test_by_strategy_breakdown(self):
         rows = _make_trade_rows(n=4, base_pnl=10.0)
         rows[0]["strategy"] = "mispricing"
-        with patch("api_server._load_trades_csv", return_value=rows):
+        with patch("api_server._load_acct_ledger_trades", return_value=rows):
             r = client.get("/performance")
         by_s = r.json()["by_strategy"]
         assert "maker" in by_s
@@ -253,7 +253,7 @@ class TestPerformance:
 
     def test_histogram_present(self):
         rows = _make_trade_rows(n=10, base_pnl=5.0)
-        with patch("api_server._load_trades_csv", return_value=rows):
+        with patch("api_server._load_acct_ledger_trades", return_value=rows):
             r = client.get("/performance")
         assert len(r.json()["pnl_histogram"]) > 0
 
@@ -485,33 +485,33 @@ class TestPerformanceByMarketType:
         _reset_state()
 
     def test_by_market_type_key_present(self):
-        with patch("api_server._load_trades_csv", return_value=_make_perf_rows_with_market_type()):
+        with patch("api_server._load_acct_ledger_trades", return_value=_make_perf_rows_with_market_type()):
             r = client.get("/performance")
         assert "by_market_type" in r.json()
 
     def test_bucket_5m_count(self):
-        with patch("api_server._load_trades_csv", return_value=_make_perf_rows_with_market_type()):
+        with patch("api_server._load_acct_ledger_trades", return_value=_make_perf_rows_with_market_type()):
             r = client.get("/performance")
         bmt = r.json()["by_market_type"]
         assert "bucket_5m" in bmt
         assert bmt["bucket_5m"]["count"] == 2
 
     def test_bucket_5m_pnl(self):
-        with patch("api_server._load_trades_csv", return_value=_make_perf_rows_with_market_type()):
+        with patch("api_server._load_acct_ledger_trades", return_value=_make_perf_rows_with_market_type()):
             r = client.get("/performance")
         bmt = r.json()["by_market_type"]
         assert bmt["bucket_5m"]["pnl"] == pytest.approx(5.0)
 
     def test_bucket_5m_win_rate(self):
         # bucket_5m: 1 win (pnl=10) out of 2 = 50 %
-        with patch("api_server._load_trades_csv", return_value=_make_perf_rows_with_market_type()):
+        with patch("api_server._load_acct_ledger_trades", return_value=_make_perf_rows_with_market_type()):
             r = client.get("/performance")
         bmt = r.json()["by_market_type"]
         assert bmt["bucket_5m"]["win_rate"] == pytest.approx(0.5)
 
     def test_bucket_1h_win_rate_100pct(self):
         # bucket_1h: 1 win (pnl=8) out of 1 = 100 %
-        with patch("api_server._load_trades_csv", return_value=_make_perf_rows_with_market_type()):
+        with patch("api_server._load_acct_ledger_trades", return_value=_make_perf_rows_with_market_type()):
             r = client.get("/performance")
         bmt = r.json()["by_market_type"]
         assert bmt["bucket_1h"]["win_rate"] == pytest.approx(1.0)

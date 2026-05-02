@@ -125,6 +125,7 @@ Pre-warm timeline:
          +-- Transition YES position: strategy="momentum", neutral_pair_id=""
 
 4. MOMENTUM HANDOFF
+    We can hand off to momentum, or keep the position held with a stop loss configuration.
    +-- Winner position is strategy="momentum" from this point.
        monitor.py, delta SL, TP, GTD hedge - all apply unchanged.
 ```

@@ -52,6 +52,7 @@ TRADES_HEADER = [
     "spot_resolve_price",   # oracle spot at market resolution (hedge rows only; 0.0 otherwise)
     "hedge_size_filled",    # contracts actually filled (empty for non-hedge rows)
     "hedge_avg_fill_price", # VWAP of all fills (empty for non-hedge rows)
+    "exit_reason",          # ExitReason string: momentum_stop_loss | upfrac_exit | time_stop | resolved | etc.
 ]
 
 
@@ -1809,6 +1810,7 @@ class RiskEngine:
         rebates_earned: float = 0.0,
         resolved_outcome: str = "",
         exit_spot_price: float = 0.0,   # underlying spot (BTC/ETH/…) at exit time
+        exit_reason: str = "",          # ExitReason string for trades.csv (e.g. "upfrac_exit")
     ) -> Optional[Position]:
         _csv_row: Optional[dict] = None
         _closed_pos: Optional[Position] = None
@@ -1884,6 +1886,7 @@ class RiskEngine:
                 "spot_resolve_price": pos.hedge_opp_best_ask if pos.hedge_fail_reason else 0.0,
                 "hedge_size_filled": "",
                 "hedge_avg_fill_price": "",
+                "exit_reason": exit_reason,
             }
             _closed_pos = pos
             log.info(

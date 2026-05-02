@@ -229,3 +229,102 @@ class TestFundingSnapshot:
 
     def test_get_funding_unknown_coin(self):
         assert self.client.get_funding("DOGE") is None
+
+
+# ── webData2 funding push ─────────────────────────────────────────────────────
+
+class TestWebData2:
+    """Tests for on_funding_update callback and webData2 WS message handling."""
+
+    def _make_client(self):
+        import config as cfg
+        cfg.PAPER_TRADING = True
+        client = HLClient.__new__(HLClient)
+        client._bbo = {}
+        client._mids = {}
+        client._fundings = {}
+        client._bbo_callbacks = []
+        client._funding_update_callbacks = []
+        client._paper_mode = True
+        client._running = True
+        client._info = None
+        client._exchange = None
+        return client
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_on_funding_update_registers_callback(self):
+        client = self._make_client()
+        calls = []
+        client.on_funding_update(lambda coin, rate, ts: calls.append((coin, rate, ts)))
+        assert len(client._funding_update_callbacks) == 1
+
+    def test_webdata2_message_fires_callback(self):
+        """webData2 WS push fires registered funding callback for each coin."""
+        client = self._make_client()
+        calls = []
+        client.on_funding_update(lambda coin, rate, ts: calls.append((coin, rate)))
+
+        msg = json.dumps({
+            "channel": "webData2",
+            "data": {
+                "meta": {
+                    "universe": [
+                        {"name": "BTC"},
+                        {"name": "ETH"},
+                    ],
+                },
+                "assetCtxs": [
+                    {"funding": "0.0001"},
+                    {"funding": "0.000025"},
+                ],
+            },
+        })
+        self._run(client._handle_ws_message(msg))
+        assert ("BTC", pytest.approx(0.0001)) in calls
+        assert ("ETH", pytest.approx(0.000025)) in calls
+
+    def test_webdata2_updates_legacy_fundings_dict(self):
+        """webData2 push populates _fundings for backward-compat with get_fundings_snapshot."""
+        client = self._make_client()
+
+        msg = json.dumps({
+            "channel": "webData2",
+            "data": {
+                "meta": {"universe": [{"name": "BTC"}]},
+                "assetCtxs": [{"funding": "0.000123"}],
+            },
+        })
+        self._run(client._handle_ws_message(msg))
+        snap = client._fundings.get("BTC")
+        assert snap is not None
+        assert snap.hl_predicted == pytest.approx(0.000123)
+
+    def test_webdata2_skips_coins_beyond_universe(self):
+        """If assetCtxs is longer than universe, surplus entries are silently ignored."""
+        client = self._make_client()
+        calls = []
+        client.on_funding_update(lambda coin, rate, ts: calls.append(coin))
+
+        msg = json.dumps({
+            "channel": "webData2",
+            "data": {
+                "meta": {"universe": [{"name": "BTC"}]},
+                "assetCtxs": [
+                    {"funding": "0.0001"},
+                    {"funding": "0.0002"},  # no matching universe entry — skip
+                ],
+            },
+        })
+        self._run(client._handle_ws_message(msg))
+        assert calls == ["BTC"]
+
+    def test_webdata2_handles_empty_payload(self):
+        """Empty webData2 message should not raise."""
+        client = self._make_client()
+        msg = json.dumps({
+            "channel": "webData2",
+            "data": {"meta": {"universe": []}, "assetCtxs": []},
+        })
+        self._run(client._handle_ws_message(msg))  # no exception

@@ -13,8 +13,8 @@ MOMENTUM STRATEGY — core logic (do not lose sight of this):
 2. PROFIT WHEN SPOT STAYS ON-SIDE
    We hold a YES/UP token if spot > strike at entry; NO/DOWN if spot < strike.
    The market resolves at oracle price at expiry.  If spot stays on the correct
-   side, the token resolves to 1.0 (full profit).  Entry token price (0.6–0.95)
-   represents the market’s current implied probability.
+   side, the token resolves to 1.0 (full profit).  Entry token price (0.6â€“0.95)
+   represents the marketâ€™s current implied probability.
 
 3. STOP-LOSS TRIGGERED BY ORACLE SPOT, NOT CLOB ALONE
    The oracle delta SL (MOMENTUM_DELTA_STOP_LOSS_PCT) fires when current spot
@@ -49,7 +49,6 @@ See MomentumStrategy.md for full specification.
 from __future__ import annotations
 
 import asyncio
-import collections
 import csv
 import json
 import math
@@ -114,7 +113,15 @@ MOMENTUM_FILLS_HEADER = [
     "kelly_fraction_cfg", # MOMENTUM_KELLY_FRACTION config value used
     "kelly_multiplier",   # per-bucket Kelly multiplier (MOMENTUM_KELLY_MULTIPLIER_BY_TYPE)
     "kelly_size_usd",     # intended position size in USD (=size_usd before fill)
-    "row_type",           # "entry" | "hedge" — distinguishes main fills from GTD hedge placements
+    "row_type",           # "entry" — fill row type for analysis
+    "funding_rate",        # HL funding rate at entry (float | None)
+    "yes_depth_share",     # YES bid depth / total bid depth (float | None)
+    "hour_utc",            # UTC hour of entry (int)
+    "effective_z",         # z-score after all multipliers (float)
+    "funding_gate_applied",# bool: was the funding gate active at entry
+    "streak_key",          # reserved, always empty string
+    "twap_dev_bps",        # oracle TWAP deviation in bps at scan time (M-14)
+    "vol_regime",          # volatility regime at scan time: HIGH | LOW | UNKNOWN (M-14)
 ]
 
 
@@ -162,6 +169,8 @@ class MomentumScanner(BaseStrategy):
         vol_fetcher: VolFetcher,
         spot_client: SpotOracle,
         on_signal: Any = None,
+        funding_cache: Any = None,
+        oracle_tracker: Any = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
@@ -170,6 +179,8 @@ class MomentumScanner(BaseStrategy):
         self._vol = vol_fetcher
         self._running = False
         self._on_signal: Any = on_signal  # optional callback(signal_dict) for API state
+        self._funding_cache = funding_cache   # M-06 FundingRateCache (Phase 1)
+        self._oracle_tracker = oracle_tracker  # M-08 OracleTickTracker (Phase 1)
         # Per-market cooldown after any open/close/failed entry
         self._market_cooldown: dict[str, float] = {}   # market_id → unix timestamp of last touch
         # Persist cooldowns to disk so restarts honour the full cooldown window.
@@ -181,17 +192,6 @@ class MomentumScanner(BaseStrategy):
         # blocked until the market's remaining TTE expires to prevent compounding losses.
         # key: condition_id  value: unix timestamp at which the block lifts
         self._stop_loss_blocked: dict[str, float] = {}
-        # Tracks the Unix timestamp when each market's signal first continuously cleared
-        # all gates.  Used to compute signal_valid_since_ts on MomentumSignal objects,
-        # which feeds the Kelly persistence z-boost.
-        # key: condition_id  value: unix timestamp of first valid pass
-        # Phase P3: persist to disk so the persistence clock survives bot restarts.
-        self._signal_first_valid_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "data", "signal_first_valid.json"
-        )
-        self._signal_first_valid: dict[str, float] = _load_cooldowns(
-            self._signal_first_valid_path
-        )
         # Open-spot cache for "Up or Down" directional markets.
         # key: condition_id  value: RTDS spot price at the moment the window opened.
         # Persisted to disk so restarts don't lose recorded opens mid-window.
@@ -222,20 +222,6 @@ class MomentumScanner(BaseStrategy):
         self._vol_prefetch_task: Optional[asyncio.Task] = None
         # Throttle: last unix timestamp we emitted a log.info for started markets.
         self._last_live_log_ts: float = 0.0
-        # Phase E: empirical win-rate table for win-rate gate.
-        # Loaded once at startup; None if data files missing or insufficient.
-        self._win_rate: Any = None
-        try:
-            from strategies.Momentum.win_rate import WinRateTable as _WRT
-            self._win_rate = _WRT()
-        except Exception:
-            pass  # no fills/trades data yet — Phase E gate skipped until available
-        # Item 4: VWAP/RoC secondary filter — per-token price history.
-        # key: token_id  value: deque of (timestamp, mid, ask_size_proxy) tuples
-        # Populated on every WS price tick regardless of whether the token is in-band;
-        # this ensures sufficient history is available when a signal first fires.
-        # maxlen=600 is ~10 minutes of 1-tick/second data.
-        self._price_history: dict[str, collections.deque] = {}
 
     # ── BaseStrategy interface ────────────────────────────────────────────────
 
@@ -248,6 +234,23 @@ class MomentumScanner(BaseStrategy):
             z=config.MOMENTUM_VOL_Z_SCORE,
         )
         _emit_event("SESSION_START", bot_version="momentum", paper=config.PAPER_TRADING)
+        # ── Pipeline availability warnings (US-03) ───────────────────────────
+        # Warn once at startup if a gate is enabled but its pipeline ref is None
+        # (e.g. due to a startup failure in main.py that set the ref to None).
+        # Without this, the gate is silently disabled for the entire session with
+        # no indication to the operator beyond the original startup ERROR log.
+        if config.MOMENTUM_FUNDING_GATE_ENABLED and self._funding_cache is None:
+            log.warning(
+                "MomentumScanner: MOMENTUM_FUNDING_GATE_ENABLED=True but funding_cache is None"
+                " — gate is silently disabled for this session"
+            )
+        if config.MOMENTUM_DEPTH_SHARE_GATE_ENABLED and not callable(
+            getattr(self._pm, "get_depth_share", None)
+        ):
+            log.warning(
+                "MomentumScanner: MOMENTUM_DEPTH_SHARE_GATE_ENABLED=True but pm.get_depth_share"
+                " is not callable — gate is silently disabled for this session"
+            )
         # Subscribe bucket markets for book updates immediately so the first scan
         # has book data.  The loop also refreshes every 5 minutes.
         await self._refresh_subscriptions()
@@ -429,10 +432,13 @@ class MomentumScanner(BaseStrategy):
         skipped_vol = 0
         skipped_cooldown = 0
         skipped_cap = 0
-        skipped_win_rate = 0     # Phase E: empirical win-rate gate
-        skipped_vwap = 0         # Item 4: VWAP/RoC secondary filter
         skipped_beyond_horizon = 0
         skipped_not_started = 0
+        skipped_funding_stale = 0
+        skipped_funding_block = 0
+        skipped_depth_share_yes = 0
+        skipped_depth_share_no = 0
+        skipped_twap_yes = 0
 
         band_lo = config.MOMENTUM_PRICE_BAND_LOW
         band_hi = config.MOMENTUM_PRICE_BAND_HIGH
@@ -506,7 +512,7 @@ class MomentumScanner(BaseStrategy):
                     # window start, but deriving from end_date ensures correctness even
                     # if the market object was loaded from a stale/partial source.
                     # fetch_crypto_price_ptb uses variant="fifteen" internally — the PM
-                    # settlement oracle for ALL bucket durations (5m, 15m, 1h, 4h, …).
+                    # settlement oracle for ALL bucket durations (5m, 15m, 1h, 4h, â€¦).
                     _mkt_dur_s = _MARKET_TYPE_DURATION_SECS.get(market.market_type, 0)
                     _window_open_iso: str = (
                         (market.end_date - timedelta(seconds=_mkt_dur_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -616,7 +622,7 @@ class MomentumScanner(BaseStrategy):
             else:
                 # NO book unavailable (WS reconnect / startup race).
                 # Do NOT derive from the YES side — YES and NO are independent
-                # CLOBs and 1-p_yes ≠ p_no in general.  Skip this market for
+                # CLOBs and 1-p_yes â‰  p_no in general.  Skip this market for
                 # this scan cycle; it will be re-evaluated on the next tick.
                 log.debug(
                     "MomentumScanner: NO book unavailable — skipping market this scan",
@@ -895,7 +901,6 @@ class MomentumScanner(BaseStrategy):
             _phase_c_min_tte = config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS.get(market.market_type, 0)
             if _phase_c_min_tte > 0 and tte_seconds < _phase_c_min_tte:
                 skipped_phase_c += 1
-                self._signal_first_valid.pop(market.condition_id, None)
                 _d["skip_reason"] = "phase_c_tte"
                 scan_diags.append(_d)
                 continue
@@ -909,9 +914,6 @@ class MomentumScanner(BaseStrategy):
             # 1h market; the absolute price distance determines survival, not TTE.
             if delta_pct < _effective_threshold:
                 skipped_delta += 1
-                # Signal dropped below threshold — reset persistence clock so a
-                # future re-entry starts fresh.
-                self._signal_first_valid.pop(market.condition_id, None)
                 _d["skip_reason"] = "delta_below_threshold"
                 scan_diags.append(_d)
                 continue
@@ -922,8 +924,6 @@ class MomentumScanner(BaseStrategy):
             _min_gap = config.MOMENTUM_MIN_GAP_PCT
             if _min_gap > 0 and (delta_pct - _effective_threshold) < _min_gap:
                 skipped_delta += 1
-                # Gap insufficient — also reset persistence (same logic as delta miss).
-                self._signal_first_valid.pop(market.condition_id, None)
                 _d["skip_reason"] = "gap_below_minimum"
                 scan_diags.append(_d)
                 continue
@@ -990,6 +990,92 @@ class MomentumScanner(BaseStrategy):
                 scan_diags.append(_d)
                 continue
 
+            # ── M-10: Funding Rate Gate ──────────────────────────────────────
+            # Fail-safe: skip if funding data is stale (WS gap). Distinguish:
+            #   skipped_funding_stale  = pipeline down or coin never received a tick
+            #   skipped_funding_block  = gate fired on a valid (fresh) rate
+            # Fail-open when FUNDING_GATE_ENABLED=False or funding_cache is None.
+            # UP/DOWN bucket markets: treat "UP" as "YES", "DOWN" as "NO".
+            # _funding_rate is always fetched (when cache available) so fills CSV
+            # logs the actual rate regardless of whether the gate is enabled.
+            _funding_rate: float | None = None
+            _gate_side = "YES" if high_side in ("YES", "UP") else "NO"
+            if self._funding_cache is not None:
+                coin = market.underlying
+                if config.MOMENTUM_FUNDING_GATE_ENABLED and self._funding_cache.is_stale(coin):
+                    skipped_funding_stale += 1
+                    _d["skip_reason"] = "funding_stale"
+                    _d["funding_rate"] = None
+                    scan_diags.append(_d)
+                    continue
+                _funding_rate = self._funding_cache.get(coin)
+                if config.MOMENTUM_FUNDING_GATE_ENABLED and _funding_rate is not None:
+                    if _gate_side == "YES" and _funding_rate > config.MOMENTUM_FUNDING_GATE_YES_MAX:
+                        skipped_funding_block += 1
+                        _d["skip_reason"] = "funding_block"
+                        _d["funding_rate"] = round(_funding_rate, 8)
+                        scan_diags.append(_d)
+                        continue
+                    if _gate_side == "NO" and _funding_rate < config.MOMENTUM_FUNDING_GATE_NO_MIN:
+                        skipped_funding_block += 1
+                        _d["skip_reason"] = "funding_block"
+                        _d["funding_rate"] = round(_funding_rate, 8)
+                        scan_diags.append(_d)
+                        continue
+            _d["funding_rate"] = round(_funding_rate, 8) if _funding_rate is not None else None
+
+            # ── M-11: Depth Share Gate ───────────────────────────────────────
+            # YES/UP gate validated (AUC 0.5683, p=0.002, Q1<25% -> 41.5% win rate).
+            # NO/DOWN gate is inferred by symmetry - NOT independently validated.
+            # Fail-open when get_depth_share() returns None (transient WS gap).
+            # UP/DOWN bucket markets: treat "UP" as "YES", "DOWN" as "NO" (reuse _gate_side).
+            # _yes_depth_share is always fetched so fills CSV logs it when gate is disabled.
+            _yes_depth_share: float | None = self._pm.get_depth_share(market)
+            if config.MOMENTUM_DEPTH_SHARE_GATE_ENABLED and _yes_depth_share is not None:
+                if _gate_side == "YES" and _yes_depth_share < config.MOMENTUM_DEPTH_SHARE_YES_MIN:
+                    skipped_depth_share_yes += 1
+                    _d["skip_reason"] = "depth_share_yes"
+                    _d["yes_depth_share"] = round(_yes_depth_share, 4)
+                    scan_diags.append(_d)
+                    continue
+                if _gate_side == "NO" and _yes_depth_share > config.MOMENTUM_DEPTH_SHARE_NO_MAX:
+                    skipped_depth_share_no += 1
+                    _d["skip_reason"] = "depth_share_no"
+                    _d["yes_depth_share"] = round(_yes_depth_share, 4)
+                    scan_diags.append(_d)
+                    continue
+            _d["yes_depth_share"] = round(_yes_depth_share, 4) if _yes_depth_share is not None else None
+
+            # ── M-14: TWAP Deviation Gate ────────────────────────────────────
+            # YES/UP entries only (NO/DOWN not validated — see PRD M-14).
+            # In LOW vol regime: if oracle is below its 10s TWAP by > threshold bps,
+            # raise the effective threshold by the multiplier (soft gate — not a hard skip).
+            # Fail-open when oracle_tracker is None or vol_regime is UNKNOWN.
+            # Always fetch for fills CSV logging regardless of gate state.
+            _twap_dev_bps: float | None = None
+            _vol_regime: str = "UNKNOWN"
+            if self._oracle_tracker is not None:
+                _twap_dev_bps = self._oracle_tracker.get_twap_deviation_bps(market.underlying)
+                _vol_regime = self._oracle_tracker.get_vol_regime(market.underlying)
+            if (
+                config.MOMENTUM_TWAP_GATE_ENABLED
+                and self._oracle_tracker is not None
+                and _gate_side == "YES"
+                and _vol_regime == "LOW"
+                and _twap_dev_bps is not None
+                and _twap_dev_bps < config.MOMENTUM_TWAP_DEV_THRESHOLD_BPS
+            ):
+                _raised_threshold = _effective_threshold * config.MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER
+                if delta_pct < _raised_threshold:
+                    skipped_twap_yes += 1
+                    _d["skip_reason"] = "twap_yes"
+                    _d["twap_dev_bps"] = round(_twap_dev_bps, 2)
+                    _d["vol_regime"] = _vol_regime
+                    scan_diags.append(_d)
+                    continue
+            _d["twap_dev_bps"] = round(_twap_dev_bps, 2) if _twap_dev_bps is not None else None
+            _d["vol_regime"] = _vol_regime
+
             # ── SIGNAL: emit immediately ─────────────────────────────────────
             # vol_src already set above from vol_result (reflects actual source used)
             signal = MomentumSignal(
@@ -1011,59 +1097,19 @@ class MomentumScanner(BaseStrategy):
                 vol_source=vol_src,
                 vol_z_score=_vol_z,
             )
-            # ── Populate Phase-A path-history fields ─────────────────────────
-            # signal_valid_since_ts: first time this market's signal cleared all gates.
-            _fv_key = market.condition_id
-            if _fv_key not in self._signal_first_valid:
-                self._signal_first_valid[_fv_key] = now_ts
-            signal.signal_valid_since_ts = self._signal_first_valid[_fv_key]
+            # signal_valid_since_ts: logging-only field — records when this signal was evaluated.
+            signal.signal_valid_since_ts = now_ts
+            # M-12/M-14: attach gate context for fills CSV
+            signal.entry_funding_rate = _funding_rate
+            signal.entry_yes_depth_share = _yes_depth_share
+            signal.entry_twap_dev_bps = _twap_dev_bps
+            signal.entry_vol_regime = _vol_regime
             # ── Kelly sizing preview for diagnostics ─────────────────────
             # Compute Kelly fields now so the webapp diagnostics row for this
             # signal shows the full sizing breakdown, not just whether it fired.
             _range_max_entry = config.MOMENTUM_RANGE_MAX_ENTRY_USD if _is_range else None
             _kelly_size_preview, _kelly_preview_debug = _compute_kelly_size_usd(signal, max_entry_usd=_range_max_entry)
             _d.update(_kelly_preview_debug)
-
-            # ── Gate: empirical win-rate (Phase E) ───────────────────────────
-            # Compare empirical win rate from historical fills to the model's
-            # Kelly win_prob.  Gate fires when emp_wr < model_wr * MIN_FACTOR.
-            # Only active when MOMENTUM_WIN_RATE_GATE_ENABLED and win-rate table
-            # has ≥ MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES fills in the bucket.
-            if config.MOMENTUM_WIN_RATE_GATE_ENABLED and self._win_rate is not None:
-                _emp_wr = self._win_rate.get(
-                    market.market_type, token_price, tte_seconds
-                )
-                _model_wr: float = _kelly_preview_debug["kelly_win_prob"]
-                if _emp_wr is not None and _emp_wr < _model_wr * config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR:
-                    skipped_win_rate += 1
-                    self._signal_first_valid.pop(market.condition_id, None)
-                    _d["skip_reason"] = "win_rate_gate"
-                    _d["emp_win_rate"] = round(_emp_wr, 4)
-                    _d["model_win_rate"] = round(_model_wr, 4)
-                    scan_diags.append(_d)
-                    continue
-
-            # ── Gate: VWAP deviation + momentum RoC (Item 4) ─────────────────
-            # Secondary filter using CLOB price history.  Both thresholds default
-            # to 0.0 (permissive / gate disabled) and can be tuned from live data.
-            # Falls through permissively when there is insufficient price history.
-            if config.MOMENTUM_MIN_VWAP_DEV_PCT > 0 or config.MOMENTUM_MIN_ROC_PCT > 0:
-                _hist = self._price_history.get(token_id)
-                _vwap_ok, _vwap_debug = _check_vwap_roc(
-                    _hist or [],
-                    now_ts,
-                    config.MOMENTUM_MIN_VWAP_DEV_PCT,
-                    config.MOMENTUM_VWAP_WINDOW_SEC,
-                    config.MOMENTUM_MIN_ROC_PCT,
-                    config.MOMENTUM_ROC_WINDOW_SEC,
-                )
-                _d.update(_vwap_debug)
-                if not _vwap_ok:
-                    skipped_vwap += 1
-                    self._signal_first_valid.pop(market.condition_id, None)
-                    _d["skip_reason"] = "vwap_roc_filter"
-                    scan_diags.append(_d)
-                    continue
 
             _d["skip_reason"] = "signal_fired"
             scan_diags.append(_d)
@@ -1081,9 +1127,6 @@ class MomentumScanner(BaseStrategy):
             # per second while the async order-placement coroutine is awaited.
             self._market_cooldown[f"{market.condition_id}:{high_side}"] = now_ts
             _save_cooldowns(self._cooldown_path, self._market_cooldown)
-            # Reset persistence clock — once we've entered the market, the next
-            # signal for the same condition_id should start a fresh persistence window.
-            self._signal_first_valid.pop(market.condition_id, None)
             executed = await self._execute_signal(signal, market)
             if executed:
                 signals_fired += 1
@@ -1100,6 +1143,23 @@ class MomentumScanner(BaseStrategy):
             log.warning(
                 "MomentumScanner: possible RTDS outage — >50% markets skipped for stale spot",
                 skipped_stale_spot=skipped_stale_spot,
+                total_bucket_markets=len(bucket_markets),
+            )
+
+        # ── Funding feed outage detection ─────────────────────────────────────
+        # If more than half of all scanned markets are being skipped for stale
+        # funding data (and the gate is enabled), it is far more likely that the
+        # HL webData2 feed has stopped delivering funding rate updates than that
+        # every coin genuinely has stale data.  Mirrors the existing RTDS pattern.
+        if (
+            config.MOMENTUM_FUNDING_GATE_ENABLED
+            and self._funding_cache is not None
+            and len(bucket_markets) > 0
+            and skipped_funding_stale / len(bucket_markets) > 0.5
+        ):
+            log.warning(
+                "MomentumScanner: possible funding feed outage — >50% markets skipped for stale funding",
+                skipped_funding_stale=skipped_funding_stale,
                 total_bucket_markets=len(bucket_markets),
             )
 
@@ -1121,8 +1181,11 @@ class MomentumScanner(BaseStrategy):
             skipped_vol=skipped_vol,
             skipped_cooldown=skipped_cooldown,
             skipped_cap=skipped_cap,
-            skipped_win_rate=skipped_win_rate,
-            skipped_vwap=skipped_vwap,
+            skipped_funding_stale=skipped_funding_stale,
+            skipped_funding_block=skipped_funding_block,
+            skipped_depth_share_yes=skipped_depth_share_yes,
+            skipped_depth_share_no=skipped_depth_share_no,
+            skipped_twap_yes=skipped_twap_yes,
         )
         # Persist diags for /momentum/diagnostics — no vol re-calls needed.
         self._last_scan_diags = scan_diags
@@ -1143,13 +1206,13 @@ class MomentumScanner(BaseStrategy):
             "skipped_vol":             skipped_vol,
             "skipped_cooldown":        skipped_cooldown,
             "skipped_cap":             skipped_cap,
-            "skipped_win_rate":        skipped_win_rate,
-            "skipped_vwap":            skipped_vwap,
+            "skipped_funding_stale":   skipped_funding_stale,
+            "skipped_funding_block":   skipped_funding_block,
+            "skipped_depth_share_yes": skipped_depth_share_yes,
+            "skipped_depth_share_no":  skipped_depth_share_no,
+            "skipped_twap_yes":        skipped_twap_yes,
         }
         self._last_scan_ts = now_ts
-
-        # Phase P3: persist signal_first_valid to survive bot restarts.
-        _save_cooldowns(self._signal_first_valid_path, self._signal_first_valid)
 
         # ── Scanner log: started markets (throttled to once per minute) ──────
         # "Started" = passed the horizon + not_started gates (i.e. market is
@@ -1197,13 +1260,6 @@ class MomentumScanner(BaseStrategy):
         Both YES/UP and NO/DOWN token IDs are in _token_to_market so either token firing
         triggers an early wakeup — important when only the DOWN/NO side is in-band.
         """
-        # Item 4: Record price tick for VWAP/RoC filter (always, not just in-band).
-        if config.MOMENTUM_MIN_VWAP_DEV_PCT > 0 or config.MOMENTUM_MIN_ROC_PCT > 0:
-            _book = self._pm.get_book(token_id)
-            _ask_sz = _book.asks[0][1] if _book and _book.asks else 1.0
-            if token_id not in self._price_history:
-                self._price_history[token_id] = collections.deque(maxlen=600)
-            self._price_history[token_id].append((time.time(), mid, _ask_sz))
         if not config.STRATEGY_MOMENTUM_ENABLED or not config.BOT_ACTIVE:
             return
         market = self._token_to_market.get(token_id)
@@ -1548,8 +1604,7 @@ class MomentumScanner(BaseStrategy):
         #   2. REST fallback → also set above on WS timeout.
         #   3. Paper mode / REST unavailable → derive from order_price.
         # True when fill landed below MOMENTUM_PRICE_BAND_LOW.  The position is
-        # registered immediately; only the GTD hedge runs — TP and the normal
-        # monitor SL/TP loop are suppressed.
+        # registered immediately; TP and the normal monitor SL/TP loop are suppressed.
         _band_floor_aborted = False
         if actual_fill is not None:
             raw_fill_price, actual_size = actual_fill["price"], actual_fill["size_matched"]
@@ -1592,9 +1647,8 @@ class MomentumScanner(BaseStrategy):
                     signal_source="band_floor_abort",
                 )
                 self._risk.open_position(_pos_bfa)
-                # Do NOT return yet — fall through so _do_hedge() runs.
-                # The opposite token may be buyable cheap right now; a $1
-                # resting hedge recovers up to $19 if the position settles wrong.
+                # Do NOT return yet — fall through so the position registers.
+                # Let settlement handle the close.
                 _band_floor_aborted = True
 
             entry_price = raw_fill_price  # actual token fill price for both YES and NO
@@ -1687,20 +1741,6 @@ class MomentumScanner(BaseStrategy):
             # band_floor_abort positions were already registered above as _pos_bfa.
             self._risk.open_position(pos)
 
-        # ── Phases C+D: TP order and GTD hedge — launched concurrently ───────
-        # The hedge must not wait behind TP placement.  Every second of TP
-        # latency drains the opposite-token book.  Both are defined as local
-        # coroutines so asyncio.gather runs them in a single event-loop pass,
-        # interleaving at each network-IO await point.
-        _hedge_id: str | None   = None  # set by _do_hedge; used in Phase E
-        _hedge_price: float     = 0.0
-        _hedge_contracts: float = 0.0
-        _hedge_size_usd: float  = 0.0
-        _hedge_side: str        = ""
-        _hedge_bucket_enabled   = config.MOMENTUM_HEDGE_ENABLED_BY_TYPE.get(
-            market.market_type, True
-        )
-
         async def _do_tp() -> None:
             # ── Item 1: Pre-arm resting TP SELL order ────────────────────────
             # Place a SELL limit at MOMENTUM_TAKE_PROFIT immediately after fill
@@ -1756,352 +1796,7 @@ class MomentumScanner(BaseStrategy):
                     market=signal.market_title[:50],
                 )
 
-        async def _do_hedge() -> None:
-            nonlocal _hedge_id, _hedge_price, _hedge_contracts, _hedge_size_usd, _hedge_side
-            # ── Phase D: Optional GTD hedge ──────────────────────────────────
-            # Place a post-only GTC limit BUY on the opposite token at a low
-            # price.  If the held token loses (→ $0), the opposite token may
-            # briefly trade below our bid; the resting order catches that dip
-            # and redeems at $1.
-            if not (config.MOMENTUM_HEDGE_ENABLED and _hedge_bucket_enabled):
-                return
-            opp_token = (
-                market.token_id_no if signal.side in ("YES", "UP") else market.token_id_yes
-            )
-            hedge_price = config.MOMENTUM_HEDGE_PRICE_BY_TYPE.get(
-                market.market_type, config.MOMENTUM_HEDGE_PRICE
-            )
-            # Recompute TTE at hedge-placement time.  signal.tte_seconds was captured
-            # at scan time; fill confirmation latency can burn several seconds.  A hedge
-            # placed with < 10 s remaining has no time to develop and will be
-            # immediately monitored post-expiry (Hedge C root cause).
-            _hedge_tte_now = (
-                (market.end_date - datetime.now(timezone.utc)).total_seconds()
-                if market.end_date is not None else signal.tte_seconds
-            )
-            # Only place a hedge when the position's projected win PnL exceeds $1.
-            # Projected PnL = what we collect if the token settles at $1 minus
-            # what we paid:  entry_size × (1.0 − entry_price).
-            _projected_pnl = round(entry_size * (1.0 - entry_price), 6)
-            # Sub-5s guard: a resting maker order has zero chance of filling.
-            # However, a taker (FAK) order can still fill immediately if someone
-            # is selling the opposite token right now.  Allow taker-mode through
-            # when MOMENTUM_HEDGE_AGGRESSIVE_TTE_S > 0 and TTE is within that
-            # threshold — that flag is exactly the "near-expiry, grab it now" path.
-            # Only block unconditionally when taker aggression is also disabled.
-            _taker_tte_allowed = (
-                config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S > 0
-                and _hedge_tte_now < config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S
-            ) or config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER
-            if _hedge_tte_now < 5.0 and not _taker_tte_allowed:
-                log.warning(
-                    "Momentum: GTD hedge skipped — market expires in < 5s and taker aggression disabled",
-                    market=signal.market_title[:50],
-                    tte_s=round(_hedge_tte_now, 1),
-                )
-            elif _projected_pnl <= 1.0:
-                log.debug(
-                    "Momentum: GTD hedge skipped — projected PnL ≤ $1",
-                    market=signal.market_title[:50],
-                    projected_pnl=round(_projected_pnl, 4),
-                )
-            else:
-                # Size hedge by contract count (same # of contracts as main position),
-                # not by USD notional.  Actual USDC cost = contracts × hedge_price.
-                hedge_contracts = round(entry_size * config.MOMENTUM_HEDGE_CONTRACTS_PCT, 6)
-                # Preserve the position-matched count BEFORE any $1 PM-minimum floor
-                # is applied.  Used for cap computation, ladder sizing, taker sizing,
-                # and stored on HedgeOrder so the monitor reprice loop can recalculate
-                # correctly at each step: max(natural, 1.0/new_price).
-                _natural_hedge_contracts: float = hedge_contracts
-                hedge_size_usd  = round(hedge_contracts * hedge_price, 6)
-                # PM requires minimum $1 notional per GTC order.  If the natural
-                # sizing falls below $1, raise the placed count to exactly $1 worth
-                # of contracts at the initial price so the order is accepted.
-                _dollar_floor_applied: bool = False
-                if hedge_size_usd < 1.0:
-                    hedge_contracts = round(1.0 / hedge_price, 6)
-                    hedge_size_usd  = round(hedge_contracts * hedge_price, 6)
-                    _dollar_floor_applied = True
-                    log.debug(
-                        "Momentum: GTD hedge size raised to $1 minimum",
-                        market=signal.market_title[:50],
-                        natural_contracts=round(_natural_hedge_contracts, 4),
-                        placed_contracts=round(hedge_contracts, 4),
-                    )
-                _hedge_price      = hedge_price
-                _hedge_contracts  = hedge_contracts
-                _hedge_size_usd   = hedge_size_usd
-                _hedge_side       = "DOWN" if signal.side in ("YES", "UP") else "UP"
-
-                # ── Cap calculation ──────────────────────────────────────────────────
-                # Maximum price per contract we can pay while retaining at least
-                # MOMENTUM_HEDGE_MIN_RETAIN_USD of projected win PnL.
-                _tick = 0.01  # Polymarket minimum price tick
-                _max_hedge_price: float = hedge_price  # default: no external cap
-                _cap_check_ok: bool = True
-                if config.MOMENTUM_HEDGE_MIN_RETAIN_USD > 0.0 and _natural_hedge_contracts > 0:
-                    # Cap is computed against the NATURAL (position-matched) count, not the
-                    # $1-floor-inflated placed count.  Inflating the divisor would shrink the
-                    # cap to ~3¢ when natural coverage costs < $1, preventing correct repricing.
-                    # With natural contracts as divisor the cap reflects how much per-contract
-                    # we can pay while retaining MIN_RETAIN of PnL, which is correct at all
-                    # reprice steps (the monitor recalculates size at each step anyway).
-                    _pnl_cap = (_projected_pnl - config.MOMENTUM_HEDGE_MIN_RETAIN_USD) / _natural_hedge_contracts
-                    if _pnl_cap <= 0.0:
-                        _cap_check_ok = False
-                        log.debug(
-                            "Momentum: GTD hedge skipped — PnL cap ≤ 0",
-                            market=signal.market_title[:50],
-                            projected_pnl=round(_projected_pnl, 4),
-                            min_retain=config.MOMENTUM_HEDGE_MIN_RETAIN_USD,
-                        )
-                    else:
-                        _max_hedge_price = round(min(_pnl_cap, 1.0 - _tick), 4)
-                        log.debug(
-                            "Momentum: GTD hedge cap computed",
-                            market=signal.market_title[:50],
-                            max_hedge_price=_max_hedge_price,
-                            dollar_floor=_dollar_floor_applied,
-                            natural_contracts=round(_natural_hedge_contracts, 4),
-                            config_price=hedge_price,
-                            projected_pnl=round(_projected_pnl, 4),
-                        )
-
-                if _cap_check_ok:
-                    # ── Book pre-check ───────────────────────────────────────────────
-                    _opp_book = self._pm.get_book(opp_token)
-                    _opp_best_ask = round(_opp_book.best_ask, 4) if (_opp_book and _opp_book.best_ask) else None
-
-                    # ── Tactic selection ─────────────────────────────────────────────
-                    # Use taker (immediate FAK) if:
-                    #   a) Global taker flag is set, OR
-                    #   b) TTE threshold configured and market is close to expiry, OR
-                    #   c) Book has a seller already within our cap (grab the fill now)
-                    # Use _hedge_tte_now (live recomputed) not signal.tte_seconds (stale
-                    # scan-time value) — fill confirmation latency can burn several seconds.
-                    _tte = _hedge_tte_now
-                    _use_taker = (
-                        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER
-                        or (config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S > 0
-                            and _tte < config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S)
-                        or (_opp_best_ask is not None
-                            and _opp_best_ask > 0.0
-                            and _opp_best_ask <= _max_hedge_price)
-                    )
-
-                    if config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S > 0 and _tte < config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S:
-                        log.debug(
-                            "Momentum: GTD hedge — TTE aggression active",
-                            market=signal.market_title[:50],
-                            tte_s=round(_tte, 1),
-                            threshold_s=config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S,
-                        )
-
-                    # Sentinel values so the success-log block never hits UnboundLocalError
-                    _attempt_price: float   = hedge_price
-                    _taker_price: float     = hedge_price
-                    _taker_contracts: float = _natural_hedge_contracts
-                    hedge_id: str | None    = None
-
-                    try:
-                        if _use_taker:
-                            # ── Taker branch: single FAK at current best ask ──────────
-                            _taker_price = _opp_best_ask if _opp_best_ask else hedge_price
-                            if _taker_price > _max_hedge_price:
-                                log.debug(
-                                    "Momentum: GTD hedge taker skipped — ask above cap",
-                                    market=signal.market_title[:50],
-                                    best_ask=_taker_price,
-                                    max_price=_max_hedge_price,
-                                )
-                            else:
-                                # ── $1 minimum size check for taker ─────────────────
-                                # Taker price may differ from config price so always
-                                # recompute from natural_contracts.  If natural coverage
-                                # costs < $1 at the taker price, floor to exactly $1.
-                                _taker_contracts = _natural_hedge_contracts
-                                _taker_cost = round(_taker_contracts * _taker_price, 6)
-                                if _taker_cost < 1.0:
-                                    _taker_contracts = round(1.0 / _taker_price, 6)
-                                    _taker_cost = round(_taker_contracts * _taker_price, 6)
-                                # Cap budget = total dollars we can spend
-                                _cap_budget = _projected_pnl - config.MOMENTUM_HEDGE_MIN_RETAIN_USD
-                                if config.MOMENTUM_HEDGE_MIN_RETAIN_USD > 0.0 and _taker_cost > _cap_budget:
-                                    log.debug(
-                                        "Momentum: GTD hedge taker skipped — $1 minimum exceeds cap budget",
-                                        market=signal.market_title[:50],
-                                        taker_price=_taker_price,
-                                        taker_contracts=round(_taker_contracts, 4),
-                                        taker_cost=_taker_cost,
-                                        cap_budget=round(_cap_budget, 4),
-                                    )
-                                else:
-                                    log.debug(
-                                        "Momentum: GTD hedge taker attempt",
-                                        market=signal.market_title[:50],
-                                        taker_price=_taker_price,
-                                        taker_contracts=round(_taker_contracts, 4),
-                                        best_ask=_opp_best_ask,
-                                    )
-                                    hedge_id = await self._pm.place_limit(
-                                        token_id=opp_token,
-                                        side="BUY",
-                                        price=_taker_price,
-                                        size=_taker_contracts,
-                                        market=market,
-                                        post_only=False,
-                                    )
-                        else:
-                            # ── Maker ladder: up to N ticks of concession ────────────
-                            # Contract sizing per step:
-                            #   natural_contracts = entry_size × PCT (equal to main position)
-                            #   natural_cost = natural_contracts × attempt_price
-                            #   if natural_cost >= $1: place natural_contracts (full coverage)
-                            #   else: place 1.0 / attempt_price  ($1 minimum floor, contracts
-                            #         decrease as price ticks up, keeping spend at exactly $1)
-                            _step_contracts: float = _natural_hedge_contracts  # sentinel
-                            for _step in range(config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION):
-                                _attempt_price = round(hedge_price + _step * _tick, 4)
-                                if _attempt_price > _max_hedge_price:
-                                    break
-                                # Use natural (position-matched) count for the $1 check.
-                                # If natural coverage costs ≥ $1 at this price, use it
-                                # (full hedge, possibly > $1).  Otherwise floor to $1.
-                                _natural_cost = round(_natural_hedge_contracts * _attempt_price, 6)
-                                if _natural_cost >= 1.0:
-                                    _step_contracts = _natural_hedge_contracts
-                                else:
-                                    # Below $1 notional — floor to exactly $1
-                                    _step_contracts = round(1.0 / _attempt_price, 6)
-                                if _step > 0:
-                                    log.debug(
-                                        "Momentum: GTD hedge ladder step",
-                                        market=signal.market_title[:50],
-                                        step=_step,
-                                        attempt_price=_attempt_price,
-                                        step_contracts=round(_step_contracts, 4),
-                                        natural_cost=_natural_cost,
-                                        max_price=_max_hedge_price,
-                                    )
-                                hedge_id = await self._pm.place_limit(
-                                    token_id=opp_token,
-                                    side="BUY",
-                                    price=_attempt_price,
-                                    size=_step_contracts,
-                                    market=market,
-                                    post_only=True,
-                                )
-                                if hedge_id:
-                                    break
-
-                    except Exception as _hex:
-                        hedge_id = None
-                        log.warning("Momentum: GTD hedge error", exc=str(_hex))
-                        _emit_event(
-                            "HEDGE_FAIL",
-                            market_id=signal.market_id,
-                            market_title=signal.market_title[:80],
-                            underlying=signal.underlying,
-                            market_type=signal.market_type,
-                            side=signal.side,
-                            hedge_side=_hedge_side,
-                            hedge_price=hedge_price,
-                            hedge_contracts=round(hedge_contracts, 4),
-                            size_usd=hedge_size_usd,
-                            reason=str(_hex)[:120],
-                        )
-
-                    if hedge_id:
-                        # Resolve actual placed price and contracts
-                        _placed_price     = _taker_price if _use_taker else _attempt_price
-                        _placed_contracts = _taker_contracts if _use_taker else _step_contracts
-                        _placed_size_usd  = round(_placed_contracts * _placed_price, 6)
-                        _hedge_id         = hedge_id
-                        # Update Phase E CSV vars to reflect actual placement
-                        _hedge_price      = _placed_price
-                        _hedge_contracts  = _placed_contracts
-                        _hedge_size_usd   = _placed_size_usd
-                        log.info(
-                            "Momentum: GTD hedge placed",
-                            market=signal.market_title[:50],
-                            main_side=signal.side,
-                            hedge_side=_hedge_side,
-                            hedge_price=_placed_price,
-                            config_price=hedge_price,
-                            hedge_contracts=round(_placed_contracts, 4),
-                            hedge_cost_usd=_placed_size_usd,
-                            taker=_use_taker,
-                            hedge_id=hedge_id[:20],
-                        )
-                        _emit_event(
-                            "HEDGE_SUBMIT",
-                            market_id=signal.market_id,
-                            market_title=signal.market_title[:80],
-                            underlying=signal.underlying,
-                            market_type=signal.market_type,
-                            side=signal.side,
-                            hedge_side=_hedge_side,
-                            hedge_price=_placed_price,
-                            hedge_contracts=round(_placed_contracts, 4),
-                            size_usd=_placed_size_usd,
-                            hedge_id=hedge_id,
-                        )
-                        self._risk.register_hedge_order(
-                            order_id=hedge_id,
-                            market_id=signal.market_id,
-                            token_id=opp_token,
-                            underlying=signal.underlying,
-                            market_type=signal.market_type,
-                            market_title=signal.market_title[:80],
-                            order_price=_placed_price,
-                            order_size=_placed_contracts,
-                            order_size_usd=_placed_size_usd,
-                            parent_side=signal.side,
-                            price_cap=_max_hedge_price,
-                            projected_pnl_usd=round(_projected_pnl, 6),
-                            natural_contracts=_natural_hedge_contracts,
-                        )
-                        self._risk.update_gtd_hedge(
-                            signal.market_id, signal.side,
-                            hedge_id, opp_token, _placed_price, _placed_size_usd,
-                        )
-                    else:
-                        # All attempts failed (ladder exhausted or taker skipped/rejected)
-                        _opp_best_ask_log = round(_opp_book.best_ask, 4) if _opp_book and _opp_book.best_ask else None
-                        log.warning(
-                            "Momentum: GTD hedge failed — all attempts exhausted",
-                            market=signal.market_title[:50],
-                            main_side=signal.side,
-                            config_price=hedge_price,
-                            max_price=_max_hedge_price,
-                            opp_best_ask=_opp_best_ask_log,
-                            taker_attempted=_use_taker,
-                            steps_tried=config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION,
-                        )
-                        self._risk.set_hedge_failed(
-                            market_id=signal.market_id,
-                            side=signal.side,
-                            reason="all_attempts_exhausted",
-                            opp_best_ask=_opp_best_ask_log or 0.0,
-                            max_price=_max_hedge_price,
-                        )
-                        _emit_event(
-                            "HEDGE_FAIL",
-                            market_id=signal.market_id,
-                            market_title=signal.market_title[:80],
-                            underlying=signal.underlying,
-                            market_type=signal.market_type,
-                            side=signal.side,
-                            hedge_side=_hedge_side,
-                            hedge_price=hedge_price,
-                            hedge_contracts=round(hedge_contracts, 4),
-                            size_usd=hedge_size_usd,
-                            opp_best_ask=_opp_best_ask_log,
-                            reason="all_attempts_exhausted",
-                        )
-
-        await asyncio.gather(_do_tp(), _do_hedge(), return_exceptions=True)
+        await _do_tp()
 
         # ── Write momentum fills CSV for execution-quality analysis ──────────
         try:
@@ -2144,32 +1839,25 @@ class MomentumScanner(BaseStrategy):
                 "kelly_fraction_cfg": _kelly_debug["kelly_fraction_cfg"],
                 "kelly_multiplier":   _kelly_debug["kelly_multiplier"],
                 "kelly_size_usd":     _kelly_debug["kelly_size_usd"],
+                "row_type":           "entry",
+                # M-12: Phase 2 gate context
+                "funding_rate":        round(signal.entry_funding_rate, 8) if signal.entry_funding_rate is not None else None,
+                "yes_depth_share":     round(signal.entry_yes_depth_share, 4) if signal.entry_yes_depth_share is not None else None,
+                "hour_utc":            datetime.now(timezone.utc).hour,
+                "effective_z":         _kelly_debug.get("kelly_z_total"),
+                "funding_gate_applied":config.MOMENTUM_FUNDING_GATE_ENABLED,
+                "streak_key":          "",
+                "twap_dev_bps":        round(signal.entry_twap_dev_bps, 2) if signal.entry_twap_dev_bps is not None else None,
+                "vol_regime":          signal.entry_vol_regime,
             }
-            _fill_row["row_type"] = "entry"
             with MOMENTUM_FILLS_CSV.open("a", newline="") as _f:
                 _writer = csv.DictWriter(_f, fieldnames=MOMENTUM_FILLS_HEADER, extrasaction="ignore")
                 _writer.writerow(_fill_row)
-                # Also record the GTD hedge placement so it appears alongside the entry.
-                if _hedge_id:
-                    _writer.writerow({
-                        "timestamp":    _fill_row["timestamp"],
-                        "market_id":    signal.market_id,
-                        "market_title": signal.market_title[:80],
-                        "underlying":   signal.underlying,
-                        "market_type":  signal.market_type,
-                        "side":         _hedge_side,
-                        "signal_price": _hedge_price,
-                        "order_price":  _hedge_price,
-                        "fill_price":   _hedge_price,
-                        "fill_size":    _hedge_contracts,
-                        "kelly_size_usd": _hedge_size_usd,
-                        "row_type":     "hedge",
-                    })
         except Exception as _ex:
             log.debug("momentum_fills.csv write error", exc=str(_ex))
 
         log.info(
-            "Momentum position opened ✓",
+            "Momentum position opened âœ“",
             market=signal.market_title[:60],
             side=signal.side,
             token_price=current_ask,
@@ -2191,7 +1879,7 @@ class MomentumScanner(BaseStrategy):
             kelly_size_usd=_kelly_debug["kelly_size_usd"],
         )
         if _band_floor_aborted:
-            # Hedge was placed above; skip monitor's active SL/TP loop.
+            # Band floor abort: skip monitor's active SL/TP loop, let settlement handle it.
             return False
         return True
 
@@ -2242,19 +1930,19 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     """Compute position size in USD using fractional Kelly Criterion.
 
     Kelly Criterion for a binary bet:
-        f* = max(0, (p×b − (1-p)) / b)
+        f* = max(0, (pÃ—b âˆ’ (1-p)) / b)
     where:
         p = win probability  estimated as N(observed_z_total)
-        b = payout per dollar risked = (1 − token_price) / token_price
+        b = payout per dollar risked = (1 âˆ’ token_price) / token_price
 
     The raw Kelly fraction is multiplied by MOMENTUM_KELLY_FRACTION (default 1.0)
-    as a safety dampener.  At 1.0 (no dampening) size = kelly_f × MAX_ENTRY.
+    as a safety dampener.  At 1.0 (no dampening) size = kelly_f Ã— MAX_ENTRY.
     Lower values scale every bet down proportionally while preserving rank.
 
     Natural behaviour (all three sizing intuitions without explicit knobs):
-      • Stronger signal (higher delta) → higher win_prob → bigger size
-      • Larger gap above threshold     → higher win_prob → bigger size
-      • Higher token price in band     → smaller payout_b → smaller size
+      â€¢ Stronger signal (higher delta) → higher win_prob → bigger size
+      â€¢ Larger gap above threshold     → higher win_prob → bigger size
+      â€¢ Higher token price in band     → smaller payout_b → smaller size
 
     The sigma_tau denominator is floored at 1 second to prevent the z
     computation blowing up when TTE approaches zero near expiry.
@@ -2263,7 +1951,7 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     fills CSV and the scanner diagnostics so every sizing decision is auditable.
 
     Debug fields:
-        kelly_sigma_tau     — σ scaled to remaining TTE window
+        kelly_sigma_tau     — Ïƒ scaled to remaining TTE window
         kelly_z_total       — total z-score above zero (vol_z + excess)
         kelly_win_prob      — N(kelly_z_total); model win probability
         kelly_payout_b      — (1 - token_price) / token_price
@@ -2273,10 +1961,10 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
 
     ASCII diagram — how each signal dimension flows to size:
 
-        delta_pct ──┐
-                    ├──▶ delta / sigma_tau = z ──▶ N(z) = win_prob ──┐
-        sigma_ann ──▶ sigma_tau ──────────────────────────────────────┘ ──▶ kelly_f ──▶ × fraction ──▶ size_usd
-        token_price ────────────────────────────────────────────────────────────▶ payout_b ──┘
+        delta_pct ──â”
+                    â”œ──â–¶ delta / sigma_tau = z ──â–¶ N(z) = win_prob ──â”
+        sigma_ann ──â–¶ sigma_tau ──────────────────────────────────────â”˜ ──â–¶ kelly_f ──â–¶ Ã— fraction ──â–¶ size_usd
+        token_price ────────────────────────────────────────────────────────────â–¶ payout_b ──â”˜
 
     NOTE: VOL_Z_SCORE, MIN_DELTA_PCT, MIN_GAP_PCT affect the *entry gate* but
     not the Kelly probability estimate once the signal has fired.  The gate
@@ -2284,48 +1972,29 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     used for signal_score analytics (position meta) — not for sizing.
     """
     # Kelly minimum effective TTE — prevents sigma_tau from collapsing at very
-    # small TTEs (e.g. 3s or 5s), which would inflate z → 6σ hard cap →
-    # win_prob ≈ 1.0 → MAX_ENTRY regardless of actual edge strength.
+    # small TTEs (e.g. 3s or 5s), which would inflate z → 6Ïƒ hard cap →
+    # win_prob â‰ˆ 1.0 → MAX_ENTRY regardless of actual edge strength.
     # MOMENTUM_KELLY_MIN_TTE_SECONDS (default 30s) is the floor; signals fired
     # with less time remaining are sized as if this many seconds remain.
     # Do NOT use MOMENTUM_MIN_TTE_SECONDS (the entry-gate CEILING) here.
     _kelly_min_tte = float(config.MOMENTUM_KELLY_MIN_TTE_SECONDS)
     tte_eff = max(signal.tte_seconds, _kelly_min_tte)
 
-    # Persistence scaling still uses the entry-gate window as its reference —
-    # "has the signal been valid for a full entry window?" is the right question.
-    _persistence_window = float(
-        config.MOMENTUM_MIN_TTE_SECONDS.get(
-            signal.market_type,
-            config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT,
-        )
-    )
-
     sigma_eff = signal.sigma_ann
 
     sigma_tau = sigma_eff * math.sqrt(tte_eff / 31_536_000)
 
     # Win probability: P(underlying finishes in-the-money at expiry).
-    # z = delta_pct / (sigma_tau * 100) — how many remaining-window σ units
+    # z = delta_pct / (sigma_tau * 100) — how many remaining-window Ïƒ units
     # the spot is currently above (YES) or below (NO) the strike.
     observed_z_raw = signal.delta_pct / (sigma_tau * 100 + 1e-9)
-
-    # Persistence z-boost — reward signals that have been continuously valid
-    # for at least one full min-TTE window, up to MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX.
-    # Scales linearly from 0 (just fired) to max (held ≥ _persistence_window seconds).
-    _z_boost = 0.0
-    _persistence_pct = 0.0
-    if config.MOMENTUM_KELLY_PERSISTENCE_ENABLED and signal.signal_valid_since_ts > 0:
-        _elapsed = time.time() - signal.signal_valid_since_ts
-        _persistence_pct = min(1.0, _elapsed / max(_persistence_window, 1.0))
-        _z_boost = config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX * _persistence_pct
 
     # Cap at 6σ to prevent erf() overflow on very strong signals.
     # Near expiry, sigma_tau → 0 so z_raw can be very large — this is correct
     # behaviour: a clear spot displacement with only seconds remaining IS high
     # confidence.  The 6σ cap just prevents float overflow; it does not dampen
     # the signal.  Higher z → higher win_prob → bigger Kelly bet, as intended.
-    observed_z_total = min(observed_z_raw + _z_boost, 6.0)
+    observed_z_total = min(observed_z_raw, 6.0)
 
     # Vol-model win probability (kept for audit/debug; NOT used for sizing).
     win_prob_vol = 0.5 * (1.0 + math.erf(observed_z_total / math.sqrt(2.0)))
@@ -2371,8 +2040,8 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     kelly_f = max(0.0, raw_kelly_f)
 
     # Fractional Kelly: multiply by KELLY_FRACTION safety factor.
-    # KELLY_FRACTION=1.0 → deploy kelly_f × MAX_ENTRY (full-Kelly relative to max).
-    # KELLY_FRACTION=0.5 → deploy 0.5 × kelly_f × MAX_ENTRY (half-Kelly).
+    # KELLY_FRACTION=1.0 → deploy kelly_f Ã— MAX_ENTRY (full-Kelly relative to max).
+    # KELLY_FRACTION=0.5 → deploy 0.5 Ã— kelly_f Ã— MAX_ENTRY (half-Kelly).
     # KELLY_FRACTION=0.25 → quarter-Kelly.
     _fraction_cfg = max(0.0, min(1.0, config.MOMENTUM_KELLY_FRACTION))
 
@@ -2399,9 +2068,7 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     debug: dict = {
         "kelly_tte_eff_s":       round(tte_eff, 1),
         "kelly_sigma_eff":       round(sigma_eff, 6),
-        "kelly_persistence_pct": round(_persistence_pct, 3),
-        "kelly_z_boost":         round(_z_boost, 4),
-        "kelly_z_before_boost":  round(observed_z_raw, 4),
+        "kelly_z_raw":           round(observed_z_raw, 4),
         "kelly_sigma_tau":       round(sigma_tau, 6),
         "kelly_z_total":         round(observed_z_total, 4),
         "kelly_win_prob_vol":    round(win_prob_vol, 4),    # N(z) vol model — audit only
@@ -2444,75 +2111,3 @@ def _signal_log_dict(s: MomentumSignal) -> dict:
         "sigma_ann":     round(s.sigma_ann, 3),
         "vol_source":    s.vol_source,
     }
-
-
-def _check_vwap_roc(
-    history: "collections.deque | list",
-    now_ts: float,
-    min_dev_pct: float,
-    vwap_window_sec: int,
-    roc_min_pct: float,
-    roc_window_sec: int,
-) -> tuple[bool, dict]:
-    """Compute VWAP deviation and momentum RoC from a CLOB mid-price history.
-
-    VWAP formula (from VWAP-bot PROJECT_LOGIC.md §4):
-        VWAP = Σ(price_i × vol_i) / Σ(vol_i)   over vwap_window_sec
-        deviation = (P_last − VWAP) / VWAP × 100%
-
-    RoC formula (from VWAP-bot §4):
-        RoC = (P_last − P_ago) / P_ago × 100%   over roc_window_sec
-
-    Args:
-        history:       deque of (timestamp, mid_price, ask_size_proxy) tuples
-        now_ts:        current unix timestamp
-        min_dev_pct:   minimum VWAP deviation required (0 = permissive)
-        vwap_window_sec: rolling window for VWAP computation
-        roc_min_pct:   minimum momentum RoC required (0 = permissive)
-        roc_window_sec: rolling window for RoC computation
-
-    Returns:
-        (passes, debug_dict)  where passes=True when the signal satisfies both
-        thresholds, or when there is insufficient history for a reliable estimate.
-    """
-    if not history:
-        return True, {"vwap_filter": "no_data"}
-
-    cutoff_vwap = now_ts - vwap_window_sec
-    vwap_samples = [(p, v) for t, p, v in history if t >= cutoff_vwap]
-
-    if len(vwap_samples) < 3:
-        # Too few ticks to compute a reliable VWAP — pass permissively.
-        return True, {"vwap_filter": "insufficient_data", "vwap_samples": len(vwap_samples)}
-
-    total_vol = sum(v for _, v in vwap_samples)
-    if total_vol <= 0:
-        return True, {"vwap_filter": "zero_vol"}
-
-    vwap = sum(p * v for p, v in vwap_samples) / total_vol
-    last_price = vwap_samples[-1][0]
-    dev = (last_price - vwap) / vwap * 100 if vwap > 0 else 0.0
-
-    # RoC over roc_window_sec
-    cutoff_roc = now_ts - roc_window_sec
-    roc_samples = [(t, p) for t, p, _ in history if t >= cutoff_roc]
-    roc: Optional[float] = None
-    roc_ok = True
-    if len(roc_samples) >= 2:
-        oldest_p = roc_samples[0][1]
-        if oldest_p > 0:
-            roc = (last_price - oldest_p) / oldest_p * 100
-            roc_ok = roc >= roc_min_pct
-    # If insufficient RoC history, pass permissively.
-
-    dev_ok = dev >= min_dev_pct
-    passes = dev_ok and roc_ok
-
-    debug: dict = {
-        "vwap": round(vwap, 4),
-        "vwap_dev_pct": round(dev, 4),
-        "vwap_samples": len(vwap_samples),
-    }
-    if roc is not None:
-        debug["roc_pct"] = round(roc, 4)
-    return passes, debug

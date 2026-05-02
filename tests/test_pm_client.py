@@ -1130,6 +1130,104 @@ class TestCancelOrderToThread:
         client._clob.cancel_all.assert_not_called()
 
 
+# ── get_depth_share ──────────────────────────────────────────────────────────
+
+class TestGetDepthShare:
+    """Unit tests for PMClient.get_depth_share (M-07)."""
+
+    def _make_client(self) -> "PMClient":
+        client = PMClient.__new__(PMClient)
+        client._books = {}
+        client._markets = {}
+        client._paper_mode = True
+        return client
+
+    def _make_market(self, yes_id: str = "yes-tok", no_id: str = "no-tok") -> "PMMarket":
+        m = MagicMock(spec=PMMarket)
+        m.token_id_yes = yes_id
+        m.token_id_no = no_id
+        return m
+
+    def test_none_when_yes_book_missing(self):
+        client = self._make_client()
+        mkt = self._make_market()
+        client._books["no-tok"] = OrderBookSnapshot(
+            token_id="no-tok",
+            bids=[(0.55, 100.0)],
+            asks=[],
+        )
+        assert client.get_depth_share(mkt) is None
+
+    def test_none_when_no_book_missing(self):
+        client = self._make_client()
+        mkt = self._make_market()
+        client._books["yes-tok"] = OrderBookSnapshot(
+            token_id="yes-tok",
+            bids=[(0.45, 100.0)],
+            asks=[],
+        )
+        assert client.get_depth_share(mkt) is None
+
+    def test_fifty_fifty_equal_depth(self):
+        client = self._make_client()
+        mkt = self._make_market()
+        client._books["yes-tok"] = OrderBookSnapshot(
+            token_id="yes-tok",
+            bids=[(0.50, 200.0)],
+            asks=[],
+        )
+        client._books["no-tok"] = OrderBookSnapshot(
+            token_id="no-tok",
+            bids=[(0.50, 200.0)],
+            asks=[],
+        )
+        result = client.get_depth_share(mkt)
+        assert result == pytest.approx(0.5)
+
+    def test_yes_heavy_depth(self):
+        """YES has 3× depth → share ≈ 0.75."""
+        client = self._make_client()
+        mkt = self._make_market()
+        client._books["yes-tok"] = OrderBookSnapshot(
+            token_id="yes-tok",
+            bids=[(0.50, 300.0)],
+            asks=[],
+        )
+        client._books["no-tok"] = OrderBookSnapshot(
+            token_id="no-tok",
+            bids=[(0.50, 100.0)],
+            asks=[],
+        )
+        result = client.get_depth_share(mkt)
+        assert result == pytest.approx(0.75)
+
+    def test_depth_cents_filters_deep_bids(self):
+        """Only bids within depth_cents of best bid are included."""
+        client = self._make_client()
+        mkt = self._make_market()
+        # YES: best bid 0.50, one bid at 0.44 (6 cents below) — outside default 5c
+        client._books["yes-tok"] = OrderBookSnapshot(
+            token_id="yes-tok",
+            bids=[(0.50, 100.0), (0.44, 10000.0)],  # deep bid should be excluded
+            asks=[],
+        )
+        client._books["no-tok"] = OrderBookSnapshot(
+            token_id="no-tok",
+            bids=[(0.50, 100.0)],
+            asks=[],
+        )
+        result = client.get_depth_share(mkt, depth_cents=5)
+        # Only the 0.50 bid (size 100) from YES counts → 50/50
+        assert result == pytest.approx(0.5)
+
+    def test_none_when_both_books_empty(self):
+        client = self._make_client()
+        mkt = self._make_market()
+        client._books["yes-tok"] = OrderBookSnapshot(token_id="yes-tok", bids=[], asks=[])
+        client._books["no-tok"] = OrderBookSnapshot(token_id="no-tok", bids=[], asks=[])
+        assert client.get_depth_share(mkt) is None
+
+
 # ── Live smoke test — real CLOB, non-destructive ─────────────────────────────
 # Places an extremely tight (non-fillable) resting post-only order on a real
 # Polymarket market using authenticated CLOB credentials, then immediately

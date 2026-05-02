@@ -47,6 +47,12 @@ class MomentumSignal:
     # ── Path history (Kelly TTE floor / persistence — Phase A) ────────────
     signal_valid_since_ts: float = field(default_factory=time.time)  # Unix ts when signal first cleared all gates
 
+    # ── M-12: gate context at entry time (set by scanner after all gates pass) ──
+    entry_funding_rate: Optional[float] = None      # HL funding rate at scan time
+    entry_yes_depth_share: Optional[float] = None   # YES bid depth share at scan time
+    entry_twap_dev_bps: Optional[float] = None      # oracle TWAP deviation in bps at scan time
+    entry_vol_regime: str = "UNKNOWN"               # vol regime at scan time ("HIGH"/"LOW"/"UNKNOWN")
+
     @property
     def edge_pct(self) -> float:
         """

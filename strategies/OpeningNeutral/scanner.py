@@ -1664,8 +1664,12 @@ class OpeningNeutralScanner(BaseStrategy):
                 winner_pos.prob_sl_threshold = round(
                     winner_pos.entry_price * (1.0 - config.MOMENTUM_PROB_SL_PCT), 6
                 )
-            # promote_position_strategy updates: in-memory strategy, _token_strategy
-            # file (for correct restart restore), and accounting (on_pair_promoted).
+            # Set strategy directly on the in-memory Position object so callers
+            # (including unit tests with mocked RiskEngine) see the new label
+            # immediately.  promote_position_strategy also persists it to disk
+            # and notifies accounting.
+            winner_pos.strategy = "momentum"
+            # promote_position_strategy updates: _token_strategy file and accounting.
             self._risk.promote_position_strategy(market_id, winner_pos.side, "momentum")
             winner_pos.neutral_pair_id = ""  # clear so it is treated as a plain momentum pos
 

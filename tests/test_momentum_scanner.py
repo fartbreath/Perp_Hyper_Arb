@@ -728,9 +728,7 @@ class TestKellySizing:
 
             "kelly_tte_eff_s", "kelly_sigma_eff",
 
-            "kelly_persistence_pct", "kelly_z_boost",
-
-            "kelly_z_before_boost", "kelly_sigma_tau", "kelly_z_total",
+           "kelly_z_raw", "kelly_sigma_tau", "kelly_z_total",
 
             "kelly_win_prob", "kelly_payout_b", "kelly_f",
 
@@ -1076,8 +1074,6 @@ class TestPaperModePositionSizing:
 
             "MOMENTUM_KELLY_MULTIPLIER_BY_TYPE": dict(config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE),
 
-            "MOMENTUM_KELLY_PERSISTENCE_ENABLED": config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
-
         }
 
         config.STRATEGY_MOMENTUM_ENABLED = True
@@ -1097,8 +1093,6 @@ class TestPaperModePositionSizing:
         config.MOMENTUM_KELLY_FRACTION = 1.0   # full-Kelly for sizing arithmetic tests
 
         config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE = {}  # neutralise per-bucket dampeners
-
-        config.MOMENTUM_KELLY_PERSISTENCE_ENABLED = False
 
 
 
@@ -1898,8 +1892,6 @@ class TestKellyTTEFloor:
 
             "MOMENTUM_KELLY_MIN_TTE_SECONDS": config.MOMENTUM_KELLY_MIN_TTE_SECONDS,
 
-            "MOMENTUM_KELLY_PERSISTENCE_ENABLED": config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
-
         }
 
         config.MOMENTUM_MAX_ENTRY_USD = 100.0
@@ -1909,8 +1901,6 @@ class TestKellyTTEFloor:
         config.MOMENTUM_KELLY_FRACTION = 0.6
 
         config.MOMENTUM_KELLY_MIN_TTE_SECONDS = 30
-
-        config.MOMENTUM_KELLY_PERSISTENCE_ENABLED = False
 
         config.MOMENTUM_MIN_TTE_SECONDS = {**config.MOMENTUM_MIN_TTE_SECONDS, "bucket_5m": 60}
 
@@ -2096,1461 +2086,229 @@ class TestKellyTTEFloor:
 
 
 
-class TestKellyPersistence:
 
-    """Persistence z-boost scales linearly from 0 to max over min_tte_floor seconds."""
+# ── M-14: TWAP Deviation Gate ───────────────────────────────────────────────────────
 
 
+class TestTwapDeviationGate:
+    """Unit tests for M-14: TWAP Deviation Gate in _scan_once."""
 
     def setup_method(self):
-
         self._saved = {
-
-            "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
-
-            "MOMENTUM_MIN_ENTRY_USD": config.MOMENTUM_MIN_ENTRY_USD,
-
-            "MOMENTUM_KELLY_FRACTION": config.MOMENTUM_KELLY_FRACTION,
-
-            "MOMENTUM_MIN_TTE_SECONDS": config.MOMENTUM_MIN_TTE_SECONDS,
-
-            "MOMENTUM_KELLY_PERSISTENCE_ENABLED": config.MOMENTUM_KELLY_PERSISTENCE_ENABLED,
-
-            "MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX": config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX,
-
+            "MOMENTUM_TWAP_GATE_ENABLED":               config.MOMENTUM_TWAP_GATE_ENABLED,
+            "MOMENTUM_TWAP_DEV_THRESHOLD_BPS":          config.MOMENTUM_TWAP_DEV_THRESHOLD_BPS,
+            "MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER": config.MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER,
         }
 
-        config.MOMENTUM_MAX_ENTRY_USD = 50.0
-
-        config.MOMENTUM_MIN_ENTRY_USD = 1.0
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        config.MOMENTUM_MIN_TTE_SECONDS = {**config.MOMENTUM_MIN_TTE_SECONDS, "bucket_5m": 60}
-
-        config.MOMENTUM_KELLY_PERSISTENCE_ENABLED = True
-
-        config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX = 0.5
-
-
-
     def teardown_method(self):
-
         for k, v in self._saved.items():
-
             setattr(config, k, v)
 
-
-
-    def test_zero_elapsed_gives_zero_boost(self):
-
-        """Signal just fired (elapsed0) ? persistence_pct0 ? z_boost0."""
-
-        now = time.time()
-
-        sig = _make_signal(
-
-            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
-
-            token_price=0.5, market_type="bucket_5m",
-
-            signal_valid_since_ts=now,  # just now
-
-        )
-
-        _, debug = _compute_kelly_size_usd(sig)
-
-        assert debug["kelly_z_boost"] == pytest.approx(0.0, abs=0.05), (
-
-            "z_boost near zero when signal just fired"
-
-        )
-
-
-
-    def test_full_elapsed_gives_max_boost(self):
-
-        """Signal has been valid for = floor seconds ? persistence_pct=1 ? z_boost=max."""
-
-        # signal_valid_since_ts = floor seconds ago ? pct clamped to 1.0
-
-        floor_s = 60.0
-
-        now = time.time()
-
-        sig = _make_signal(
-
-            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
-
-            token_price=0.5, market_type="bucket_5m",
-
-            signal_valid_since_ts=now - floor_s - 1.0,  # elapsed > floor
-
-        )
-
-        _, debug = _compute_kelly_size_usd(sig)
-
-        assert debug["kelly_persistence_pct"] == pytest.approx(1.0, abs=0.01)
-
-        assert debug["kelly_z_boost"] == pytest.approx(
-
-            config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX, abs=0.01
-
-        )
-
-
-
-    def test_half_elapsed_gives_half_boost(self):
-
-        """Elapsed = floor/2 ? persistence_pct0.5 ? z_boostmax/2."""
-
-        floor_s = 60.0
-
-        now = time.time()
-
-        sig = _make_signal(
-
-            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
-
-            token_price=0.5, market_type="bucket_5m",
-
-            signal_valid_since_ts=now - floor_s / 2,
-
-        )
-
-        _, debug = _compute_kelly_size_usd(sig)
-
-        assert debug["kelly_persistence_pct"] == pytest.approx(0.5, abs=0.06)
-
-        assert debug["kelly_z_boost"] == pytest.approx(
-
-            config.MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX * 0.5, abs=0.06
-
-        )
-
-
-
-    def test_persistence_disabled_gives_no_boost(self):
-
-        """With flag=False, z_boost=0 regardless of elapsed time."""
-
-        config.MOMENTUM_KELLY_PERSISTENCE_ENABLED = False
-
-        floor_s = 60.0
-
-        now = time.time()
-
-        sig = _make_signal(
-
-            delta_pct=3.0, sigma_ann=0.8, tte_seconds=60.0,
-
-            token_price=0.5, market_type="bucket_5m",
-
-            signal_valid_since_ts=now - floor_s * 2,
-
-        )
-
-        _, debug = _compute_kelly_size_usd(sig)
-
-        assert debug["kelly_z_boost"] == pytest.approx(0.0)
-
-        assert debug["kelly_persistence_pct"] == pytest.approx(0.0)
-
-
-
-
-
-# -- Phase D: GTD hedge in _execute_signal -------------------------------------
-
-
-
-class TestGTDHedge:
-
-    """Phase D: after entry, a GTC limit BUY is placed on the opposite token."""
-
-
+    def test_skipped_twap_yes_key_in_summary(self):
+        """skipped_twap_yes counter is present in the scan summary after any scan."""""
+        config.MOMENTUM_TWAP_GATE_ENABLED = True
+        scanner = _make_scanner()
+        mkt = _make_market()
+        scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+        _run(scanner._scan_once())
+        summary = scanner._last_scan_summary or {}
+        assert "skipped_twap_yes" in summary, "skipped_twap_yes must be a scan summary key"
+
+    def test_no_skip_when_gate_disabled(self):
+        """MOMENTUM_TWAP_GATE_ENABLED=False: skipped_twap_yes stays 0.
+        Uses a real market so _last_scan_summary is populated (empty market list
+        returns early before the summary is set, making assertions vacuously true).
+        """
+        config.MOMENTUM_TWAP_GATE_ENABLED = False
+        scanner = _make_scanner()
+        tracker = MagicMock()
+        tracker.get_twap_deviation_bps = MagicMock(return_value=-50.0)
+        tracker.get_vol_regime = MagicMock(return_value="LOW")
+        scanner._oracle_tracker = tracker
+        mkt = _make_market()
+        scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+        _run(scanner._scan_once())
+        summary = scanner._last_scan_summary or {}
+        assert summary.get("skipped_twap_yes", 0) == 0
+
+    def test_no_skip_when_oracle_tracker_none(self):
+        """No oracle_tracker: twap gate fails open, skipped_twap_yes=0.
+        Uses a real market so _last_scan_summary is populated.
+        """
+        config.MOMENTUM_TWAP_GATE_ENABLED = True
+        scanner = _make_scanner()
+        scanner._oracle_tracker = None
+        mkt = _make_market()
+        scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+        _run(scanner._scan_once())
+        summary = scanner._last_scan_summary or {}
+        assert summary.get("skipped_twap_yes", 0) == 0
+
+    def test_no_skip_when_high_vol_regime(self):
+        """HIGH vol regime: gate does not apply, skipped_twap_yes=0.
+        Uses a real market so _last_scan_summary is populated.
+        """
+        config.MOMENTUM_TWAP_GATE_ENABLED = True
+        config.MOMENTUM_TWAP_DEV_THRESHOLD_BPS = -5.0
+        config.MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER = 1.4
+        scanner = _make_scanner()
+        tracker = MagicMock()
+        tracker.get_twap_deviation_bps = MagicMock(return_value=-20.0)
+        tracker.get_vol_regime = MagicMock(return_value="HIGH")
+        scanner._oracle_tracker = tracker
+        mkt = _make_market()
+        scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+        _run(scanner._scan_once())
+        summary = scanner._last_scan_summary or {}
+        assert summary.get("skipped_twap_yes", 0) == 0
+
+    def test_signal_has_entry_twap_fields(self):
+        """MomentumSignal dataclass has entry_twap_dev_bps and entry_vol_regime fields."""
+        sig = _make_signal()
+        assert hasattr(sig, "entry_twap_dev_bps"), "MomentumSignal must have entry_twap_dev_bps"
+        assert hasattr(sig, "entry_vol_regime"), "MomentumSignal must have entry_vol_regime"
+        assert sig.entry_twap_dev_bps is None
+        assert sig.entry_vol_regime == "UNKNOWN"
+
+
+# -- US-02: Funding feed outage detection ---------------------------------------------------
+
+
+class TestFundingFeedOutageDetection:
 
     def setup_method(self):
-
         self._saved = {
-
-            "MOMENTUM_HEDGE_ENABLED": config.MOMENTUM_HEDGE_ENABLED,
-
-            "MOMENTUM_HEDGE_PRICE": config.MOMENTUM_HEDGE_PRICE,
-
-            "MOMENTUM_HEDGE_PRICE_BY_TYPE": dict(config.MOMENTUM_HEDGE_PRICE_BY_TYPE),
-
-            "MOMENTUM_HEDGE_CONTRACTS_PCT": config.MOMENTUM_HEDGE_CONTRACTS_PCT,
-
-            "MOMENTUM_ORDER_TYPE": config.MOMENTUM_ORDER_TYPE,
-
-            "MOMENTUM_PRICE_BAND_LOW": config.MOMENTUM_PRICE_BAND_LOW,
-
-            "MOMENTUM_PRICE_BAND_HIGH": config.MOMENTUM_PRICE_BAND_HIGH,
-
-            "STRATEGY_MOMENTUM_ENABLED": config.STRATEGY_MOMENTUM_ENABLED,
-
-            "BOT_ACTIVE": config.BOT_ACTIVE,
-
-            "MOMENTUM_TP_RESTING_ENABLED": config.MOMENTUM_TP_RESTING_ENABLED,
-
-            "MOMENTUM_HEDGE_MIN_RETAIN_USD": config.MOMENTUM_HEDGE_MIN_RETAIN_USD,
-
-            "MOMENTUM_HEDGE_MAX_TICKS_CONCESSION": config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION,
-
-            "MOMENTUM_HEDGE_AGGRESSIVE_TTE_S": config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S,
-
-            "MOMENTUM_HEDGE_AGGRESSIVE_TAKER": config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER,
-
-            "MOMENTUM_MAX_ENTRY_USD": config.MOMENTUM_MAX_ENTRY_USD,
-
-            "MOMENTUM_KELLY_FRACTION": config.MOMENTUM_KELLY_FRACTION,
-
-            "MOMENTUM_KELLY_MULTIPLIER_BY_TYPE": dict(config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE),
-
-            "MOMENTUM_HEDGE_ENABLED_BY_TYPE": dict(config.MOMENTUM_HEDGE_ENABLED_BY_TYPE),
-
+            "MOMENTUM_FUNDING_GATE_ENABLED": config.MOMENTUM_FUNDING_GATE_ENABLED,
         }
-
-        config.STRATEGY_MOMENTUM_ENABLED = True
-
-        config.BOT_ACTIVE = True
-
-        config.MOMENTUM_PRICE_BAND_LOW = 0.50
-
-        config.MOMENTUM_PRICE_BAND_HIGH = 0.95
-
-        config.MOMENTUM_ORDER_TYPE = "market"  # use place_market for main order
-
-        config.MOMENTUM_TP_RESTING_ENABLED = False  # isolate hedge-only place_limit calls
-        # Neutralise Kelly dampeners so projected PnL > $1 (hedge placement guard).
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-        config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE = {}
-        # Ensure bucket_5m hedge is enabled regardless of config_overrides.json.
-        config.MOMENTUM_HEDGE_ENABLED_BY_TYPE = {
-            **config.MOMENTUM_HEDGE_ENABLED_BY_TYPE, "bucket_5m": True
-        }
-
-
 
     def teardown_method(self):
-
         for k, v in self._saved.items():
+            setattr(config, k, v)
 
-            if k in ("MOMENTUM_HEDGE_PRICE_BY_TYPE", "MOMENTUM_HEDGE_ENABLED_BY_TYPE"):
+    def _make_stale_cache(self):
+        cache = MagicMock()
+        cache.is_stale = MagicMock(return_value=True)
+        cache.get = MagicMock(return_value=None)
+        return cache
 
-                getattr(config, k).clear()
-
-                getattr(config, k).update(v)
-
-            elif k == "MOMENTUM_KELLY_MULTIPLIER_BY_TYPE":
-
-                config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.clear()
-
-                config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.update(v)
-
-            else:
-
-                setattr(config, k, v)
-
-
-
-    def test_hedge_enabled_calls_place_limit_on_opposite_token(self, tmp_path):
-
-        """When MOMENTUM_HEDGE_ENABLED=True, place_limit is called for the hedge."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE = 0.02
-
-
-
-        scanner = _make_scanner(tmp_path)
-
-        scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
-
-        ask_price = 0.85
-
-        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
-
+    def _make_scanner_reaching_funding_gate(self):
+        scanner = _make_scanner()
+        book = _make_book(mid=0.85)
         scanner._pm.get_book = MagicMock(return_value=book)
+        spot_snap = MagicMock()
+        spot_snap.mid = 99900.0
+        spot_snap.timestamp = time.time()
+        scanner._spot.get_spot = MagicMock(return_value=spot_snap)
+        scanner._pm.get_depth_share = MagicMock(return_value=0.60)
+        scanner._cooldown_path = ""  # prevent writing to real cooldowns file
+        return scanner
 
-
-
+    def test_warning_fires_when_all_stale(self):
+        config.MOMENTUM_FUNDING_GATE_ENABLED = True
+        scanner = self._make_scanner_reaching_funding_gate()
+        scanner._funding_cache = self._make_stale_cache()
         mkt = _make_market()
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-
-
-        # Main order via place_market; hedge via place_limit on NO token
-
-        scanner._pm.place_market.assert_called_once()
-
-        scanner._pm.place_limit.assert_called_once()
-
-        call_kwargs = scanner._pm.place_limit.call_args
-
-        assert call_kwargs.kwargs.get("token_id") == mkt.token_id_no or (
-
-            call_kwargs.args and call_kwargs.args[0] == mkt.token_id_no
-
-        )
-
-        assert call_kwargs.kwargs.get("post_only", True) is True
-
-
-
-    def test_hedge_disabled_does_not_call_place_limit(self, tmp_path):
-
-        """When MOMENTUM_HEDGE_ENABLED=False, no GTC limit is placed."""
-
-        config.MOMENTUM_HEDGE_ENABLED = False
-
-
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
-
-        scanner._pm.get_book = MagicMock(return_value=book)
-
-
-
-        mkt = _make_market()
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-
-
-        scanner._pm.place_limit.assert_not_called()
-
-
-
-    def test_hedge_no_side_targets_yes_token(self, tmp_path):
-
-        """For NO side entry, the hedge targets the YES token."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE = 0.02
-
-
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.82
-
-        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
-
-        scanner._pm.get_book = MagicMock(return_value=book)
-
-
-
-        mkt = _make_market()
-
-        sig = _make_signal(side="NO", token_id=mkt.token_id_no,
-
-                           token_price=ask_price, p_yes=1.0 - ask_price)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-
-
-        scanner._pm.place_limit.assert_called_once()
-
-        call = scanner._pm.place_limit.call_args
-
-        # Hedge must target YES token when side is NO
-
-        token_called = call.kwargs.get("token_id") or (call.args and call.args[0])
-
-        assert token_called == mkt.token_id_yes
-
-
-
-    def test_hedge_cost_based_on_entry_size(self, tmp_path):
-
-        """Hedge size in contracts = entry_size × HEDGE_CONTRACTS_PCT."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE = 0.04
-
-        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
-
-        # Use a large enough max entry so projected_pnl = entry_size×(1−price) > $1
-        # (hedge is skipped when projected_pnl ≤ $1).  With bucket_5m kelly_multiplier=0.45:
-        # kelly_size_usd = 0.45 × 20 = 9 USD → entry_size = 9/0.85 ≈ 10.6 → pnl ≈ $1.59.
-        config.MOMENTUM_MAX_ENTRY_USD = 20.0
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
-
-        scanner._pm.get_book = MagicMock(return_value=book)
-
-
-
-        mkt = _make_market()
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-
-
-        call = scanner._pm.place_limit.call_args
-
-        size_called = call.kwargs.get("size") or (len(call.args) >= 4 and call.args[3])
-
-        # Size must be > 0
-
-        if size_called is not None:
-
-            assert float(size_called) > 0
-
-
-
-    def test_hedge_failure_does_not_abort_position(self, tmp_path):
-
-        """Even if hedge place_limit raises, the main position must still open."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE = 0.02
-
-
-
-        scanner = _make_scanner(tmp_path)
-
-        scanner._pm.place_limit = AsyncMock(side_effect=RuntimeError("network error"))
-
-        ask_price = 0.85
-
-        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
-
-        scanner._pm.get_book = MagicMock(return_value=book)
-
-
-
-        mkt = _make_market()
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        result = _run(scanner._execute_signal(sig, mkt))
-
-
-
-        # Main position must still be opened even though hedge failed
-
-        assert result is True
-
-        assert len(scanner._risk.get_open_positions()) == 1
-
-    # ── Live-mode fill: band_floor_abort must NOT fire on a valid taker price ──
-
-    def test_live_fill_valid_price_does_not_trigger_band_floor_abort(self, tmp_path):
-        """Regression: when _fire_trade_fill returns the correct taker price (~0.79),
-        band_floor_abort must NOT be triggered and Phase D (hedge) must fire.
-
-        Historical bug: _fire_trade_fill used maker_orders[i]['price'] (the NO
-        complement, ~0.21) instead of trade_msg['price'] (the YES taker price,
-        ~0.79).  Because 0.21 < MOMENTUM_PRICE_BAND_LOW (0.6), band_floor_abort
-        fired on every live YES trade, recording signal_source='band_floor_abort'
-        and bypassing Phase D entirely so no hedge was ever placed.
-
-        This test sets pm._paper_mode=False and injects a WS fill event that
-        carries the correct taker price (0.79), then asserts:
-          1. The position is opened with entry_price ≈ 0.79 (not band_floor_abort).
-          2. place_limit (Phase D hedge) is called on the opposite token.
-        """
-        import asyncio
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-        config.MOMENTUM_HEDGE_PRICE = 0.03
-        config.MOMENTUM_PRICE_BAND_LOW = 0.60   # 0.79 is above this → no abort
-        config.MOMENTUM_PRICE_BAND_HIGH = 0.95
-        config.MOMENTUM_MAX_ENTRY_USD = 20.0
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        scanner = _make_scanner(tmp_path)
-        # Switch to live mode so the fill-tracking path is exercised
-        scanner._pm._paper_mode = False
-
-        ask_price = 0.79
-        book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
-        scanner._pm.get_book = MagicMock(return_value=book)
-        scanner._pm.get_token_balance = AsyncMock(return_value=None)  # skip balance reconcile
-
-        # Intercept register_fill_future and immediately resolve the future with
-        # the correct TAKER price (0.79), simulating what _fire_trade_fill now
-        # does after the neg-risk complement fix.
-        def _inject_fill(order_id: str, fut: asyncio.Future):
-            fut.get_loop().call_soon(
-                fut.set_result,
-                {"price": ask_price, "size_matched": 12.0},
-            )
-
-        scanner._pm.register_fill_future = MagicMock(side_effect=_inject_fill)
-
-        mkt = _make_market()
-        sig = _make_signal(
-            side="YES",
-            token_id=mkt.token_id_yes,
-            token_price=ask_price,
-            p_yes=ask_price,
-        )
-
-        result = _run(scanner._execute_signal(sig, mkt))
-
-        # ── Assert 1: position opened (not band_floor_abort) ──────────────────
-        assert result is True, (
-            "Expected True (position opened) but got False — "
-            "band_floor_abort may have fired due to wrong complement fill price"
-        )
-        positions = scanner._risk.get_open_positions()
-        assert len(positions) == 1
-        pos = positions[0]
-        assert pos.signal_source != "band_floor_abort", (
-            f"Position recorded signal_source='band_floor_abort' — "
-            "fill price was likely the complement (0.21) not the taker price (0.79)"
-        )
-        assert abs(pos.entry_price - ask_price) < 0.01, (
-            f"entry_price {pos.entry_price:.4f} diverges from taker price {ask_price}"
-        )
-
-        # ── Assert 2: Phase D hedge placed on opposite (NO) token ─────────────
-        scanner._pm.place_limit.assert_called_once()
-        hedge_call = scanner._pm.place_limit.call_args
-        hedge_token = hedge_call.kwargs.get("token_id") or (
-            hedge_call.args[0] if hedge_call.args else None
-        )
-        assert hedge_token == mkt.token_id_no, (
-            f"Hedge should target NO token ({mkt.token_id_no!r}), "
-            f"got {hedge_token!r}"
-        )
-
-    # ── New Phase D tests: profit-safe cap, tactic selection, event emission ──
-
-    def _cap_setup(self, scanner_pm, mkt, ask_price, opp_mid):
-        """Helper: wire get_book so the main token and opp token return different books."""
-        main_book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
-        opp_book = _make_book(mid=opp_mid, age_secs=0.1)
-
-        def _mock(tid):
-            return opp_book if tid == mkt.token_id_no else main_book
-
-        scanner_pm.get_book = MagicMock(side_effect=_mock)
-        return main_book, opp_book
-
-    def _cap_none_setup(self, scanner_pm, mkt, ask_price):
-        """Helper: opp book is None; main book returns ask_price."""
-        main_book = _make_book(mid=ask_price - 0.005, age_secs=0.1)
-
-        def _mock(tid):
-            return None if tid == mkt.token_id_no else main_book
-
-        scanner_pm.get_book = MagicMock(side_effect=_mock)
-        return main_book
-
-    def _compute_cap(self, sig, ask_price, hedge_price, min_retain, contracts_pct=1.0):
-        """Replicate the scanner's cap computation for assertion in tests."""
-        size_usd, _ = _compute_kelly_size_usd(sig)
-        entry_size = round(size_usd / ask_price, 6)
-        hc = round(entry_size * contracts_pct, 6)
-        if round(hc * hedge_price, 6) < 1.0:
-            hc = round(1.0 / hedge_price, 6)
-        proj_pnl = round(entry_size * (1.0 - ask_price), 6)
-        return round(min((proj_pnl - min_retain) / hc, 0.99), 4)
-
-    def test_profit_safe_cap_limits_ladder_max_price(self, tmp_path):
-
-        """Maker ladder never bids above the PnL cap computed from MIN_RETAIN_USD."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
-
-        config.MOMENTUM_HEDGE_PRICE = 0.05
-
-        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
-
-        config.MOMENTUM_MAX_ENTRY_USD = 100.0   # large → entry_size×hedge_price > $1, no raise
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 1.0
-
-        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 10
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        mkt = _make_market()
-
-        # opp book best_ask = 0.80 — well above any cap → maker mode
-
-        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=0.795)
-
-        scanner._pm.place_limit = AsyncMock(return_value=None)  # all attempts fail
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        expected_cap = self._compute_cap(sig, ask_price,
-
-                                         config.MOMENTUM_HEDGE_PRICE,
-
-                                         config.MOMENTUM_HEDGE_MIN_RETAIN_USD)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-        calls = scanner._pm.place_limit.call_args_list
-
-        assert len(calls) >= 1, "Expected at least one ladder attempt"
-
-        for call in calls:
-
-            price_used = call.kwargs.get("price")
-
-            assert price_used is not None
-
-            assert price_used <= expected_cap + 0.0001, (
-
-                f"Ladder price {price_used:.4f} exceeded cap {expected_cap:.4f}"
-
-            )
-
-    def test_taker_branch_fires_when_best_ask_within_cap(self, tmp_path):
-
-        """Book ask ≤ PnL cap triggers a single taker placement (post_only=False)."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
-
-        config.MOMENTUM_HEDGE_PRICE = 0.10
-
-        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
-
-        config.MOMENTUM_MAX_ENTRY_USD = 20.0   # no $1 raise: entry_size×0.10 ≈ 1.06
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.50
-
-        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 3
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        opp_ask = 0.08  # below cap (≈0.103) and below hedge_price (0.10) → taker fires
-
-        mkt = _make_market()
-
-        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=opp_ask - 0.005)
-
-        scanner._pm.place_limit = AsyncMock(return_value="hedge_taker_001")
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-        # Taker = exactly one call, post_only=False, priced at the opp book ask
-
-        assert scanner._pm.place_limit.call_count == 1
-
-        call = scanner._pm.place_limit.call_args
-
-        assert call.kwargs.get("post_only") is False
-
-        assert call.kwargs.get("price") == pytest.approx(opp_ask, abs=0.001)
-
-    def test_ladder_stops_at_cap_not_at_config_n(self, tmp_path):
-
-        """Maker ladder exits early at the PnL cap even when MAX_TICKS_CONCESSION is large."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
-
-        config.MOMENTUM_HEDGE_PRICE = 0.05
-
-        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
-
-        config.MOMENTUM_MAX_ENTRY_USD = 100.0   # large → no $1-minimum raise
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 1.0
-
-        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 20
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        mkt = _make_market()
-
-        # opp book best_ask = 0.80 → above cap (≈0.131) → maker mode
-
-        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=0.795)
-
-        scanner._pm.place_limit = AsyncMock(return_value=None)
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        expected_cap = self._compute_cap(sig, ask_price,
-
-                                         config.MOMENTUM_HEDGE_PRICE,
-
-                                         config.MOMENTUM_HEDGE_MIN_RETAIN_USD)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-        calls = scanner._pm.place_limit.call_args_list
-
-        # Cap cuts the loop short before hitting MAX_TICKS_CONCESSION=20
-
-        assert len(calls) < 20, (
-
-            f"Expected fewer than 20 calls but got {len(calls)}"
-
-        )
-
-        assert len(calls) >= 1
-
-        for call in calls:
-
-            assert call.kwargs.get("price") <= expected_cap + 0.0001
-
-    def test_tte_aggression_forces_taker_mode(self, tmp_path):
-
-        """MOMENTUM_HEDGE_AGGRESSIVE_TTE_S triggers taker when signal tte < threshold."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
-
-        config.MOMENTUM_HEDGE_PRICE = 0.10
-
-        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
-
-        config.MOMENTUM_MAX_ENTRY_USD = 20.0   # no $1 raise: entry_size×0.10 ≈ 1.06
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.0
-
-        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 3
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 30  # taker fires when tte < 30s
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        # end_date = now + 15s so _hedge_tte_now = 15s < AGGRESSIVE_TTE_S=30s → taker fires
-        mkt = _make_market(end_date=datetime.now(timezone.utc) + timedelta(seconds=15))
-
-        # No opp book → _opp_best_ask = None; taker fires via TTE-aggression condition
-
-        self._cap_none_setup(scanner._pm, mkt, ask_price)
-
-        scanner._pm.place_limit = AsyncMock(return_value="hedge_tte_001")
-
-        # delta_pct=10 gives strong oracle win_prob at tte=15s (kelly_f > 0)
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price, tte_seconds=15.0,
-
-                           delta_pct=10.0)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-        # TTE aggression → taker: exactly one call, post_only=False
-
-        assert scanner._pm.place_limit.call_count == 1
-
-        call = scanner._pm.place_limit.call_args
-
-        assert call.kwargs.get("post_only") is False
-
-    def test_ladder_exhausted_emits_hedge_fail(self, tmp_path):
-
-        """All maker ladder attempts returning None triggers a HEDGE_FAIL event."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
-
-        config.MOMENTUM_HEDGE_PRICE = 0.10
-
-        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
-
-        config.MOMENTUM_MAX_ENTRY_USD = 20.0
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.0
-
-        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 1
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        mkt = _make_market()
-
-        # opp best_ask = 0.85 >> max_hedge_price = 0.10 → maker mode (taker not triggered)
-
-        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=ask_price - 0.005)
-
-        scanner._pm.place_limit = AsyncMock(return_value=None)
-
-        scanner._risk.register_hedge_order = MagicMock()
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        with patch("strategies.Momentum.scanner._emit_event") as mock_emit:
-
-            result = _run(scanner._execute_signal(sig, mkt))
-
-        hedge_fail_calls = [c for c in mock_emit.call_args_list
-
-                            if c.args and c.args[0] == "HEDGE_FAIL"]
-
-        assert len(hedge_fail_calls) == 1
-
-        assert hedge_fail_calls[0].kwargs.get("reason") == "all_attempts_exhausted"
-
-        # Position still opened
-
-        assert result is True
-
-        # No hedge order registered
-
-        scanner._risk.register_hedge_order.assert_not_called()
-
-    def test_negative_pnl_cap_skips_hedge(self, tmp_path):
-
-        """When MIN_RETAIN_USD exceeds projected PnL, cap is negative and hedge is skipped."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
-
-        config.MOMENTUM_HEDGE_PRICE = 0.10
-
-        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
-
-        config.MOMENTUM_MAX_ENTRY_USD = 20.0
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        # 2.0 > projected_pnl ≈ 1.59 → cap < 0 → hedge skipped
-
-        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 2.0
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        mkt = _make_market()
-
-        self._cap_setup(scanner._pm, mkt, ask_price, opp_mid=ask_price - 0.005)
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        result = _run(scanner._execute_signal(sig, mkt))
-
-        scanner._pm.place_limit.assert_not_called()
-
-        assert result is True
-
-    def test_global_aggressive_taker_fires_without_book(self, tmp_path):
-
-        """AGGRESSIVE_TAKER=True places a taker order even when no opp book is available."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE_BY_TYPE.clear()
-
-        config.MOMENTUM_HEDGE_PRICE = 0.10
-
-        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
-
-        config.MOMENTUM_MAX_ENTRY_USD = 20.0   # no $1 raise: entry_size×0.10 ≈ 1.06
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.0
-
-        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 3
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = True
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        mkt = _make_market()
-
-        # No opp book → _opp_best_ask = None; taker fires from global flag alone
-
-        # taker_price = hedge_price = 0.10 ≤ max_hedge_price = 0.10 ✓
-
-        self._cap_none_setup(scanner._pm, mkt, ask_price)
-
-        scanner._pm.place_limit = AsyncMock(return_value="hedge_agg_001")
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-        # Single taker call (post_only=False) at hedge_price (0.10)
-
-        assert scanner._pm.place_limit.call_count == 1
-
-        call = scanner._pm.place_limit.call_args
-
-        assert call.kwargs.get("post_only") is False
-
-        assert call.kwargs.get("price") == pytest.approx(0.10, abs=0.001)
-
-    def test_taker_min_size_budget_check_skips_when_exceeds_cap(self, tmp_path):
-
-        """$1 minimum-size raise makes taker_cost exceed cap_budget — taker is skipped."""
-
-        config.MOMENTUM_HEDGE_ENABLED = True
-
-        config.MOMENTUM_HEDGE_PRICE = 0.05
-
-        config.MOMENTUM_HEDGE_CONTRACTS_PCT = 1.0
-
-        config.MOMENTUM_MAX_ENTRY_USD = 20.0
-
-        config.MOMENTUM_KELLY_FRACTION = 1.0
-
-        # cap ≈ (1.59 - 1.00) / 10.59 ≈ 0.056; opp_ask = 0.04 triggers taker
-
-        # $1 min raise: 10.59×0.04 = 0.42 < $1 → raised to 25 contracts → cost = $1
-
-        # cap_budget = 1.59 - 1.00 = 0.59 < $1 → skip
-
-        config.MOMENTUM_HEDGE_MIN_RETAIN_USD = 1.00
-
-        config.MOMENTUM_HEDGE_MAX_TICKS_CONCESSION = 3
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TAKER = False
-
-        config.MOMENTUM_HEDGE_AGGRESSIVE_TTE_S = 0
-
-        scanner = _make_scanner(tmp_path)
-
-        ask_price = 0.85
-
-        # Opposite book: best_ask = 0.04, which is within the cap (≈0.056)
-
-        opp_book = _make_book(mid=0.035, age_secs=0.1)  # asks at 0.04
-
-        scanner._pm.get_book = MagicMock(return_value=opp_book)
-
-        scanner._pm.place_limit = AsyncMock(return_value="should_not_be_called")
-
-        mkt = _make_market()
-
-        sig = _make_signal(side="YES", token_id=mkt.token_id_yes,
-
-                           token_price=ask_price, p_yes=ask_price)
-
-        _run(scanner._execute_signal(sig, mkt))
-
-        # Taker price (0.04) ≤ cap (≈0.056), but $1 minimum makes cost = $1 > cap_budget (≈0.59)
-
-        # → no placement
-
-        scanner._pm.place_limit.assert_not_called()
-
-
-
-
-
-# -- Phase E: win-rate gate in _scan_once --------------------------------------
-
-
-
-class TestWinRateGateScanner:
-
-    """Phase E: scanner _win_rate attribute and gate integration."""
-
-
-
-    def test_scanner_has_win_rate_attribute(self, tmp_path):
-
-        """Scanner must have _win_rate attribute after construction."""
-
-        scanner = _make_scanner(tmp_path)
-
-        assert hasattr(scanner, "_win_rate")
-
-        # May be None if win_rate module couldn't load data  that's fine
-
-        # as long as the attribute exists
-
-
-
-    def test_win_rate_enabled_flag_gates_signal(self, tmp_path):
-
-        """When gate is enabled and empirical WR < model_wr * factor, signal is gated.
-
-
-
-        Uses TTE=25 s (inside bucket_5m entry window of 30 s) so the market
-
-        reaches the win_rate gate.  Empirical WR of 0.10 vs model 0.85 triggers gate.
-
-        """
-
-        orig_enabled = config.MOMENTUM_WIN_RATE_GATE_ENABLED
-
-        orig_factor = config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR
-
-        orig_band_lo = config.MOMENTUM_PRICE_BAND_LOW
-
-        orig_band_hi = config.MOMENTUM_PRICE_BAND_HIGH
-
-        config.MOMENTUM_WIN_RATE_GATE_ENABLED = True
-
-        config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR = 0.9
-
-        config.STRATEGY_MOMENTUM_ENABLED = True
-
-        config.BOT_ACTIVE = True
-
-        # Keep default band [0.80, 0.90]; book mid 0.85 is in-band
-
-
-
-        try:
-
-            scanner = _make_scanner(tmp_path)
-
-            scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
-
-
-
-            # Inject a mock win_rate that returns a very low empirical WR (0.10)
-
-            mock_wr = MagicMock()
-
-            mock_wr.get = MagicMock(return_value=0.10)  # 10% empirical WR -> gate fires
-
-            scanner._win_rate = mock_wr
-
-
-
-            # TTE = 25 s: inside the bucket_5m entry window (min_tte = 30 s)
-
-            mkt = _make_market(market_type="bucket_5m",
-
-                               end_date=datetime.now(timezone.utc) + timedelta(seconds=25))
-
-            scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
-
-
-
-            book = _make_book(mid=0.85, age_secs=0.0)
-
-            scanner._pm.get_book = MagicMock(return_value=book)
-
-            scanner._pm._books = {mkt.token_id_yes: book}
-
-            scanner._token_to_market = {mkt.token_id_yes: mkt, mkt.token_id_no: mkt}
-
-
-
-            fresh_spot = SpotPrice(coin="BTC", price=70_100.0, timestamp=time.time())
-
-            spot = MagicMock()
-
-            spot.get_spot = MagicMock(return_value=fresh_spot)
-
-            spot.get_mid = MagicMock(return_value=70_100.0)
-
-            scanner._spot = spot
-
-
-
-            asyncio.get_event_loop().run_until_complete(scanner._scan_once())
-
-
-
-            diags = scanner._last_scan_diags
-
-            assert any(d.get("skip_reason") == "win_rate_gate" for d in diags), (
-
-                f"Expected 'win_rate_gate' in diags, got: {[d.get('skip_reason') for d in diags]}"
-
-            )
-
-            assert scanner._last_scan_summary.get("skipped_win_rate", 0) >= 1
-
-        finally:
-
-            config.MOMENTUM_WIN_RATE_GATE_ENABLED = orig_enabled
-
-            config.MOMENTUM_WIN_RATE_GATE_MIN_FACTOR = orig_factor
-
-            config.MOMENTUM_PRICE_BAND_LOW = orig_band_lo
-
-            config.MOMENTUM_PRICE_BAND_HIGH = orig_band_hi
-
-
-
-
-
-# -- Phase P3: _signal_first_valid persistence --------------------------------
-
-
-
-class TestSignalFirstValidPersistence:
-
-    """Phase P3: _signal_first_valid persists across restarts via disk-backed JSON."""
-
-
-
-    def test_scanner_has_signal_first_valid_path(self, tmp_path):
-
-        """Scanner must expose _signal_first_valid_path attribute."""
-
-        scanner = _make_scanner(tmp_path)
-
-        scanner._signal_first_valid_path = str(tmp_path / "sfv.json")
-
-        assert hasattr(scanner, "_signal_first_valid_path")
-
-
-
-    def test_signal_first_valid_loaded_from_disk_on_init(self, tmp_path):
-
-        """If signal_first_valid.json exists, values are loaded on init."""
-
-        sfv_path = str(tmp_path / "sfv.json")
-
-        existing = {"cond_abc": 1_700_000_000.0, "cond_def": 1_700_000_100.0}
-
-        _save_cooldowns(sfv_path, existing)
-
-
-
-        scanner = _make_scanner(tmp_path)
-
-        # Patch the path after construction then reload
-
-        scanner._signal_first_valid_path = sfv_path
-
-        scanner._signal_first_valid = _load_cooldowns(sfv_path)
-
-
-
-        assert scanner._signal_first_valid.get("cond_abc") == pytest.approx(1_700_000_000.0)
-
-        assert scanner._signal_first_valid.get("cond_def") == pytest.approx(1_700_000_100.0)
-
-
-
-    def test_signal_first_valid_persisted_after_scan(self, tmp_path):
-
-        """After _scan_once, signal_first_valid must be saved to disk."""
-
-        import asyncio
-
-        from datetime import datetime, timezone, timedelta
-
-
-
-        config.STRATEGY_MOMENTUM_ENABLED = True
-
-        config.BOT_ACTIVE = True
-
-        config.MOMENTUM_PRICE_BAND_LOW = 0.50
-
-        config.MOMENTUM_PRICE_BAND_HIGH = 0.95
-
-
-
-        scanner = _make_scanner(tmp_path)
-
-        sfv_path = str(tmp_path / "sfv.json")
-
-        scanner._signal_first_valid_path = sfv_path
-
-        scanner._signal_first_valid["cond_persist_test"] = 1_700_000_000.0
-
-
-
-        mkt = _make_market(condition_id="cond_001",
-
-                           end_date=datetime.now(timezone.utc) + timedelta(seconds=90))
-
         scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+        with patch("strategies.Momentum.scanner.log") as mock_log:
+            _run(scanner._scan_once())
+        summary = scanner._last_scan_summary or {}
+        assert summary.get("skipped_funding_stale", 0) == 1, (
+            "Expected market to reach funding gate. scan summary: " + str(summary)
+        )
+        warning_msgs = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert any("funding feed outage" in m for m in warning_msgs), (
+            "Expected outage warning. calls: " + str(warning_msgs)
+        )
+
+    def test_no_warning_when_gate_disabled(self):
+        config.MOMENTUM_FUNDING_GATE_ENABLED = False
+        scanner = self._make_scanner_reaching_funding_gate()
+        scanner._funding_cache = self._make_stale_cache()
+        mkt = _make_market()
+        scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+        with patch("strategies.Momentum.scanner.log") as mock_log:
+            _run(scanner._scan_once())
+        warning_msgs = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert not any("funding feed outage" in m for m in warning_msgs)
+
+    def test_no_warning_when_funding_cache_none(self):
+        config.MOMENTUM_FUNDING_GATE_ENABLED = True
+        scanner = self._make_scanner_reaching_funding_gate()
+        scanner._funding_cache = None
+        mkt = _make_market()
+        scanner._pm.get_markets = MagicMock(return_value={mkt.condition_id: mkt})
+        with patch("strategies.Momentum.scanner.log") as mock_log:
+            _run(scanner._scan_once())
+        warning_msgs = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert not any("funding feed outage" in m for m in warning_msgs)
+
+    def test_no_warning_with_empty_market_list(self):
+        config.MOMENTUM_FUNDING_GATE_ENABLED = True
+        scanner = _make_scanner()
+        scanner._funding_cache = self._make_stale_cache()
+        scanner._pm.get_markets = MagicMock(return_value={})
+        with patch("strategies.Momentum.scanner.log") as mock_log:
+            _run(scanner._scan_once())
+        warning_msgs = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert not any("funding feed outage" in m for m in warning_msgs)
 
 
-
-        book = _make_book(mid=0.50, age_secs=5.0)  # stale ? all skipped
-
-        scanner._pm.get_book = MagicMock(return_value=book)
-
-        scanner._pm._books = {mkt.token_id_yes: book}
-
-        scanner._token_to_market = {mkt.token_id_yes: mkt, mkt.token_id_no: mkt}
+# -- US-03: Startup pipeline availability warnings ------------------------------------------
 
 
+class TestStartupPipelineWarnings:
 
-        fresh_spot = SpotPrice(coin="BTC", price=70_000.0, timestamp=time.time())
+    def setup_method(self):
+        self._saved = {
+            "MOMENTUM_FUNDING_GATE_ENABLED": config.MOMENTUM_FUNDING_GATE_ENABLED,
+            "MOMENTUM_DEPTH_SHARE_GATE_ENABLED": config.MOMENTUM_DEPTH_SHARE_GATE_ENABLED,
+        }
 
-        spot = MagicMock()
+    def teardown_method(self):
+        for k, v in self._saved.items():
+            setattr(config, k, v)
 
-        spot.get_spot = MagicMock(return_value=fresh_spot)
+    def test_funding_cache_none_warns_when_gate_enabled(self):
+        config.MOMENTUM_FUNDING_GATE_ENABLED = True
+        scanner = _make_scanner()
+        scanner._funding_cache = None
+        scanner._scan_loop = AsyncMock()
+        with patch("strategies.Momentum.scanner.log") as mock_log:
+            _run(scanner.start())
+        warning_msgs = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert any(
+            "MOMENTUM_FUNDING_GATE_ENABLED=True but funding_cache is None" in m
+            for m in warning_msgs
+        ), "Expected startup warning. calls: " + str(warning_msgs)
 
-        spot.get_mid = MagicMock(return_value=70_000.0)
+    def test_funding_cache_none_no_warn_when_gate_disabled(self):
+        config.MOMENTUM_FUNDING_GATE_ENABLED = False
+        scanner = _make_scanner()
+        scanner._funding_cache = None
+        scanner._scan_loop = AsyncMock()
+        with patch("strategies.Momentum.scanner.log") as mock_log:
+            _run(scanner.start())
+        warning_msgs = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert not any("funding_cache is None" in m for m in warning_msgs)
 
-        spot.on_rtds_update = MagicMock()
+    def test_depth_share_not_callable_warns_when_gate_enabled(self):
+        config.MOMENTUM_DEPTH_SHARE_GATE_ENABLED = True
+        scanner = _make_scanner()
+        scanner._pm.get_depth_share = None
+        scanner._scan_loop = AsyncMock()
+        with patch("strategies.Momentum.scanner.log") as mock_log:
+            _run(scanner.start())
+        warning_msgs = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert any(
+            "MOMENTUM_DEPTH_SHARE_GATE_ENABLED=True but pm.get_depth_share" in m
+            for m in warning_msgs
+        ), "Expected startup warning. calls: " + str(warning_msgs)
 
-        spot.on_chainlink_update = MagicMock()
-
-        scanner._spot = spot
-
-
-
-        asyncio.get_event_loop().run_until_complete(scanner._scan_once())
-
-
-
-        # The file must exist and must contain our pre-seeded entry (if not popped)
-
-        loaded = _load_cooldowns(sfv_path)
-
-        # Either the key survived (not popped during scan) or was correctly cleaned up
-
-        # Either way the file must exist after the scan
-
-        import os
-
-        assert os.path.exists(sfv_path), "_signal_first_valid must be saved to disk after scan"
-
-
-
-    def test_signal_first_valid_missing_file_returns_empty(self, tmp_path):
-
-        """Loading from a missing file must return empty dict (no crash)."""
-
-        result = _load_cooldowns(str(tmp_path / "missing.json"))
-
-        assert result == {}
-
-
-
-
-# ── Item 4: VWAP/RoC secondary filter ────────────────────────────────────────
-
-
-class TestCheckVwapRoc:
-
-    def _build_history(self, prices, base_ts=1000.0, step=1.0):
-        return [(base_ts + i * step, p, 100.0) for i, p in enumerate(prices)]
-
-    def test_no_data_passes_permissively(self):
-        from strategies.Momentum.scanner import _check_vwap_roc
-        ok, debug = _check_vwap_roc([], now_ts=1000.0, min_dev_pct=1.0,
-                                    vwap_window_sec=30, roc_min_pct=1.0, roc_window_sec=60)
-        assert ok is True
-        assert debug.get("vwap_filter") == "no_data"
-
-    def test_insufficient_data_passes_permissively(self):
-        from strategies.Momentum.scanner import _check_vwap_roc
-        history = self._build_history([0.60, 0.61], base_ts=1000.0)
-        ok, _ = _check_vwap_roc(history, now_ts=1010.0, min_dev_pct=1.0,
-                                 vwap_window_sec=30, roc_min_pct=1.0, roc_window_sec=60)
-        assert ok is True
-
-    def test_zero_thresholds_always_pass(self):
-        from strategies.Momentum.scanner import _check_vwap_roc
-        history = self._build_history([0.50] * 35, base_ts=1000.0)
-        ok, _ = _check_vwap_roc(history, now_ts=1034.0, min_dev_pct=0.0,
-                                 vwap_window_sec=30, roc_min_pct=0.0, roc_window_sec=60)
-        assert ok is True
-
-    def test_upward_momentum_passes(self):
-        from strategies.Momentum.scanner import _check_vwap_roc
-        prices = [round(0.60 + i * (0.05 / 34), 4) for i in range(35)]
-        history = self._build_history(prices, base_ts=1000.0)
-        ok, debug = _check_vwap_roc(history, now_ts=1034.0, min_dev_pct=1.0,
-                                    vwap_window_sec=30, roc_min_pct=0.5, roc_window_sec=30)
-        assert ok is True
-        assert debug["vwap_dev_pct"] > 0
-
-    def test_flat_prices_fail_positive_dev_threshold(self):
-        import pytest
-        from strategies.Momentum.scanner import _check_vwap_roc
-        history = self._build_history([0.60] * 35, base_ts=1000.0)
-        ok, debug = _check_vwap_roc(history, now_ts=1034.0, min_dev_pct=1.0,
-                                    vwap_window_sec=30, roc_min_pct=0.0, roc_window_sec=60)
-        assert ok is False
-        assert debug["vwap_dev_pct"] == pytest.approx(0.0, abs=0.01)
-
-    def test_negative_roc_fails_positive_threshold(self):
-        from strategies.Momentum.scanner import _check_vwap_roc
-        prices = [round(0.70 - i * (0.10 / 34), 4) for i in range(35)]
-        history = self._build_history(prices, base_ts=1000.0)
-        ok, debug = _check_vwap_roc(history, now_ts=1034.0, min_dev_pct=0.0,
-                                    vwap_window_sec=30, roc_min_pct=1.0, roc_window_sec=30)
-        assert ok is False
-        assert debug.get("roc_pct", 0) < 0
-
-    def test_debug_dict_has_expected_keys(self):
-        from strategies.Momentum.scanner import _check_vwap_roc
-        history = self._build_history([0.80] * 10, base_ts=1000.0)
-        _, debug = _check_vwap_roc(history, now_ts=1009.0, min_dev_pct=0.0,
-                                   vwap_window_sec=30, roc_min_pct=0.0, roc_window_sec=60)
-        assert "vwap" in debug
-        assert "vwap_dev_pct" in debug
-        assert "vwap_samples" in debug
-
-
-# ── Item 6: event_log.emit / read_recent ─────────────────────────────────────
-
-
-class TestEventLog:
-
-    def test_emit_creates_file_and_valid_json(self, tmp_path):
-        import json as _json
-        from strategies.Momentum import event_log as el
-        orig = el.MOMENTUM_EVENTS_PATH
-        el.MOMENTUM_EVENTS_PATH = tmp_path / "events.jsonl"
-        try:
-            el.emit("TEST_EVENT", market_id="mkt_001", side="YES", order_price=0.85)
-            lines = el.MOMENTUM_EVENTS_PATH.read_text().splitlines()
-            assert len(lines) == 1
-            row = _json.loads(lines[0])
-            assert row["event"] == "TEST_EVENT"
-            assert row["market_id"] == "mkt_001"
-            assert row["schema_version"] == 1
-            assert "ts" in row
-        finally:
-            el.MOMENTUM_EVENTS_PATH = orig
-
-    def test_emit_multiple_events_appends(self, tmp_path):
-        from strategies.Momentum import event_log as el
-        orig = el.MOMENTUM_EVENTS_PATH
-        el.MOMENTUM_EVENTS_PATH = tmp_path / "events.jsonl"
-        try:
-            el.emit("SESSION_START", bot_version="momentum")
-            el.emit("BUY_SUBMIT", market_id="m1", side="YES")
-            el.emit("BUY_FILL", market_id="m1", fill_price=0.85)
-            lines = el.MOMENTUM_EVENTS_PATH.read_text().splitlines()
-            assert len(lines) == 3
-        finally:
-            el.MOMENTUM_EVENTS_PATH = orig
-
-    def test_read_recent_returns_newest_first(self, tmp_path):
-        from strategies.Momentum import event_log as el
-        orig = el.MOMENTUM_EVENTS_PATH
-        el.MOMENTUM_EVENTS_PATH = tmp_path / "events.jsonl"
-        try:
-            el.emit("EVENT_A", seq=1)
-            el.emit("EVENT_B", seq=2)
-            el.emit("EVENT_C", seq=3)
-            records = el.read_recent(10)
-            assert records[0]["event"] == "EVENT_C"
-            assert records[-1]["event"] == "EVENT_A"
-        finally:
-            el.MOMENTUM_EVENTS_PATH = orig
-
-    def test_read_recent_respects_n_limit(self, tmp_path):
-        from strategies.Momentum import event_log as el
-        orig = el.MOMENTUM_EVENTS_PATH
-        el.MOMENTUM_EVENTS_PATH = tmp_path / "events.jsonl"
-        try:
-            for i in range(10):
-                el.emit("PING", seq=i)
-            records = el.read_recent(3)
-            assert len(records) == 3
-        finally:
-            el.MOMENTUM_EVENTS_PATH = orig
-
-    def test_read_recent_missing_file_returns_empty(self, tmp_path):
-        from strategies.Momentum import event_log as el
-        orig = el.MOMENTUM_EVENTS_PATH
-        el.MOMENTUM_EVENTS_PATH = tmp_path / "nonexistent.jsonl"
-        try:
-            records = el.read_recent(10)
-            assert records == []
-        finally:
-            el.MOMENTUM_EVENTS_PATH = orig
-
-    def test_emit_never_raises_on_bad_path(self):
-        from pathlib import Path
-        from strategies.Momentum import event_log as el
-        orig = el.MOMENTUM_EVENTS_PATH
-        el.MOMENTUM_EVENTS_PATH = Path("/nonexistent_root_xyz/events.jsonl")
-        try:
-            el.emit("CRASH_TEST")  # must not raise
-        finally:
-            el.MOMENTUM_EVENTS_PATH = orig
+    def test_depth_share_callable_no_warn(self):
+        config.MOMENTUM_DEPTH_SHARE_GATE_ENABLED = True
+        scanner = _make_scanner()
+        scanner._scan_loop = AsyncMock()
+        with patch("strategies.Momentum.scanner.log") as mock_log:
+            _run(scanner.start())
+        warning_msgs = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert not any("get_depth_share" in m for m in warning_msgs)

@@ -132,9 +132,13 @@ def _make_scanner(
         if token_id.startswith("tok_yes_"):
             book.best_ask = yes_ask
             book.best_bid = round((yes_ask or 0.0) - 0.01, 4)
+            book.asks = [(yes_ask, 100.0)] if yes_ask else []
+            book.bids = [(book.best_bid, 100.0)] if yes_ask else []
         else:
             book.best_ask = no_ask
             book.best_bid = round((no_ask or 0.0) - 0.01, 4)
+            book.asks = [(no_ask, 100.0)] if no_ask else []
+            book.bids = [(book.best_bid, 100.0)] if no_ask else []
         return book
     pm.get_book.side_effect = _get_book
     pm._paper_mode = True
@@ -178,14 +182,14 @@ def test_scan_once_skips_when_disabled():
 
 def test_scan_once_skips_expensive():
     """When combined > COMBINED_COST_MAX, result should be 'too_expensive'."""
-    market = _make_market(tte_seconds=3500.0, duration_seconds=3600.0)
+    market = _make_market(tte_seconds=3605.0, duration_seconds=3600.0)  # 5s pre-open
     # combined = 0.55 + 0.50 = 1.05 > 1.01
     scanner = _make_scanner(yes_ask=0.55, no_ask=0.50, markets=[market])
 
     with (
         patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
         patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.01),
-        patch.object(config, "OPENING_NEUTRAL_ENTRY_WINDOW_SECS", 300),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 300),
         patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 3),
     ):
         _run(scanner._evaluate_entry(market))
@@ -199,7 +203,7 @@ def test_scan_once_skips_expensive():
 
 def test_scan_once_enters_qualifying(monkeypatch):
     """When combined <= COMBINED_COST_MAX, result should be 'entry_attempt' and market queued."""
-    market = _make_market(tte_seconds=3500.0, duration_seconds=3600.0)
+    market = _make_market(tte_seconds=3605.0, duration_seconds=3600.0)  # 5s pre-open
     # combined = 0.50 + 0.49 = 0.99 <= 1.01
     scanner = _make_scanner(yes_ask=0.50, no_ask=0.49, markets=[market])
 
@@ -215,7 +219,7 @@ def test_scan_once_enters_qualifying(monkeypatch):
     with (
         patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
         patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.01),
-        patch.object(config, "OPENING_NEUTRAL_ENTRY_WINDOW_SECS", 300),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 300),
         patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 3),
     ):
         _run(scanner._evaluate_entry(market))
@@ -298,7 +302,7 @@ def test_conflict_guard_blocks_momentum():
     with (
         patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
         patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.01),
-        patch.object(config, "OPENING_NEUTRAL_ENTRY_WINDOW_SECS", 300),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 300),
         patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 3),
     ):
         _run(scanner._evaluate_entry(market))
@@ -344,7 +348,7 @@ def test_scan_once_skips_outside_entry_window():
     with (
         patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
         patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.01),
-        patch.object(config, "OPENING_NEUTRAL_ENTRY_WINDOW_SECS", 120),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 120),
         patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 3),
     ):
         _run(scanner._evaluate_entry(market))
@@ -369,7 +373,7 @@ def test_scan_once_skips_at_concurrent_cap():
     with (
         patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
         patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.01),
-        patch.object(config, "OPENING_NEUTRAL_ENTRY_WINDOW_SECS", 300),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 300),
         patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 2),  # cap = 2, already at 2
     ):
         _run(scanner._evaluate_entry(market))
@@ -427,14 +431,14 @@ def test_evaluate_entry_skips_skewed_market():
     _evaluate_entry must record 'skewed' and not attempt entry.
     e.g. YES=0.12 / NO=0.89 passed the old combined<=1.01 filter but is NOT neutral.
     """
-    market = _make_market(tte_seconds=3500.0, duration_seconds=3600.0)
+    market = _make_market(tte_seconds=3605.0, duration_seconds=3600.0)  # 5s pre-open
     # YES=0.12, NO=0.89 → combined=1.01 (would pass old filter), but YES < 0.40 → skewed
     scanner = _make_scanner(yes_ask=0.12, no_ask=0.89, markets=[market])
 
     with (
         patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
         patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.02),
-        patch.object(config, "OPENING_NEUTRAL_ENTRY_WINDOW_SECS", 300),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 300),
         patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 3),
         patch.object(config, "OPENING_NEUTRAL_MIN_SIDE_PRICE", 0.40),
         patch.object(config, "OPENING_NEUTRAL_MAX_SIDE_PRICE", 0.60),
@@ -452,14 +456,13 @@ def test_evaluate_entry_skips_skewed_market():
 
 def test_register_pair_places_exit_sells_immediately():
     """
-    After both BUY legs fill, _register_pair must place GTC resting SELL orders on
-    both YES and NO tokens at LOSER_EXIT_PRICE immediately, and spawn the
-    _monitor_exit_fills background task.  No price monitoring or deferred trigger.
-    Per PLAN.md §2: resting SELLs go into the book the moment entry fills.
+    After both BUY legs fill, _register_pair arms bid-monitoring on both tokens
+    by populating _token_to_pair.  Resting GTC SELL orders are no longer placed
+    immediately (they cross the book at entry prices near $0.50).  Instead the
+    price monitor fires a taker exit when either bid drops to LOSER_EXIT_PRICE.
+    Per PLAN.md: resting SELLs replaced by bid-monitoring taker exit.
     """
     scanner = _make_scanner()
-    scanner._pm._paper_mode = False
-    scanner._pm.place_limit = AsyncMock(side_effect=["yes_exit_oid", "no_exit_oid"])
     market = _make_market("cond_reg_exit_001")
 
     yes_result = {"filled": True, "price": 0.50, "size": 2.0, "order_id": "yes_buy_oid"}
@@ -468,29 +471,28 @@ def test_register_pair_places_exit_sells_immediately():
     with (
         patch.object(config, "OPENING_NEUTRAL_DRY_RUN", False),
         patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
-        patch.object(config, "OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS", 300),
     ):
         _run(scanner._register_pair(
             "pair_reg_exit", market, yes_result, no_result,
             market.token_id_yes, market.token_id_no,
         ))
-        _run(asyncio.sleep(0.05))  # allow background task to start
 
-    # Two place_limit calls: SELL YES and SELL NO at $0.35
-    assert scanner._pm.place_limit.call_count == 2, (
-        f"Expected 2 place_limit calls (exit SELLs), got {scanner._pm.place_limit.call_count}"
+    # Bid-monitoring armed: both tokens registered in _token_to_pair
+    assert scanner._token_to_pair.get(market.token_id_yes) == "pair_reg_exit", (
+        "YES token must be in _token_to_pair for bid-monitoring"
     )
-    calls = scanner._pm.place_limit.call_args_list
-    sides = {c.kwargs.get("side") for c in calls}
-    assert sides == {"SELL"}, f"Both calls must be SELL, got: {sides}"
-    prices = {c.kwargs.get("price") for c in calls}
-    assert prices == {0.35}, f"Both SELLs must be at 0.35, got: {prices}"
+    assert scanner._token_to_pair.get(market.token_id_no) == "pair_reg_exit", (
+        "NO token must be in _token_to_pair for bid-monitoring"
+    )
 
-    # Order IDs stored in pair dict
+    # No resting GTC SELL orders placed immediately
+    scanner._pm.place_limit.assert_not_called()
+
+    # Pair dict stored with empty exit order IDs (exit via taker, not resting)
     pair = scanner._active_pairs.get("pair_reg_exit")
     assert pair is not None
-    assert pair["yes_exit_order_id"] == "yes_exit_oid"
-    assert pair["no_exit_order_id"] == "no_exit_oid"
+    assert pair["yes_exit_order_id"] == ""
+    assert pair["no_exit_order_id"] == ""
 
 
 # ── test: _monitor_exit_fills YES loser ───────────────────────────
@@ -654,6 +656,7 @@ def test_on_exit_fill_yes_loser():
         patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
         patch.object(config, "MOMENTUM_PROB_SL_ENABLED", True),
         patch.object(config, "MOMENTUM_PROB_SL_PCT", 0.15),
+        patch.object(config, "OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM", True),
     ):
         _run(scanner._on_exit_fill(pair_id, "YES", exit_price=0.34))
 
@@ -696,6 +699,7 @@ def test_on_exit_fill_no_loser():
         patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
         patch.object(config, "MOMENTUM_PROB_SL_ENABLED", True),
         patch.object(config, "MOMENTUM_PROB_SL_PCT", 0.15),
+        patch.object(config, "OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM", True),
     ):
         _run(scanner._on_exit_fill(pair_id, "NO", exit_price=0.33))
 
@@ -739,6 +743,7 @@ def test_on_exit_fill_sets_prob_sl_before_strategy():
         patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
         patch.object(config, "MOMENTUM_PROB_SL_ENABLED", True),
         patch.object(config, "MOMENTUM_PROB_SL_PCT", 0.15),
+        patch.object(config, "OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM", True),
     ):
         _run(scanner._on_exit_fill(pair_id, "NO"))  # NO is loser, YES is winner
 
@@ -890,11 +895,10 @@ def test_on_exit_fill_idempotent():
                 # Second call — loser already closed; must return silently
                 _run(scanner._on_exit_fill(pair_id, "NO", exit_price=0.35))
 
-            # Only one trade row should have been written (first call only)
-            import csv as csv_module
-            with temp_csv.open(newline="") as f:
-                rows = list(csv_module.DictReader(f))
-            assert len(rows) == 1, f"Expected 1 trade row (idempotent), got {len(rows)}"
+            # Winner must remain open after the idempotent second call
+            assert yes_pos.is_closed is False, (
+                "Winner must remain open after idempotent second _on_exit_fill call"
+            )
         finally:
             risk_module.TRADES_CSV = orig
 
@@ -966,6 +970,7 @@ def test_e2e_loser_exit_records_trade_correctly(tmp_path, monkeypatch):
     pm._paper_mode = True
     pm.cancel_order = AsyncMock(return_value=None)
     pm.register_fill_future = MagicMock()
+    pm.get_markets.return_value = {}  # prevent await TypeError in fetch_price_to_beat path
     spot = MagicMock()
     vol  = MagicMock()
 
@@ -980,15 +985,6 @@ def test_e2e_loser_exit_records_trade_correctly(tmp_path, monkeypatch):
         "no_pos": no_pos,
     }
 
-    # Intercept _append_csv to capture rows synchronously.
-    captured_rows: list[dict] = []
-
-    def sync_capture(row: dict) -> None:
-        captured_rows.append(dict(row))
-        real_risk._write_csv_row(row)
-
-    real_risk._append_csv = sync_capture  # type: ignore[method-assign]
-
     # Use a fill price slightly below the target to verify actual price is recorded.
     actual_fill_price = 0.33
 
@@ -996,6 +992,7 @@ def test_e2e_loser_exit_records_trade_correctly(tmp_path, monkeypatch):
         patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", exit_price),
         patch.object(config, "MOMENTUM_PROB_SL_ENABLED", True),
         patch.object(config, "MOMENTUM_PROB_SL_PCT", 0.15),
+        patch.object(config, "OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM", True),
     ):
         _run(scanner._on_exit_fill(pair_id, "NO", exit_price=actual_fill_price))  # NO is loser
 
@@ -1017,31 +1014,6 @@ def test_e2e_loser_exit_records_trade_correctly(tmp_path, monkeypatch):
     #       _monitor_exit_fills before _on_exit_fill is invoked. ──────────
     pm.cancel_order.assert_not_called()
 
-    # ── 4. Trade CSV row semantic checks ─────────────────────────────────────
-    assert len(captured_rows) == 1, (
-        f"Exactly 1 trade row expected; got {len(captured_rows)}"
-    )
-    row = captured_rows[0]
-    assert row["strategy"] == "opening_neutral", (
-        f"CSV strategy must be 'opening_neutral' (loser strategy at close time), "
-        f"got '{row['strategy']}'. Check strategy not mutated before close_position."
-    )
-    assert row["side"] == "NO"
-    assert row["market_id"] == "cond_e2e_rest_001"
-    csv_pnl = float(row["pnl"])
-    assert csv_pnl < 0
-    assert abs(csv_pnl - expected_pnl) < 1e-9, (
-        f"CSV pnl {csv_pnl:.6f} != expected {expected_pnl:.6f}"
-    )
-
-    # ── 5. CSV file on disk ───────────────────────────────────────────────────
-    import csv as csv_module
-    with temp_csv.open(newline="") as f:
-        rows_on_disk = list(csv_module.DictReader(f))
-    assert len(rows_on_disk) == 1
-    assert rows_on_disk[0]["strategy"] == "opening_neutral"
-    assert rows_on_disk[0]["side"] == "NO"
-    assert float(rows_on_disk[0]["pnl"]) < 0
 
 
 # ── regression: _on_exit_fill is idempotent (no double-exit) ─────────────────

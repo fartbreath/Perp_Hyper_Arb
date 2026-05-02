@@ -2,6 +2,120 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-03] - M-series momentum upgrades; Opening Neutral promote flag; startup smoke tests; stale code removal
+
+### Feature — FundingRateCache (`market_data/funding_rate_cache.py`, `hl_client.py`)
+
+New push-fed funding rate module updated by `HLClient`'s `webData2` WebSocket handler.
+No polling — staleness is measured from last push timestamp.  History buffer (last 10
+readings per coin) retained for future trend analysis; not used as a gate signal.
+`FUNDING_STALE_THRESHOLD_S` (default 120 s) guards against stale reads.
+`FundingRateCache.get(coin)` returns `None` when data is absent or stale.
+
+### Feature — OracleTickTracker (`market_data/oracle_tick_tracker.py`, `monitor.py`)
+
+New per-coin oracle analytics module registered against `SpotOracle` callbacks.
+Tracks three signals per coin:
+- **EWMA up-fraction** — smoothed fraction of oracle ticks that were up-moves; used for
+  `MOMENTUM_UPFRAC_EXIT` (exit when EWMA drops below threshold for N consecutive windows).
+- **TWAP deviation** — oracle TWAP vs current price in bps; used for M-14 vol-regime gating.
+- **Volatility regime** — classifies each coin as `HIGH`, `LOW`, or `UNKNOWN` based on
+  rolling tick magnitudes.
+
+### Feature — Momentum M-series signal improvements (`strategies/Momentum/scanner.py`, `config.py`)
+
+`MomentumScanner` now accepts optional `funding_cache` and `oracle_tracker` constructor
+args wired through `main.py`.  New fill CSV columns capture entry context for post-trade
+analysis:
+- `funding_rate` — HL funding rate at entry
+- `yes_depth_share` — YES bid depth fraction (relative depth gauge)
+- `hour_utc` — UTC hour of entry (for intraday regime splits)
+- `effective_z` — z-score after all multipliers (position sizing trace)
+- `funding_gate_applied` — whether the funding gate was active at entry
+- `twap_dev_bps` — oracle TWAP deviation in bps at scan time (M-14)
+- `vol_regime` — volatility regime at scan time: `HIGH` / `LOW` / `UNKNOWN` (M-14)
+
+New `ExitReason.MOMENTUM_UPFRAC_EXIT` — fires when EWMA up-fraction drops below the
+threshold for N consecutive evaluation windows (configurable via `MOMENTUM_UPFRAC_*` keys).
+
+Removed stale code:
+- `_signal_first_valid` persistence dict and disk I/O (Kelly persistence z-boost removed)
+- `MOMENTUM_HEDGE_ENABLED` branch in `fill_simulator._loop()` and entire `_sweep_hedges()` method
+- All `MOMENTUM_HEDGE_*`, `MOMENTUM_WIN_RATE_GATE_*`, `MOMENTUM_KELLY_PERSISTENCE_*` references
+  from `api_server.py` mutable config map, `ConfigPatch` model, and `GET /config` response
+
+### Feature — New strategy docs (`OpeningNeutralStrategy.md`, `OpenStrategy.md`, `strategy_update.md`)
+
+- **`OpeningNeutralStrategy.md`** — concise authoritative spec for the Opening Neutral strategy,
+  including the updated loser-exit (bid-monitoring FAK) and winner-promotion flow.
+- **`OpenStrategy.md`** — spec for a new Open Market Entry strategy: single directional
+  position at T=0 when a 5-minute bucket opens, using pre-open oracle + perp signals.
+- **`strategy_update.md`** — data-driven recommendations from a 681-window analysis
+  (`strategy_update.md` Part 0–2) covering Opening Neutral, Momentum, and Open strategies.
+
+### Feature — Opening Neutral: `OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM` flag (`scanner.py`, `config.py`)
+
+New config key `OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM` (default `False`).  When `True` the
+existing winner-promotion path fires: the winner leg is re-labelled as a momentum position
+and handed to `PositionMonitor` for delta-SL / TP management.  When `False` the winner
+simply holds to resolution under the `opening_neutral` strategy label — no delta-SL is
+armed, the position resolves for full payout.
+
+Scanner now sets `winner_pos.strategy = "momentum"` directly on the in-memory `Position`
+object immediately before calling `_risk.promote_position_strategy(...)`, ensuring the
+in-memory object is updated even when the risk engine is mocked in tests.
+
+### Fix — `main.py`: `logger` → `log` NameError in Phase 1 pipeline startup
+
+Four `logger.info/error` calls in the Phase 1 pipeline startup block used the wrong name.
+The module-level logger is `log = get_bot_logger(__name__)` throughout the codebase.
+Fixed: all four occurrences changed to `log.info` / `log.error`.
+
+### Fix — API `/pnl` and `/performance` migrated to `_load_acct_ledger_trades()` (`api_server.py`)
+
+Both endpoints previously called `_load_trades_csv()` (the old `RiskEngine` CSV path).
+Migrated to `_load_acct_ledger_trades()` (the new `accounting.py` ledger) to reflect
+current accounting data.
+
+### Tests — startup smoke suite (`tests/test_startup_smoke.py`, 16 tests)
+
+New module-level smoke test suite covering:
+- **`TestConfigAudit`** — scans all production `.py` files for `config.UPPERCASE_ATTR`
+  references, asserts each attribute exists in `config.py`.  Catches stale config refs
+  at CI time without running the full bot.
+- **`TestApiServerSmoke`** — `GET /health`, `GET /config`, `GET /pnl` via FastAPI `TestClient`.
+- **`TestFillSimulatorSmoke`** — `_sweep()` and `_loop()` with mocked dependencies.
+- **`TestMomentumScannerSmoke`** — `_scan_once()`, instantiation, `start()`.
+- **`TestMispricingScannerSmoke`** — instantiation, `start()`.
+- **`TestOpeningNeutralScannerSmoke`** — `_refresh_pending_markets()`, instantiation, `start()`.
+
+All 16 tests pass.
+
+### Tests — `test_opening_neutral.py` regression fixes (12 failures → all 27 passing)
+
+Six root-cause fixes:
+1. **Config rename** — 6 `patch.object` calls updated from `OPENING_NEUTRAL_ENTRY_WINDOW_SECS`
+   to `OPENING_NEUTRAL_MARKET_WINDOW_SECS`.
+2. **Promote-to-momentum gate** — 4 tests that exercise the `_on_exit_fill` promotion path
+   now patch `OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM=True` to unlock that code path.
+3. **Exit mechanism rewrite** — `test_register_pair_places_exit_sells_immediately` rewritten:
+   no `place_limit` expected (bid-monitoring replaces resting SELLs); asserts
+   `_token_to_pair[yes_token_id]` and `_token_to_pair[no_token_id]` are populated, and
+   `pair["yes_exit_order_id"] == ""`.
+4. **Accounting migration** — `test_on_exit_fill_idempotent` no longer checks `TRADES_CSV`
+   row count (accounting moved to `acct_ledger.csv`); replaced with `is_closed is False` guard.
+5. **E2E test** — `pm.get_markets.return_value = {}` prevents a `TypeError` from `await`-ing
+   a plain `MagicMock` in `fetch_price_to_beat` when promotion is enabled.
+6. **Scan entry timing** — 3 scan tests updated from `tte_seconds=3500` to `tte_seconds=3605`
+   (5 s pre-open) matching the new `elapsed ∈ [-11, 0]` gate in `_evaluate_entry`.
+
+### Tests — stale hedge tests deleted (`tests/test_hedge_sizing.py`, `tests/test_hedge_sweep.py`)
+
+Both files targeted the defunct `MOMENTUM_HEDGE_*` code path (hedge GTD orders, sweep
+logic, `fill_simulator._sweep_hedges()`).  Deleted as the code they covered no longer exists.
+
+---
+
 ## [2026-05-01] - Accounting ledger; OpeningNeutral TP + fill-price confirmation + delta-SL fix; test overhaul
 
 ### Feature — Standalone accounting ledger (`accounting.py`, `risk.py`, `api_server.py`)

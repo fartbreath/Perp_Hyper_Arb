@@ -109,15 +109,6 @@ def _isolate_pending_resolutions(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_hedge_clob_ticks(tmp_path):
-    """Patch monitor.HEDGE_CLOB_TICKS_CSV to a per-test temp file."""
-    original = _monitor_mod.HEDGE_CLOB_TICKS_CSV
-    _monitor_mod.HEDGE_CLOB_TICKS_CSV = tmp_path / "hedge_clob_ticks.csv"
-    yield
-    _monitor_mod.HEDGE_CLOB_TICKS_CSV = original
-
-
-@pytest.fixture(autouse=True)
 def _isolate_log_files(tmp_path):
     """Redirect rotating file handlers (bot.log, errors.log) to tmp_path.
 

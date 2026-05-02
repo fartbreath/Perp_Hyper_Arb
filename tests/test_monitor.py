@@ -2876,3 +2876,175 @@ class TestHedgeRepriceSizing:
         assert abs(size - round(22.22, 6)) < 1e-4
         notional = size * new_bid
         assert notional < 3.27 + 0.01, f"Notional {notional:.4f} exceeds budget 3.27"
+
+
+
+
+
+
+
+
+# ── M-13: cl_upfrac EWMA early exit ─────────────────────────────────────────────────────────────────────
+
+
+class TestUpfracEwmaExit:
+    """Behavioral tests for M-13: cl_upfrac EWMA early exit.
+
+    Tests exercise PositionMonitor._check_position() end-to-end with a real
+    momentum Position and a mocked OracleTickTracker so that counter state,
+    exit triggering, and fail-open conditions are verified through the
+    production code path.
+    """
+
+    def setup_method(self):
+        self._saved = {
+            "MOMENTUM_UPFRAC_EXIT_ENABLED":  config.MOMENTUM_UPFRAC_EXIT_ENABLED,
+            "MOMENTUM_UPFRAC_EXIT_THRESHOLD": config.MOMENTUM_UPFRAC_EXIT_THRESHOLD,
+            "MOMENTUM_UPFRAC_EXIT_WINDOWS":  config.MOMENTUM_UPFRAC_EXIT_WINDOWS,
+            "PROFIT_TARGET_PCT":             config.PROFIT_TARGET_PCT,
+            "STOP_LOSS_USD":                 config.STOP_LOSS_USD,
+            "MIN_HOLD_SECONDS":              config.MIN_HOLD_SECONDS,
+            "EXIT_DAYS_BEFORE_RESOLUTION":   config.EXIT_DAYS_BEFORE_RESOLUTION,
+        }
+        # Safe defaults: disable all P&L-based exits so only upfrac can trigger.
+        config.MOMENTUM_UPFRAC_EXIT_ENABLED = True
+        config.MOMENTUM_UPFRAC_EXIT_THRESHOLD = 0.40
+        config.MOMENTUM_UPFRAC_EXIT_WINDOWS = 2
+        config.PROFIT_TARGET_PCT = 999.0
+        config.STOP_LOSS_USD = 999.0
+        config.MIN_HOLD_SECONDS = 0
+        config.EXIT_DAYS_BEFORE_RESOLUTION = 0
+
+    def teardown_method(self):
+        for k, v in self._saved.items():
+            setattr(config, k, v)
+
+    def _make_market(self):
+        mkt = MagicMock()
+        mkt.condition_id = "mkt_001"
+        mkt.token_id_yes = "tok_yes"
+        mkt.token_id_no = "tok_no"
+        mkt.fees_enabled = False
+        mkt.end_date = None   # not resolved: skip RESOLVED fast-path
+        mkt.title = "Will BTC reach $100k?"
+        return mkt
+
+    def _make_book(self, mid=0.50):
+        book = MagicMock()
+        book.mid = mid
+        book.best_bid = mid
+        book.best_ask = mid
+        return book
+
+    def _make_setup(self, upfrac_value=0.20, side="YES"):
+        """Return (monitor, pm, risk, tracker, pos) ready for _check_position calls.
+
+        Invariants:
+          - price == entry_price so no P&L-based exit fires
+          - spot_client=None so delta SL cannot evaluate
+          - end_date=None so RESOLVED / time-stop do not fire
+        """
+        monitor, pm, risk = _make_monitor()
+        tracker = MagicMock()
+        tracker.get_upfrac_ewma = MagicMock(return_value=upfrac_value)
+        monitor._oracle_tracker = tracker
+        pm._markets["mkt_001"] = self._make_market()
+        pm._books["tok_yes"] = self._make_book(mid=0.50)
+        if side == "NO":
+            pm._books["tok_no"] = self._make_book(mid=0.50)
+        pos = _make_position(
+            side=side, strategy="momentum",
+            entry_price=0.50, size=100.0, seconds_ago=120,
+        )
+        risk.open_position(pos)
+        return monitor, pm, risk, tracker, pos
+
+    # ── init / wiring ─────────────────────────────────────────────────────────────────────────
+
+    def test_oracle_tracker_stored_on_init(self):
+        """oracle_tracker kwarg is forwarded to and stored by the PositionMonitor constructor."""
+        tracker = MagicMock()
+        monitor = PositionMonitor(pm=MagicMock(), risk=RiskEngine(), oracle_tracker=tracker)
+        assert monitor._oracle_tracker is tracker
+
+    def test_upfrac_below_count_initialised_empty(self):
+        """_upfrac_below_count starts as an empty dict on a fresh PositionMonitor."""
+        monitor, _, _ = _make_monitor()
+        assert monitor._upfrac_below_count == {}
+
+    def test_exit_reason_constant_exists(self):
+        """ExitReason.MOMENTUM_UPFRAC_EXIT is defined with the canonical string value."""
+        assert hasattr(ExitReason, "MOMENTUM_UPFRAC_EXIT")
+        assert ExitReason.MOMENTUM_UPFRAC_EXIT == "upfrac_exit"
+
+    # ── counter increments / exit firing ─────────────────────────────────────────────────────
+
+    def test_counter_increments_and_does_not_exit_before_n_windows(self):
+        """WINDOWS=2: after 1 below-threshold tick the counter is 1 and position stays open."""
+        monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.20)  # 0.20 < threshold 0.40
+        _run(monitor._check_position(pos))
+        assert not risk._positions["mkt_001:YES"].is_closed
+        assert monitor._upfrac_below_count.get("mkt_001", 0) == 1
+
+    def test_exit_fires_at_n_consecutive_below_threshold_yes(self):
+        """WINDOWS=2: YES position is closed on the 2nd consecutive below-threshold tick."""
+        monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.20)
+        _run(monitor._check_position(pos))   # tick 1 → counter=1, no exit
+        _run(monitor._check_position(pos))   # tick 2 → counter=2 == WINDOWS → exit
+        assert risk._positions["mkt_001:YES"].is_closed
+        assert risk._positions["mkt_001:YES"].realized_pnl == pytest.approx(0.0, abs=0.01)
+
+    def test_upfrac_counter_cleared_after_exit(self):
+        """_upfrac_below_count entry is removed once the upfrac exit fires."""
+        monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.20)
+        _run(monitor._check_position(pos))
+        _run(monitor._check_position(pos))   # exit fires on tick 2
+        assert "mkt_001" not in monitor._upfrac_below_count
+
+    # ── counter resets on recovery ────────────────────────────────────────────────────────────────────
+
+    def test_counter_resets_when_upfrac_recovers(self):
+        """Counter resets to 0 when upfrac recovers above threshold; exit does not fire."""
+        monitor, pm, risk, tracker, pos = self._make_setup(upfrac_value=0.20)
+        _run(monitor._check_position(pos))                          # tick 1: counter → 1
+        tracker.get_upfrac_ewma = MagicMock(return_value=0.65)     # recovery (0.65 > 0.40)
+        _run(monitor._check_position(pos))                          # tick 2: counter → 0
+        assert monitor._upfrac_below_count.get("mkt_001", 0) == 0
+        assert not risk._positions["mkt_001:YES"].is_closed
+
+    # ── NO side ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+    def test_no_side_exits_when_upfrac_above_inverted_threshold(self):
+        """NO position exits when upfrac > (1 - threshold) for WINDOWS consecutive ticks."""
+        monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.75, side="NO")
+        # 0.75 > (1.0 - 0.40 = 0.60): oracle is bullish, NO is losing direction
+        _run(monitor._check_position(pos))   # tick 1
+        _run(monitor._check_position(pos))   # tick 2 → exit
+        assert risk._positions["mkt_001:NO"].is_closed
+
+    # ── fail-open conditions ──────────────────────────────────────────────────────────────────────────
+
+    def test_gate_disabled_no_exit(self):
+        """MOMENTUM_UPFRAC_EXIT_ENABLED=False: gate is bypassed even with low upfrac."""
+        monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.05)
+        config.MOMENTUM_UPFRAC_EXIT_ENABLED = False
+        for _ in range(5):
+            _run(monitor._check_position(pos))
+        assert not risk._positions["mkt_001:YES"].is_closed
+
+    def test_oracle_tracker_none_fails_open(self):
+        """oracle_tracker=None: gate short-circuits; position never exits via upfrac."""
+        monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.05)
+        monitor._oracle_tracker = None
+        for _ in range(5):
+            _run(monitor._check_position(pos))
+        assert not risk._positions["mkt_001:YES"].is_closed
+        assert monitor._upfrac_below_count == {}
+
+    def test_upfrac_none_fails_open(self):
+        """get_upfrac_ewma returning None: gate fails open, position stays open."""
+        monitor, pm, risk, _, pos = self._make_setup(upfrac_value=None)
+        for _ in range(5):
+            _run(monitor._check_position(pos))
+        assert not risk._positions["mkt_001:YES"].is_closed
+        assert monitor._upfrac_below_count.get("mkt_001", 0) == 0

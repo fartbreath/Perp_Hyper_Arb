@@ -29,9 +29,8 @@ Outcome definition
 
 Minimum sample guard
 --------------------
-  config.MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES (default 10) fills required per
-  bucket before the win rate is considered reliable enough to gate on.
-  Below this threshold, get() returns None (gate is effectively open).
+  10 fills are required per bucket before the win rate is considered reliable
+  enough to gate on.  Below this threshold, get() returns None (gate is open).
 """
 from __future__ import annotations
 

@@ -80,7 +80,8 @@ HL_PERP_COINS: list[str] = ["BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP"]
 HL_DEFAULT_SLIPPAGE: float = 0.003   # 0.3% max slippage for hedge market orders
 
 HL_DEAD_MAN_INTERVAL: int = 300      # seconds — refresh dead man's switch every 5 min
-HL_FUNDING_POLL_INTERVAL: int = 120  # seconds
+HL_FUNDING_POLL_INTERVAL: int = 120  # seconds — unused (funding now via webData2 WS)
+FUNDING_STALE_THRESHOLD_S: int = 120  # seconds — FundingRateCache staleness window
 
 # ── Strategy 1 — Market Making ───────────────────────────────────────────────
 # Repricing: cancel + repost when HL BBO moves by more than this fraction
@@ -350,13 +351,13 @@ OPENING_NEUTRAL_TIMER_ADVANCE_SECS: float = 10.0
 # an entry to qualify.  Keeps the strategy truly neutral (near 50/50) and
 # prevents entries into highly-skewed markets (e.g. YES=0.12 / NO=0.89)
 # where the exit logic breaks down and one leg is almost certain to lose.
-OPENING_NEUTRAL_MIN_SIDE_PRICE: float = 0.48
-OPENING_NEUTRAL_MAX_SIDE_PRICE: float = 0.52
+OPENING_NEUTRAL_MIN_SIDE_PRICE: float = 0.49
+OPENING_NEUTRAL_MAX_SIDE_PRICE: float = 0.51
 # Maximum simultaneous opening-neutral pairs.
 OPENING_NEUTRAL_MAX_CONCURRENT: int = 1
 # DRY_RUN: when True all order placements are skipped (no real orders sent).
 # Signals, pair tracking, and all logic run normally — only the pm_client calls
-# are suppressed.  Safe to deploy inactive; set False after validation.
+# are suppressed.  Safe to deploy inactive; set False after validation.``
 OPENING_NEUTRAL_DRY_RUN: bool = True
 # Take-profit for the promoted winner leg.
 # When enabled, after the loser exits the bot places a resting SELL limit on
@@ -477,16 +478,51 @@ MOMENTUM_KELLY_ORACLE_SENSITIVITY: float = 0.15  # slope: delta multiples → wi
 
 # Kelly Phase-A extension — persistence z-boost.
 
-# PERSISTENCE: rewards signals that have remained continuously valid (above
-# threshold) for a sustained period.  A z-boost ramps linearly from 0 up to
-# PERSISTENCE_Z_BOOST_MAX as the signal ages, so a signal that has been strong
-# for the full min-TTE window gets slightly more sizing than a brand-new trigger.
-MOMENTUM_KELLY_PERSISTENCE_ENABLED: bool = True
-MOMENTUM_KELLY_PERSISTENCE_Z_BOOST_MAX: float = 0.5  # max additional z at full persistence window
-
 # Minimum USDC depth on the ask side within 1c of best ask (thin-book guard).
 # Prevents entering markets where our order would exhaust available liquidity.
 MOMENTUM_MIN_CLOB_DEPTH: float = 200.0
+
+# ── M-10: Funding Rate Entry Gate ────────────────────────────────────────────
+# Block entry when HL perpetual funding rate signals market structure opposed to
+# the prediction-market side.  High positive funding = longs paying shorts (price
+# biased DOWN); high negative funding = shorts paying longs (price biased UP).
+#
+# MOMENTUM_FUNDING_GATE_YES_MAX: skip YES/UP entry when funding > this value
+#   (market is paying longs → expensive to hold long, bearish signal)
+# MOMENTUM_FUNDING_GATE_NO_MIN: skip NO/DOWN entry when funding < this value
+#   (market is paying shorts → expensive to hold short, bullish signal)
+# Values are expressed as HL's per-8h rate (e.g. 0.00001 = 0.001% per 8h).
+MOMENTUM_FUNDING_GATE_ENABLED: bool = True
+MOMENTUM_FUNDING_GATE_YES_MAX: float = 0.00001   # ~0.001%/8h; block YES when funding > this
+MOMENTUM_FUNDING_GATE_NO_MIN: float = -0.00001   # ~-0.001%/8h; block NO when funding < this
+
+# ── M-11: Depth Share Entry Gate ─────────────────────────────────────────────
+# yes_depth_share = YES-side depth / (YES-side + NO-side depth).
+# Low share for YES signals the market is not supporting the UP direction.
+# Validated for YES/UP (AUC=0.5683, p=0.002, Q1<25% → 41.5% win rate).
+# NO/DOWN gate is inferred by symmetry — not independently validated.
+# Fail-open when get_depth_share() returns None.
+MOMENTUM_DEPTH_SHARE_GATE_ENABLED: bool = True
+MOMENTUM_DEPTH_SHARE_YES_MIN: float = 0.40   # skip YES entry when yes_depth_share < 0.40
+MOMENTUM_DEPTH_SHARE_NO_MAX: float = 0.60    # skip NO entry when yes_depth_share > 0.60
+
+# ── M-14: TWAP Deviation Entry Gate ──────────────────────────────────────────
+# YES/UP entries only (NO/DOWN not validated — see PRD M-14).
+# In LOW volatility regime: if oracle is below its 10s TWAP by this many bps,
+# raise the z-bar by the multiplier. Soft gate — strong delta can still pass.
+# Source: strategy_update.md §1.6. 37.6% YES win rate in low-vol + TWAP dev < 0.
+MOMENTUM_TWAP_GATE_ENABLED: bool = True
+MOMENTUM_TWAP_DEV_THRESHOLD_BPS: float = -5.0        # dev below this (oracle below TWAP) triggers multiplier
+MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER: float = 1.4  # raises YES/UP z-bar in low-vol + neg TWAP dev
+
+# ── M-13: cl_upfrac EWMA Early Exit ──────────────────────────────────────────
+# Oracle tick up-fraction EWMA. For YES positions: exit when EWMA stays below
+# threshold for UPFRAC_EXIT_WINDOWS consecutive scan ticks.
+# Source: strategy_update.md §1.7. AUC = 0.703 (strongest signal in dataset).
+MOMENTUM_UPFRAC_EXIT_ENABLED: bool = True
+MOMENTUM_UPFRAC_EXIT_THRESHOLD: float = 0.40    # exit YES when ewma < this; exit NO when ewma > (1 - this)
+MOMENTUM_UPFRAC_EXIT_WINDOWS: int = 2            # consecutive below-threshold windows before exit fires
+MOMENTUM_UPFRAC_EWMA_ALPHA: float = 0.3         # EWMA smoothing factor (owned by OracleTickTracker)
 
 # Order type: "limit" = taker limit at ask+0.5c (ensures fill); "market" = immediate cross.
 MOMENTUM_ORDER_TYPE: str = "limit"
@@ -588,116 +624,11 @@ MOMENTUM_MIN_GAP_PCT: float = 0.0
 # Empty dict = disabled for all types.  Per-type example: {"bucket_5m": 30}.
 MOMENTUM_PHASE_C_MIN_TTE_SECONDS: dict[str, int] = {}  # 0 = OFF; N = block entries in last N s
 
-# Phase D — GTD (GTC resting) hedge: after a confirmed entry, optionally place
-# a low-price GTC limit BUY on the opposite token as oracle-free downside cover.
-# If the trade loses (held token → $0), the opposite token may briefly trade
-# at HEDGE_PRICE; the GTC order catches that dip and redeems at $1.00.
-MOMENTUM_HEDGE_ENABLED: bool = True
-MOMENTUM_HEDGE_PRICE: float = 0.02    # GTC bid price fallback (when no per-bucket override)
-# Per-bucket hedge bid prices — shorter windows carry higher mismatch risk, so
-# the resting bid needs to be a bit higher to get filled during a panic dip.
-# These are intentionally deep OTM bids: the opposite token must fall from
-# its ~10-30% implied prob all the way to these prices before filling.
-MOMENTUM_HEDGE_PRICE_BY_TYPE: dict[str, float] = {
-    "bucket_5m":  0.02,
-    "bucket_15m": 0.02,
-    "bucket_1h":  0.015,
-    "bucket_4h":  0.01,
-    "bucket_daily":   0.01,
-    "bucket_weekly":  0.01,
-    "milestone":      0.01,
-}
-# Per-bucket hedge on/off flags.
-# 5m and 15m are OFF by default: at ≤120 s TTE there is no time for the whipsaw
-# path (favorable excursion + reversal) that gives the hedge insurance value.
-# The hedge is also cancelled on any non-RESOLVED exit to prevent double-jeopardy.
-# MOMENTUM_HEDGE_ENABLED is the global master switch; per-bucket flags are only
-# consulted when the master switch is True.
-MOMENTUM_HEDGE_ENABLED_BY_TYPE: dict[str, bool] = {
-    "bucket_5m":    False,
-    "bucket_15m":   False,
-    "bucket_1h":    True,
-    "bucket_4h":    True,
-    "bucket_daily": True,
-    "bucket_weekly":True,
-    "milestone":    True,
-}
-# Hedge size as fraction of main entry contracts (1.0 = same contract count as main position).
-# Actual USDC cost = hedge_contracts × hedge_price (e.g. 25ct × $0.02 = $0.50).
-MOMENTUM_HEDGE_CONTRACTS_PCT: float = 1.0
-
-# Profit-safe hedge price cap: the bot will not pay more per hedge contract than
-# (projected_pnl - MOMENTUM_HEDGE_MIN_RETAIN_USD) / hedge_contracts.
-# Set to 0.0 to disable the cap (no floor on retained profit — old behaviour).
-MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.25
-
-# N-tick concession ladder: how many times to retry with price raised by 1 tick ($0.01).
-# 1 = single attempt at the configured price (closest to old behaviour).
-MOMENTUM_HEDGE_MAX_TICKS_CONCESSION: int = 15
-
-# Post-placement gap-closing reprice.
-# On every monitor sweep, if the hedge token's best_ask has FALLEN since the prior
-# sweep (seller moving toward us), cancel + repost the hedge at current_bid + $0.01.
-# If the ask is flat or rising (seller moved away), hold — we don't chase upward.
-# Repricing is capped by price_cap (computed at placement from projected PnL minus
-# MOMENTUM_HEDGE_MIN_RETAIN_USD), so the hedge is always PnL-positive.
-#
-# Near-expiry cancel: if TTE ≤ MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS and the held
-# token's CLOB mid is above 0.50 (we are winning), the hedge is cancelled — the
-# insurance is no longer needed and we prevent an adverse fill at resolution.
-# Set to 0 to disable the near-expiry cancel.
-MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS: int = 5
-
-# TTE aggression threshold (seconds).  When time-to-expiry is below this value the
-# bot forces a taker (FAK) order regardless of the book state.
-# 0 = disabled.  Recommended starting value if enabling: 30.
-
-MOMENTUM_HEDGE_AGGRESSIVE_TTE_S: int = 0
-# Global taker override.  True = always use taker for hedge regardless of TTE or book.
-# Useful for paper-mode testing.  Leave False in production.
-MOMENTUM_HEDGE_AGGRESSIVE_TAKER: bool = False
-
 # ── Logging toggles (post-trade analysis files) ───────────────────────────────
 # These CSV files are only needed for post-trade analysis and calibration.
 # Disable them when running in production to save disk space and improve I/O
 # performance.  Both default to True so analysis data is collected by default.
-MOMENTUM_HEDGE_CLOB_LOG_ENABLED: bool = True   # hedge_clob_ticks.csv — CLOB prices for open hedge bids
 MOMENTUM_TICKS_LOG_ENABLED: bool = True         # momentum_ticks.csv   — intra-hold price ticks
-
-# SL hedge cancel: deferred cancellation factor.
-# When the main position exits via delta SL, the GTD hedge is NOT cancelled
-# immediately.  Instead, the cancel is held until delta recovers to
-#   cancel_threshold = coin_sl * (1 + MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT)
-# This keeps the hedge alive during transient spikes (false-positive SLs), so
-# the hedge can still catch a whipsaw fill if the opposite token dips.
-# When delta does recover back above the threshold, the hedge is cancelled.
-# If delta never recovers and the market resolves, the hedge rides to resolution.
-# Set to 0.0 to restore immediate-cancel behaviour (old default).
-MOMENTUM_HEDGE_CANCEL_RECOVERY_PCT: float = 0.5
-
-# When True, suppress ALL stop-losses for any position that already has an
-# active GTD hedge order placed.  This includes the oracle delta SL, the
-# near-expiry time stop, and the CLOB prob-SL.  The hedge is the insurance
-# leg — once it is resting in the CLOB the downside is bounded, so any SL
-# exit would only lock in a loss before the hedge can pay off at resolution.
-# Take-profit remains active (winning path; hedge is irrelevant there).
-# Defaults to False (conservative) — all SLs fire regardless of hedge status.
-MOMENTUM_HEDGE_SUPPRESSES_DELTA_SL: bool = False
-
-# Paper-mode GTD hedge fill simulation.
-# When PAPER_TRADING=True the fill_simulator also checks resting hedge bids against
-# the live CLOB on every sweep.  If the opposite token's best_ask ≤ hedge_price,
-# the hedge is considered "at touch" and fills with this probability.
-# Mirrors the maker's taker-arrival model but without queue-position randomness
-# (a resting BUY at the touch fills quickly in real CLOBs).
-PAPER_HEDGE_FILL_PROB: float = 0.60   # probability of fill per sweep when ask <= bid
-
-# Phase E — Empirical win-rate gate: load data/win_rate.csv at startup and gate
-# entries where historical win rate < WIN_RATE_GATE_MIN_FACTOR × model win_prob.
-# Disabled by default until ≥100 fills per bucket are available.
-MOMENTUM_WIN_RATE_GATE_ENABLED: bool = False
-MOMENTUM_WIN_RATE_GATE_MIN_FACTOR: float = 0.9  # empirical WR must be ≥ 90% of model WR
-MOMENTUM_WIN_RATE_GATE_MIN_SAMPLES: int = 10    # minimum fills per bucket before gate activates
 
 # How often to run a full scan pass over all bucket markets (seconds).
 MOMENTUM_SCAN_INTERVAL: int = 1

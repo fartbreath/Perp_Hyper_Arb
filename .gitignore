@@ -41,8 +41,10 @@ data/
 *.jsonl
 
 # Analysis / one-off research helpers
+analysis/
 scripts/
 Reports/
+analysis/
 
 # Preamble
 .preamble/

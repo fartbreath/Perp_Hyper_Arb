@@ -76,6 +76,8 @@ from market_data.rtds_client import RTDSClient
 from market_data.chainlink_ws_client import ChainlinkWSClient
 from market_data.chainlink_streams_client import ChainlinkStreamsClient
 from market_data.spot_oracle import SpotOracle
+from market_data.funding_rate_cache import FundingRateCache
+from market_data.oracle_tick_tracker import OracleTickTracker
 from risk import RiskEngine, Position
 from strategies.maker.strategy import MakerStrategy
 from strategies.mispricing.strategy import MispricingScanner
@@ -708,6 +710,32 @@ async def main() -> None:
     # Records every oracle event from all sources regardless of open positions.
     # Used for post-trade analysis, feed-liveness checks, and inter-feed latency.
     spot_oracle.enable_oracle_tick_log()
+
+    # ── Phase 1 pipelines ────────────────────────────────────────────────────
+    # M-06: FundingRateCache — receives pushes from HL webData2 WS subscription.
+    # M-08: OracleTickTracker — registers on Chainlink + RTDS update callbacks.
+    # Fail-safe: if either pipeline fails to start, the bot continues with those
+    # gates disabled (fail-open) and logs the failure at ERROR level.
+    funding_cache = None
+    oracle_tracker = None
+    try:
+        funding_cache = FundingRateCache()
+        hl.on_funding_update(funding_cache.on_ws_update)
+        log.info("FundingRateCache started")
+    except Exception as e:
+        log.error(f"FundingRateCache failed to start — funding gate disabled: {e}")
+
+    try:
+        oracle_tracker = OracleTickTracker()
+        oracle_tracker.register(spot_oracle)
+        log.info("OracleTickTracker started")
+    except Exception as e:
+        log.error(f"OracleTickTracker failed to start — oracle gate disabled: {e}")
+
+    # Expose to API health endpoint.
+    api_state.funding_cache_ref = funding_cache
+    api_state.oracle_tracker_ref = oracle_tracker
+
     maker = MakerStrategy(pm, hl, risk_engine, spot_client=spot_oracle)
     scanner = MispricingScanner(pm, hl, _on_mispricing_signal, scan_interval=config.MISPRICING_SCAN_INTERVAL, spot_client=spot_oracle)
     agent = AgentDecisionLayer(risk_engine)
@@ -721,7 +749,7 @@ async def main() -> None:
             api_state.momentum_signals = api_state.momentum_signals[-200:]
         notify_state_changed()
 
-    momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, spot_client=spot_oracle, on_signal=_on_momentum_signal)
+    momentum_scanner = MomentumScanner(pm, hl, risk_engine, vol_fetcher, spot_client=spot_oracle, on_signal=_on_momentum_signal, funding_cache=funding_cache, oracle_tracker=oracle_tracker)
 
     opening_neutral_scanner: OpeningNeutralScanner | None = None
     if config.OPENING_NEUTRAL_ENABLED:
@@ -764,6 +792,7 @@ async def main() -> None:
         spot_client=spot_oracle,
         on_close_callback=_on_position_close,
         on_stop_loss_callback=_on_momentum_stop_loss,
+        oracle_tracker=oracle_tracker,
     )
     fill_sim = FillSimulator(pm, maker, risk_engine, monitor)
     live_fill_handler = LiveFillHandler(pm, maker, risk_engine, monitor)

@@ -201,6 +201,8 @@ Key parameters:
 | `OPENING_NEUTRAL_DRY_RUN` | `True` | Signals and pair tracking run normally; no real orders placed |
 | `OPENING_NEUTRAL_SIZE_USD` | `1.0` | USDC notional per leg (YES and NO each get this amount) |
 | `OPENING_NEUTRAL_ONE_LEG_FALLBACK` | `"keep_as_momentum"` | Action when only one FAK leg fills: `"keep_as_momentum"` or `"exit_immediately"` |
+| `OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM` | `False` | When `True`, winner leg is promoted to a momentum position for delta-SL/TP management; when `False` holds to resolution as `opening_neutral` |
+| `OPENING_NEUTRAL_MARKET_WINDOW_SECS` | `60` | Window around market open within which entry is attempted (renamed from `OPENING_NEUTRAL_ENTRY_WINDOW_SECS`) |
 | `HEDGE_THRESHOLD_USD` | `100` | Net inventory before a perp hedge fires (USD) |
 | `MOMENTUM_SCAN_INTERVAL` | `10` | Seconds between momentum scan passes |
 | `MAX_QUOTE_AGE_SECONDS` | `30` | Backstop reprice interval |
@@ -211,6 +213,19 @@ Key parameters:
 ---
 
 ## Recent Changes
+
+### 2026-05-03 — M-series momentum upgrades; Opening Neutral promote flag; startup smoke tests
+
+- **`FundingRateCache`** (`market_data/funding_rate_cache.py`): push-fed HL funding rate module updated by `HLClient` WebSocket `webData2` handler. No polling; staleness is measured from last push timestamp.
+- **`OracleTickTracker`** (`market_data/oracle_tick_tracker.py`): per-coin oracle analytics tracking EWMA up-fraction, TWAP deviation, and volatility regime (`HIGH`/`LOW`/`UNKNOWN`). Integrated into `monitor.py` and `MomentumScanner`.
+- **Momentum scanner improvements**: new fill CSV columns (`funding_rate`, `yes_depth_share`, `hour_utc`, `effective_z`, `funding_gate_applied`, `twap_dev_bps`, `vol_regime`) capture entry context for post-trade analysis. New `MOMENTUM_UPFRAC_EXIT` exit reason fires when EWMA up-fraction drops below threshold for N consecutive windows.
+- **Opening Neutral `OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM`**: new flag (default `False`) controls whether the winner leg is handed to `PositionMonitor` as a momentum position or simply held to resolution. Default-off means the winner collects full payout without delta-SL risk.
+- **Config rename**: `OPENING_NEUTRAL_ENTRY_WINDOW_SECS` → `OPENING_NEUTRAL_MARKET_WINDOW_SECS`.
+- **New strategy docs**: `OpeningNeutralStrategy.md` (concise spec), `OpenStrategy.md` (new Open Market Entry strategy), `strategy_update.md` (data-driven recommendations from 681-window analysis).
+- **Stale code removed**: `MOMENTUM_HEDGE_*` branch and `_sweep_hedges()` from `fill_simulator.py`; all `MOMENTUM_HEDGE_*` / `MOMENTUM_WIN_RATE_GATE_*` / `MOMENTUM_KELLY_PERSISTENCE_*` entries removed from `api_server.py` mutable config.
+- **Bug fix** (`main.py`): `logger.info/error` → `log.info/error` in Phase 1 pipeline startup (NameError at startup when Phase 1 modules failed to import).
+- **API `/pnl` and `/performance`**: migrated from `_load_trades_csv()` to `_load_acct_ledger_trades()` to reflect current accounting ledger.
+- **Tests**: 16-test startup smoke suite added (`tests/test_startup_smoke.py`) including a `TestConfigAudit` that catches stale `config.ATTR` references at CI time. Stale `test_hedge_sizing.py` and `test_hedge_sweep.py` deleted. All 27 `test_opening_neutral.py` tests passing.
 
 ### 2026-04-29 — Strategy 5 (Opening Neutral); CLOB v2 migration; hedge SL fix; venv auto-detection
 

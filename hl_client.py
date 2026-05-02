@@ -86,6 +86,7 @@ class HLClient:
         self._mids: dict[str, float] = {}        # coin → mid price
         self._fundings: dict[str, FundingSnapshot] = {}
         self._bbo_callbacks: list[Callable] = []
+        self._funding_update_callbacks: list[Callable] = []
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
         self._paper_mode = config.PAPER_TRADING
@@ -97,12 +98,23 @@ class HLClient:
         """Register an async callback(coin, bbo) called on BBO changes."""
         self._bbo_callbacks.append(callback)
 
+    def on_funding_update(self, callback: Callable) -> None:
+        """Register a callback(coin, funding_rate, ts) called on every webData2 push."""
+        self._funding_update_callbacks.append(callback)
+
     async def _fire_bbo(self, coin: str, bbo: BBO) -> None:
         for cb in self._bbo_callbacks:
             try:
                 await cb(coin, bbo)
             except Exception as exc:
                 log.error("bbo callback error", exc=str(exc))
+
+    def _fire_funding(self, coin: str, rate: float, ts: float) -> None:
+        for cb in self._funding_update_callbacks:
+            try:
+                cb(coin, rate, ts)
+            except Exception as exc:
+                log.error("funding callback error", exc=str(exc))
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -121,7 +133,6 @@ class HLClient:
 
         asyncio.create_task(self._ws_loop())
         asyncio.create_task(self._dead_mans_refresh_loop())
-        asyncio.create_task(self._funding_poll_loop())
 
     async def stop(self) -> None:
         self._running = False
@@ -195,6 +206,14 @@ class HLClient:
                 "method": "subscribe",
                 "subscription": {"type": "l2Book", "coin": coin},
             }))
+        # Subscribe to webData2 for real-time funding rates.
+        # Requires a user address; skip if none configured.
+        if self._address:
+            await ws.send(json.dumps({
+                "method": "subscribe",
+                "subscription": {"type": "webData2", "user": self._address},
+            }))
+            log.debug("HL WS subscribed to webData2", address=self._address[:10] + "...")
         log.debug("HL WS subscribed", coins=config.HL_PERP_COINS)
 
     async def _handle_ws_message(self, raw: str) -> None:
@@ -236,15 +255,33 @@ class HLClient:
             self._bbo[coin] = bbo
             await self._fire_bbo(coin, bbo)
 
-    # ── Funding rates ──────────────────────────────────────────────────────────
+        elif channel == "webData2":
+            # Real-time funding rate + mark price feed.
+            # data = {"meta": {"universe": [{"name": str, ...}]}, "assetCtxs": [{"funding": str, ...}]}
+            meta = data.get("meta", {})
+            universe = meta.get("universe", [])
+            ctxs = data.get("assetCtxs", [])
+            ts = time.time()
+            for idx, ctx in enumerate(ctxs):
+                if idx >= len(universe):
+                    break
+                coin = universe[idx].get("name", "")
+                if not coin:
+                    continue
+                rate = float(ctx.get("funding") or 0)
+                # Update legacy FundingSnapshot cache so get_fundings_snapshot() still works
+                self._fundings[coin] = FundingSnapshot(
+                    coin=coin,
+                    hl_predicted=rate,
+                    timestamp=ts,
+                )
+                # Fire registered callbacks (e.g. FundingRateCache.on_ws_update)
+                self._fire_funding(coin, rate, ts)
 
-    async def _funding_poll_loop(self) -> None:
-        while self._running:
-            await asyncio.sleep(config.HL_FUNDING_POLL_INTERVAL)
-            try:
-                await asyncio.get_event_loop().run_in_executor(None, self._fetch_fundings)
-            except Exception as exc:
-                log.error("Funding poll failed", exc=str(exc))
+    # ── Funding rates ──────────────────────────────────────────────────────────
+    # NOTE: _funding_poll_loop has been removed. Funding data now arrives via
+    # webData2 WebSocket push (subscribed in _subscribe_all if address is set).
+    # _fetch_fundings is kept as a manual-refresh fallback but is NOT called automatically.
 
     def _fetch_fundings(self) -> None:
         if self._info is None:

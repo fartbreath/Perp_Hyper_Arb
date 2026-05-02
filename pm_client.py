@@ -2088,6 +2088,34 @@ class PMClient:
     def get_book(self, token_id: str) -> Optional[OrderBookSnapshot]:
         return self._books.get(token_id)
 
+    def get_depth_share(self, market: "PMMarket", depth_cents: int = 5) -> Optional[float]:
+        """Fraction of bid-side depth within *depth_cents* cents that sits on YES.
+
+        YES/UP depth as a share of total (YES + NO) bid depth.  Returns None
+        if either book is absent or has no bids.  Used by M-07 (depth gate).
+
+        depth_cents — how deep into the book to sum, measured from each book's
+                      best bid.  Default 5 = 5¢ = $0.05 in probability space.
+        """
+        depth_dollars = depth_cents / 100.0
+        yes_book = self._books.get(market.token_id_yes)
+        no_book = self._books.get(market.token_id_no)
+        if yes_book is None or no_book is None:
+            return None
+
+        def _sum_bids(book: OrderBookSnapshot, max_spread: float) -> float:
+            if not book.bids:
+                return 0.0
+            best = book.bids[0][0]
+            return sum(sz for px, sz in book.bids if px >= best - max_spread)
+
+        yes_depth = _sum_bids(yes_book, depth_dollars)
+        no_depth = _sum_bids(no_book, depth_dollars)
+        total = yes_depth + no_depth
+        if total <= 0:
+            return None
+        return yes_depth / total
+
     async def fetch_book_rest(self, token_id: str) -> Optional["OrderBookSnapshot"]:
         """Fetch a fresh orderbook snapshot from the CLOB REST API.
 

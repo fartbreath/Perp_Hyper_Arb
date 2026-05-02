@@ -53,6 +53,26 @@ fully closed the gap yet.
 
 ---
 
+## Core Agent Rules
+
+Read before every task involving this strategy.
+
+1. **Enter near expiry** (last ~60s of the bucket). Low TTE = tiny remaining vol = little room for spot to reverse. This is the source of edge.
+
+2. **Hold YES/Up token** when `spot > strike` at entry. **Hold NO/Down token** when `spot < strike` at entry.
+
+3. **Stop-loss is oracle-driven, not CLOB-driven.** The delta SL (`MOMENTUM_DELTA_STOP_LOSS_PCT`) fires when the Chainlink oracle spot retreats within threshold of the strike. The CLOB token price is used only for take-profit (`token → 0.999`). Do not use CLOB price drops alone as the primary SL signal — CLOB reprices forward and can collapse on book drain while the position is winning.
+
+4. **Read `MOMENTUM_IMPL_PLAN.md` before making any code changes.** The plan is the current source of truth for what is being stripped, what is being added, and what config values are changing. The code in `scanner.py` and `monitor.py` may not yet match the plan — the plan takes precedence over what you find in the code.
+
+5. **Oracle and market data feeds must be event-driven WebSocket streams, not HTTP polling.** Funding rate, mark price, CLOB depth, and oracle prices all come from WebSocket subscriptions. Polling is never acceptable for real-time data used by this strategy.
+
+6. **PM Gamma API is the source of truth for settlement.** Use the CLOB `tokens[].winner` flag for final outcome. Never infer settlement from spot prices, PM UI prices, or `curPrice`.
+
+7. **No GTD hedge on Momentum positions.** The GTD hedge has been deliberately removed from Momentum. All 3 real 5m/15m losses had $0 GTD recovery — the hedge fills only on reversal, not adverse trend (documented in `taker_hedge_design.md`). The `cl_upfrac` EWMA early exit (Phase 3) is the replacement: it fires before positions ride to expiry as a full loss. Do NOT add hedge placement back to Momentum. The preamble GTD hedge accounting rules still apply to Opening Neutral and Open strategy positions.
+
+---
+
 ## Configuration
 
 All parameters are set in `config.py` under the `MOMENTUM_*` namespace and can be hot-patched
@@ -607,7 +627,77 @@ MomentumScanner._on_signal cb ────→ GET /momentum/signals
 
 ---
 
+## Current Development Phase
+
+> Full detail in `MOMENTUM_IMPL_PLAN.md`. This section captures the strategic direction so the strategy doc stays current. Source of all data-validated decisions: `strategy_update.md`.
+
+### Phase 0 — Strip (before adding anything)
+
+Removing accreted complexity with no validated positive EV:
+
+| Item | What | Why |
+|------|------|-----|
+| VWAP/RoC PM token filter | `_price_history` deque + gate in `scanner.py` | PM VWAP is not a validated predictor. Replaced by oracle TWAP deviation (Phase 1). |
+| WinRateTable empirical gate | `win_rate.py` gate | Too sparse (<500 fills). Replaced by funding rate gate (Phase 2). |
+| Kelly persistence z-boost | `_signal_first_valid` dict | Over-engineering. Funding gate is the correct conviction signal. |
+| CalendarSpread Mixin | `CalendarSpreadMixin` in `MomentumScanner` | Different strategy, different risk profile. Extract to `strategies/CalendarSpread/`. |
+| GTD hedge | Hedge placement in `scanner.py` Phase D + `MOMENTUM_HEDGE_*` config keys + hedge tracking in `monitor.py` | All 3 real 5m/15m losses had $0 GTD recovery. Hedge fills only on reversal, not adverse trend. `cl_upfrac` EWMA exit (Phase 3) is the replacement. See `taker_hedge_design.md`. |
+
+### Phase 1 — Reusable Data Pipelines (strategy-agnostic, `market_data/`)
+
+| Pipeline | Source | Interface | Consumers |
+|----------|--------|-----------|----------|
+| `FundingRateCache` | HL WebSocket (`webData2`) | `get(coin) → float \| None` | Momentum (entry gate), Open, Opening Neutral |
+| `PMClient.get_depth_share()` | PM CLOB WS (cached) | `get_depth_share(market) → float \| None` | Momentum (entry gate), Open |
+| `OracleTickTracker` | CL oracle ticks | `get_upfrac_ewma(coin)`, `get_twap_deviation_bps(coin)`, `get_vol_regime(coin)` | Momentum (exit + TWAP gate), Open |
+
+### Phase 2 — Entry Signal Changes
+
+| Change | Type | Config Key | Status |
+|--------|------|-----------|--------|
+| Per-coin SL values | Config only | `MOMENTUM_DELTA_SL_PCT_BY_COIN` | Enabled immediately |
+| Funding rate gate | Hard block + z-boost | `MOMENTUM_FUNDING_GATE_ENABLED` | Enabled (requires P1) |
+| Depth share gate | Hard block | `MOMENTUM_DEPTH_SHARE_GATE_ENABLED` | Enabled (requires P1) |
+| TWAP deviation gate | Z-score multiplier | `MOMENTUM_TWAP_GATE_ENABLED` | Enabled (requires P1) |
+| Hour-of-day bias | Z-score multiplier | `MOMENTUM_HOUR_BIAS_ENABLED` | **DISABLED — single-day data only** |
+| DOGE streak bias | Z-score multiplier | `MOMENTUM_STREAK_BIAS_ENABLED` | **NOT BUILT — multi-day evidence required** |
+
+### Phase 3 — Exit Management
+
+| Change | Signal | Config Key | Status |
+|--------|--------|-----------|--------|
+| `cl_upfrac` EWMA exit | `upfrac_ewma < 0.40` for 2+ consecutive 5s windows (AUC=0.703) | `MOMENTUM_UPFRAC_EXIT_ENABLED` | Enabled (requires P1) |
+| Dynamic SL width | `max(per_coin_floor, 0.5 × prev_bucket_vol_60s)` | `MOMENTUM_DYNAMIC_SL_ENABLED` | **DEFERRED — needs 2+ weeks of vol data** |
+
+### Updated Gate Pipeline (post-implementation)
+
+```
+for market in bucket_markets:
+    ├── horizon / cooldown / book / TTE        (existing)
+    ├── signal band: token 0.80–0.90           (existing)
+    ├── effective_z = base_z × funding_conviction_mult
+    │                       × twap_dev_mult (low-vol only)
+    │                       × streak_mult   (deferred)
+    ├── delta >= effective_z threshold         (existing, now uses multiplied z)
+    ├── CLOB depth gate                        (existing)
+    ├── [REMOVED] VWAP/RoC filter
+    ├── [REMOVED] WinRateTable gate
+    ├── funding rate direction gate             (NEW — hard block if contradicts direction)
+    ├── depth share gate                        (NEW — block if crowd book contradicts)
+    └── ENTER POSITION
+```
+
+---
+
 ## Implementation Checklist
+
+### P0 Strip (before adding anything)
+
+- [ ] Remove GTD hedge placement from `scanner.py` (Phase D block) and `MOMENTUM_HEDGE_*` config keys
+- [ ] Remove GTD hedge tracking from `monitor.py` for Momentum positions
+- [ ] Remove VWAP/RoC PM token filter (`_price_history` + gate)
+- [ ] Remove WinRateTable gate (`win_rate.py` import + `skipped_win_rate` counter)
+- [ ] Remove Kelly persistence z-boost (`_signal_first_valid` dict + z-boost logic)
 
 ### MVP (required before any live capital)
 
