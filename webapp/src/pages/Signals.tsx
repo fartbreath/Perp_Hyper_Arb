@@ -604,7 +604,7 @@ export default function Signals() {
                   </tr>
                 </thead>
                 <tbody>
-                  {onStatus.tracked_markets.map((m, i) => {
+                  {onStatus.tracked_markets.map((m) => {
                     const combined = m.combined;
                     const threshold = 1.01; // OPENING_NEUTRAL_COMBINED_COST_MAX
                     const overThreshold = combined != null && combined > threshold;

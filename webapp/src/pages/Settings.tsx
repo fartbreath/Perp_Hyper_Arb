@@ -616,6 +616,87 @@ export default function Settings() {
         />
       </div>
 
+      {/* ── 2c. Opening Neutral — Asymmetric Sells (Phase 1) ─────────── */}
+      <div className="card">
+        <h3>
+          Opening Neutral — Asymmetric Sells
+          <span
+            style={{
+              fontSize: "0.65rem",
+              color: "#f59e0b",
+              fontWeight: 500,
+              marginLeft: "0.5rem",
+              background: "#451a03",
+              padding: "0.1rem 0.35rem",
+              borderRadius: "0.25rem",
+            }}
+          >
+            PHASE 1 — DISABLED BY DEFAULT
+          </span>
+        </h3>
+        <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+          Signal-informed sell trigger pricing. Enable only after ≥ 2 weeks of symmetric
+          paper-fill data confirms (a) the predicted winner bid never dips below
+          (Loser Exit Trigger − Winner Sell Buffer) intraday, and (b) the predicted loser
+          fills at least 30% faster. Both features ship disabled.
+        </p>
+
+        <SectionHead title="ON-04 — Asymmetric Sell Triggers" />
+
+        <Toggle
+          label="Asymmetric Sells Enabled"
+          description="When enabled, funding rate determines which leg is the predicted winner and lowers that leg's bid-monitor trigger so it must fall further before a loser-exit fires — protecting against accidental early exits on intraday noise."
+          value={data.opening_neutral_asymmetric_sells_enabled ?? false}
+          onChange={(v) => apply({ opening_neutral_asymmetric_sells_enabled: v })}
+        />
+        {data.opening_neutral_asymmetric_sells_enabled && (
+          <>
+            {GAP}
+            <FloatInput
+              label="Funding Threshold"
+              description="Funding rate magnitude above which asymmetric pricing activates. Below this threshold, both legs use the same trigger. Validated threshold from data: 0.00001."
+              value={data.opening_neutral_funding_gate_threshold ?? 0.00001}
+              step={0.000001}
+              unit="rate"
+              onSubmit={(v) => apply({ opening_neutral_funding_gate_threshold: v })}
+            />
+            {GAP}
+            <FloatInput
+              label="Winner Sell Buffer"
+              description="Amount subtracted from the standard bid-monitor trigger for the predicted winner leg (e.g. 0.03 → winner fires only when bid falls to trigger − $0.03). Must be < Loser Exit Trigger."
+              value={data.opening_neutral_winner_sell_buffer ?? 0.03}
+              step={0.005}
+              unit="$"
+              onSubmit={(v) => apply({ opening_neutral_winner_sell_buffer: v })}
+            />
+          </>
+        )}
+
+        {GAP}
+
+        <SectionHead title="ON-05 — Loser Confidence Scoring" />
+
+        <Toggle
+          label="Loser Confidence Scoring Enabled"
+          description="When both HL funding rate and PM depth share agree on the predicted loser (|score| ≥ 2), that leg's bid-monitor trigger is raised by the Confidence Tighten amount so the market sell fires sooner. Additive on top of ON-04."
+          value={data.opening_neutral_loser_confidence_enabled ?? false}
+          onChange={(v) => apply({ opening_neutral_loser_confidence_enabled: v })}
+        />
+        {data.opening_neutral_loser_confidence_enabled && (
+          <>
+            {GAP}
+            <FloatInput
+              label="Confidence Tighten"
+              description="Amount added to the predicted loser's bid-monitor trigger when both signals agree (|score| ≥ 2). E.g. 0.02 → trigger raised from $0.38 to $0.40, firing the market sell sooner."
+              value={data.opening_neutral_loser_confidence_tighten ?? 0.02}
+              step={0.005}
+              unit="$"
+              onSubmit={(v) => apply({ opening_neutral_loser_confidence_tighten: v })}
+            />
+          </>
+        )}
+      </div>
+
       {/* ── 3. Market Types ──────────────────────────────────────────── */}
       <div className="card">
         <h3>
@@ -2443,6 +2524,13 @@ export default function Settings() {
                   step={0.05}
                   unit=""
                   onSubmit={(v) => apply({ momentum_upfrac_ewma_alpha: v })}
+                />
+                {GAP}
+                <Toggle
+                  label="Suppress Until Entry Window"
+                  description="When ON, upfrac exit is suppressed while TTE is above the entry window for the market type (e.g. >120s for 5m buckets). Prevents the stale pre-promotion EWMA — carried from the oracle bounce that triggered the loser exit — from firing immediately on Opening Neutral promoted positions."
+                  value={data.momentum_upfrac_suppress_until_entry_window ?? false}
+                  onChange={(v) => apply({ momentum_upfrac_suppress_until_entry_window: v })}
                 />
               </>
             )}

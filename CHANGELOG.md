@@ -2,6 +2,101 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-04b] - M-13 upfrac refactor; delta SL bucket-market fix; ON sell-trigger improvements; accounting exit_reason; bug fixes
+
+### Fix — Delta SL dip/reach misclassification for bucket-market NO positions (`monitor.py`, `tests/test_monitor.py`)
+
+`should_exit()` used `pos.spot_price > pos.strike` to select the dip-market delta formula
+(where NO wins by spot staying above strike).  For bucket markets the ON scanner sets
+`pos.spot_price` from the live oracle at registration time; a tiny timing window at the
+bucket open can place spot fractionally above the strike, silently activating the dip branch
+for a UP/DOWN position where NO always means "ends below strike".
+
+Fix: the dip branch now requires `pos.market_type not in _MARKET_TYPE_DURATION_SECS`
+(i.e. only fires for non-bucket milestone markets).  Bucket markets always use the reach
+formula regardless of `pos.spot_price`.
+
+Two regression tests added:
+- `test_bucket_no_uses_reach_formula_even_when_spot_price_above_strike` — reproduces the
+  HYPE 9:05AM loss where `pos.spot_price=41.09368 > pos.strike=41.08321` inverted delta SL.
+- `test_milestone_no_dip_branch_preserved_when_spot_price_above_strike` — confirms milestone
+  dip markets are unaffected.
+
+### Fix — Upfrac rolling-window premature exit (`monitor.py`, `tests/test_monitor.py`)
+
+`_upfrac_window_ts.get(pos.market_id, 0)` returned epoch zero for any new position,
+making `now - 0 >= WINDOW_SECONDS` always True on the very first monitor scan after entry.
+With `WINDOWS=2` this halved the effective minimum dwell: window 1 fired at entry, window 2
+fired `WINDOW_SECONDS` later — instead of the intended `2 × WINDOW_SECONDS`.
+
+Observed impact: SOL and XRP UP positions exited at `upfrac=0.29` and `0.375` after 5.5 s
+and 15.3 s respectively, while both markets subsequently resolved UP.
+
+Fix: on the first visit for a position, seed the clock and skip evaluation.  The first real
+window evaluation occurs `WINDOW_SECONDS` after entry, giving a true `WINDOWS × WINDOW_SECONDS`
+minimum dwell.  Also clears `_upfrac_window_ts` on position close so re-entries into the
+same market start with a fresh clock.
+
+Four existing `TestUpfracEwmaExit` tests updated to reflect the new seed-and-skip behavior.
+
+### Refactor — M-13: EWMA → rolling-window upfrac (`market_data/oracle_tick_tracker.py`, `monitor.py`, `config.py`)
+
+Replaced per-tick EWMA up-fraction with a true rolling-window fraction (`get_upfrac_rolling()`),
+matching the plan's "raw fraction over last N ticks" intent.  The new method counts up-ticks
+in the last `window_secs` of oracle history and returns `up_count / total_ticks`.  This gives
+a stable, interpretable signal compared with the EWMA which was sensitive to tick rate and
+lookback length.  `get_upfrac_ewma()` retained on `OracleTickTracker` but no longer called
+by the monitor.
+
+New config keys:
+- `MOMENTUM_UPFRAC_WINDOW_SECONDS` (5) — duration of each measurement window
+- `MOMENTUM_UPFRAC_SUPPRESS_UNTIL_ENTRY_WINDOW` (True) — suppress upfrac while TTE is above
+  the entry-window threshold (prevents stale pre-entry signal from firing on ON-promoted positions)
+- `MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE` (0.90) — suppress all taker exits (delta SL, prob SL,
+  upfrac) when CLOB mid ≥ 0.90; position held to settlement at high-confidence levels
+
+### Feature — ON sell-trigger improvements: asymmetric triggers and loser-confidence tighten (`strategies/OpeningNeutral/scanner.py`, `config.py`)
+
+Two new ON-04/ON-05 refinements to per-pair exit trigger computation:
+
+**ON-04 — Asymmetric triggers** (`OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED`, `OPENING_NEUTRAL_WINNER_SELL_BUFFER=0.03`):
+The predicted winner's loser-exit trigger is lowered by `WINNER_SELL_BUFFER` so it is
+harder to accidentally sell the winning leg, while the predicted loser's trigger is kept
+at the global threshold.  Prediction is based on funding direction (positive funding → YES
+favored; negative → NO favored) when the gate is enabled.
+
+**ON-05 — Loser confidence tighten** (`OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED`, `OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN=0.02`):
+When the loser-confidence score exceeds a threshold, the loser leg's exit trigger is raised
+by `LOSER_CONFIDENCE_TIGHTEN`, making it more sensitive and reducing exit latency on
+high-confidence loser signals.  Confidence score now back-filled into `on_fills.csv`.
+
+New ON funding gate (`OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD=0.00001`): entry blocked when
+|funding| exceeds threshold and direction disagrees with intended position.
+
+**`OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM`** (True) — controls whether the ON winner is
+promoted to a full momentum position (with delta-SL, prob-SL, upfrac gates) after the loser
+exits.  Previously wired but not config-gated.
+
+### Feature — `accounting.py`: `exit_reason` column; paper-mode reconcile loop (`accounting.py`, `risk.py`, `main.py`)
+
+`exit_reason` (e.g. `momentum_stop_loss`, `prob_sl`, `upfrac_exit`, `loser_exit`) added as
+a dedicated column in the accounting ledger CSV alongside the coarser `exit_type`
+(`TAKER` / `SL` / `RESOLVED`).  Propagated from `ExitReason` through `RiskEngine.close_position()`
+→ `_Ledger.record_fill()` → `AccountingPosition.exit_reason`.
+
+Paper-mode reconcile loop (`get_ledger().reconcile_loop(pm)`) launched as a named asyncio
+task in `main.py`.  Ensures `PENDING_RESOLVE` paper positions advance through PM CLOB
+winner-flag resolution even when no on-chain events arrive.  Also wires `funding_cache`
+into `OpeningNeutralScanner` constructor.
+
+### Fix — `hl_client.py`: funding update filtered to `HL_PERP_COINS`
+
+`HLClient` `webData2` handler was updating the funding cache for all coins in the universe
+snapshot, including coins not tracked by the bot.  Now skips any coin not in
+`config.HL_PERP_COINS`, preventing stale or irrelevant funding data from polluting the cache.
+
+---
+
 ## [2026-05-04] - Opening Neutral wiring; Momentum diagnostics; webapp Settings; HMR fix
 
 ### Feature — Opening Neutral ON-02: fills CSV (`strategies/OpeningNeutral/scanner.py`)

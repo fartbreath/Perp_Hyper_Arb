@@ -552,6 +552,7 @@ _MUTABLE_CONFIG = {
     "momentum_upfrac_exit_threshold":        ("MOMENTUM_UPFRAC_EXIT_THRESHOLD",        float),
     "momentum_upfrac_exit_windows":          ("MOMENTUM_UPFRAC_EXIT_WINDOWS",          int),
     "momentum_upfrac_ewma_alpha":            ("MOMENTUM_UPFRAC_EWMA_ALPHA",            float),
+    "momentum_upfrac_suppress_until_entry_window": ("MOMENTUM_UPFRAC_SUPPRESS_UNTIL_ENTRY_WINDOW", bool),
     # Stop-loss hysteresis
     "momentum_delta_sl_min_ticks":           ("MOMENTUM_DELTA_SL_MIN_TICKS",           int),
     # Range markets (sub-strategy of Momentum)
@@ -599,6 +600,12 @@ _MUTABLE_CONFIG = {
     "opening_neutral_order_type":                  ("OPENING_NEUTRAL_ORDER_TYPE",                   str),
     "opening_neutral_one_leg_fallback":            ("OPENING_NEUTRAL_ONE_LEG_FALLBACK",             str),
     "opening_neutral_max_concurrent":              ("OPENING_NEUTRAL_MAX_CONCURRENT",               int),
+    # Strategy 5 — Phase 1 (ON-04/05)
+    "opening_neutral_asymmetric_sells_enabled":    ("OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED",      bool),
+    "opening_neutral_funding_gate_threshold":      ("OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD",        float),
+    "opening_neutral_winner_sell_buffer":          ("OPENING_NEUTRAL_WINNER_SELL_BUFFER",            float),
+    "opening_neutral_loser_confidence_enabled":    ("OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED",      bool),
+    "opening_neutral_loser_confidence_tighten":    ("OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN",      float),
 }
 
 
@@ -795,6 +802,7 @@ class ConfigPatch(BaseModel):
     momentum_upfrac_exit_threshold: float | None = None
     momentum_upfrac_exit_windows: int | None = None
     momentum_upfrac_ewma_alpha: float | None = None
+    momentum_upfrac_suppress_until_entry_window: bool | None = None
     # Stop-loss hysteresis
     momentum_delta_sl_min_ticks: int | None = None
     momentum_kelly_multiplier_5m: float | None = None
@@ -848,6 +856,12 @@ class ConfigPatch(BaseModel):
     opening_neutral_order_type: str | None = None
     opening_neutral_one_leg_fallback: str | None = None
     opening_neutral_max_concurrent: int | None = None
+    # Strategy 5 — Phase 1 (ON-04/05)
+    opening_neutral_asymmetric_sells_enabled: bool | None = None
+    opening_neutral_funding_gate_threshold: float | None = None
+    opening_neutral_winner_sell_buffer: float | None = None
+    opening_neutral_loser_confidence_enabled: bool | None = None
+    opening_neutral_loser_confidence_tighten: float | None = None
 
 
 @app.get("/config")
@@ -1046,6 +1060,7 @@ def get_config() -> dict:
         "momentum_upfrac_exit_threshold":        config.MOMENTUM_UPFRAC_EXIT_THRESHOLD,
         "momentum_upfrac_exit_windows":          config.MOMENTUM_UPFRAC_EXIT_WINDOWS,
         "momentum_upfrac_ewma_alpha":            config.MOMENTUM_UPFRAC_EWMA_ALPHA,
+        "momentum_upfrac_suppress_until_entry_window": config.MOMENTUM_UPFRAC_SUPPRESS_UNTIL_ENTRY_WINDOW,
         # Stop-loss hysteresis
         "momentum_delta_sl_min_ticks":           config.MOMENTUM_DELTA_SL_MIN_TICKS,
         "momentum_kelly_multiplier_5m":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_5m",    1.0),
@@ -1099,6 +1114,12 @@ def get_config() -> dict:
         "opening_neutral_order_type":                  config.OPENING_NEUTRAL_ORDER_TYPE,
         "opening_neutral_one_leg_fallback":            config.OPENING_NEUTRAL_ONE_LEG_FALLBACK,
         "opening_neutral_max_concurrent":              config.OPENING_NEUTRAL_MAX_CONCURRENT,
+        # Strategy 5 — Phase 1 (ON-04/05)
+        "opening_neutral_asymmetric_sells_enabled":    config.OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED,
+        "opening_neutral_funding_gate_threshold":      config.OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD,
+        "opening_neutral_winner_sell_buffer":          config.OPENING_NEUTRAL_WINNER_SELL_BUFFER,
+        "opening_neutral_loser_confidence_enabled":    config.OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED,
+        "opening_neutral_loser_confidence_tighten":    config.OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN,
         "timestamp":            time.time(),
     }
 

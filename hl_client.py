@@ -266,7 +266,7 @@ class HLClient:
                 if idx >= len(universe):
                     break
                 coin = universe[idx].get("name", "")
-                if not coin:
+                if not coin or coin not in config.HL_PERP_COINS:
                     continue
                 rate = float(ctx.get("funding") or 0)
                 # Update legacy FundingSnapshot cache so get_fundings_snapshot() still works

@@ -36,6 +36,12 @@ _EWMA_ALPHA: float = 0.3
 # Minimum ticks before get_upfrac_ewma() returns a value
 _MIN_TICKS: int = 5
 
+# Default rolling window (seconds) for get_upfrac_rolling()
+_UPFRAC_WINDOW_DEFAULT: float = 5.0
+
+# Minimum tick-pairs required inside the window for get_upfrac_rolling() to return a value
+_UPFRAC_MIN_PAIRS: int = 10
+
 # Seconds of price history to include in TWAP calculation
 _TWAP_WINDOW_DEFAULT: float = 10.0
 
@@ -122,6 +128,33 @@ class OracleTickTracker:
         if state is None or state.tick_count < _MIN_TICKS:
             return None
         return state.upfrac_ewma
+
+    def get_upfrac_rolling(
+        self,
+        coin: str,
+        window_secs: float = _UPFRAC_WINDOW_DEFAULT,
+    ) -> Optional[float]:
+        """Fraction of up-ticks in the last `window_secs` seconds [0, 1].
+
+        Counts consecutive (prev, curr) price pairs within the time window.
+        Returns None if fewer than _UPFRAC_MIN_PAIRS pairs are available.
+
+        This is a count-based equivalent of cl_upfrac_during from REPORT.md
+        (AUC 0.703) computed in a continuous rolling fashion rather than over
+        a completed 5-minute batch window.  At ~1-2 oracle ticks/second per
+        coin, a 60-second window yields ~60-120 pairs — enough for a stable
+        estimate while remaining responsive within a single 5-minute bucket.
+        """
+        state = self._coins.get(coin)
+        if state is None or not state.price_buffer:
+            return None
+        now = time.time()
+        cutoff = now - window_secs
+        window = [p for ts, p in state.price_buffer if ts >= cutoff]
+        if len(window) < _UPFRAC_MIN_PAIRS + 1:
+            return None
+        up_count = sum(1 for i in range(1, len(window)) if window[i] > window[i - 1])
+        return up_count / (len(window) - 1)
 
     def get_twap_deviation_bps(
         self, coin: str, window_secs: float = _TWAP_WINDOW_DEFAULT

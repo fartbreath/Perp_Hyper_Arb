@@ -77,7 +77,7 @@ LEDGER_HEADER = [
     "market_id", "market_title", "market_type", "underlying",
     "side", "token_id",
     "entry_vwap", "entry_contracts", "entry_cost_usd", "entry_time",
-    "exit_vwap",  "exit_contracts",  "exit_time",     "exit_type",
+    "exit_vwap",  "exit_contracts",  "exit_time",     "exit_type",     "exit_reason",
     "spot_entry", "spot_exit", "strike", "tte_seconds",
     "resolve_price", "resolved_outcome",
     "gross_pnl", "fees_usd", "rebates_usd", "net_pnl",
@@ -164,6 +164,7 @@ class AccountingPosition:
     exit_contracts:  float = 0.0
     exit_time:       str = ""
     exit_type:       str = ""      # RESOLVED | TAKER | SL | TP | LOSER_EXIT | REDEMPTION
+    exit_reason:     str = ""      # ExitReason string: momentum_stop_loss | prob_sl | upfrac_exit | loser_exit | …
     closing_since:   str = ""      # timestamp when CLOSING state was first entered
     pm_exit_confirmed: bool = False
 
@@ -240,6 +241,7 @@ def _write_ledger_record(pos: AccountingPosition) -> None:
         "exit_contracts":     round(pos.exit_contracts, 6),
         "exit_time":          pos.exit_time,
         "exit_type":          pos.exit_type,
+        "exit_reason":        pos.exit_reason,
         "spot_entry":         pos.spot_entry,
         "spot_exit":          pos.spot_exit,
         "strike":             pos.strike,
@@ -448,6 +450,7 @@ class _Ledger:
         fill_price:  float,
         contracts:   float,
         exit_type:   str,    # RESOLVED | TAKER | SL | TP | LOSER_EXIT | REDEMPTION
+        exit_reason: str = "",   # ExitReason string (more granular; stored for display)
         source:      str = "ws",
         spot_exit:   float = 0.0,
         fees_usd:    float = 0.0,
@@ -515,6 +518,8 @@ class _Ledger:
             # First exit fill — record exit_type and move to CLOSING
             if not pos.exit_type:
                 pos.exit_type = exit_type
+            if not pos.exit_reason and exit_reason:
+                pos.exit_reason = exit_reason
             if pos.status == PositionStatus.LIVE:
                 pos.status       = PositionStatus.CLOSING
                 pos.closing_since = now
@@ -572,6 +577,7 @@ class _Ledger:
                     pos.exit_contracts = pos.entry_contracts
                     pos.exit_time      = _now_iso()
                     pos.exit_type      = "RESOLVED"
+                    pos.exit_reason    = "resolved"
 
                 # Terminal status
                 if pos.exit_type in ("SL",):
@@ -654,9 +660,22 @@ class _Ledger:
             return
 
         if config.PAPER_TRADING:
-            # PM /activity is irrelevant in paper mode; just advance state
-            # for positions that have exit fills.
+            # PM /activity is irrelevant in paper mode; advance CLOSING →
+            # PENDING_RESOLVE for any position that already has exit fills.
+            # Phase 3 (winner-flag resolution) still runs — fetch_market_resolution
+            # queries the PM CLOB winner flag directly and works in paper mode.
             self._advance_paper_positions()
+            _pending_cids: set[str] = {
+                p.market_id for p in self._positions.values()
+                if p.status == PositionStatus.PENDING_RESOLVE and p.market_id
+            }
+            for _cid in _pending_cids:
+                try:
+                    _resolved_yes = await pm_client.fetch_market_resolution(_cid)
+                    if _resolved_yes is not None:
+                        self.on_resolved(_cid, _resolved_yes)
+                except Exception as _exc:
+                    log.debug("acct: resolution fetch failed", condition_id=_cid[:16], exc=str(_exc))
             return
 
         # ── Phase 1: PM /activity → confirm fills ─────────────────────────────

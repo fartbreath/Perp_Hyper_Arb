@@ -95,6 +95,8 @@ class ExitReason:
     MOMENTUM_TAKE_PROFIT        = "momentum_take_profit"        # momentum: held token rose above MOMENTUM_TAKE_PROFIT
     MOMENTUM_NEAR_EXPIRY        = "momentum_near_expiry"        # momentum: near expiry and spot has crossed strike
     MOMENTUM_UPFRAC_EXIT        = "upfrac_exit"                 # momentum: oracle tick up-fraction EWMA below threshold for N windows (M-13)
+    MOMENTUM_PROB_STOP_LOSS     = "prob_sl"                     # momentum: CLOB token-price dropped below prob-SL threshold
+    LOSER_EXIT                  = "loser_exit"                  # opening_neutral: loser bid-monitor trigger fired
 
 
 
@@ -411,6 +413,21 @@ def should_exit(
 
     # ── Momentum exits — delta-based (live spot vs strike) ─────────────────────
     if pos.strategy == "momentum":
+        # ── High-probability suppression ─────────────────────────────────────
+        # When the held token is at/above MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE
+        # (default 0.90) the position is deeply in-the-money: the crowd has
+        # priced a ~90c+ win.  Exiting via taker forfeits expected value.
+        # Skip ALL stop-loss exits (delta SL, near-expiry, prob SL, upfrac).
+        # Take-profit (→ 0.999) is never suppressed.
+        _suppress_above = getattr(config, "MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE", 0.0)
+        _token_price_for_suppress = (
+            current_token_price if current_token_price is not None else current_price
+        )
+        _suppress_taker_exits = (
+            _suppress_above > 0.0
+            and _token_price_for_suppress >= _suppress_above
+        )
+
         # Delta SL runs FIRST — requires only spot+strike, NOT token_price.
         # This must evaluate even when the NO CLOB book is drained near expiry
         # (book drain sets current_token_price=None for NO positions, which
@@ -420,17 +437,24 @@ def should_exit(
             if pos.side in ("YES", "BUY_YES", "UP"):
                 # Long YES/UP: profit when spot > strike.  Delta positive when in-the-money.
                 current_delta_pct = (current_spot - pos.strike) / pos.strike * 100
-            elif pos.spot_price > pos.strike:
-                # Long NO/DOWN on a "dip" market (e.g. "Will ETH dip to $X?"):
+            elif pos.spot_price > pos.strike and pos.market_type not in _MARKET_TYPE_DURATION_SECS:
+                # Long NO/DOWN on a "dip" milestone market (e.g. "Will ETH dip to $X?"):
                 # NO wins when spot STAYS ABOVE the strike.
                 # Entry spot was above strike → winning delta = (spot - strike) / strike.
                 # pos.spot_price defaults to 0.0 so this branch only activates for live
                 # dip-market positions where the scanner stored the actual entry spot.
+                # NOTE: bucket markets (5m/15m/4h/1h/daily/weekly) are EXCLUDED here — they
+                # are always UP/DOWN format where YES=above-strike and NO=below-strike.
+                # In a bucket market, pos.spot_price can be fractionally above the strike
+                # (tiny sub-second timing window) while NO still means "ends below strike".
+                # Applying the dip-market formula in that case inverts the delta sign and
+                # silently disables delta SL for the entire bucket (observed HYPE 9:05AM loss).
                 current_delta_pct = (current_spot - pos.strike) / pos.strike * 100
             else:
-                # Long NO/DOWN on a "reach" market (e.g. "Will ETH reach $X?"):
+                # Long NO/DOWN on a reach / bucket UP-DOWN market:
                 # NO wins when spot STAYS BELOW the strike.
-                # Entry spot was at or below strike → winning delta = (strike - spot) / strike.
+                # — Reach milestone: "Will ETH reach $X?" — entry spot at or below strike.
+                # — All bucket markets: YES=above-strike, NO=below-strike (always this branch).
                 current_delta_pct = (pos.strike - current_spot) / pos.strike * 100
             # PROTECTIVE BUFFER: fire when delta drops below +SL_PCT, i.e. while
             # still in-the-money but within SL_PCT% of the strike.  With
@@ -448,14 +472,15 @@ def should_exit(
                 pos.market_type, config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
             ) if isinstance(config.MOMENTUM_MIN_TTE_SECONDS, dict) else config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
             _outside_entry_window = (
-                tte_seconds is not None and tte_seconds > _min_tte
+                tte_seconds is not None and tte_seconds >= _min_tte
             )
-            if not _outside_entry_window and current_delta_pct < _sl:
+            if not _suppress_taker_exits and not _outside_entry_window and current_delta_pct < _sl:
                 return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
             # Near-expiry: only exit if spot has already crossed the strike
             # (delta < 0).  Avoids premature exits from CLOB price collapse.
             if (
-                tte_seconds is not None
+                not _suppress_taker_exits
+                and tte_seconds is not None
                 and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
                 and current_delta_pct < 0
             ):
@@ -507,13 +532,14 @@ def should_exit(
             or _oracle_confirmed_stale                       # confirmed oracle lag
         )
         if (
-            _prob_sl_oracle_ok
+            not _suppress_taker_exits
+            and _prob_sl_oracle_ok
             and _prob_sl_tte_ok
             and config.MOMENTUM_PROB_SL_ENABLED
             and pos.prob_sl_threshold > 0.0
             and token_price < pos.prob_sl_threshold
         ):
-            return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
+            return True, ExitReason.MOMENTUM_PROB_STOP_LOSS, unrealised
 
         # Take-profit: still CLOB-based (converging to 1.0 at resolution).
         # Opening Neutral promoted positions carry a per-position TP price
@@ -629,10 +655,11 @@ class PositionMonitor:
         # ticks each momentum position has been below MOMENTUM_DELTA_STOP_LOSS_PCT.
         # SL only fires once the count reaches MOMENTUM_DELTA_SL_MIN_TICKS.
         self._delta_sl_ticks: dict[str, int] = {}
-        # M-13: consecutive below-threshold upfrac EWMA counter per momentum position.
-        # Incremented when upfrac is below threshold; reset to 0 on recovery.
+        # M-13: consecutive below-threshold upfrac counter per momentum position.
+        # Incremented once per MOMENTUM_UPFRAC_WINDOW_SECONDS; reset to 0 on recovery.
         # Exit fires when count reaches config.MOMENTUM_UPFRAC_EXIT_WINDOWS.
         self._upfrac_below_count: dict[str, int] = {}   # pos.market_id → count
+        self._upfrac_window_ts: dict[str, float] = {}   # pos.market_id → last window evaluation time
         self._oracle_tracker = oracle_tracker  # M-13 OracleTickTracker (Phase 3)
         # Tracks positions currently being exited to prevent double-exit races
         # between the poll loop and the event-driven on_price_update path.
@@ -1757,44 +1784,83 @@ class PositionMonitor:
             if current_spot is not None and pos.strike > 0:
                 self._delta_sl_ticks.pop(pos.market_id, None)
 
-        # ── M-13: cl_upfrac EWMA early exit ──────────────────────────────────
+        # ── M-13: cl_upfrac rolling-window exit ──────────────────────────────
         # AUC 0.703 — strongest predictor in the dataset (strategy_update.md §1.7).
-        # Per-position consecutive below-threshold counter in _upfrac_below_count.
-        # YES positions exit when upfrac_ewma < THRESHOLD; NO when > (1 - THRESHOLD).
-        # Fail-open when oracle_tracker is None or tracker returns None (< 5 ticks).
+        # Sampled once per MOMENTUM_UPFRAC_WINDOW_SECONDS (not per oracle tick).
+        # Uses a rolling count of up-ticks over the last WINDOW_SECONDS rather than
+        # per-tick EWMA — this matches the plan's "raw fraction over last N ticks"
+        # intent and gives a stable ~8-16 tick sample at oracle tick rates.
+        # Counter increments per window-boundary evaluation, not per tick, so
+        # WINDOWS=2 means a true 2×WINDOW_SECONDS = 10 seconds minimum dwell.
+        #
+        # SUPPRESS_UNTIL_ENTRY_WINDOW: when enabled, upfrac is skipped while the
+        # position's TTE is still above the entry window for its market type.
+        # Prevents stale pre-promotion signal from firing on ON-promoted positions.
         if (
             not exit_flag
             and pos.strategy == "momentum"
             and config.MOMENTUM_UPFRAC_EXIT_ENABLED
             and self._oracle_tracker is not None
         ):
-            _upfrac = self._oracle_tracker.get_upfrac_ewma(pos.underlying or "")
-            if _upfrac is not None:
-                _threshold = config.MOMENTUM_UPFRAC_EXIT_THRESHOLD
-                _below = (
-                    _upfrac < _threshold
-                    if pos.side in ("YES", "UP", "BUY_YES")
-                    else _upfrac > (1.0 - _threshold)
+            # High-prob suppression: skip upfrac when token is at/above the 90c
+            # threshold — same gate as delta SL / prob SL in should_exit().
+            _suppress_above_upfrac = getattr(config, "MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE", 0.0)
+            _upfrac_suppress = (
+                _suppress_above_upfrac > 0.0
+                and current_token_price is not None
+                and current_token_price >= _suppress_above_upfrac
+            )
+            if not _upfrac_suppress and getattr(config, "MOMENTUM_UPFRAC_SUPPRESS_UNTIL_ENTRY_WINDOW", False):
+                _upfrac_min_tte = (
+                    config.MOMENTUM_MIN_TTE_SECONDS.get(
+                        pos.market_type, config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
+                    ) if isinstance(config.MOMENTUM_MIN_TTE_SECONDS, dict)
+                    else config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
                 )
-                if _below:
-                    self._upfrac_below_count[pos.market_id] = (
-                        self._upfrac_below_count.get(pos.market_id, 0) + 1
-                    )
+                _upfrac_suppress = tte_seconds is not None and tte_seconds >= _upfrac_min_tte
+            if not _upfrac_suppress:
+                _window_secs = getattr(config, "MOMENTUM_UPFRAC_WINDOW_SECONDS", 5)
+                _now = time.time()
+                _last_ts = self._upfrac_window_ts.get(pos.market_id)
+                if _last_ts is None:
+                    # First visit for this position: seed the clock and skip.
+                    # This ensures the first real window starts WINDOW_SECONDS after
+                    # entry, not immediately (default=0 would make epoch delta always True).
+                    self._upfrac_window_ts[pos.market_id] = _now
+                    _due = False
                 else:
-                    self._upfrac_below_count[pos.market_id] = 0  # reset on recovery
-                if (
-                    self._upfrac_below_count.get(pos.market_id, 0)
-                    >= config.MOMENTUM_UPFRAC_EXIT_WINDOWS
-                ):
-                    exit_flag = True
-                    reason = ExitReason.MOMENTUM_UPFRAC_EXIT
-                    log.info(
-                        "Monitor: upfrac exit triggered",
-                        market_id=pos.market_id[:20],
-                        upfrac=round(_upfrac, 4),
-                        threshold=_threshold,
-                        windows=self._upfrac_below_count[pos.market_id],
+                    _due = _now - _last_ts >= _window_secs
+                if _due:
+                    self._upfrac_window_ts[pos.market_id] = _now
+                    _upfrac = self._oracle_tracker.get_upfrac_rolling(
+                        pos.underlying or "", window_secs=float(_window_secs)
                     )
+                    if _upfrac is not None:
+                        _threshold = config.MOMENTUM_UPFRAC_EXIT_THRESHOLD
+                        _below = (
+                            _upfrac < _threshold
+                            if pos.side in ("YES", "UP", "BUY_YES")
+                            else _upfrac > (1.0 - _threshold)
+                        )
+                        if _below:
+                            self._upfrac_below_count[pos.market_id] = (
+                                self._upfrac_below_count.get(pos.market_id, 0) + 1
+                            )
+                        else:
+                            self._upfrac_below_count[pos.market_id] = 0  # reset on recovery
+                        if (
+                            self._upfrac_below_count.get(pos.market_id, 0)
+                            >= config.MOMENTUM_UPFRAC_EXIT_WINDOWS
+                        ):
+                            exit_flag = True
+                            reason = ExitReason.MOMENTUM_UPFRAC_EXIT
+                            log.info(
+                                "Monitor: upfrac exit triggered",
+                                market_id=pos.market_id[:20],
+                                upfrac=round(_upfrac, 4),
+                                threshold=_threshold,
+                                windows=self._upfrac_below_count[pos.market_id],
+                            )
 
         # Write every intra-hold price check to momentum_ticks.csv for momentum
         # and range positions. Kept out of bot.log to avoid noise; the dedicated
@@ -1871,8 +1937,10 @@ class PositionMonitor:
             if key in self._exiting_positions:
                 return  # another path is already handling this exit
             self._exiting_positions.add(key)
-            # M-13: clean up upfrac counter so dict doesn't grow indefinitely.
+            # M-13: clean up upfrac state so dicts don't grow indefinitely and
+            # a re-entry into the same market starts with a fresh clock.
             self._upfrac_below_count.pop(pos.market_id, None)
+            self._upfrac_window_ts.pop(pos.market_id, None)
 
             if reason == ExitReason.RESOLVED:
                 # Use mid for both legs on resolution.  best_bid and best_ask straddle

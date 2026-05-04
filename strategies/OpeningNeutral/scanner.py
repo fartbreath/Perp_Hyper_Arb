@@ -139,6 +139,7 @@ class OpeningNeutralScanner(BaseStrategy):
         momentum_scanner=None,
         on_close_callback=None,
         on_open_callback=None,
+        funding_cache=None,
     ) -> None:
         self._pm = pm
         self._risk = risk
@@ -147,6 +148,7 @@ class OpeningNeutralScanner(BaseStrategy):
         self._momentum = momentum_scanner
         self._on_close_callback = on_close_callback
         self._on_open_callback = on_open_callback
+        self._funding_cache = funding_cache   # ON-04/05: FundingRateCache (Phase 1)
 
         self._running: bool = False
         # Markets currently being entered (guards against double-entry).
@@ -689,7 +691,15 @@ class OpeningNeutralScanner(BaseStrategy):
                 if mon_pos is not None and mon_side is not None:
                     book = self._pm.get_book(token_id)
                     best_bid = book.best_bid if book is not None else None
-                    if best_bid is not None and best_bid <= config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER:
+                    # ON-04/05: use per-pair trigger for this leg.
+                    # Falls back to the global LOSER_EXIT_TRIGGER if the trigger
+                    # key is absent (e.g. pairs registered before the feature was
+                    # enabled in a running session).
+                    _trigger_key = "yes_trigger" if mon_side == "YES" else "no_trigger"
+                    _bid_threshold = pair.get(
+                        _trigger_key, config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER
+                    )
+                    if best_bid is not None and best_bid <= _bid_threshold:
                         # ── Min-hold gate ────────────────────────────────────
                         # Do not declare a loser until enough time has elapsed
                         # since entry.  At T+1s YES/NO bids are statistically
@@ -1429,10 +1439,29 @@ class OpeningNeutralScanner(BaseStrategy):
             "yes_exit_order_id": "",
             "no_exit_order_id":  "",
             "entry_ts": time.time(),  # used by min-hold gate in _on_price_event
+            # ON-04/05: per-pair bid-monitor trigger prices (computed below).
+            "yes_trigger": config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER,
+            "no_trigger":  config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER,
         }
 
         # ON-02: initialise fills CSV row for this pair.
         _yes_spread, _no_spread = self._entry_spread_cache.pop(market_id, (None, None))
+
+        # ON-04/05: fetch live signal data for CSV logging and trigger computation.
+        # Always fetched (even when features disabled) per ON-02 spec so fills CSV
+        # contains calibration data for retrospective analysis.
+        _funding: Optional[float] = None
+        if self._funding_cache is not None:
+            _funding = self._funding_cache.get(getattr(market, "underlying", ""))
+        _depth_share: Optional[float] = None
+        try:
+            _depth_share = self._pm.get_depth_share(market)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        _yes_trigger, _no_trigger, _loser_conf = self._compute_sell_prices(
+            market, _funding, _depth_share
+        )
+
         self._pair_csv_data[pair_id] = {
             "timestamp":             datetime.now(timezone.utc).isoformat(),
             "pair_id":               pair_id,
@@ -1445,17 +1474,31 @@ class OpeningNeutralScanner(BaseStrategy):
             "combined_cost":         round(yes_pos.entry_price + no_pos.entry_price, 6),
             "yes_spread":            _yes_spread,
             "no_spread":             _no_spread,
-            "funding_rate":          None,
-            "yes_depth_share":       None,
-            "loser_confidence_score": None,
-            "yes_sell_price_placed": config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
-            "no_sell_price_placed":  config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
+            "funding_rate":          round(_funding, 8) if _funding is not None else None,
+            "yes_depth_share":       round(_depth_share, 4) if _depth_share is not None else None,
+            "loser_confidence_score": _loser_conf,
+            "yes_sell_price_placed": _yes_trigger,
+            "no_sell_price_placed":  _no_trigger,
             "loser_leg":             "none",
             "loser_fill_price":      None,
             "loser_fill_time_secs":  None,
             "winner_exit_price":     None,
             "_entry_ts":             time.time(),   # internal only — popped before write
         }
+
+        # ON-04/05: store per-pair triggers in _active_pairs so _on_price_event
+        # can check each leg against its individual threshold.
+        self._active_pairs[pair_id]["yes_trigger"] = _yes_trigger
+        self._active_pairs[pair_id]["no_trigger"]  = _no_trigger
+        log.info(
+            "OpeningNeutral: bid-monitor triggers computed",
+            pair_id=pair_id[:12],
+            yes_trigger=_yes_trigger,
+            no_trigger=_no_trigger,
+            loser_conf=_loser_conf,
+            funding=round(_funding, 8) if _funding is not None else None,
+            depth_share=round(_depth_share, 4) if _depth_share is not None else None,
+        )
 
         # Remove from pending now that entry is registered.
         # Only the YES token was in _token_to_pending (NO was never registered
@@ -1840,6 +1883,7 @@ class OpeningNeutralScanner(BaseStrategy):
             market_id,
             exit_price,
             side=filled_side,
+            exit_reason="loser_exit",
         )
 
         # ON-02: write fills CSV row now that we have the loser exit data.
@@ -1965,6 +2009,79 @@ class OpeningNeutralScanner(BaseStrategy):
             self._on_close_callback(market_id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _compute_sell_prices(
+        self,
+        market: Any,
+        funding: Optional[float],
+        depth_share: Optional[float],
+    ) -> tuple[float, float, Optional[int]]:
+        """Compute per-leg bid-monitor trigger prices and loser confidence score.
+
+        Returns (yes_trigger, no_trigger, loser_confidence_score | None).
+
+        Both triggers default to OPENING_NEUTRAL_LOSER_EXIT_TRIGGER.
+        Features are independently gated (ON-04 / ON-05) and both default to
+        disabled — callers always get a safe symmetric fallback.
+
+        ON-04 — Asymmetric triggers (OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED):
+            Predicted winner's trigger is lowered by WINNER_SELL_BUFFER so its
+            bid must fall further before a loser-exit fires — protecting the
+            winner from accidental early exits on intraday noise.
+
+        ON-05 — Loser confidence tighten (OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED):
+            When both funding and depth share agree on the loser (|score| >= 2),
+            that leg's trigger is raised by LOSER_CONFIDENCE_TIGHTEN so the
+            market sell fires sooner, freeing capital faster.
+
+        Funding semantics (validated in strategy_update.md §0.3 data):
+            funding > threshold  →  YES is likely loser (NO wins 62.3%)
+            funding < -threshold →  NO is likely loser (YES wins 76.2%)
+
+        Depth-share semantics (strategy_update.md §0.4 data):
+            depth_share < 0.25 →  YES wins only 41.5% →  YES is likely loser
+            depth_share > 0.75 →  YES wins 60.0%      →  NO is likely loser
+
+        Score convention: positive = YES predicted loser; negative = NO predicted loser.
+        |score| >= 2 means both signals agree → tighten that leg's trigger.
+        """
+        base = config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER
+        yes_trigger: float = base
+        no_trigger:  float = base
+        score: Optional[int] = None
+
+        # ON-04: asymmetric sell triggers based on funding direction.
+        if config.OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED and funding is not None:
+            buf = config.OPENING_NEUTRAL_WINNER_SELL_BUFFER
+            thr = config.OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD
+            if funding > thr:
+                # YES is likely loser → YES trigger stays standard; NO (winner) lowered.
+                no_trigger = round(base - buf, 4)
+            elif funding < -thr:
+                # NO is likely loser → NO trigger stays standard; YES (winner) lowered.
+                yes_trigger = round(base - buf, 4)
+
+        # ON-05: loser confidence score + tighten.
+        if config.OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED:
+            thr = config.OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD
+            _score = 0
+            if funding is not None:
+                if funding > thr:    _score += 1   # YES likely loser
+                elif funding < -thr: _score -= 1   # NO likely loser
+            if depth_share is not None:
+                if depth_share < 0.25:   _score += 1  # YES likely loser
+                elif depth_share > 0.75: _score -= 1  # NO likely loser
+            score = _score
+            if abs(_score) >= 2:
+                tighten = config.OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN
+                if _score > 0:
+                    # YES is predicted loser — raise YES trigger (fires sooner).
+                    yes_trigger = round(yes_trigger + tighten, 4)
+                else:
+                    # NO is predicted loser — raise NO trigger (fires sooner).
+                    no_trigger = round(no_trigger + tighten, 4)
+
+        return yes_trigger, no_trigger, score
 
     def _pair_is_resolved(self, pair: dict) -> bool:
         """True if both legs of a pair are closed (market resolved or manual exit)."""

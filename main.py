@@ -85,6 +85,7 @@ from strategies.mispricing.signals import MispricingSignal
 from strategies.Momentum.scanner import MomentumScanner
 from strategies.Momentum.vol_fetcher import VolFetcher
 from strategies.OpeningNeutral import OpeningNeutralScanner
+from accounting import get_ledger
 from agent import AgentDecisionLayer, AgentDecision
 from monitor import PositionMonitor, compute_unrealised_pnl
 from fill_simulator import FillSimulator
@@ -758,6 +759,7 @@ async def main() -> None:
             momentum_scanner=momentum_scanner,
             on_close_callback=None,  # patched after _on_position_close is defined
             on_open_callback=notify_state_changed,
+            funding_cache=funding_cache,
         )
 
     def _on_position_close(market_id: str) -> None:
@@ -845,6 +847,10 @@ async def main() -> None:
         asyncio.create_task(
             api_server.run_api_server(port=config.API_PORT),
             name="api_server",
+        ),
+        asyncio.create_task(
+            get_ledger().reconcile_loop(pm),
+            name="acct_reconcile",
         ),
     ]
     if config.PAPER_TRADING:

@@ -8,7 +8,7 @@
  * Columns: Market · Type · Underlying · Side · Entry VWAP · Exit VWAP ·
  *          Contracts · Exit Type · Gross · Fees · Rebates · Net P&L · Status · Time
  */
-import { useState, useMemo, Fragment } from "react";
+import { useState, useMemo } from "react";
 import { useAcctLedger } from "../api/client";
 import type { AcctLedgerRow } from "../api/client";
 import {
@@ -16,6 +16,7 @@ import {
   netPnl, grossPnl, pnlColor,
   buildGroups,
 } from "./tradesUtils";
+import type { LedgerGroup } from "./tradesUtils";
 export type { LedgerGroup } from "./tradesUtils";
 
 const UNDERLYINGS = ["", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE", "other"];
@@ -110,6 +111,67 @@ function PmBadge({ confirmed, label }: { confirmed: string; label: string }) {
   );
 }
 
+const EXIT_REASON_LABELS: Record<string, string> = {
+  momentum_stop_loss:   "Delta SL",
+  prob_sl:              "Prob SL",
+  momentum_take_profit: "TP",
+  momentum_near_expiry: "Near Expiry",
+  upfrac_exit:          "Upfrac",
+  loser_exit:           "Loser Exit",
+  LOSER_EXIT:           "Loser Exit",
+  resolved:             "Resolved",
+  profit_target:        "TP",
+  stop_loss:            "SL",
+  time_stop:            "Time Stop",
+  coin_loss_limit:      "Coin Loss",
+  TAKER:                "Taker",
+  SL:                   "SL",
+  TP:                   "TP",
+  RESOLVED:             "Resolved",
+  REDEMPTION:           "Redemption",
+};
+
+function ExitReasonBadge({ reason, exitType, outcome }: {
+  reason:   string | undefined;
+  exitType: string | undefined;
+  outcome:  string | undefined;
+}) {
+  const raw = reason || exitType || "";
+  if (!raw) return <span style={{ color: "#64748b" }}>—</span>;
+
+  const isResolved = raw === "resolved" || exitType === "RESOLVED";
+  let label = EXIT_REASON_LABELS[raw] ?? raw;
+  if (isResolved && outcome) {
+    label = outcome === "WIN" ? "Resolved Win" : outcome === "LOSS" ? "Resolved Loss" : label;
+  }
+
+  const SL_TYPES = new Set(["momentum_stop_loss", "prob_sl", "stop_loss", "SL", "coin_loss_limit"]);
+  const TP_TYPES = new Set(["momentum_take_profit", "profit_target", "TP"]);
+  const SPECIAL_TYPES = new Set(["upfrac_exit", "loser_exit", "LOSER_EXIT", "momentum_near_expiry", "time_stop"]);
+
+  let bg = "#1e293b", color = "#94a3b8", border = "#374151";
+  if (SL_TYPES.has(raw)) {
+    bg = "#450a0a"; color = "#fca5a5"; border = "#7f1d1d";
+  } else if (TP_TYPES.has(raw)) {
+    bg = "#052e16"; color = "#86efac"; border = "#166534";
+  } else if (isResolved) {
+    if (outcome === "WIN")      { bg = "#052e16"; color = "#86efac"; border = "#166534"; }
+    else if (outcome === "LOSS") { bg = "#450a0a"; color = "#fca5a5"; border = "#7f1d1d"; }
+  } else if (SPECIAL_TYPES.has(raw)) {
+    bg = "#1c1407"; color = "#fbbf24"; border = "#92400e";
+  }
+
+  return (
+    <span style={{
+      background: bg, border: `1px solid ${border}`,
+      borderRadius: 4, padding: "1px 6px", fontSize: 10, fontWeight: 600,
+      color, whiteSpace: "nowrap",
+    }}>
+      {label}
+    </span>
+  );
+}
+
 // ─── summary bar ─────────────────────────────────────────────────────────────
 
 function SummaryBar({ groups }: { groups: LedgerGroup[] }) {
@@ -176,8 +238,8 @@ function LedgerRow({ row, indent = false }: { row: AcctLedgerRow; indent?: boole
       <td style={{ padding: "8px 8px", fontSize: 12, color: "#cbd5e1", textAlign: "right", fontFamily: "monospace" }}>
         {fmtContracts(row.entry_contracts)}
       </td>
-      <td style={{ padding: "8px 8px", fontSize: 11, color: "#94a3b8", textAlign: "center" }}>
-        {row.exit_type || "—"}
+      <td style={{ padding: "8px 8px", textAlign: "center" }}>
+        <ExitReasonBadge reason={row.exit_reason} exitType={row.exit_type} outcome={row.resolved_outcome} />
       </td>
       <td style={{ padding: "8px 8px", fontSize: 12, textAlign: "right", fontFamily: "monospace",
         color: gross > 0 ? "#86efac" : gross < 0 ? "#fca5a5" : "#94a3b8" }}>

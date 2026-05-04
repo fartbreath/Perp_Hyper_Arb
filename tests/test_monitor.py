@@ -426,6 +426,70 @@ class TestShouldExit:
         assert exit_flag
         assert reason == ExitReason.MOMENTUM_STOP_LOSS
 
+    # ── Bucket-market NO: reach formula always (dip/reach heuristic disabled) ──
+
+    def test_bucket_no_uses_reach_formula_even_when_spot_price_above_strike(self):
+        """ON-promoted NO on a bucket_5m market: delta SL fires even when
+        pos.spot_price > pos.strike (tiny timing margin at bucket open).
+
+        Before the fix, pos.spot_price=41.09 > pos.strike=41.083 → dip-market
+        branch → (spot−strike)/strike=+0.046% → SL never fires as HYPE rises.
+        After fix, bucket markets always use the reach formula → (strike−spot)/strike
+        → −0.046% < threshold → SL fires.  Reproduces the HYPE 9:05AM loss.
+        """
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.015
+        config.MIN_HOLD_SECONDS = 0
+        strike = 41.08321
+        pos = _make_position(
+            entry_price=0.51, size=10.0, seconds_ago=120,
+            strategy="momentum", side="NO",
+            strike=strike,
+        )
+        # Mimic ON scanner setting spot_price ABOVE the strike due to sub-second timing.
+        pos.spot_price = 41.09368  # fractionally above strike
+        pos.market_type = "bucket_5m"  # this is what enables the fix
+
+        # Spot is 0.12% above strike: with the dip formula this would be +0.12%
+        # (no SL); with the reach formula this is −0.12% < −0.015% (SL fires).
+        exit_flag, reason, _ = should_exit(
+            pos=pos,
+            current_price=0.60,
+            current_token_price=0.10,
+            current_spot=41.135,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(seconds=30),
+            now=self.NOW,
+        )
+        assert exit_flag, "Delta SL must fire for bucket NO when spot > strike"
+        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+
+    def test_milestone_no_dip_branch_preserved_when_spot_price_above_strike(self):
+        """Milestone (non-bucket) NO with pos.spot_price > pos.strike keeps the dip
+        formula: SL does NOT fire when HYPE is still above the strike (in-the-money
+        for a dip-market NO position)."""
+        config.MOMENTUM_DELTA_STOP_LOSS_PCT = 0.015
+        config.MIN_HOLD_SECONDS = 0
+        strike = 41.08321
+        pos = _make_position(
+            entry_price=0.51, size=10.0, seconds_ago=120,
+            strategy="momentum", side="NO",
+            strike=strike,
+        )
+        pos.spot_price = 41.09368  # above strike — dip-market classification
+        pos.market_type = "milestone"  # NOT a bucket market → dip branch still applies
+
+        # Spot above strike → dip-market delta = (spot−strike)/strike = +0.12% > threshold → no SL.
+        exit_flag, _, _ = should_exit(
+            pos=pos,
+            current_price=0.60,
+            current_token_price=0.10,
+            current_spot=41.135,
+            initial_deviation=0.0,
+            market_end_date=self.NOW + timedelta(hours=2),
+            now=self.NOW,
+        )
+        assert not exit_flag, "Dip-market milestone NO must NOT fire SL when spot is above strike"
+
     # ── Near-expiry stop ──────────────────────────────────────────────────
 
     def test_momentum_near_expiry_stop_triggers(self):
@@ -2102,7 +2166,7 @@ class TestProbSlShouldExit:
             oracle_age_seconds=25.0,  # stale — confirmed oracle lag
         )
         assert exit_flag is True
-        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+        assert reason == ExitReason.MOMENTUM_PROB_STOP_LOSS
 
     def test_prob_sl_does_not_fire_at_threshold(self):
         config.MOMENTUM_PROB_SL_ENABLED = True
@@ -2224,7 +2288,7 @@ class TestProbSlShouldExit:
             oracle_age_seconds=25.0,  # stale — confirmed oracle lag
         )
         assert exit_flag is True
-        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+        assert reason == ExitReason.MOMENTUM_PROB_STOP_LOSS
 
     def test_prob_sl_blocked_when_oracle_fresh(self):
         """Oracle-lag gate: prob-SL must NOT fire when oracle ticked recently.
@@ -2274,7 +2338,7 @@ class TestProbSlShouldExit:
             oracle_age_seconds=25.0,  # stale — beyond 10s window
         )
         assert exit_flag is True
-        assert reason == ExitReason.MOMENTUM_STOP_LOSS
+        assert reason == ExitReason.MOMENTUM_PROB_STOP_LOSS
 
     def test_prob_sl_blocked_when_oracle_age_unknown(self):
         """Oracle-lag gate: prob-SL must be BLOCKED when oracle_age_seconds is None.
@@ -2943,10 +3007,12 @@ class TestUpfracEwmaExit:
           - price == entry_price so no P&L-based exit fires
           - spot_client=None so delta SL cannot evaluate
           - end_date=None so RESOLVED / time-stop do not fire
+          - _upfrac_window_ts is left empty; the FIRST call seeds the clock (no
+            evaluation), subsequent calls after expiry perform real window checks.
         """
         monitor, pm, risk = _make_monitor()
         tracker = MagicMock()
-        tracker.get_upfrac_ewma = MagicMock(return_value=upfrac_value)
+        tracker.get_upfrac_rolling = MagicMock(return_value=upfrac_value)
         monitor._oracle_tracker = tracker
         pm._markets["mkt_001"] = self._make_market()
         pm._books["tok_yes"] = self._make_book(mid=0.50)
@@ -2980,25 +3046,33 @@ class TestUpfracEwmaExit:
     # ── counter increments / exit firing ─────────────────────────────────────────────────────
 
     def test_counter_increments_and_does_not_exit_before_n_windows(self):
-        """WINDOWS=2: after 1 below-threshold tick the counter is 1 and position stays open."""
+        """WINDOWS=2: after 1 below-threshold window the counter is 1 and position stays open."""
         monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.20)  # 0.20 < threshold 0.40
-        _run(monitor._check_position(pos))
+        _run(monitor._check_position(pos))                                # seed: clock starts, no evaluation
+        monitor._upfrac_window_ts["mkt_001"] = 0                          # expire window
+        _run(monitor._check_position(pos))                                # window 1 → counter=1, no exit
         assert not risk._positions["mkt_001:YES"].is_closed
         assert monitor._upfrac_below_count.get("mkt_001", 0) == 1
 
     def test_exit_fires_at_n_consecutive_below_threshold_yes(self):
-        """WINDOWS=2: YES position is closed on the 2nd consecutive below-threshold tick."""
+        """WINDOWS=2: YES position is closed on the 2nd consecutive below-threshold window."""
         monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.20)
-        _run(monitor._check_position(pos))   # tick 1 → counter=1, no exit
-        _run(monitor._check_position(pos))   # tick 2 → counter=2 == WINDOWS → exit
+        _run(monitor._check_position(pos))          # seed: clock starts, no evaluation
+        monitor._upfrac_window_ts["mkt_001"] = 0    # expire window
+        _run(monitor._check_position(pos))          # window 1 → counter=1, no exit
+        monitor._upfrac_window_ts["mkt_001"] = 0    # expire window so next call evaluates
+        _run(monitor._check_position(pos))          # window 2 → counter=2 == WINDOWS → exit
         assert risk._positions["mkt_001:YES"].is_closed
         assert risk._positions["mkt_001:YES"].realized_pnl == pytest.approx(0.0, abs=0.01)
 
     def test_upfrac_counter_cleared_after_exit(self):
         """_upfrac_below_count entry is removed once the upfrac exit fires."""
         monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.20)
-        _run(monitor._check_position(pos))
-        _run(monitor._check_position(pos))   # exit fires on tick 2
+        _run(monitor._check_position(pos))           # seed: clock starts
+        monitor._upfrac_window_ts["mkt_001"] = 0    # expire window
+        _run(monitor._check_position(pos))           # window 1 → counter=1
+        monitor._upfrac_window_ts["mkt_001"] = 0    # expire window
+        _run(monitor._check_position(pos))           # exit fires on window 2
         assert "mkt_001" not in monitor._upfrac_below_count
 
     # ── counter resets on recovery ────────────────────────────────────────────────────────────────────
@@ -3006,20 +3080,24 @@ class TestUpfracEwmaExit:
     def test_counter_resets_when_upfrac_recovers(self):
         """Counter resets to 0 when upfrac recovers above threshold; exit does not fire."""
         monitor, pm, risk, tracker, pos = self._make_setup(upfrac_value=0.20)
-        _run(monitor._check_position(pos))                          # tick 1: counter → 1
-        tracker.get_upfrac_ewma = MagicMock(return_value=0.65)     # recovery (0.65 > 0.40)
-        _run(monitor._check_position(pos))                          # tick 2: counter → 0
+        _run(monitor._check_position(pos))                                # window 1: counter → 1
+        monitor._upfrac_window_ts["mkt_001"] = 0                          # expire window
+        tracker.get_upfrac_rolling = MagicMock(return_value=0.65)         # recovery (0.65 > 0.40)
+        _run(monitor._check_position(pos))                                # window 2: counter → 0
         assert monitor._upfrac_below_count.get("mkt_001", 0) == 0
         assert not risk._positions["mkt_001:YES"].is_closed
 
     # ── NO side ──────────────────────────────────────────────────────────────────────────────────────────────────
 
     def test_no_side_exits_when_upfrac_above_inverted_threshold(self):
-        """NO position exits when upfrac > (1 - threshold) for WINDOWS consecutive ticks."""
+        """NO position exits when upfrac > (1 - threshold) for WINDOWS consecutive windows."""
         monitor, pm, risk, _, pos = self._make_setup(upfrac_value=0.75, side="NO")
         # 0.75 > (1.0 - 0.40 = 0.60): oracle is bullish, NO is losing direction
-        _run(monitor._check_position(pos))   # tick 1
-        _run(monitor._check_position(pos))   # tick 2 → exit
+        _run(monitor._check_position(pos))          # seed: clock starts, no evaluation
+        monitor._upfrac_window_ts["mkt_001"] = 0   # expire window
+        _run(monitor._check_position(pos))          # window 1 → counter=1
+        monitor._upfrac_window_ts["mkt_001"] = 0   # expire window
+        _run(monitor._check_position(pos))          # window 2 → exit
         assert risk._positions["mkt_001:NO"].is_closed
 
     # ── fail-open conditions ──────────────────────────────────────────────────────────────────────────
@@ -3042,9 +3120,10 @@ class TestUpfracEwmaExit:
         assert monitor._upfrac_below_count == {}
 
     def test_upfrac_none_fails_open(self):
-        """get_upfrac_ewma returning None: gate fails open, position stays open."""
+        """get_upfrac_rolling returning None: gate fails open, position stays open."""
         monitor, pm, risk, _, pos = self._make_setup(upfrac_value=None)
         for _ in range(5):
+            monitor._upfrac_window_ts["mkt_001"] = 0  # always expire so each iteration evaluates
             _run(monitor._check_position(pos))
         assert not risk._positions["mkt_001:YES"].is_closed
         assert monitor._upfrac_below_count.get("mkt_001", 0) == 0

@@ -372,6 +372,42 @@ OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED: bool = True
 OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD: float = 0.15
 # Maximum simultaneous opening-neutral pairs.
 OPENING_NEUTRAL_MAX_CONCURRENT: int = 1
+
+# ── Phase 1 — Asymmetric Sell Triggers (ON-04) ───────────────────────────────
+# Ship disabled. Enable only after ≥ 2 weeks of symmetric paper-fill data
+# confirms (a) the winner bid never dips below (LOSER_EXIT_TRIGGER - buffer)
+# intraday, and (b) the loser reaches the trigger at least 30% faster.
+# strategy_update.md §0.3 and PRD ON-04 are the source of truth for enablement.
+#
+# Bid-monitor semantics:
+#   Predicted loser: monitored at LOSER_EXIT_TRIGGER (standard).
+#   Predicted winner: monitored at LOSER_EXIT_TRIGGER - WINNER_SELL_BUFFER so
+#     its bid must fall further before a loser-exit fires — protecting against
+#     accidental early exits on intraday noise.
+#
+# Funding semantics (from strategy_update.md §0.3 data):
+#   funding_rate > threshold  →  YES is likely loser (NO wins 62.3%)
+#   funding_rate < -threshold →  NO is likely loser (YES wins 76.2%)
+OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED: bool = True
+OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD: float = 0.00001
+OPENING_NEUTRAL_WINNER_SELL_BUFFER: float = 0.03
+
+# ── Phase 1 — Loser Confidence Scoring (ON-05) ───────────────────────────────
+# Ship disabled. Additive on top of ON-04; either feature can be enabled alone.
+# When |score| >= 2 (funding and depth share agree on the loser), the predicted
+# loser's bid-monitor trigger is raised by TIGHTEN so the market sell fires
+# sooner, freeing capital faster.
+# Score convention (strategy_update.md §0.4 data):
+#   +1 per signal that predicts YES as loser:
+#     funding > threshold       → YES loser (NO wins 62.3%)
+#     depth_share < 0.25        → YES loser (YES wins only 41.5%)
+#   -1 per signal that predicts NO as loser:
+#     funding < -threshold      → NO loser (YES wins 76.2%)
+#     depth_share > 0.75        → NO loser (YES wins 60.0%)
+#   |score| >= 2 → both signals agree → apply TIGHTEN to predicted loser trigger.
+OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED: bool = True
+OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN: float = 0.02
+
 # DRY_RUN: when True all order placements are skipped (no real orders sent).
 # Signals, pair tracking, and all logic run normally — only the pm_client calls
 # are suppressed.  Safe to deploy inactive; set False after validation.``
@@ -391,7 +427,7 @@ OPENING_NEUTRAL_TP_PROFIT_PCT: float = 0.30  # 30% profit on combined cost
 # the loser exits; momentum SL / TP / delta-SL / prob-SL all apply from that
 # point.  When False the winner stays as strategy="opening_neutral" and is held
 # until the market resolves — no stop-loss or take-profit is applied.
-OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM: bool = False
+OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM: bool = True
 
 # ── Strategy 3 — Momentum Scanner ─────────────────────────────────────────
 # Price band: scanner fires when held-side is in [LOW, HIGH].
@@ -532,14 +568,16 @@ MOMENTUM_TWAP_GATE_ENABLED: bool = True
 MOMENTUM_TWAP_DEV_THRESHOLD_BPS: float = -5.0        # dev below this (oracle below TWAP) triggers multiplier
 MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER: float = 1.4  # raises YES/UP z-bar in low-vol + neg TWAP dev
 
-# ── M-13: cl_upfrac EWMA Early Exit ──────────────────────────────────────────
-# Oracle tick up-fraction EWMA. For YES positions: exit when EWMA stays below
-# threshold for UPFRAC_EXIT_WINDOWS consecutive scan ticks.
+# ── M-13: cl_upfrac rolling-window exit ──────────────────────────────────────
+# Rolling up-tick fraction over UPFRAC_WINDOW_SECONDS. Sampled once per window.
+# For YES positions: exit when rolling fraction stays below threshold for
+# UPFRAC_EXIT_WINDOWS consecutive windows (= WINDOWS × WINDOW_SECONDS minimum).
 # Source: strategy_update.md §1.7. AUC = 0.703 (strongest signal in dataset).
 MOMENTUM_UPFRAC_EXIT_ENABLED: bool = True
-MOMENTUM_UPFRAC_EXIT_THRESHOLD: float = 0.40    # exit YES when ewma < this; exit NO when ewma > (1 - this)
+MOMENTUM_UPFRAC_EXIT_THRESHOLD: float = 0.40    # exit YES when frac < this; exit NO when frac > (1 - this)
 MOMENTUM_UPFRAC_EXIT_WINDOWS: int = 2            # consecutive below-threshold windows before exit fires
-MOMENTUM_UPFRAC_EWMA_ALPHA: float = 0.3         # EWMA smoothing factor (owned by OracleTickTracker)
+MOMENTUM_UPFRAC_WINDOW_SECONDS: int = 5          # duration of each measurement window in seconds
+MOMENTUM_UPFRAC_SUPPRESS_UNTIL_ENTRY_WINDOW: bool = True  # when True: upfrac exit is suppressed while TTE > MOMENTUM_MIN_TTE_SECONDS[market_type] (guards against stale pre-promotion EWMA on ON-promoted positions)
 
 # Order type: "limit" = taker limit at ask+0.5c (ensures fill); "market" = immediate cross.
 MOMENTUM_ORDER_TYPE: str = "limit"
@@ -551,6 +589,13 @@ MOMENTUM_ORDER_TYPE: str = "limit"
 MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.01  # protective buffer: exit when delta (in-the-money %) drops BELOW this threshold (fires before strike is crossed)
 MOMENTUM_DELTA_SL_MIN_TICKS: int = 3        # hysteresis: delta SL only fires after this many consecutive below-threshold ticks (prevents single-tick noise from triggering exit)
 MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
+# High-probability taker-exit suppression: when the held token's CLOB mid is AT OR
+# ABOVE this price all stop-loss taker exits (delta SL, near-expiry time stop, prob
+# SL, upfrac) are suppressed and the position is held to settlement.  The take-profit
+# (MOMENTUM_TAKE_PROFIT ≈ 0.999) is never suppressed.
+# Rationale: at 90c+ the crowd has priced a near-certain win; any taker exit forfeits
+# expected value.  Set to 0.0 to disable.
+MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE: float = 0.90
 # How long to wait for PM API to confirm settlement before falling back to the
 # resolution oracle.  PM can take 1–10 min to flip closed=True on the CLOB API
 # for short-duration (5m/15m) bucket markets.  After this many seconds past

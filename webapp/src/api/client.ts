@@ -573,6 +573,7 @@ export interface ConfigData {
   momentum_upfrac_exit_threshold?: number;
   momentum_upfrac_exit_windows?: number;
   momentum_upfrac_ewma_alpha?: number;
+  momentum_upfrac_suppress_until_entry_window?: boolean;
   // Stop-loss hysteresis
   momentum_delta_sl_min_ticks?: number;
   // Kelly extensions (COB)
@@ -636,6 +637,13 @@ export interface ConfigData {
   opening_neutral_order_type?: string;
   opening_neutral_one_leg_fallback?: string;
   opening_neutral_max_concurrent?: number;
+  // ON-04 — Asymmetric sell triggers
+  opening_neutral_asymmetric_sells_enabled?: boolean;
+  opening_neutral_funding_gate_threshold?: number;
+  opening_neutral_winner_sell_buffer?: number;
+  // ON-05 — Loser confidence scoring
+  opening_neutral_loser_confidence_enabled?: boolean;
+  opening_neutral_loser_confidence_tighten?: number;
 }
 
 export interface InventoryData {
@@ -1022,6 +1030,7 @@ export interface AcctLedgerRow {
   exit_contracts:      string;
   exit_time:           string;
   exit_type:           string;
+  exit_reason?:        string;
   spot_exit:           string;
   resolve_price:       string;
   resolved_outcome:    string;

@@ -37,6 +37,19 @@ Coverage:
   - loser exit writes complete row to on_fills.csv (spreads, combined_cost, loser leg/price/time)
   - notify_winner_closed() backfills winner_exit_price in the existing CSV row
   - schema migration: old header → backup .csv.bak + fresh file with current schema
+  --- ON-04: asymmetric sell triggers ---
+  - positive funding → YES trigger = base (loser), NO trigger = base - buffer (winner protected)
+  - negative funding → NO trigger = base (loser), YES trigger = base - buffer (winner protected)
+  - funding within threshold → symmetric (both = base)
+  - funding = None → symmetric (both = base)
+  - feature disabled → symmetric regardless of funding value
+  --- ON-05: loser confidence scoring ---
+  - funding + depth share both predict YES loser (score=+2) → yes_trigger tightened
+  - funding + depth share both predict NO loser (score=-2) → no_trigger tightened
+  - partial agreement (score=±1) → no tighten applied
+  - no signals (score=0) → no tighten applied
+  - ON-04 + ON-05 combined: winner protected AND loser tightened
+  - feature disabled → score=None, no tighten
 """
 
 from __future__ import annotations
@@ -1471,4 +1484,306 @@ def test_on02_fills_csv_schema_migration(tmp_path, monkeypatch):
         bak_rows = list(csv.reader(f))
     assert bak_rows[0] == old_header, "Backup must preserve old header"
     assert bak_rows[1][0] == "2026-05-01", "Backup must preserve old rows"
+
+
+# ── ON-04: asymmetric sell triggers ──────────────────────────────────────────
+
+
+def _make_scanner_for_compute() -> OpeningNeutralScanner:
+    """Minimal scanner suitable for calling _compute_sell_prices (no async needed)."""
+    pm = MagicMock()
+    pm.get_markets.return_value = {}
+    pm.get_book.return_value = None
+    pm._paper_mode = True
+    pm.place_limit = AsyncMock(return_value="ord_001")
+    pm.place_market = AsyncMock(return_value="ord_002")
+    pm.cancel_order = AsyncMock(return_value=None)
+    pm.register_fill_future = MagicMock()
+    risk = MagicMock()
+    risk.get_open_positions.return_value = []
+    spot = MagicMock()
+    spot.get_price = MagicMock(return_value=70000.0)
+    vol = MagicMock()
+    vol.get_sigma_ann = AsyncMock(return_value=0.8)
+    return OpeningNeutralScanner(pm=pm, risk=risk, spot_client=spot, vol_fetcher=vol)
+
+
+def test_on04_positive_funding_protects_no_winner():
+    """
+    ON-04 AC: positive funding (YES likely loser) →
+      YES trigger = base (standard, loser exits at normal speed)
+      NO  trigger = base - buffer (winner protected from accidental early exit)
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+    buf = 0.03
+    thr = 0.00001
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_WINNER_SELL_BUFFER", buf),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", thr),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", False),
+    ):
+        yes_t, no_t, score = scanner._compute_sell_prices(market, funding=0.001, depth_share=None)
+
+    assert yes_t == base, "YES (loser) must keep standard trigger"
+    assert no_t == round(base - buf, 4), "NO (winner) trigger must be lowered by buffer"
+    assert score is None, "ON-05 disabled → no score"
+
+
+def test_on04_negative_funding_protects_yes_winner():
+    """
+    ON-04 AC: negative funding (NO likely loser) →
+      NO  trigger = base (standard, loser exits at normal speed)
+      YES trigger = base - buffer (winner protected)
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+    buf = 0.03
+    thr = 0.00001
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_WINNER_SELL_BUFFER", buf),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", thr),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", False),
+    ):
+        yes_t, no_t, score = scanner._compute_sell_prices(market, funding=-0.001, depth_share=None)
+
+    assert no_t == base, "NO (loser) must keep standard trigger"
+    assert yes_t == round(base - buf, 4), "YES (winner) trigger must be lowered by buffer"
+    assert score is None
+
+
+def test_on04_funding_within_threshold_is_symmetric():
+    """
+    ON-04 AC: |funding| < threshold → both legs use symmetric base trigger.
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+    thr = 0.00001
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_WINNER_SELL_BUFFER", 0.03),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", thr),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", False),
+    ):
+        yes_t, no_t, _ = scanner._compute_sell_prices(market, funding=0.000005, depth_share=None)
+
+    assert yes_t == base
+    assert no_t == base
+
+
+def test_on04_none_funding_is_symmetric():
+    """
+    ON-04 AC: funding=None → symmetric fallback (both = base).
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_WINNER_SELL_BUFFER", 0.03),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", 0.00001),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", False),
+    ):
+        yes_t, no_t, _ = scanner._compute_sell_prices(market, funding=None, depth_share=None)
+
+    assert yes_t == base
+    assert no_t == base
+
+
+def test_on04_disabled_ignores_funding():
+    """
+    ON-04 AC: feature disabled → both triggers = base regardless of funding direction.
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", False),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_WINNER_SELL_BUFFER", 0.03),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", 0.00001),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", False),
+    ):
+        yes_t, no_t, _ = scanner._compute_sell_prices(market, funding=0.1, depth_share=None)
+
+    assert yes_t == base
+    assert no_t == base
+
+
+# ── ON-05: loser confidence scoring ──────────────────────────────────────────
+
+
+def test_on05_both_signals_predict_yes_loser_tightens_yes():
+    """
+    ON-05 AC: funding > threshold (YES loser, +1) AND depth_share < 0.25 (YES loser, +1)
+    → score = +2 → yes_trigger raised by tighten; no_trigger unchanged.
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+    tighten = 0.02
+    thr = 0.00001
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", False),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", thr),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN", tighten),
+    ):
+        yes_t, no_t, score = scanner._compute_sell_prices(
+            market, funding=0.001, depth_share=0.10
+        )
+
+    assert score == 2
+    assert yes_t == round(base + tighten, 4), "YES (loser) trigger must be raised"
+    assert no_t == base, "NO (winner) trigger must be unchanged"
+
+
+def test_on05_both_signals_predict_no_loser_tightens_no():
+    """
+    ON-05 AC: funding < -threshold (NO loser, -1) AND depth_share > 0.75 (NO loser, -1)
+    → score = -2 → no_trigger raised by tighten; yes_trigger unchanged.
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+    tighten = 0.02
+    thr = 0.00001
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", False),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", thr),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN", tighten),
+    ):
+        yes_t, no_t, score = scanner._compute_sell_prices(
+            market, funding=-0.001, depth_share=0.90
+        )
+
+    assert score == -2
+    assert no_t == round(base + tighten, 4), "NO (loser) trigger must be raised"
+    assert yes_t == base, "YES (winner) trigger must be unchanged"
+
+
+def test_on05_partial_agreement_no_tighten():
+    """
+    ON-05 AC: only one signal agrees (|score| = 1) → no tighten applied.
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+    thr = 0.00001
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", False),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", thr),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN", 0.02),
+    ):
+        # funding says YES loser (+1), depth_share is neutral → score = +1
+        yes_t, no_t, score = scanner._compute_sell_prices(
+            market, funding=0.001, depth_share=0.50
+        )
+
+    assert score == 1
+    assert yes_t == base, "No tighten at score=+1"
+    assert no_t == base
+
+
+def test_on05_no_signals_no_tighten():
+    """
+    ON-05 AC: both signals unavailable or neutral → score = 0 → no tighten.
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", False),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", 0.00001),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN", 0.02),
+    ):
+        yes_t, no_t, score = scanner._compute_sell_prices(
+            market, funding=None, depth_share=None
+        )
+
+    assert score == 0
+    assert yes_t == base
+    assert no_t == base
+
+
+def test_on05_disabled_returns_none_score():
+    """
+    ON-05 AC: feature disabled → score = None, no tighten.
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", False),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", 0.00001),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", False),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN", 0.02),
+    ):
+        yes_t, no_t, score = scanner._compute_sell_prices(
+            market, funding=0.1, depth_share=0.10
+        )
+
+    assert score is None
+    assert yes_t == base
+    assert no_t == base
+
+
+def test_on04_on05_combined_winner_protected_and_loser_tightened():
+    """
+    ON-04 + ON-05 both enabled: winner's trigger is lowered AND loser's trigger is
+    additionally raised when both signals agree.
+
+    Scenario: positive funding (YES loser) + low depth_share (YES loser) → score = +2.
+      ON-04: no_trigger = base - buffer (NO winner protected)
+      ON-05: yes_trigger = (base) + tighten   (YES loser fires sooner)
+    """
+    scanner = _make_scanner_for_compute()
+    market = MagicMock()
+    base = 0.38
+    buf = 0.03
+    tighten = 0.02
+    thr = 0.00001
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ASYMMETRIC_SELLS_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", base),
+        patch.object(config, "OPENING_NEUTRAL_WINNER_SELL_BUFFER", buf),
+        patch.object(config, "OPENING_NEUTRAL_FUNDING_GATE_THRESHOLD", thr),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN", tighten),
+    ):
+        yes_t, no_t, score = scanner._compute_sell_prices(
+            market, funding=0.001, depth_share=0.10
+        )
+
+    assert score == 2
+    assert yes_t == round(base + tighten, 4), "YES (loser) tightened: base + tighten"
+    assert no_t == round(base - buf, 4), "NO (winner) protected: base - buffer"
 
