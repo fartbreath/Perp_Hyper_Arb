@@ -692,9 +692,18 @@ class MomentumScanner(BaseStrategy):
                 skipped_band += 1
                 # Distance to nearest band edge shows tuning headroom.
                 _d["skip_reason"] = "out_of_band"
-                _d["dist_to_band"] = round(
-                    min(abs(p_yes - _b_lo), abs(p_yes - _b_hi),
-                        abs(p_no - _b_lo), abs(p_no - _b_hi)), 4)
+                _dist_yes = min(abs(p_yes - _b_lo), abs(p_yes - _b_hi))
+                _dist_no  = min(abs(p_no  - _b_lo), abs(p_no  - _b_hi))
+                _d["dist_to_band"] = round(min(_dist_yes, _dist_no), 4)
+                # Expose whichever side is closest to the band so the UI can
+                # display a real price and side instead of "—".
+                _closer_yes = _dist_yes <= _dist_no
+                _d["token_price"] = round(p_yes if _closer_yes else p_no, 4)
+                _d["side"] = ("UP" if _is_updown else "YES") if _closer_yes else ("DOWN" if _is_updown else "NO")
+                # Best-effort spot for display (cache hit, no I/O).
+                _oob_snap = self._spot.get_spot(market.underlying, market.market_type)
+                if _oob_snap is not None and _oob_snap.mid is not None:
+                    _d["spot"] = round(_oob_snap.mid, 4)
                 if _tte_pre is not None:
                     _d["tte_seconds"] = round(_tte_pre)
                 scan_diags.append(_d)

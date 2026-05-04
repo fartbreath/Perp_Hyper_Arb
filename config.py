@@ -335,6 +335,17 @@ OPENING_NEUTRAL_ONE_LEG_FALLBACK: str = "keep_as_momentum"
 # after entry at this price.  Whichever fills first is the loser.
 # Net pair P&L = exit_price + $1.00 − 2×entry.
 OPENING_NEUTRAL_LOSER_EXIT_PRICE: float = 0.35
+# Bid-monitor trigger price: the exit task fires when best_bid <= this value.
+# Setting this slightly above LOSER_EXIT_PRICE (e.g. 0.38) acts as a buffer
+# against CLOB discreteness — the loser bid can jump from $0.40 to $0.22
+# with no tick at $0.35, so triggering at $0.38 captures value before the gap.
+# Must be >= LOSER_EXIT_PRICE.  Set equal to LOSER_EXIT_PRICE to disable.
+OPENING_NEUTRAL_LOSER_EXIT_TRIGGER: float = 0.38
+# Minimum seconds to hold both legs before the bid-monitor loser exit can fire.
+# Prevents early "false loser" exits: at T+1s YES/NO bids are statistically
+# indistinguishable (REPORT.md §7.6).  A 30s hold aligns with the T+30s
+# divergence window where a 526bp gap separates true losers from reversals.
+OPENING_NEUTRAL_MIN_HOLD_SECS: float = 30.0
 # Seconds to wait for either resting exit SELL to fill before cancelling both orders.
 # Should cover the full market duration (5m market = 300 s).
 OPENING_NEUTRAL_EXIT_ORDER_TIMEOUT_SECS: int = 300
@@ -353,6 +364,12 @@ OPENING_NEUTRAL_TIMER_ADVANCE_SECS: float = 10.0
 # where the exit logic breaks down and one leg is almost certain to lose.
 OPENING_NEUTRAL_MIN_SIDE_PRICE: float = 0.49
 OPENING_NEUTRAL_MAX_SIDE_PRICE: float = 0.51
+# Cold-book spread gate (ON-01): skip entry when either leg's spread (ask − bid)
+# exceeds this threshold.  A wide spread at open indicates thin liquidity where
+# the loser bid-monitoring exit may never trigger before resolution.
+# Set ENABLED=False during early calibration to log spreads without rejecting entries.
+OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED: bool = True
+OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD: float = 0.15
 # Maximum simultaneous opening-neutral pairs.
 OPENING_NEUTRAL_MAX_CONCURRENT: int = 1
 # DRY_RUN: when True all order placements are skipped (no real orders sent).
@@ -576,7 +593,7 @@ MOMENTUM_MIN_TTE_SECONDS_DEFAULT: int = 120
 
 # Staleness guards: discard signals if price data is older than these thresholds.
 MOMENTUM_SPOT_MAX_AGE_SECS: float = 30.0   # HL BBO age (seconds)
-MOMENTUM_BOOK_MAX_AGE_SECS: float = 60.0   # PM book age gate: skip market if book is older than this (WS shard outage).
+MOMENTUM_BOOK_MAX_AGE_SECS: float = 30.0   # PM book age gate: skip market if book is older than this (WS shard outage).
 
 # Volatility source / threshold config.
 # MOMENTUM_VOL_CACHE_TTL: Deribit ATM IV is cached this many seconds before re-fetch.

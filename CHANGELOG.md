@@ -2,6 +2,73 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-04] - Opening Neutral wiring; Momentum diagnostics; webapp Settings; HMR fix
+
+### Feature — Opening Neutral ON-02: fills CSV (`strategies/OpeningNeutral/scanner.py`)
+
+`on_fills.csv` is now written on every completed pair.  Schema (v1) captures entry
+context (yes/no entry prices, combined cost, spreads, funding rate, YES depth share,
+loser confidence score), sell prices placed, and outcome fields (loser leg, loser fill
+price, loser fill time, winner exit price).  Auto-creates file with header on first run;
+backs up and migrates on schema change.  `_update_on_fills_winner_exit()` backfills
+winner exit price when the winner resolves.
+
+### Feature — Opening Neutral new config keys (`config.py`, `api_server.py`, `config_overrides.json`)
+
+Nine new ON config fields wired end-to-end (config defaults → overrides → runtime PATCH):
+- `OPENING_NEUTRAL_LOSER_EXIT_TRIGGER` (0.38) — bid-monitor trigger with buffer above exit price
+- `OPENING_NEUTRAL_MIN_HOLD_SECS` (30.0) — minimum hold before loser bid monitor can fire
+- `OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED` / `OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD` (0.15) — cold-book spread gate
+- `OPENING_NEUTRAL_LOSER_EXIT_PRICE` (0.35) — market-sell target price for loser leg
+- `OPENING_NEUTRAL_SIZE_USD` (5.0) — dollars per leg
+- `OPENING_NEUTRAL_ORDER_TYPE` ("market") — FAK entry order type
+- `OPENING_NEUTRAL_ONE_LEG_FALLBACK` ("keep_as_momentum") — one-leg fill disposition
+- `OPENING_NEUTRAL_MAX_CONCURRENT` (5) — concurrent pair ceiling
+
+All nine keys added to `_MUTABLE_CONFIG`, `ConfigPatch` model, and `GET /config` response in `api_server.py`.
+
+### Feature — Webapp Settings: Opening Neutral card (`webapp/src/pages/Settings.tsx`, `webapp/src/api/client.ts`)
+
+New dedicated Opening Neutral settings card with 11 controls:
+- Dry Run toggle
+- Take Profit toggle + conditional TP Target % float input
+- Cold Book Spread Gate toggle + conditional Max Individual Spread float input
+- Loser Exit Trigger ($), Min Hold (s), Loser Exit Price ($)
+- Size per Leg ($), Max Concurrent Pairs (int)
+- Entry Order Type select (market / limit)
+- One-Leg Fallback select (keep_as_momentum / exit_immediately)
+
+New `SelectInput` primitive added alongside existing `FloatInput` for dropdown fields.
+`ConfigData` TypeScript interface extended with all nine new ON keys.
+
+### Fix — Vite Fast Refresh HMR warnings (`webapp/src/pages/`)
+
+`Pending.tsx` and `Trades.tsx` were exporting non-component helpers alongside the default
+component export, breaking Vite Fast Refresh.  Fixed by extracting helpers into dedicated
+util modules:
+- `pendingUtils.ts` — `timeSince()`, `unrealizedPnl()`
+- `tradesUtils.ts` — `fmtUsd()`, `fmtPrice()`, `fmtContracts()`, `netPnl()`, `grossPnl()`,
+  `pnlColor()`, `buildGroups()`, `LedgerGroup` interface
+
+Both page files now import from utils; page files export only React components.
+Test files (`Pending.test.tsx`, `Trades.test.tsx`) updated to import from utils.
+
+### Fix — Momentum scanner out-of-band diagnostics (`strategies/Momentum/scanner.py`)
+
+`out_of_band` diag entries now expose `token_price` and `side` for whichever token is
+closest to the entry band, plus a best-effort `spot` field from cache.  Previously the
+diag row showed `"—"` for price and side, making the webapp diagnostics table uninformative
+for the majority of skipped markets.
+
+### Config — `MOMENTUM_BOOK_MAX_AGE_SECS` default corrected (`config.py`, `config_overrides.json`)
+
+Default lowered from 60 s to 30 s in `config.py` to match the override already in
+`config_overrides.json`.  The previous 60 s default was inherited from pre-M-series code;
+10 s was briefly set as an override with no data justification and eliminated 54% of
+candidates as stale.  30 s balances freshness with the WS update cadence of illiquid markets.
+
+---
+
 ## [2026-05-03] - M-series momentum upgrades; Opening Neutral promote flag; startup smoke tests; stale code removal
 
 ### Feature — FundingRateCache (`market_data/funding_rate_cache.py`, `hl_client.py`)

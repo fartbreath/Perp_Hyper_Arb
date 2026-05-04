@@ -134,6 +134,41 @@ function FloatInput({
   );
 }
 
+function SelectInput({
+  label,
+  description,
+  value,
+  options,
+  onSubmit,
+}: {
+  label: string;
+  description: string;
+  value: string;
+  options: { value: string; label: string }[];
+  onSubmit: (v: string) => void;
+}) {
+  return (
+    <div className="settings-row">
+      <div className="settings-label">
+        <span className="settings-name">{label}</span>
+        <span className="settings-desc">{description}</span>
+      </div>
+      <div className="settings-input-group">
+        <select
+          className="settings-input"
+          value={value}
+          onChange={(e) => onSubmit(e.target.value)}
+          style={{ cursor: "pointer" }}
+        >
+          {options.map((o) => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
+      </div>
+    </div>
+  );
+}
+
 // ── UI helpers ────────────────────────────────────────────────────────────────
 
 function SaveBanner({ msg }: { msg: string | null }) {
@@ -439,17 +474,27 @@ export default function Settings() {
           value={data.opening_neutral_enabled ?? false}
           onChange={(v) => apply({ opening_neutral_enabled: v })}
         />
-        {GAP}
+      </div>
+
+      {/* ── 2b. Opening Neutral Settings ────────────────────────────── */}
+      <div className="card">
+        <h3>Opening Neutral</h3>
+        <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+          Entry gates, exit thresholds, and hold parameters for the Opening Neutral strategy.
+        </p>
+
         <Toggle
-          label="Opening Neutral — Dry Run"
-          description="When ON, scanner runs and logs signals but places no real orders. Safe to disable once you've validated signals."
+          label="Dry Run"
+          description="Scanner runs and logs signals but places no real orders. Disable once signals are validated."
           value={data.opening_neutral_dry_run ?? true}
           onChange={(v) => apply({ opening_neutral_dry_run: v })}
         />
+
         {GAP}
+
         <Toggle
-          label="Opening Neutral — Take Profit"
-          description="After the loser leg exits, place a resting SELL on the winner at a price that earns the target % profit on the combined entry cost."
+          label="Take Profit"
+          description="After the loser exits, arm a take-profit on the winner at a price that earns the target % on the combined entry cost."
           value={data.opening_neutral_tp_enabled ?? true}
           onChange={(v) => apply({ opening_neutral_tp_enabled: v })}
         />
@@ -457,7 +502,7 @@ export default function Settings() {
           <>
             {GAP}
             <FloatInput
-              label="Opening Neutral — TP Target %"
+              label="TP Target %"
               description="Target profit as a % of combined entry cost. Formula: combined_cost × (1 + pct) − loser_exit_price."
               value={+((data.opening_neutral_tp_profit_pct ?? 0.10) * 100).toFixed(1)}
               step={1}
@@ -466,6 +511,109 @@ export default function Settings() {
             />
           </>
         )}
+
+        {GAP}
+
+        <Toggle
+          label="Cold Book Spread Gate"
+          description="Block entry when either the YES or NO book has a spread (ask − bid) wider than the threshold at open. Wide spreads indicate cold books where the loser exit may stall."
+          value={data.opening_neutral_max_individual_spread_enabled ?? true}
+          onChange={(v) => apply({ opening_neutral_max_individual_spread_enabled: v })}
+        />
+        {data.opening_neutral_max_individual_spread_enabled !== false && (
+          <>
+            {GAP}
+            <FloatInput
+              label="Max Individual Spread"
+              description="Maximum spread (ask − bid) on either leg at open. Entry is blocked when either YES or NO exceeds this threshold."
+              value={data.opening_neutral_max_individual_spread ?? 0.15}
+              step={0.01}
+              unit="$"
+              onSubmit={(v) => apply({ opening_neutral_max_individual_spread: v })}
+            />
+          </>
+        )}
+
+        {GAP}
+
+        <FloatInput
+          label="Loser Exit Trigger"
+          description="Bid-monitor fires when the loser bid drops to ≤ this price. Set slightly above the exit price (e.g. $0.38) to catch fills before the book gaps past $0.35."
+          value={data.opening_neutral_loser_exit_trigger ?? 0.38}
+          step={0.01}
+          unit="$"
+          onSubmit={(v) => apply({ opening_neutral_loser_exit_trigger: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="Min Hold (seconds)"
+          description="Minimum seconds after entry before the bid monitor can declare a loser. Prevents false-loser exits during the first-30s reversal window (T+30s is where YES/NO bids diverge meaningfully)."
+          value={data.opening_neutral_min_hold_secs ?? 30}
+          step={5}
+          unit="s"
+          onSubmit={(v) => apply({ opening_neutral_min_hold_secs: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="Loser Exit Price"
+          description="Resting GTC SELL price placed on both legs immediately after entry. Whichever leg fills first is declared the loser. Net pair P&L = exit_price + $1.00 − 2×entry."
+          value={data.opening_neutral_loser_exit_price ?? 0.35}
+          step={0.01}
+          unit="$"
+          onSubmit={(v) => apply({ opening_neutral_loser_exit_price: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="Size per Leg"
+          description="USDC notional for each leg (YES and NO each get this amount). Combined cost ≈ 2× this value before the spread gate applies."
+          value={data.opening_neutral_size_usd ?? 1}
+          step={0.5}
+          unit="$"
+          onSubmit={(v) => apply({ opening_neutral_size_usd: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="Max Concurrent Pairs"
+          description="Maximum number of simultaneously open YES+NO pairs. New entry signals are skipped when this limit is reached."
+          value={data.opening_neutral_max_concurrent ?? 1}
+          step={1}
+          unit="pairs"
+          onSubmit={(v) => apply({ opening_neutral_max_concurrent: Math.round(v) })}
+        />
+
+        {GAP}
+
+        <SelectInput
+          label="Entry Order Type"
+          description="Order type for the entry BUY legs. 'market' crosses immediately (higher fill rate); 'limit' posts at the current ask (lower cost, may miss fast opens)."
+          value={data.opening_neutral_order_type ?? "market"}
+          options={[
+            { value: "market", label: "Market (FAK — cross immediately)" },
+            { value: "limit",  label: "Limit (post at ask)" },
+          ]}
+          onSubmit={(v) => apply({ opening_neutral_order_type: v })}
+        />
+
+        {GAP}
+
+        <SelectInput
+          label="One-Leg Fallback"
+          description="Action when only one leg fills within the entry timeout. 'keep_as_momentum' leaves the filled leg open; 'exit_immediately' taker-exits it at best bid."
+          value={data.opening_neutral_one_leg_fallback ?? "keep_as_momentum"}
+          options={[
+            { value: "keep_as_momentum", label: "Keep as momentum" },
+            { value: "exit_immediately",  label: "Exit immediately" },
+          ]}
+          onSubmit={(v) => apply({ opening_neutral_one_leg_fallback: v })}
+        />
       </div>
 
       {/* ── 3. Market Types ──────────────────────────────────────────── */}
@@ -1498,6 +1646,17 @@ export default function Settings() {
             {GAP}
 
             <FloatInput
+              label="Min Entry (USD)"
+              description="Minimum position size floor. Prevents dust orders when kelly_f is very small near the entry threshold. Set to 1.0 to allow any size; increase to $5–$10 to skip marginal signals."
+              value={data.momentum_min_entry_usd ?? 1}
+              step={0.5}
+              unit="USD"
+              onSubmit={(v) => apply({ momentum_min_entry_usd: v })}
+            />
+
+            {GAP}
+
+            <FloatInput
               label="Min CLOB Depth"
               description="Minimum total ask-side depth (USD) required before entering. Prevents entering illiquid markets."
               value={data.momentum_min_clob_depth ?? 200}
@@ -1651,6 +1810,17 @@ export default function Settings() {
               onSubmit={(v) => apply({ momentum_delta_stop_loss_pct: v })}
             />
 
+            {GAP}
+
+            <NumberInput
+              label="Delta SL Hysteresis (ticks)"
+              description="Number of consecutive below-threshold oracle ticks before the delta stop-loss fires. Prevents a single noisy tick from triggering an exit. Set to 1 to fire on the first bad tick."
+              value={data.momentum_delta_sl_min_ticks ?? 3}
+              step={1}
+              unit="ticks"
+              onSubmit={(v) => apply({ momentum_delta_sl_min_ticks: v })}
+            />
+
             <SectionHead title="Per-Coin Stop-Loss Overrides" />
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
               Higher-IV coins need wider stops — a single DOGE/SOL oracle tick routinely exceeds the global 0.04% stop.
@@ -1757,6 +1927,50 @@ export default function Settings() {
               unit="s"
               onSubmit={(v) => apply({ momentum_resolved_force_close_sec: v })}
             />
+
+            <SectionHead title="Probability-Based Stop-Loss" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Exit when the CLOB ask price implies win probability has fallen below a threshold.
+              Fires independently of the oracle delta SL — catches cases where the market is already
+              pricing in a loss before spot has fully moved.
+            </p>
+            <Toggle
+              label="Prob SL Enabled"
+              description="When ON, exit if implied win probability (1 − ask_price) drops below the threshold."
+              value={data.momentum_prob_sl_enabled ?? true}
+              onChange={(v) => apply({ momentum_prob_sl_enabled: v })}
+            />
+            {(data.momentum_prob_sl_enabled ?? true) && (
+              <>
+                {GAP}
+                <FloatInput
+                  label="Win Prob Threshold"
+                  description="Exit when implied win probability falls below this value. 0.25 = exit if CLOB prices the position at ≤25% chance of winning."
+                  value={data.momentum_prob_sl_pct ?? 0.25}
+                  step={0.05}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_prob_sl_pct: v })}
+                />
+                {GAP}
+                <NumberInput
+                  label="Min TTE to Arm (s)"
+                  description="Prob SL only arms when at least this many seconds remain. Prevents misfires near expiry when the CLOB price collapses naturally."
+                  value={data.momentum_prob_sl_min_tte_secs ?? 30}
+                  step={5}
+                  unit="s"
+                  onSubmit={(v) => apply({ momentum_prob_sl_min_tte_secs: v })}
+                />
+                {GAP}
+                <FloatInput
+                  label="Oracle Staleness Limit (s)"
+                  description="Skip the prob SL check when the oracle price is older than this. Stale oracles give unreliable CLOB-vs-oracle comparisons."
+                  value={data.momentum_prob_sl_oracle_stale_secs ?? 10.0}
+                  step={1}
+                  unit="s"
+                  onSubmit={(v) => apply({ momentum_prob_sl_oracle_stale_secs: v })}
+                />
+              </>
+            )}
           </div>
 
           <div className="card">
@@ -2007,7 +2221,7 @@ export default function Settings() {
 
           {/* ── Phase B/C/D/E + Kelly Extensions ─────────────── */}
           <div className="card">
-            <h3>Momentum — Advanced Phases</h3>
+            <h3>Momentum — Advanced Settings</h3>
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
               Optional enhancements to the momentum scanner. All are disabled by default.
             </p>
@@ -2084,225 +2298,213 @@ export default function Settings() {
               onSubmit={(v) => apply({ momentum_phase_c_min_tte_milestone: v })}
             />
 
-            <SectionHead title="Phase D — Downside Hedge" />
+            <SectionHead title="M-10: Funding Rate Entry Gate" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Skip entries when HL funding rate signals market structure opposed to the trade direction.
+              High positive funding = market biased DOWN (skip YES); deep negative = biased UP (skip NO).
+              Values are HL per-8h rate (e.g. 0.00001 = 0.001% per 8h).
+            </p>
             <Toggle
-              label="Hedge Master Switch"
-              description="Global on/off for the GTD downside hedge. When OFF, no hedge is placed for any bucket. When ON, per-bucket toggles below control which bucket types actually place a hedge."
-              value={data.momentum_hedge_enabled ?? false}
-              onChange={(v) => apply({ momentum_hedge_enabled: v })}
+              label="Funding Gate Enabled"
+              description="When ON, entries are skipped when funding rate opposes the trade direction."
+              value={data.momentum_funding_gate_enabled ?? true}
+              onChange={(v) => apply({ momentum_funding_gate_enabled: v })}
             />
-            {(data.momentum_hedge_enabled ?? false) && (
+            {(data.momentum_funding_gate_enabled ?? true) && (
               <>
                 {GAP}
-                <Toggle
-                  label="5m Bucket Hedge"
-                  description="OFF by default. At ≤60 s TTE there is no time for the fill path (favorable excursion + reversal). Cost is wasted."
-                  value={data.momentum_hedge_enabled_5m ?? false}
-                  onChange={(v) => apply({ momentum_hedge_enabled_5m: v })}
-                />
-                {GAP}
-                <Toggle
-                  label="15m Bucket Hedge"
-                  description="OFF by default. At ≤120 s TTE the whipsaw + recovery path rarely develops before expiry."
-                  value={data.momentum_hedge_enabled_15m ?? false}
-                  onChange={(v) => apply({ momentum_hedge_enabled_15m: v })}
-                />
-                {GAP}
-                <Toggle
-                  label="1h Bucket Hedge"
-                  description="ON by default. At 2–4 min TTE there is meaningful time for a fill + recovery move. Hedge is cancelled on any non-resolved exit to prevent double jeopardy."
-                  value={data.momentum_hedge_enabled_1h ?? true}
-                  onChange={(v) => apply({ momentum_hedge_enabled_1h: v })}
-                />
-                {GAP}
-                <Toggle
-                  label="4h Bucket Hedge"
-                  description="ON by default. Sufficient TTE for fill paths to develop."
-                  value={data.momentum_hedge_enabled_4h ?? true}
-                  onChange={(v) => apply({ momentum_hedge_enabled_4h: v })}
-                />
-                {GAP}
-                <Toggle
-                  label="Daily Bucket Hedge"
-                  description="ON by default."
-                  value={data.momentum_hedge_enabled_daily ?? true}
-                  onChange={(v) => apply({ momentum_hedge_enabled_daily: v })}
-                />
-                {GAP}
-                <Toggle
-                  label="Weekly Bucket Hedge"
-                  description="ON by default."
-                  value={data.momentum_hedge_enabled_weekly ?? true}
-                  onChange={(v) => apply({ momentum_hedge_enabled_weekly: v })}
-                />
-                {GAP}
-                <Toggle
-                  label="Milestone Hedge"
-                  description="ON by default."
-                  value={data.momentum_hedge_enabled_milestone ?? true}
-                  onChange={(v) => apply({ momentum_hedge_enabled_milestone: v })}
+                <FloatInput
+                  label="YES Max Funding Rate"
+                  description="Skip YES/UP entry when HL 8h funding rate exceeds this. Positive funding = longs paying shorts (bearish signal). e.g. 0.00001 = 0.001% per 8h."
+                  value={data.momentum_funding_gate_yes_max ?? 0.00001}
+                  step={0.000005}
+                  unit="per 8h"
+                  onSubmit={(v) => apply({ momentum_funding_gate_yes_max: v })}
                 />
                 {GAP}
                 <FloatInput
-                  label="Contracts %"
-                  description="Hedge size as % of main entry contracts (e.g. 100 = same count). Actual USDC cost = contracts × bid price (e.g. 25ct × $0.02 = $0.50)."
-                  value={(data.momentum_hedge_contracts_pct ?? 1.0) * 100}
-                  step={10}
-                  unit="%"
-                  onSubmit={(v) => apply({ momentum_hedge_contracts_pct: v / 100 })}
+                  label="NO Min Funding Rate"
+                  description="Skip NO/DOWN entry when HL 8h funding rate is below this. Negative funding = shorts paying longs (bullish signal). e.g. -0.00001 = -0.001% per 8h."
+                  value={data.momentum_funding_gate_no_min ?? -0.00001}
+                  step={0.000005}
+                  unit="per 8h"
+                  onSubmit={(v) => apply({ momentum_funding_gate_no_min: v })}
                 />
+              </>
+            )}
+
+            <SectionHead title="M-11: Depth Share Entry Gate" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              yes_depth_share = YES-side bid depth / (YES + NO depth). Low share for YES signals
+              the market is not supporting the UP direction (AUC = 0.568, p = 0.002). Fail-open when
+              depth share is unavailable.
+            </p>
+            <Toggle
+              label="Depth Share Gate Enabled"
+              description="When ON, YES entries require a minimum depth share; NO entries require a maximum."
+              value={data.momentum_depth_share_gate_enabled ?? true}
+              onChange={(v) => apply({ momentum_depth_share_gate_enabled: v })}
+            />
+            {(data.momentum_depth_share_gate_enabled ?? true) && (
+              <>
                 {GAP}
                 <FloatInput
-                  label="SL Cancel Recovery %"
-                  description="When a delta SL fires, the hedge is NOT cancelled immediately. Instead it is cancelled once delta recovers to SL_threshold × (1 + this). E.g. 50 → cancel when delta rebounds to 1.5× the SL threshold. Set to 0 to cancel immediately on SL (old behaviour)."
-                  value={(data.momentum_hedge_cancel_recovery_pct ?? 0.5) * 100}
-                  step={10}
-                  unit="%"
-                  onSubmit={(v) => apply({ momentum_hedge_cancel_recovery_pct: v / 100 })}
-                />
-                {GAP}
-                <Toggle
-                  label="Hedge Suppresses Delta SL"
-                  description="When ON, ALL stop-losses are suppressed for any position that has an active GTD hedge order: oracle delta SL, near-expiry time stop, and CLOB prob-SL. The hedge bounds the downside — any SL exit would lock in a loss before the hedge pays off. Take-profit remains active."
-                  value={data.momentum_hedge_suppresses_delta_sl ?? false}
-                  onChange={(v) => apply({ momentum_hedge_suppresses_delta_sl: v })}
-                />
-                {GAP}
-                <FloatInput
-                  label="Default Bid Price"
-                  description="Fallback GTC bid price on the opposite token when no per-bucket override applies (e.g. 0.02)."
-                  value={data.momentum_hedge_price ?? 0.02}
-                  step={0.005}
+                  label="YES Min Depth Share"
+                  description="Skip YES/UP entry when yes_depth_share is below this. e.g. 0.40 = YES-side must have at least 40% of total depth."
+                  value={data.momentum_depth_share_yes_min ?? 0.40}
+                  step={0.05}
                   unit=""
-                  onSubmit={(v) => apply({ momentum_hedge_price: v })}
+                  onSubmit={(v) => apply({ momentum_depth_share_yes_min: v })}
                 />
                 {GAP}
                 <FloatInput
-                  label="5m Bucket Price"
-                  description="Hedge bid price for 5-minute bucket markets (highest mismatch risk → higher bid)."
-                  value={data.momentum_hedge_price_5m ?? 0.02}
-                  step={0.005}
+                  label="NO Max Depth Share"
+                  description="Skip NO/DOWN entry when yes_depth_share is above this (inferred by symmetry). e.g. 0.60."
+                  value={data.momentum_depth_share_no_max ?? 0.60}
+                  step={0.05}
                   unit=""
-                  onSubmit={(v) => apply({ momentum_hedge_price_5m: v })}
+                  onSubmit={(v) => apply({ momentum_depth_share_no_max: v })}
+                />
+              </>
+            )}
+
+            <SectionHead title="M-14: TWAP Deviation Gate (YES only)" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              In a low-volatility regime, if the oracle is below its recent 10-second TWAP
+              (price pulling back), raise the YES/UP entry z-bar. Source: strategy_update.md
+              section 1.6 — 37.6% YES win rate in low-vol + negative TWAP deviation.
+            </p>
+            <Toggle
+              label="TWAP Gate Enabled"
+              description="When ON, negative TWAP deviation in low-vol raises the YES z-bar by the multiplier below."
+              value={data.momentum_twap_gate_enabled ?? true}
+              onChange={(v) => apply({ momentum_twap_gate_enabled: v })}
+            />
+            {(data.momentum_twap_gate_enabled ?? true) && (
+              <>
+                {GAP}
+                <FloatInput
+                  label="TWAP Dev Threshold (bps)"
+                  description="Trigger when oracle is below its 10s TWAP by this many bps. Negative = oracle below TWAP. e.g. -5.0 = oracle 0.5 bps below TWAP triggers the gate."
+                  value={data.momentum_twap_dev_threshold_bps ?? -5.0}
+                  step={1}
+                  unit="bps"
+                  onSubmit={(v) => apply({ momentum_twap_dev_threshold_bps: v })}
                 />
                 {GAP}
                 <FloatInput
-                  label="15m Bucket Price"
-                  description="Hedge bid price for 15-minute bucket markets."
-                  value={data.momentum_hedge_price_15m ?? 0.02}
-                  step={0.005}
+                  label="Low-Vol YES Z-Bar Multiplier"
+                  description="Multiplies the effective z-bar when TWAP gate fires in low-vol. 1.4 = require 40% more sigma to enter. Does not affect NO/DOWN entries."
+                  value={data.momentum_twap_dev_low_vol_yes_multiplier ?? 1.4}
+                  step={0.1}
+                  unit="x"
+                  onSubmit={(v) => apply({ momentum_twap_dev_low_vol_yes_multiplier: v })}
+                />
+              </>
+            )}
+
+            <SectionHead title="M-13: Up-Fraction EWMA Early Exit" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Oracle tick up-fraction EWMA. For YES positions: exit when EWMA stays below threshold
+              for N consecutive scan windows. Strongest early-exit signal in the dataset (AUC = 0.703)
+              and fires before positions ride to a full loss.
+            </p>
+            <Toggle
+              label="Upfrac Exit Enabled"
+              description="When ON, fire an early exit when the oracle tick up-fraction EWMA drops below the threshold for N consecutive windows."
+              value={data.momentum_upfrac_exit_enabled ?? true}
+              onChange={(v) => apply({ momentum_upfrac_exit_enabled: v })}
+            />
+            {(data.momentum_upfrac_exit_enabled ?? true) && (
+              <>
+                {GAP}
+                <FloatInput
+                  label="Exit Threshold"
+                  description="For YES: exit when EWMA is below threshold. For NO: exit when EWMA is above (1 - threshold). 0.40 = exit YES when fewer than 40% of recent ticks moved up."
+                  value={data.momentum_upfrac_exit_threshold ?? 0.40}
+                  step={0.05}
                   unit=""
-                  onSubmit={(v) => apply({ momentum_hedge_price_15m: v })}
+                  onSubmit={(v) => apply({ momentum_upfrac_exit_threshold: v })}
+                />
+                {GAP}
+                <NumberInput
+                  label="Consecutive Windows"
+                  description="Exit only fires after the EWMA has been below-threshold for this many consecutive evaluation windows. Prevents a single bad scan from triggering an exit."
+                  value={data.momentum_upfrac_exit_windows ?? 2}
+                  step={1}
+                  unit="windows"
+                  onSubmit={(v) => apply({ momentum_upfrac_exit_windows: v })}
                 />
                 {GAP}
                 <FloatInput
-                  label="1h Bucket Price"
-                  description="Hedge bid price for 1-hour bucket markets."
-                  value={data.momentum_hedge_price_1h ?? 0.015}
-                  step={0.005}
+                  label="EWMA Alpha"
+                  description="Smoothing factor for the up-fraction EWMA. Higher = more reactive; lower = smoother. 0.3 = moderate smoothing."
+                  value={data.momentum_upfrac_ewma_alpha ?? 0.3}
+                  step={0.05}
                   unit=""
-                  onSubmit={(v) => apply({ momentum_hedge_price_1h: v })}
-                />
-                {GAP}
-                <FloatInput
-                  label="4h Bucket Price"
-                  description="Hedge bid price for 4-hour bucket markets (lowest mismatch risk → lower bid)."
-                  value={data.momentum_hedge_price_4h ?? 0.01}
-                  step={0.005}
-                  unit=""
-                  onSubmit={(v) => apply({ momentum_hedge_price_4h: v })}
-                />
-                {GAP}
-                <FloatInput
-                  label="Daily Bucket Price"
-                  description="Hedge bid price for daily bucket markets."
-                  value={data.momentum_hedge_price_daily ?? 0.01}
-                  step={0.005}
-                  unit=""
-                  onSubmit={(v) => apply({ momentum_hedge_price_daily: v })}
-                />
-                {GAP}
-                <FloatInput
-                  label="Weekly Bucket Price"
-                  description="Hedge bid price for weekly bucket markets."
-                  value={data.momentum_hedge_price_weekly ?? 0.01}
-                  step={0.005}
-                  unit=""
-                  onSubmit={(v) => apply({ momentum_hedge_price_weekly: v })}
-                />
-                {GAP}
-                <FloatInput
-                  label="Milestone Price"
-                  description="Hedge bid price for milestone markets."
-                  value={data.momentum_hedge_price_milestone ?? 0.01}
-                  step={0.005}
-                  unit=""
-                  onSubmit={(v) => apply({ momentum_hedge_price_milestone: v })}
+                  onSubmit={(v) => apply({ momentum_upfrac_ewma_alpha: v })}
                 />
               </>
             )}
 
             <SectionHead title="Analysis Logging" />
-
-            <SectionHead title="Phase E — Empirical Win-Rate Gate" />
             <Toggle
-              label="Win-Rate Gate Enabled"
-              description="Gate entries where the historical (empirical) win rate for the bucket type is significantly below the model's predicted win probability. Requires ≥ Min Samples fills to activate."
-              value={data.momentum_win_rate_gate_enabled ?? false}
-              onChange={(v) => apply({ momentum_win_rate_gate_enabled: v })}
+              label="Oracle Tick Log"
+              description="Write intra-hold oracle ticks to momentum_ticks.csv. Disable in production to reduce disk I/O. Required for post-trade analysis and strategy calibration."
+              value={data.momentum_ticks_log_enabled ?? true}
+              onChange={(v) => apply({ momentum_ticks_log_enabled: v })}
             />
-            {(data.momentum_win_rate_gate_enabled ?? false) && (
-              <>
-                {GAP}
-                <FloatInput
-                  label="Min Factor"
-                  description="Empirical win rate must be ≥ this fraction of the model win probability. 0.9 = allow up to 10% shortfall."
-                  value={data.momentum_win_rate_gate_min_factor ?? 0.9}
-                  step={0.05}
-                  unit=""
-                  onSubmit={(v) => apply({ momentum_win_rate_gate_min_factor: v })}
-                />
-                {GAP}
-                <NumberInput
-                  label="Min Samples"
-                  description="Minimum historical fills required per bucket before the gate activates. Below this, the gate stays open (optimistic prior)."
-                  value={data.momentum_win_rate_gate_min_samples ?? 10}
-                  step={5}
-                  unit="fills"
-                  onSubmit={(v) => apply({ momentum_win_rate_gate_min_samples: v })}
-                />
-              </>
-            )}
 
-            <SectionHead title="Kelly Extensions" />
+            <SectionHead title="Kelly Extensions (COB)" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              The win probability used by Kelly blends two signals: CLOB ask price (reliable when
+              liquid) and oracle delta strength (stable near expiry). Weight shifts from CLOB to
+              oracle as TTE shrinks, preventing either failure mode from dominating sizing.
+            </p>
             <NumberInput
               label="Min Effective TTE"
-              description="Kelly-specific TTE floor (seconds). Prevents sigma_tau collapsing at near-expiry (e.g. 3s), which would inflate z → 6σ → MAX bet regardless of edge. Signals with less TTE remaining are sized as if this many seconds remain. Rule of thumb: ~50% of the bucket's entry-gate window."
+              description="Kelly-specific TTE floor (seconds). Prevents sigma_tau collapsing at near-expiry (e.g. 3s), which would inflate z very high regardless of edge. Signals with less TTE remaining are sized as if this many seconds remain. Rule of thumb: ~50% of the bucket entry-gate window."
               value={data.momentum_kelly_min_tte_seconds ?? 30}
               step={5}
               unit="s"
               onSubmit={(v) => apply({ momentum_kelly_min_tte_seconds: v })}
             />
             {GAP}
-            <Toggle
-              label="Persistence Z-Boost"
-              description="Boost the effective z-score when consecutive signals fire in the same direction (trend persistence). Sizes up into confirmed momentum runs."
-              value={data.momentum_kelly_persistence_enabled ?? false}
-              onChange={(v) => apply({ momentum_kelly_persistence_enabled: v })}
+            <FloatInput
+              label="Edge Premium"
+              description="Systematic alpha added to the CLOB ask price when computing win_prob_clob. Calibrate from historical win rate. e.g. 0.07 = assume 7% better win rate than CLOB implies."
+              value={data.momentum_kelly_edge_premium ?? 0.07}
+              step={0.01}
+              unit=""
+              onSubmit={(v) => apply({ momentum_kelly_edge_premium: v })}
             />
-            {(data.momentum_kelly_persistence_enabled ?? false) && (
-              <>
-                {GAP}
-                <FloatInput
-                  label="Max Z-Boost"
-                  description="Maximum additional z (σ) added at full persistence. 0.5 = up to +0.5σ boost at peak run length."
-                  value={data.momentum_kelly_persistence_z_boost_max ?? 0.5}
-                  step={0.1}
-                  unit="σ"
-                  onSubmit={(v) => apply({ momentum_kelly_persistence_z_boost_max: v })}
-                />
-              </>
-            )}
+            {GAP}
+            <FloatInput
+              label="Win Prob Cap"
+              description="Hard ceiling on effective win probability. Prevents Kelly sizing runaway when both signals agree near-certainty. e.g. 0.95 = never assume more than 95% chance of winning."
+              value={data.momentum_kelly_win_prob_cap ?? 0.95}
+              step={0.01}
+              unit=""
+              onSubmit={(v) => apply({ momentum_kelly_win_prob_cap: v })}
+            />
+            {GAP}
+            <NumberInput
+              label="CLOB Reliable TTE (s)"
+              description="TTE above which the CLOB book is considered fully reliable. Below this, weight shifts toward oracle delta. e.g. 60 = full CLOB weight when more than 60s remain."
+              value={data.momentum_kelly_clob_reliable_tte ?? 60}
+              step={5}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_kelly_clob_reliable_tte: v })}
+            />
+            {GAP}
+            <FloatInput
+              label="Oracle Sensitivity"
+              description="Slope: maps signal strength above threshold to win_prob. e.g. 0.15 = each multiple of threshold adds 15pp of win probability."
+              value={data.momentum_kelly_oracle_sensitivity ?? 0.15}
+              step={0.01}
+              unit=""
+              onSubmit={(v) => apply({ momentum_kelly_oracle_sensitivity: v })}
+            />
 
             <SectionHead title="Kelly Per-Bucket Multipliers" />
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
@@ -2333,6 +2535,129 @@ export default function Settings() {
                 />
               </div>
             ))}
+
+            <SectionHead title="VWAP / RoC Secondary Filter" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Optional secondary confirmation layer. When non-zero, the signal is only
+              accepted if price has deviated from its short-term VWAP by at least
+              <code>min_vwap_dev_pct</code> AND the rate-of-change over the RoC window
+              exceeds <code>min_roc_pct</code>. Set both to 0 to disable.
+            </p>
+            {GAP}
+            <NumberInput
+              label="VWAP Window (s)"
+              description="Lookback window for VWAP calculation."
+              value={data.momentum_vwap_window_sec ?? 30}
+              step={5}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_vwap_window_sec: v })}
+            />
+            {GAP}
+            <NumberInput
+              label="RoC Window (s)"
+              description="Lookback window for rate-of-change calculation."
+              value={data.momentum_roc_window_sec ?? 60}
+              step={5}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_roc_window_sec: v })}
+            />
+            {GAP}
+            <FloatInput
+              label="Min VWAP Deviation (%)"
+              description="Minimum % price deviation from VWAP required to pass. 0 = disabled."
+              value={data.momentum_min_vwap_dev_pct ?? 0}
+              step={0.1}
+              unit="%"
+              onSubmit={(v) => apply({ momentum_min_vwap_dev_pct: v })}
+            />
+            {GAP}
+            <FloatInput
+              label="Min RoC (%)"
+              description="Minimum rate-of-change over the RoC window required to pass. 0 = disabled."
+              value={data.momentum_min_roc_pct ?? 0}
+              step={0.1}
+              unit="%"
+              onSubmit={(v) => apply({ momentum_min_roc_pct: v })}
+            />
+
+            <SectionHead title="Order Execution" />
+            {GAP}
+            <Toggle
+              label="Take-Profit Resting Order"
+              description="Place a resting GTC limit order at the take-profit price immediately after entry fill. When OFF, TP is managed by polling only."
+              value={data.momentum_tp_resting_enabled ?? true}
+              onChange={(v) => apply({ momentum_tp_resting_enabled: v })}
+            />
+            {GAP}
+            <NumberInput
+              label="TP Retry Max"
+              description="Maximum number of attempts to place/cancel the TP resting order before giving up."
+              value={data.momentum_tp_retry_max ?? 3}
+              step={1}
+              unit="retries"
+              onSubmit={(v) => apply({ momentum_tp_retry_max: v })}
+            />
+            {GAP}
+            <FloatInput
+              label="TP Retry Step"
+              description="Price improvement per retry tick when TP placement fails (e.g. 0.005 = half-cent)."
+              value={data.momentum_tp_retry_step ?? 0.005}
+              step={0.001}
+              unit=""
+              onSubmit={(v) => apply({ momentum_tp_retry_step: v })}
+            />
+            {GAP}
+            <FloatInput
+              label="Order Cancel Timeout (s)"
+              description="Seconds to wait before cancelling an unfilled entry order and retrying."
+              value={data.momentum_order_cancel_sec ?? 8.0}
+              step={0.5}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_order_cancel_sec: v })}
+            />
+            {GAP}
+            <FloatInput
+              label="Slippage Cap"
+              description="Maximum allowed slippage (in probability points) above the signal price. Entry rejected if best ask exceeds signal_price + slippage_cap."
+              value={data.momentum_slippage_cap ?? 0.05}
+              step={0.005}
+              unit=""
+              onSubmit={(v) => apply({ momentum_slippage_cap: v })}
+            />
+            {GAP}
+            <NumberInput
+              label="Entry Max Retries"
+              description="Maximum entry retry attempts after slippage or cancel timeout."
+              value={data.momentum_max_retries ?? 2}
+              step={1}
+              unit="retries"
+              onSubmit={(v) => apply({ momentum_max_retries: v })}
+            />
+            {GAP}
+            <FloatInput
+              label="Buy Retry Step"
+              description="Price improvement per entry retry tick (e.g. 0.01 = 1 cent higher bid)."
+              value={data.momentum_buy_retry_step ?? 0.01}
+              step={0.005}
+              unit=""
+              onSubmit={(v) => apply({ momentum_buy_retry_step: v })}
+            />
+
+            <SectionHead title="Chainlink Watchdog" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Emergency circuit-breaker for the Chainlink oracle feed. If no Chainlink
+              price update is received within the silence window, new momentum entries are
+              blocked until the feed recovers.
+            </p>
+            {GAP}
+            <NumberInput
+              label="Chainlink Silence Timeout (s)"
+              description="Seconds without a Chainlink update before entries are blocked. 30 = block if feed silent for 30 s."
+              value={data.chainlink_silence_watchdog_secs ?? 30}
+              step={5}
+              unit="s"
+              onSubmit={(v) => apply({ chainlink_silence_watchdog_secs: v })}
+            />
           </div>
 
           {/* ── Range markets sub-strategy ───────────────────── */}

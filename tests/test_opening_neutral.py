@@ -28,6 +28,15 @@ Coverage:
   - _on_exit_fill fires on_close_callback with market_id
   - _on_exit_fill idempotent: second call when loser already closed returns silently
   - E2E: _on_exit_fill with real RiskEngine writes correct trade CSV row
+  --- ON-01: cold-book spread gate ---
+  - wide YES spread (>0.15) → result='cold_book', skipped_cold_book incremented
+  - wide NO spread (>0.15)  → result='cold_book', skipped_cold_book incremented
+  - missing bid (None)      → result='no_spread',  skipped_no_spread incremented
+  - both spreads ok (<0.15) → result='entry_attempt', spreads logged, cache populated
+  --- ON-02: fills CSV ---
+  - loser exit writes complete row to on_fills.csv (spreads, combined_cost, loser leg/price/time)
+  - notify_winner_closed() backfills winner_exit_price in the existing CSV row
+  - schema migration: old header → backup .csv.bak + fresh file with current schema
 """
 
 from __future__ import annotations
@@ -1053,3 +1062,413 @@ def test_no_double_exit_after_loser_promotes_winner():
     assert scanner._risk.close_position.call_count == 1, (
         f"close_position must be called once; got {scanner._risk.close_position.call_count}"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ON-01 — Cold-book spread gate unit tests
+# AC: wide YES spread → cold_book; wide NO spread → cold_book;
+#     missing bid → no_spread; both ok → entry_attempt proceeds.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _make_scanner_custom_books(yes_ask, no_ask, yes_bid, no_bid, markets):
+    """Like _make_scanner but with independent yes_bid/no_bid control."""
+    pm = MagicMock()
+    pm.get_markets.return_value = {m.condition_id: m for m in markets}
+
+    def _get_book(token_id):
+        book = MagicMock()
+        if token_id.startswith("tok_yes_"):
+            book.best_ask = yes_ask
+            book.best_bid = yes_bid
+            book.asks = [(yes_ask, 100.0)] if yes_ask else []
+            book.bids = [(yes_bid, 100.0)] if yes_bid is not None else []
+        else:
+            book.best_ask = no_ask
+            book.best_bid = no_bid
+            book.asks = [(no_ask, 100.0)] if no_ask else []
+            book.bids = [(no_bid, 100.0)] if no_bid is not None else []
+        return book
+
+    pm.get_book.side_effect = _get_book
+    pm._paper_mode = True
+    pm.place_limit  = AsyncMock(return_value="ord_001")
+    pm.place_market = AsyncMock(return_value="ord_002")
+    pm.cancel_order = AsyncMock(return_value=None)
+    pm.register_fill_future = MagicMock()
+
+    risk = MagicMock()
+    risk.get_open_positions.return_value = []
+    risk.open_position = MagicMock()
+    risk.close_position = MagicMock()
+    spot = MagicMock()
+    vol  = MagicMock()
+
+    scanner = OpeningNeutralScanner(pm=pm, risk=risk, spot_client=spot, vol_fetcher=vol)
+    scanner._running = True
+    return scanner
+
+
+def test_on01_wide_yes_spread_skips_cold_book():
+    """
+    ON-01 AC: when YES spread > MAX_INDIVIDUAL_SPREAD, result must be 'cold_book'.
+    YES spread = 0.50 - 0.30 = 0.20 > threshold 0.15 → cold_book.
+    skipped_cold_book counter must increment.
+    """
+    market = _make_market(tte_seconds=3605.0, duration_seconds=3600.0)  # 5 s pre-open
+    # YES spread = 0.50 - 0.30 = 0.20 (wide); NO spread = 0.50 - 0.46 = 0.04 (ok)
+    scanner = _make_scanner_custom_books(
+        yes_ask=0.50, no_ask=0.50,
+        yes_bid=0.30, no_bid=0.46,
+        markets=[market],
+    )
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.01),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 300),
+        patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 3),
+        patch.object(config, "OPENING_NEUTRAL_MIN_SIDE_PRICE", 0.40),
+        patch.object(config, "OPENING_NEUTRAL_MAX_SIDE_PRICE", 0.60),
+        patch.object(config, "OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD", 0.15),
+    ):
+        _run(scanner._evaluate_entry(market))
+
+    assert len(scanner._signals) == 1, f"Expected 1 signal, got {len(scanner._signals)}"
+    sig = scanner._signals[0]
+    assert sig["result"] == "cold_book", (
+        f"Expected 'cold_book', got '{sig['result']}'"
+    )
+    assert sig["yes_spread"] == pytest.approx(0.20, abs=1e-4), (
+        f"yes_spread logged incorrectly: {sig['yes_spread']}"
+    )
+    assert sig["no_spread"] == pytest.approx(0.04, abs=1e-4), (
+        f"no_spread logged incorrectly: {sig['no_spread']}"
+    )
+    assert scanner._entering_markets == set(), "cold_book must not add to _entering_markets"
+    assert scanner._skipped_cold_book == 1, (
+        f"skipped_cold_book must be 1, got {scanner._skipped_cold_book}"
+    )
+    assert scanner._skipped_no_spread == 0
+
+
+def test_on01_wide_no_spread_skips_cold_book():
+    """
+    ON-01 AC: when NO spread > MAX_INDIVIDUAL_SPREAD, result must be 'cold_book'.
+    YES spread = 0.04 (ok); NO spread = 0.50 - 0.30 = 0.20 (wide) → cold_book.
+    """
+    market = _make_market(tte_seconds=3605.0, duration_seconds=3600.0)
+    scanner = _make_scanner_custom_books(
+        yes_ask=0.50, no_ask=0.50,
+        yes_bid=0.46, no_bid=0.30,   # NO is cold
+        markets=[market],
+    )
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.01),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 300),
+        patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 3),
+        patch.object(config, "OPENING_NEUTRAL_MIN_SIDE_PRICE", 0.40),
+        patch.object(config, "OPENING_NEUTRAL_MAX_SIDE_PRICE", 0.60),
+        patch.object(config, "OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD", 0.15),
+    ):
+        _run(scanner._evaluate_entry(market))
+
+    sig = scanner._signals[0]
+    assert sig["result"] == "cold_book", f"Expected 'cold_book', got '{sig['result']}'"
+    assert sig["no_spread"] == pytest.approx(0.20, abs=1e-4)
+    assert scanner._skipped_cold_book == 1
+    assert scanner._entering_markets == set()
+
+
+def test_on01_missing_bid_skips_no_spread():
+    """
+    ON-01 AC: when either book has no bid (best_bid=None), result must be 'no_spread'.
+    skipped_no_spread counter must increment, skipped_cold_book must stay 0.
+    """
+    market = _make_market(tte_seconds=3605.0, duration_seconds=3600.0)
+    scanner = _make_scanner_custom_books(
+        yes_ask=0.50, no_ask=0.50,
+        yes_bid=None, no_bid=0.46,   # YES has no bid — empty book
+        markets=[market],
+    )
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.01),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 300),
+        patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 3),
+        patch.object(config, "OPENING_NEUTRAL_MIN_SIDE_PRICE", 0.40),
+        patch.object(config, "OPENING_NEUTRAL_MAX_SIDE_PRICE", 0.60),
+        patch.object(config, "OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD", 0.15),
+    ):
+        _run(scanner._evaluate_entry(market))
+
+    assert len(scanner._signals) == 1
+    sig = scanner._signals[0]
+    assert sig["result"] == "no_spread", f"Expected 'no_spread', got '{sig['result']}'"
+    assert sig["yes_spread"] is None, "yes_spread must be None when bid is absent"
+    assert scanner._skipped_no_spread == 1, (
+        f"skipped_no_spread must be 1, got {scanner._skipped_no_spread}"
+    )
+    assert scanner._skipped_cold_book == 0
+    assert scanner._entering_markets == set()
+
+
+def test_on01_narrow_spreads_proceeds_to_entry(monkeypatch):
+    """
+    ON-01 AC: when both spreads are within threshold, the gate must NOT block entry.
+    Both spreads = 0.04 < 0.15 → result 'entry_attempt', both spreads logged.
+    spread cache must be populated for _register_pair to consume.
+    """
+    market = _make_market(tte_seconds=3605.0, duration_seconds=3600.0)
+    # YES spread = 0.50 - 0.46 = 0.04; NO spread = 0.50 - 0.46 = 0.04
+    scanner = _make_scanner_custom_books(
+        yes_ask=0.50, no_ask=0.50,
+        yes_bid=0.46, no_bid=0.46,
+        markets=[market],
+    )
+
+    entry_calls: list = []
+
+    async def fake_enter_pair(mkt, ya, na):
+        entry_calls.append((mkt.condition_id, ya, na))
+        scanner._entering_markets.discard(mkt.condition_id)
+
+    monkeypatch.setattr(scanner, "_enter_pair", fake_enter_pair)
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_COMBINED_COST_MAX", 1.01),
+        patch.object(config, "OPENING_NEUTRAL_MARKET_WINDOW_SECS", 300),
+        patch.object(config, "OPENING_NEUTRAL_MAX_CONCURRENT", 3),
+        patch.object(config, "OPENING_NEUTRAL_MIN_SIDE_PRICE", 0.40),
+        patch.object(config, "OPENING_NEUTRAL_MAX_SIDE_PRICE", 0.60),
+        patch.object(config, "OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED", True),
+        patch.object(config, "OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD", 0.15),
+    ):
+        _run(scanner._evaluate_entry(market))
+        _run(asyncio.sleep(0.01))
+
+    assert len(scanner._signals) == 1, f"Expected 1 signal, got {len(scanner._signals)}"
+    sig = scanner._signals[0]
+    assert sig["result"] == "entry_attempt", (
+        f"Narrow spreads must not block entry; got '{sig['result']}'"
+    )
+    assert sig["yes_spread"] == pytest.approx(0.04, abs=1e-4), "yes_spread must be logged"
+    assert sig["no_spread"]  == pytest.approx(0.04, abs=1e-4), "no_spread must be logged"
+    # Spread cache populated for _register_pair
+    assert market.condition_id in scanner._entry_spread_cache, (
+        "spread cache must be populated after entry_attempt"
+    )
+    cached = scanner._entry_spread_cache[market.condition_id]
+    assert cached == (pytest.approx(0.04, abs=1e-4), pytest.approx(0.04, abs=1e-4))
+    assert scanner._skipped_cold_book == 0
+    assert scanner._skipped_no_spread == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ON-02 — Fills CSV unit tests
+# AC: spreads/context written to CSV; winner_exit_price backfill via
+#     notify_winner_closed(); schema migrated on header change.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_on02_fills_csv_row_written_on_loser_exit(tmp_path, monkeypatch):
+    """
+    ON-02 AC: when a loser fills, a complete row is appended to on_fills.csv.
+    Row must include: pair_id, loser_leg, loser_fill_price, loser_fill_time_secs,
+    yes_spread (from cache), no_spread (from cache), combined_cost, winner_exit_price=None.
+    """
+    import strategies.OpeningNeutral.scanner as _on_scanner
+    # Redirect on_fills.csv to a temp directory
+    monkeypatch.setattr(_on_scanner, "_DATA_DIR", tmp_path)
+    monkeypatch.setattr(_on_scanner, "_ON_FILLS_CSV", tmp_path / "on_fills.csv")
+
+    scanner = _make_scanner()
+    pair_id = "pair_csv_row_001"
+    market_id = "cond_csv_001"
+    yes_pos = _make_position(market_id, "YES", 0.51, pair_id)
+    no_pos  = _make_position(market_id, "NO",  0.50, pair_id)
+    scanner._active_pairs[pair_id] = {
+        "market_id": market_id,
+        "market_title": "Will BTC go up or down?",
+        "yes_pos": yes_pos,
+        "no_pos": no_pos,
+    }
+    # Pre-populate fills row as _register_pair would
+    import time
+    market_mock = _make_market(condition_id=market_id)
+    scanner._entry_spread_cache[market_id] = (0.04, 0.05)
+    scanner._pair_csv_data[pair_id] = {
+        "timestamp":              "2026-05-03T00:00:00+00:00",
+        "pair_id":                pair_id,
+        "market_id":              market_id,
+        "market_title":           "Will BTC go up or down?",
+        "underlying":             "BTC",
+        "market_type":            "bucket_1h",
+        "yes_entry":              0.51,
+        "no_entry":               0.50,
+        "combined_cost":          1.01,
+        "yes_spread":             0.04,
+        "no_spread":              0.05,
+        "funding_rate":           None,
+        "yes_depth_share":        None,
+        "loser_confidence_score": None,
+        "yes_sell_price_placed":  0.35,
+        "no_sell_price_placed":   0.35,
+        "loser_leg":              "none",
+        "loser_fill_price":       None,
+        "loser_fill_time_secs":   None,
+        "winner_exit_price":      None,
+        "_entry_ts":              time.time() - 12.0,  # simulate 12 s since entry
+    }
+
+    # Ensure CSV file exists with header
+    _on_scanner._ensure_on_fills_csv()
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
+        patch.object(config, "OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM", False),
+        patch.object(config, "MOMENTUM_PROB_SL_ENABLED", False),
+    ):
+        _run(scanner._on_exit_fill(pair_id, "NO", exit_price=0.34))
+
+    import csv
+    csv_path = tmp_path / "on_fills.csv"
+    assert csv_path.exists(), "on_fills.csv must be created"
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 1, f"Expected 1 CSV row, got {len(rows)}"
+    row = rows[0]
+
+    assert row["pair_id"] == pair_id
+    assert row["loser_leg"] == "NO"
+    assert float(row["loser_fill_price"]) == pytest.approx(0.34, abs=1e-4)
+    assert float(row["loser_fill_time_secs"]) >= 10.0, (
+        "loser_fill_time_secs should be ~12s"
+    )
+    assert float(row["yes_spread"]) == pytest.approx(0.04, abs=1e-4)
+    assert float(row["no_spread"])  == pytest.approx(0.05, abs=1e-4)
+    assert float(row["combined_cost"]) == pytest.approx(1.01, abs=1e-4)
+    assert row["winner_exit_price"] == ""  # None serialises to empty string in CSV
+
+
+def test_on02_winner_exit_price_backfilled(tmp_path, monkeypatch):
+    """
+    ON-02 AC: notify_winner_closed() must backfill winner_exit_price in on_fills.csv.
+    """
+    import strategies.OpeningNeutral.scanner as _on_scanner
+    import csv
+
+    monkeypatch.setattr(_on_scanner, "_DATA_DIR", tmp_path)
+    monkeypatch.setattr(_on_scanner, "_ON_FILLS_CSV", tmp_path / "on_fills.csv")
+
+    scanner = _make_scanner()
+    pair_id = "pair_winner_bfill"
+    market_id = "cond_winner_001"
+    yes_pos = _make_position(market_id, "YES", 0.51, pair_id)
+    no_pos  = _make_position(market_id, "NO",  0.50, pair_id)
+    scanner._active_pairs[pair_id] = {
+        "market_id": market_id,
+        "market_title": "Will BTC go up or down?",
+        "yes_pos": yes_pos,
+        "no_pos": no_pos,
+    }
+    import time
+    scanner._pair_csv_data[pair_id] = {
+        "timestamp":              "2026-05-03T00:00:00+00:00",
+        "pair_id":                pair_id,
+        "market_id":              market_id,
+        "market_title":           "Will BTC go up or down?",
+        "underlying":             "BTC",
+        "market_type":            "bucket_1h",
+        "yes_entry":              0.51,
+        "no_entry":               0.50,
+        "combined_cost":          1.01,
+        "yes_spread":             0.04,
+        "no_spread":              0.05,
+        "funding_rate":           None,
+        "yes_depth_share":        None,
+        "loser_confidence_score": None,
+        "yes_sell_price_placed":  0.35,
+        "no_sell_price_placed":   0.35,
+        "loser_leg":              "none",
+        "loser_fill_price":       None,
+        "loser_fill_time_secs":   None,
+        "winner_exit_price":      None,
+        "_entry_ts":              time.time() - 5.0,
+    }
+    _on_scanner._ensure_on_fills_csv()
+
+    with (
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
+        patch.object(config, "OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM", False),
+        patch.object(config, "MOMENTUM_PROB_SL_ENABLED", False),
+    ):
+        # Loser (NO) fills — row written with winner_exit_price=None
+        _run(scanner._on_exit_fill(pair_id, "NO", exit_price=0.34))
+
+    # Winner (YES) key registered in _winner_pending
+    assert f"{market_id}:YES" in scanner._winner_pending, (
+        "winner pending key must be set after loser exit"
+    )
+
+    # Winner closes at 0.96 via notify_winner_closed
+    scanner.notify_winner_closed(market_id, "YES", 0.96)
+
+    # winner_exit_price must now be backfilled in the CSV
+    with (tmp_path / "on_fills.csv").open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 1
+    assert rows[0]["winner_exit_price"] == "0.96", (
+        f"winner_exit_price not backfilled correctly: {rows[0]['winner_exit_price']}"
+    )
+    # _winner_pending entry must be consumed after backfill
+    assert f"{market_id}:YES" not in scanner._winner_pending
+
+
+def test_on02_fills_csv_schema_migration(tmp_path, monkeypatch):
+    """
+    ON-02 AC: if on_fills.csv exists with a different header, it must be renamed
+    to a .csv.bak file and a fresh file created with the current schema.
+    Existing CSV rows must not be lost (they are in the backup).
+    """
+    import strategies.OpeningNeutral.scanner as _on_scanner
+    import csv
+
+    monkeypatch.setattr(_on_scanner, "_DATA_DIR", tmp_path)
+    csv_path = tmp_path / "on_fills.csv"
+    monkeypatch.setattr(_on_scanner, "_ON_FILLS_CSV", csv_path)
+
+    # Write a CSV with an old/different schema
+    old_header = ["timestamp", "pair_id", "market_id", "old_column"]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(old_header)
+        writer.writerow(["2026-05-01", "p1", "m1", "value"])
+
+    # Call _ensure_on_fills_csv — must detect schema mismatch and migrate
+    _on_scanner._ensure_on_fills_csv()
+
+    # New file must have the current schema
+    assert csv_path.exists()
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        new_header = next(reader)
+    assert new_header == _on_scanner._ON_FILLS_HEADER, (
+        "Migrated CSV must have current schema header"
+    )
+
+    # Backup file must exist with the old data
+    backups = list(tmp_path.glob("on_fills_*.csv.bak"))
+    assert len(backups) == 1, f"Expected 1 backup file, found {len(backups)}"
+    with backups[0].open(newline="", encoding="utf-8") as f:
+        bak_rows = list(csv.reader(f))
+    assert bak_rows[0] == old_header, "Backup must preserve old header"
+    assert bak_rows[1][0] == "2026-05-01", "Backup must preserve old rows"
+

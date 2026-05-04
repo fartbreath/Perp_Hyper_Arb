@@ -558,40 +558,58 @@ export interface ConfigData {
   momentum_phase_c_min_tte_daily?: number;
   momentum_phase_c_min_tte_weekly?: number;
   momentum_phase_c_min_tte_milestone?: number;
-  // Phase D — hedge
-  momentum_hedge_enabled?: boolean;
-  momentum_hedge_enabled_5m?: boolean;
-  momentum_hedge_enabled_15m?: boolean;
-  momentum_hedge_enabled_1h?: boolean;
-  momentum_hedge_enabled_4h?: boolean;
-  momentum_hedge_enabled_daily?: boolean;
-  momentum_hedge_enabled_weekly?: boolean;
-  momentum_hedge_enabled_milestone?: boolean;
-  momentum_hedge_price?: number;
-  momentum_hedge_contracts_pct?: number;
-  momentum_hedge_cancel_recovery_pct?: number;
-  momentum_hedge_suppresses_delta_sl?: boolean;
-  momentum_hedge_price_5m?: number;
-  momentum_hedge_price_15m?: number;
-  momentum_hedge_price_1h?: number;
-  momentum_hedge_price_4h?: number;
-  momentum_hedge_price_daily?: number;
-  momentum_hedge_price_weekly?: number;
-  momentum_hedge_price_milestone?: number;
-  // Phase E — empirical win-rate gate
-  momentum_win_rate_gate_enabled?: boolean;
-  momentum_win_rate_gate_min_factor?: number;
-  momentum_win_rate_gate_min_samples?: number;
-  // Kelly extensions
+  // Signal entry gates (M-10, M-11, M-14)
+  momentum_funding_gate_enabled?: boolean;
+  momentum_funding_gate_yes_max?: number;
+  momentum_funding_gate_no_min?: number;
+  momentum_depth_share_gate_enabled?: boolean;
+  momentum_depth_share_yes_min?: number;
+  momentum_depth_share_no_max?: number;
+  momentum_twap_gate_enabled?: boolean;
+  momentum_twap_dev_threshold_bps?: number;
+  momentum_twap_dev_low_vol_yes_multiplier?: number;
+  // M-13: upfrac EWMA early exit
+  momentum_upfrac_exit_enabled?: boolean;
+  momentum_upfrac_exit_threshold?: number;
+  momentum_upfrac_exit_windows?: number;
+  momentum_upfrac_ewma_alpha?: number;
+  // Stop-loss hysteresis
+  momentum_delta_sl_min_ticks?: number;
+  // Kelly extensions (COB)
   momentum_kelly_min_tte_seconds?: number;
-  momentum_kelly_persistence_enabled?: boolean;
-  momentum_kelly_persistence_z_boost_max?: number;
+  momentum_min_entry_usd?: number;
+  momentum_kelly_edge_premium?: number;
+  momentum_kelly_win_prob_cap?: number;
+  momentum_kelly_clob_reliable_tte?: number;
+  momentum_kelly_oracle_sensitivity?: number;
   momentum_kelly_multiplier_5m?: number;
   momentum_kelly_multiplier_15m?: number;
   momentum_kelly_multiplier_1h?: number;
   momentum_kelly_multiplier_4h?: number;
   momentum_kelly_multiplier_daily?: number;
   momentum_kelly_multiplier_weekly?: number;
+  // Probability-based stop-loss
+  momentum_prob_sl_enabled?: boolean;
+  momentum_prob_sl_pct?: number;
+  momentum_prob_sl_min_tte_secs?: number;
+  momentum_prob_sl_oracle_stale_secs?: number;
+  // Order execution
+  momentum_tp_resting_enabled?: boolean;
+  momentum_tp_retry_max?: number;
+  momentum_tp_retry_step?: number;
+  momentum_order_cancel_sec?: number;
+  momentum_slippage_cap?: number;
+  momentum_max_retries?: number;
+  momentum_buy_retry_step?: number;
+  // VWAP/RoC secondary filter
+  momentum_vwap_window_sec?: number;
+  momentum_roc_window_sec?: number;
+  momentum_min_vwap_dev_pct?: number;
+  momentum_min_roc_pct?: number;
+  // Analysis logging
+  momentum_ticks_log_enabled?: boolean;
+  // Chainlink watchdog
+  chainlink_silence_watchdog_secs?: number;
   // Range markets sub-strategy
   momentum_range_enabled?: boolean;
   momentum_range_price_band_low?: number;
@@ -604,6 +622,20 @@ export interface ConfigData {
   // Strategy 5 — Opening Neutral
   opening_neutral_enabled?: boolean;
   opening_neutral_dry_run?: boolean;
+  opening_neutral_tp_enabled?: boolean;
+  opening_neutral_tp_profit_pct?: number;
+  // ON-01 — Cold-book spread gate
+  opening_neutral_max_individual_spread_enabled?: boolean;
+  opening_neutral_max_individual_spread?: number;
+  // ON exit — loser exit trigger and min hold
+  opening_neutral_loser_exit_trigger?: number;
+  opening_neutral_min_hold_secs?: number;
+  // ON entry — sizing, order type, fallback, concurrency, exit price
+  opening_neutral_loser_exit_price?: number;
+  opening_neutral_size_usd?: number;
+  opening_neutral_order_type?: string;
+  opening_neutral_one_leg_fallback?: string;
+  opening_neutral_max_concurrent?: number;
 }
 
 export interface InventoryData {

@@ -13,50 +13,52 @@ import { usePolymarketEventSlugs } from "../utils/usePolymarketEventSlugs";
 // so operators can see thin/zero-liquidity markets and monitor WS subscription health.
 const SCAN_HIDDEN = new Set(["beyond_horizon", "not_started"]);
 
-function momentumSkipBadge(m: MomentumDiagnosticMarket): { label: string; color: string } {
+function momentumSkipBadge(m: MomentumDiagnosticMarket): { label: string; color: string; tooltip: string } {
   const sr = m.skip_reason;
-  if (sr === "signal_fired") return { label: "\u2713 Fired", color: "#22c55e" };
-  if (sr === "empty_book") return { label: "Empty book", color: "#f97316" };
-  if (sr === "no_book") return { label: "No book data", color: "#f97316" };
+  if (sr === "signal_fired") return { label: "\u2713 Fired", color: "#22c55e", tooltip: "Signal passed all filters and a trade was submitted this scan." };
+  if (sr === "empty_book") return { label: "Empty book", color: "#f97316", tooltip: "The order book has no resting orders — market maker has stepped away, so there is no liquidity to trade against." };
+  if (sr === "no_book") return { label: "No book data", color: "#f97316", tooltip: "No order book snapshot has been received yet via WebSocket for this token." };
   if (sr === "not_started") {
     const tte = m.tte_seconds != null ? Math.round(m.tte_seconds / 60) : "\u2014";
-    return { label: `Not started \u2014 ${tte}m TTE`, color: "#475569" };
+    return { label: `Not started \u2014 ${tte}m TTE`, color: "#475569", tooltip: "This bucket market has not opened yet — it is still too far from expiry to be in the entry window." };
   }
   if (sr === "delta_below_threshold") {
     const delta = m.delta_pct != null ? m.delta_pct.toFixed(1) : "\u2014";
     const thresh = m.threshold_pct != null ? m.threshold_pct.toFixed(1) : "\u2014";
-    return { label: `\u0394 ${delta}% vs \u2265${thresh}%`, color: "#f59e0b" };
+    return { label: `\u0394 ${delta}% vs \u2265${thresh}%`, color: "#f59e0b", tooltip: `Spot has moved ${delta}% away from the strike but the volatility-adjusted threshold requires at least ${thresh}% — not enough momentum yet.` };
   }
   if (sr === "tte_too_long") {
     const tte = m.tte_seconds != null ? Math.round(m.tte_seconds / 60) : "\u2014";
     const min = m.min_tte_s != null ? Math.round(m.min_tte_s / 60) : "\u2014";
-    return { label: `TTE ${tte}m (max ${min}m)`, color: "#60a5fa" };
+    return { label: `TTE ${tte}m (max ${min}m)`, color: "#60a5fa", tooltip: `Market expires in ${tte} min but the entry window for this bucket only opens inside ${min} min — too early to enter.` };
   }
   if (sr === "tte_floor") {
     const tte = m.tte_seconds != null ? `${m.tte_seconds}s` : "\u2014";
-    return { label: `TTE ${tte} \u2014 too close (no stop-loss window)`, color: "#f97316" };
+    return { label: `TTE ${tte} \u2014 too close (no stop-loss window)`, color: "#f97316", tooltip: `Only ${tte} left — too close to expiry to place a trade with enough time for the stop-loss to fire if wrong.` };
   }
   if (sr === "out_of_band") {
     const price = m.token_price != null ? Math.round(m.token_price * 100) : "\u2014";
     const lo = m.band_lo != null ? Math.round(m.band_lo * 100) : "\u2014";
     const hi = m.band_hi != null ? Math.round(m.band_hi * 100) : "\u2014";
-    return { label: `${price}\u00a2 outside ${lo}\u00a2\u2013${hi}\u00a2`, color: "#64748b" };
+    return { label: `${price}\u00a2 outside ${lo}\u00a2\u2013${hi}\u00a2`, color: "#64748b", tooltip: `Token is priced at ${price}¢ which is outside the ${lo}¢–${hi}¢ entry band — spot is not close enough to this strike to give the trade a meaningful edge.` };
   }
   if (sr === "thin_clob") {
     const depth = m.ask_depth_usd != null ? m.ask_depth_usd.toFixed(0) : "\u2014";
     const min = m.min_clob_depth != null ? m.min_clob_depth.toFixed(0) : "\u2014";
-    return { label: `Thin book $${depth} vs $${min}`, color: "#f97316" };
+    return { label: `Thin book $${depth} vs $${min}`, color: "#f97316", tooltip: `Only $${depth} of ask-side liquidity — the minimum required is $${min}, so the order would have too much market impact.` };
   }
-  if (sr === "no_ask") return { label: "No asks", color: "#f97316" };
-  if (sr === "no_vol") return { label: "No vol data", color: "#ef4444" };
-  if (sr === "no_spot" || sr === "stale_spot") return { label: "No spot data", color: "#ef4444" };
-  if (sr === "duplicate_position") return { label: "Already held", color: "#a78bfa" };
-  if (sr === "concurrent_cap") return { label: "Position cap", color: "#a78bfa" };
+  if (sr === "no_ask") return { label: "No asks", color: "#f97316", tooltip: "There are no ask-side resting orders, so the bot cannot buy a token at any price right now." };
+  if (sr === "no_vol") return { label: "No vol data", color: "#ef4444", tooltip: "Implied volatility data is unavailable for this coin, so the entry threshold cannot be calculated." };
+  if (sr === "no_spot" || sr === "stale_spot") return { label: "No spot data", color: "#ef4444", tooltip: "The live spot price feed for this coin is missing or stale, so delta vs strike cannot be computed." };
+  if (sr === "duplicate_position") return { label: "Already held", color: "#a78bfa", tooltip: "An open position already exists for this market — the bot does not add to existing positions." };
+  if (sr === "concurrent_cap") return { label: "Position cap", color: "#a78bfa", tooltip: "The maximum number of concurrent Momentum positions is already open — no new trades until one closes." };
+  if (sr === "gap_below_minimum") return { label: "Gap too small", color: "#f59e0b", tooltip: "The absolute gap between spot and strike is below the minimum distance required for a safe entry." };
+  if (sr === "stale_book") return { label: "Stale book", color: "#64748b", tooltip: "The last order book update arrived too long ago — book data may be stale and is not trusted for entry." };
   if (sr === "cooldown") {
     const s = m.cooldown_remaining_s != null ? Math.round(m.cooldown_remaining_s) : "\u2014";
-    return { label: `Cooldown ${s}s`, color: "#94a3b8" };
+    return { label: `Cooldown ${s}s`, color: "#94a3b8", tooltip: `This market is in a ${s}s cooldown period after a recent trade or rejection — re-entry is blocked until it expires.` };
   }
-  return { label: sr ?? "\u2014", color: "#475569" };
+  return { label: sr ?? "\u2014", color: "#475569", tooltip: sr ?? "" };
 }
 
 const DECISION_COLOR: Record<string, string> = {
@@ -475,7 +477,7 @@ export default function Signals() {
                       </thead>
                       <tbody>
                         {sortedMarkets.map((m, i) => {
-                          const { label: badgeLabel, color: badgeColor } = momentumSkipBadge(m);
+                          const { label: badgeLabel, color: badgeColor, tooltip: badgeTooltip } = momentumSkipBadge(m);
                           const sideColor = (m.side === "YES" || m.side === "UP") ? "#22c55e" : "#ef4444";
                           const tteSecs = m.tte_seconds ?? 0;
                           const tteMins = Math.round(tteSecs / 60);
@@ -526,10 +528,12 @@ export default function Signals() {
                                   : "—"}
                               </td>
                               <td style={{ padding: "0.4rem 0.6rem" }}>
-                                <span style={{
+                                <span
+                                  title={badgeTooltip}
+                                  style={{
                                   padding: "2px 8px", borderRadius: 4, fontSize: "0.75rem", fontWeight: 500,
                                   background: `${badgeColor}22`, color: badgeColor, border: `1px solid ${badgeColor}44`,
-                                  whiteSpace: "nowrap",
+                                  whiteSpace: "nowrap", cursor: "help",
                                 }}>
                                   {badgeLabel}
                                 </span>

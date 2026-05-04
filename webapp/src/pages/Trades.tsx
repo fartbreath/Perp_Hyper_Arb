@@ -10,7 +10,13 @@
  */
 import { useState, useMemo, Fragment } from "react";
 import { useAcctLedger } from "../api/client";
-import type { AcctLedgerRow } from "../api/client"
+import type { AcctLedgerRow } from "../api/client";
+import {
+  fmtUsd, fmtPrice, fmtContracts,
+  netPnl, grossPnl, pnlColor,
+  buildGroups,
+} from "./tradesUtils";
+export type { LedgerGroup } from "./tradesUtils";
 
 const UNDERLYINGS = ["", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE", "other"];
 const STRATEGIES  = ["", "maker", "mispricing", "momentum", "range", "opening_neutral", "momentum_hedge"];
@@ -21,33 +27,7 @@ const OUTCOMES    = [
 ];
 const ALL_LIMIT   = 2000;
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
-
-export function fmtUsd(v: string | number | undefined): string {
-  const n = Number(v ?? 0);
-  if (!isFinite(n)) return "—";
-  const sign = n > 0 ? "+" : n < 0 ? "" : "";
-  return `${sign}$${n.toFixed(2)}`;
-}
-
-export function fmtPrice(v: string | number | undefined): string {
-  const n = Number(v ?? 0);
-  if (!isFinite(n) || n === 0) return "—";
-  return `${(n * 100).toFixed(1)}¢`;
-}
-
-export function fmtContracts(v: string | number | undefined): string {
-  const n = Number(v ?? 0);
-  if (!isFinite(n) || n === 0) return "—";
-  return n.toFixed(2);
-}
-
-export function netPnl(row: AcctLedgerRow): number { return Number(row.net_pnl ?? 0); }
-export function grossPnl(row: AcctLedgerRow): number { return Number(row.gross_pnl ?? 0); }
-
-export function pnlColor(n: number): string {
-  return n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#94a3b8";
-}
+// ─── helpers (local, private) ────────────────────────────────────────────────
 
 function relTime(iso: string | undefined): string {
   if (!iso) return "—";
@@ -128,67 +108,6 @@ function PmBadge({ confirmed, label }: { confirmed: string; label: string }) {
       color: ok ? "#86efac" : "#78716c",
     }}>{label}: {ok ? "✓" : "?"}</span>
   );
-}
-
-// ─── group logic ──────────────────────────────────────────────────────────────
-
-export interface LedgerGroup {
-  pair_id:      string;
-  rows:         AcctLedgerRow[];
-  hedges:       AcctLedgerRow[];
-  totalNetPnl:  number;
-  totalGross:   number;
-  totalFees:    number;
-  totalRebates: number;
-  lastTime:     string;
-}
-
-export function buildGroups(rows: AcctLedgerRow[]): LedgerGroup[] {
-  const hedges = rows.filter(r => r.fill_type === "HEDGE" || r.strategy === "momentum_hedge");
-  const mains  = rows.filter(r => r.fill_type !== "HEDGE" && r.strategy !== "momentum_hedge");
-
-  const hedgeByParent = new Map<string, AcctLedgerRow[]>();
-  for (const h of hedges) {
-    const key = h.parent_pos_id || h.market_id;
-    const arr = hedgeByParent.get(key) ?? [];
-    arr.push(h);
-    hedgeByParent.set(key, arr);
-  }
-
-  const pairMap = new Map<string, AcctLedgerRow[]>();
-  for (const r of mains) {
-    const key = r.pair_id || r.pos_id;
-    const arr = pairMap.get(key) ?? [];
-    arr.push(r);
-    pairMap.set(key, arr);
-  }
-
-  return Array.from(pairMap.entries()).map(([pairKey, grpRows]) => {
-    const grpHedges: AcctLedgerRow[] = [];
-    const seenHedgeIds = new Set<string>();
-    for (const r of grpRows) {
-      for (const h of (hedgeByParent.get(r.pos_id) ?? [])) {
-        if (!seenHedgeIds.has(h.pos_id)) { grpHedges.push(h); seenHedgeIds.add(h.pos_id); }
-      }
-      for (const h of (hedgeByParent.get(r.market_id) ?? [])) {
-        if (!seenHedgeIds.has(h.pos_id)) { grpHedges.push(h); seenHedgeIds.add(h.pos_id); }
-      }
-    }
-    const allRows = [...grpRows, ...grpHedges];
-    return {
-      pair_id:      pairKey,
-      rows:         grpRows,
-      hedges:       grpHedges,
-      totalNetPnl:  allRows.reduce((s, r) => s + Number(r.net_pnl   ?? 0), 0),
-      totalGross:   allRows.reduce((s, r) => s + Number(r.gross_pnl  ?? 0), 0),
-      totalFees:    allRows.reduce((s, r) => s + Number(r.fees_usd   ?? 0), 0),
-      totalRebates: allRows.reduce((s, r) => s + Number(r.rebates_usd ?? 0), 0),
-      lastTime:     grpRows.reduce((best, r) => {
-        const t = r.exit_time || r.entry_time || "";
-        return t > best ? t : best;
-      }, ""),
-    };
-  }).sort((a, b) => b.lastTime.localeCompare(a.lastTime));
 }
 
 // ─── summary bar ─────────────────────────────────────────────────────────────
@@ -293,7 +212,7 @@ function LedgerRow({ row, indent = false }: { row: AcctLedgerRow; indent?: boole
 // ─── group rows (collapsible) ─────────────────────────────────────────────────
 
 function GroupRows({ group }: { group: LedgerGroup }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
   const isPair = group.rows.length > 1 || group.hedges.length > 0;
   const net = group.totalNetPnl;
 

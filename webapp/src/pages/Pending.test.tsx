@@ -14,7 +14,7 @@ import React from "react";
 import { render, screen } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
 import type { AcctPosition } from "../api/client";
-import { timeSince, unrealizedPnl } from "./Pending";
+import { timeSince, unrealizedPnl } from "./pendingUtils";
 
 // ── Mock the API hook ─────────────────────────────────────────────────────────
 const mockUseAcctPending = vi.fn();

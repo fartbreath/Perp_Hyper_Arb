@@ -532,6 +532,28 @@ _MUTABLE_CONFIG = {
     "momentum_ticks_log_enabled":          ("MOMENTUM_TICKS_LOG_ENABLED",           bool),
     # Kelly extensions
     "momentum_kelly_min_tte_seconds":         ("MOMENTUM_KELLY_MIN_TTE_SECONDS",         int),
+    "momentum_min_entry_usd":                ("MOMENTUM_MIN_ENTRY_USD",                float),
+    "momentum_kelly_edge_premium":           ("MOMENTUM_KELLY_EDGE_PREMIUM",           float),
+    "momentum_kelly_win_prob_cap":           ("MOMENTUM_KELLY_WIN_PROB_CAP",           float),
+    "momentum_kelly_clob_reliable_tte":      ("MOMENTUM_KELLY_CLOB_RELIABLE_TTE",      int),
+    "momentum_kelly_oracle_sensitivity":     ("MOMENTUM_KELLY_ORACLE_SENSITIVITY",     float),
+    # Signal entry gates (M-10, M-11, M-14)
+    "momentum_funding_gate_enabled":         ("MOMENTUM_FUNDING_GATE_ENABLED",         bool),
+    "momentum_funding_gate_yes_max":         ("MOMENTUM_FUNDING_GATE_YES_MAX",         float),
+    "momentum_funding_gate_no_min":          ("MOMENTUM_FUNDING_GATE_NO_MIN",          float),
+    "momentum_depth_share_gate_enabled":     ("MOMENTUM_DEPTH_SHARE_GATE_ENABLED",     bool),
+    "momentum_depth_share_yes_min":          ("MOMENTUM_DEPTH_SHARE_YES_MIN",          float),
+    "momentum_depth_share_no_max":           ("MOMENTUM_DEPTH_SHARE_NO_MAX",           float),
+    "momentum_twap_gate_enabled":            ("MOMENTUM_TWAP_GATE_ENABLED",            bool),
+    "momentum_twap_dev_threshold_bps":       ("MOMENTUM_TWAP_DEV_THRESHOLD_BPS",       float),
+    "momentum_twap_dev_low_vol_yes_multiplier": ("MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER", float),
+    # M-13: upfrac EWMA early exit
+    "momentum_upfrac_exit_enabled":          ("MOMENTUM_UPFRAC_EXIT_ENABLED",          bool),
+    "momentum_upfrac_exit_threshold":        ("MOMENTUM_UPFRAC_EXIT_THRESHOLD",        float),
+    "momentum_upfrac_exit_windows":          ("MOMENTUM_UPFRAC_EXIT_WINDOWS",          int),
+    "momentum_upfrac_ewma_alpha":            ("MOMENTUM_UPFRAC_EWMA_ALPHA",            float),
+    # Stop-loss hysteresis
+    "momentum_delta_sl_min_ticks":           ("MOMENTUM_DELTA_SL_MIN_TICKS",           int),
     # Range markets (sub-strategy of Momentum)
     "momentum_range_enabled":              ("MOMENTUM_RANGE_ENABLED",              bool),
     "momentum_range_price_band_low":       ("MOMENTUM_RANGE_PRICE_BAND_LOW",       float),
@@ -556,16 +578,27 @@ _MUTABLE_CONFIG = {
     # Item 7: Probability-based SL
     "momentum_prob_sl_enabled":            ("MOMENTUM_PROB_SL_ENABLED",             bool),
     "momentum_prob_sl_pct":                ("MOMENTUM_PROB_SL_PCT",                 float),
+    "momentum_prob_sl_min_tte_secs":       ("MOMENTUM_PROB_SL_MIN_TTE_SECS",        int),
+    "momentum_prob_sl_oracle_stale_secs":  ("MOMENTUM_PROB_SL_ORACLE_STALE_SECS",  float),
     # Item 5: Chainlink watchdog
     "chainlink_silence_watchdog_secs":     ("CHAINLINK_SILENCE_WATCHDOG_SECS",      int),
     # RESOLVED fast-path fallback timeout
     "momentum_resolved_force_close_sec":   ("MOMENTUM_RESOLVED_FORCE_CLOSE_SEC",    int),
     # Strategy 5 — Opening Neutral
-    "opening_neutral_enabled":             ("OPENING_NEUTRAL_ENABLED",             bool),
-    "opening_neutral_dry_run":             ("OPENING_NEUTRAL_DRY_RUN",             bool),
-    "opening_neutral_tp_enabled":          ("OPENING_NEUTRAL_TP_ENABLED",           bool),
-    "opening_neutral_tp_profit_pct":       ("OPENING_NEUTRAL_TP_PROFIT_PCT",        float),
-    "opening_neutral_promote_to_momentum": ("OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM",  bool),
+    "opening_neutral_enabled":                     ("OPENING_NEUTRAL_ENABLED",                     bool),
+    "opening_neutral_dry_run":                     ("OPENING_NEUTRAL_DRY_RUN",                     bool),
+    "opening_neutral_tp_enabled":                  ("OPENING_NEUTRAL_TP_ENABLED",                   bool),
+    "opening_neutral_tp_profit_pct":               ("OPENING_NEUTRAL_TP_PROFIT_PCT",                float),
+    "opening_neutral_promote_to_momentum":         ("OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM",          bool),
+    "opening_neutral_max_individual_spread_enabled": ("OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED", bool),
+    "opening_neutral_max_individual_spread":       ("OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD",        float),
+    "opening_neutral_loser_exit_trigger":          ("OPENING_NEUTRAL_LOSER_EXIT_TRIGGER",           float),
+    "opening_neutral_min_hold_secs":               ("OPENING_NEUTRAL_MIN_HOLD_SECS",               float),
+    "opening_neutral_loser_exit_price":            ("OPENING_NEUTRAL_LOSER_EXIT_PRICE",             float),
+    "opening_neutral_size_usd":                    ("OPENING_NEUTRAL_SIZE_USD",                     float),
+    "opening_neutral_order_type":                  ("OPENING_NEUTRAL_ORDER_TYPE",                   str),
+    "opening_neutral_one_leg_fallback":            ("OPENING_NEUTRAL_ONE_LEG_FALLBACK",             str),
+    "opening_neutral_max_concurrent":              ("OPENING_NEUTRAL_MAX_CONCURRENT",               int),
 }
 
 
@@ -742,6 +775,28 @@ class ConfigPatch(BaseModel):
     momentum_ticks_log_enabled: bool | None = None
     # Kelly extensions
     momentum_kelly_min_tte_seconds: int | None = None
+    momentum_min_entry_usd: float | None = None
+    momentum_kelly_edge_premium: float | None = None
+    momentum_kelly_win_prob_cap: float | None = None
+    momentum_kelly_clob_reliable_tte: int | None = None
+    momentum_kelly_oracle_sensitivity: float | None = None
+    # Signal entry gates (M-10, M-11, M-14)
+    momentum_funding_gate_enabled: bool | None = None
+    momentum_funding_gate_yes_max: float | None = None
+    momentum_funding_gate_no_min: float | None = None
+    momentum_depth_share_gate_enabled: bool | None = None
+    momentum_depth_share_yes_min: float | None = None
+    momentum_depth_share_no_max: float | None = None
+    momentum_twap_gate_enabled: bool | None = None
+    momentum_twap_dev_threshold_bps: float | None = None
+    momentum_twap_dev_low_vol_yes_multiplier: float | None = None
+    # M-13: upfrac EWMA early exit
+    momentum_upfrac_exit_enabled: bool | None = None
+    momentum_upfrac_exit_threshold: float | None = None
+    momentum_upfrac_exit_windows: int | None = None
+    momentum_upfrac_ewma_alpha: float | None = None
+    # Stop-loss hysteresis
+    momentum_delta_sl_min_ticks: int | None = None
     momentum_kelly_multiplier_5m: float | None = None
     momentum_kelly_multiplier_15m: float | None = None
     momentum_kelly_multiplier_1h: float | None = None
@@ -772,6 +827,8 @@ class ConfigPatch(BaseModel):
     # Item 7: Probability-based SL
     momentum_prob_sl_enabled: bool | None = None
     momentum_prob_sl_pct: float | None = None
+    momentum_prob_sl_min_tte_secs: int | None = None
+    momentum_prob_sl_oracle_stale_secs: float | None = None
     # Item 5: Chainlink watchdog
     chainlink_silence_watchdog_secs: int | None = None
     # RESOLVED fast-path fallback timeout
@@ -782,6 +839,15 @@ class ConfigPatch(BaseModel):
     opening_neutral_tp_enabled: bool | None = None
     opening_neutral_tp_profit_pct: float | None = None
     opening_neutral_promote_to_momentum: bool | None = None
+    opening_neutral_max_individual_spread_enabled: bool | None = None
+    opening_neutral_max_individual_spread: float | None = None
+    opening_neutral_loser_exit_trigger: float | None = None
+    opening_neutral_min_hold_secs: float | None = None
+    opening_neutral_loser_exit_price: float | None = None
+    opening_neutral_size_usd: float | None = None
+    opening_neutral_order_type: str | None = None
+    opening_neutral_one_leg_fallback: str | None = None
+    opening_neutral_max_concurrent: int | None = None
 
 
 @app.get("/config")
@@ -960,6 +1026,28 @@ def get_config() -> dict:
         "momentum_ticks_log_enabled":          config.MOMENTUM_TICKS_LOG_ENABLED,
         # Kelly extensions
         "momentum_kelly_min_tte_seconds":         config.MOMENTUM_KELLY_MIN_TTE_SECONDS,
+        "momentum_min_entry_usd":                config.MOMENTUM_MIN_ENTRY_USD,
+        "momentum_kelly_edge_premium":           config.MOMENTUM_KELLY_EDGE_PREMIUM,
+        "momentum_kelly_win_prob_cap":           config.MOMENTUM_KELLY_WIN_PROB_CAP,
+        "momentum_kelly_clob_reliable_tte":      config.MOMENTUM_KELLY_CLOB_RELIABLE_TTE,
+        "momentum_kelly_oracle_sensitivity":     config.MOMENTUM_KELLY_ORACLE_SENSITIVITY,
+        # Signal entry gates (M-10, M-11, M-14)
+        "momentum_funding_gate_enabled":         config.MOMENTUM_FUNDING_GATE_ENABLED,
+        "momentum_funding_gate_yes_max":         config.MOMENTUM_FUNDING_GATE_YES_MAX,
+        "momentum_funding_gate_no_min":          config.MOMENTUM_FUNDING_GATE_NO_MIN,
+        "momentum_depth_share_gate_enabled":     config.MOMENTUM_DEPTH_SHARE_GATE_ENABLED,
+        "momentum_depth_share_yes_min":          config.MOMENTUM_DEPTH_SHARE_YES_MIN,
+        "momentum_depth_share_no_max":           config.MOMENTUM_DEPTH_SHARE_NO_MAX,
+        "momentum_twap_gate_enabled":            config.MOMENTUM_TWAP_GATE_ENABLED,
+        "momentum_twap_dev_threshold_bps":       config.MOMENTUM_TWAP_DEV_THRESHOLD_BPS,
+        "momentum_twap_dev_low_vol_yes_multiplier": config.MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER,
+        # M-13: upfrac EWMA early exit
+        "momentum_upfrac_exit_enabled":          config.MOMENTUM_UPFRAC_EXIT_ENABLED,
+        "momentum_upfrac_exit_threshold":        config.MOMENTUM_UPFRAC_EXIT_THRESHOLD,
+        "momentum_upfrac_exit_windows":          config.MOMENTUM_UPFRAC_EXIT_WINDOWS,
+        "momentum_upfrac_ewma_alpha":            config.MOMENTUM_UPFRAC_EWMA_ALPHA,
+        # Stop-loss hysteresis
+        "momentum_delta_sl_min_ticks":           config.MOMENTUM_DELTA_SL_MIN_TICKS,
         "momentum_kelly_multiplier_5m":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_5m",    1.0),
         "momentum_kelly_multiplier_15m":          config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_15m",   1.0),
         "momentum_kelly_multiplier_1h":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_1h",    1.0),
@@ -990,16 +1078,27 @@ def get_config() -> dict:
         # Item 7: Probability-based SL
         "momentum_prob_sl_enabled":            config.MOMENTUM_PROB_SL_ENABLED,
         "momentum_prob_sl_pct":                config.MOMENTUM_PROB_SL_PCT,
+        "momentum_prob_sl_min_tte_secs":       config.MOMENTUM_PROB_SL_MIN_TTE_SECS,
+        "momentum_prob_sl_oracle_stale_secs":  config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS,
         # Item 5: Chainlink watchdog
         "chainlink_silence_watchdog_secs":     config.CHAINLINK_SILENCE_WATCHDOG_SECS,
         # RESOLVED fast-path fallback timeout
         "momentum_resolved_force_close_sec":   config.MOMENTUM_RESOLVED_FORCE_CLOSE_SEC,
         # Strategy 5 — Opening Neutral
-        "opening_neutral_enabled":             config.OPENING_NEUTRAL_ENABLED,
-        "opening_neutral_dry_run":             config.OPENING_NEUTRAL_DRY_RUN,
-        "opening_neutral_tp_enabled":          config.OPENING_NEUTRAL_TP_ENABLED,
-        "opening_neutral_tp_profit_pct":       config.OPENING_NEUTRAL_TP_PROFIT_PCT,
-        "opening_neutral_promote_to_momentum": config.OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM,
+        "opening_neutral_enabled":                     config.OPENING_NEUTRAL_ENABLED,
+        "opening_neutral_dry_run":                     config.OPENING_NEUTRAL_DRY_RUN,
+        "opening_neutral_tp_enabled":                  config.OPENING_NEUTRAL_TP_ENABLED,
+        "opening_neutral_tp_profit_pct":               config.OPENING_NEUTRAL_TP_PROFIT_PCT,
+        "opening_neutral_promote_to_momentum":         config.OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM,
+        "opening_neutral_max_individual_spread_enabled": config.OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED,
+        "opening_neutral_max_individual_spread":       config.OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD,
+        "opening_neutral_loser_exit_trigger":          config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER,
+        "opening_neutral_min_hold_secs":               config.OPENING_NEUTRAL_MIN_HOLD_SECS,
+        "opening_neutral_loser_exit_price":            config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
+        "opening_neutral_size_usd":                    config.OPENING_NEUTRAL_SIZE_USD,
+        "opening_neutral_order_type":                  config.OPENING_NEUTRAL_ORDER_TYPE,
+        "opening_neutral_one_leg_fallback":            config.OPENING_NEUTRAL_ONE_LEG_FALLBACK,
+        "opening_neutral_max_concurrent":              config.OPENING_NEUTRAL_MAX_CONCURRENT,
         "timestamp":            time.time(),
     }
 
@@ -1156,119 +1255,10 @@ def patch_config(patch: ConfigPatch) -> dict:
         _save_overrides(attr_changes)
     return {
         "updated": updated,
-        "current": {
-            "paper_trading":       config.PAPER_TRADING,
-            "agent_auto":          config.AGENT_AUTO,
-            "auto_approve":        config.AUTO_APPROVE,
-            "mispricing_scan_interval": config.MISPRICING_SCAN_INTERVAL,
-            "strategy_mispricing": config.STRATEGY_MISPRICING_ENABLED,
-            "strategy_maker":      config.STRATEGY_MAKER_ENABLED,
-            "fill_check_interval": config.FILL_CHECK_INTERVAL,
-            "paper_fill_probability": config.PAPER_FILL_PROBABILITY,
-            "max_buy_no_yes_price": config.MAX_BUY_NO_YES_PRICE,
-            "mispricing_market_cooldown_seconds": config.MISPRICING_MARKET_COOLDOWN_SECONDS,
-            "momentum_market_cooldown_seconds":   config.MOMENTUM_MARKET_COOLDOWN_SECONDS,
-            "min_strike_distance_pct": config.MIN_STRIKE_DISTANCE_PCT,
-            "kalshi_enabled": config.KALSHI_ENABLED,
-            "kalshi_require_nd2_confirmation": config.KALSHI_REQUIRE_ND2_CONFIRMATION,
-            "kalshi_min_deviation": config.KALSHI_MIN_DEVIATION,
-            "kalshi_match_max_strike_diff": config.KALSHI_MATCH_MAX_STRIKE_DIFF,
-            "kalshi_match_max_expiry_days": config.KALSHI_MATCH_MAX_EXPIRY_DAYS,
-            "max_concurrent_positions":   config.MAX_CONCURRENT_POSITIONS,
-            # Market-making config
-            "reprice_trigger_pct":    config.REPRICE_TRIGGER_PCT,
-            "max_quote_age_seconds":  config.MAX_QUOTE_AGE_SECONDS,
-            "maker_min_edge_pct":      config.MAKER_MIN_EDGE_PCT,
-            "max_concurrent_maker_positions":      config.MAX_CONCURRENT_MAKER_POSITIONS,
-            "max_concurrent_mispricing_positions": config.MAX_CONCURRENT_MISPRICING_POSITIONS,
-            "paper_fill_prob_base":   config.PAPER_FILL_PROB_BASE,
-            "paper_fill_prob_new_market": config.PAPER_FILL_PROB_NEW_MARKET,
-            "paper_adverse_selection_pct": config.PAPER_ADVERSE_SELECTION_PCT,
-            "paper_adverse_fill_multiplier": config.PAPER_ADVERSE_FILL_MULTIPLIER,
-            "maker_coin_max_loss_usd": config.MAKER_COIN_MAX_LOSS_USD,
-            "maker_exit_hours":       config.MAKER_EXIT_HOURS,
-            "maker_exit_tte_frac":    config.MAKER_EXIT_TTE_FRAC,
-            "maker_entry_tte_frac":   config.MAKER_ENTRY_TTE_FRAC,
-            "maker_batch_size":       config.MAKER_BATCH_SIZE,
-            "maker_positions_per_underlying": config.MAX_MAKER_POSITIONS_PER_UNDERLYING,
-            "maker_quote_size_pct":    config.MAKER_SPREAD_SIZE_PCT,
-            "maker_quote_size_min":    config.MAKER_SPREAD_SIZE_MIN,
-            "maker_quote_size_max":    config.MAKER_SPREAD_SIZE_MAX,
-            "maker_quote_size_new_market": config.MAKER_SPREAD_SIZE_NEW_MARKET,
-            "hedge_threshold_usd":    config.HEDGE_THRESHOLD_USD,
-            "hedge_rebalance_pct":    config.HEDGE_REBALANCE_PCT,
-            "hedge_min_interval":     config.HEDGE_MIN_INTERVAL,
-            "hedge_debounce_secs":    config.HEDGE_DEBOUNCE_SECS,
-            "deployment_mode":        config.MAKER_DEPLOYMENT_MODE,
-            "paper_capital_usd":      config.PAPER_CAPITAL_USD,
-            # Quote guards & new-market logic
-            "maker_min_quote_price":       config.MAKER_MIN_QUOTE_PRICE,
-            "maker_min_volume_24hr":        config.MAKER_MIN_VOLUME_24HR,
-            "maker_max_tte_days":          config.MAKER_MAX_TTE_DAYS,
-            "new_market_age_limit":        config.NEW_MARKET_AGE_LIMIT,
-            "new_market_wide_spread":      config.NEW_MARKET_WIDE_SPREAD,
-            "new_market_pull_spread":      config.NEW_MARKET_PULL_SPREAD,
-            # Inventory skew
-            "inventory_skew_coeff":        config.INVENTORY_SKEW_COEFF,
-            "inventory_skew_max":          config.INVENTORY_SKEW_MAX,
-            # Hedge sizing
-            "max_hl_notional":             config.MAX_HL_NOTIONAL,
-            # Position monitor
-            "profit_target_pct":           config.PROFIT_TARGET_PCT,
-            "stop_loss_usd":               config.STOP_LOSS_USD,
-            "exit_days_before_resolution": config.EXIT_DAYS_BEFORE_RESOLUTION,
-            "min_hold_seconds":            config.MIN_HOLD_SECONDS,
-            # Risk limits
-            "max_pm_exposure_per_market":  config.MAX_PM_EXPOSURE_PER_MARKET,
-            "max_total_pm_exposure":       config.MAX_TOTAL_PM_EXPOSURE,
-            "hard_stop_drawdown":          config.HARD_STOP_DRAWDOWN,
-            # Signal scoring
-            "min_signal_score_mispricing": config.MIN_SIGNAL_SCORE_MISPRICING,
-            "min_signal_score_maker":      config.MIN_SIGNAL_SCORE_MAKER,
-            "maker_min_signal_score_5m":   config.MAKER_MIN_SIGNAL_SCORE_5M,
-            "maker_min_signal_score_1h":   config.MAKER_MIN_SIGNAL_SCORE_1H,
-            "maker_min_signal_score_4h":   config.MAKER_MIN_SIGNAL_SCORE_4H,
-            "maker_exit_tte_frac_5m":      config.MAKER_EXIT_TTE_FRAC_5M,
-            "score_weight_edge":           config.SCORE_WEIGHT_EDGE,
-            "score_weight_source":         config.SCORE_WEIGHT_SOURCE,
-            "score_weight_timing":         config.SCORE_WEIGHT_TIMING,
-            "score_weight_liquidity":      config.SCORE_WEIGHT_LIQUIDITY,
-            # Hedge control
-            "maker_hedge_enabled":         config.MAKER_HEDGE_ENABLED,
-            "maker_max_book_age_secs":     config.MAKER_MAX_BOOK_AGE_SECS,
-            # Per-market imbalance skew
-            "maker_imbalance_skew_coeff":  config.MAKER_IMBALANCE_SKEW_COEFF,
-            "maker_imbalance_skew_max":    config.MAKER_IMBALANCE_SKEW_MAX,
-            "maker_imbalance_skew_min_ct": config.MAKER_IMBALANCE_SKEW_MIN_CT,
-            # Incentive spread gate & imbalance hard-stops
-            "maker_min_incentive_spread":     config.MAKER_MIN_INCENTIVE_SPREAD,
-            "maker_max_imbalance_contracts":  config.MAKER_MAX_IMBALANCE_CONTRACTS,
-            "maker_naked_close_contracts":    config.MAKER_NAKED_CLOSE_CONTRACTS,
-            "maker_naked_close_secs":         config.MAKER_NAKED_CLOSE_SECS,
-            "maker_max_fills_per_leg":        config.MAKER_MAX_FILLS_PER_LEG,
-            "maker_max_contracts_per_market": config.MAKER_MAX_CONTRACTS_PER_MARKET,
-            # CLOB depth gate
-            "maker_min_depth_to_quote":       config.MAKER_MIN_DEPTH_TO_QUOTE,
-            "maker_depth_thin_threshold":     config.MAKER_DEPTH_THIN_THRESHOLD,
-            "maker_depth_spread_factor_thin": config.MAKER_DEPTH_SPREAD_FACTOR_THIN,
-            "maker_depth_spread_factor_zero": config.MAKER_DEPTH_SPREAD_FACTOR_ZERO,
-            # Volatility & drift guards
-            "maker_vol_filter_pct":           config.MAKER_VOL_FILTER_PCT,
-            "maker_adverse_drift_reprice":    config.MAKER_ADVERSE_DRIFT_REPRICE,
-            # Second-leg profit margin
-            "maker_min_spread_profit_margin": config.MAKER_MIN_SPREAD_PROFIT_MARGIN,
-            # Market type exclusion
-            "maker_excluded_market_types": list(config.MAKER_EXCLUDED_MARKET_TYPES),
-            # Range markets sub-strategy
-            "momentum_range_enabled":              config.MOMENTUM_RANGE_ENABLED,
-            "momentum_range_price_band_low":       config.MOMENTUM_RANGE_PRICE_BAND_LOW,
-            "momentum_range_price_band_high":      config.MOMENTUM_RANGE_PRICE_BAND_HIGH,
-            "momentum_range_max_entry_usd":        config.MOMENTUM_RANGE_MAX_ENTRY_USD,
-            "momentum_range_vol_z_score":          config.MOMENTUM_RANGE_VOL_Z_SCORE,
-            "momentum_range_min_tte_seconds":      config.MOMENTUM_RANGE_MIN_TTE_SECONDS,
-        },
-        "timestamp": time.time(),
+        "current": get_config(),
     }
+
+
 
 
 @app.get("/config/effective")

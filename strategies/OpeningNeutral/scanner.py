@@ -10,9 +10,11 @@ See strategies/OpeningNeutral/PLAN.md for full specification.
 from __future__ import annotations
 
 import asyncio
+import csv
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import config
@@ -25,11 +27,90 @@ from strategies.Momentum.market_utils import _is_updown_market
 
 log = get_bot_logger(__name__)
 
+# ── ON-02: Opening Neutral fills CSV ─────────────────────────────────────────
+_DATA_DIR = Path(__file__).parent.parent.parent / "data"
+_ON_FILLS_CSV = _DATA_DIR / "on_fills.csv"
+# on_fills.csv schema — v1 (Phase 0: cold-book guard + entry context logging).
+# Increment this comment and add migration in _ensure_on_fills_csv() whenever
+# columns are added or removed.
+_ON_FILLS_HEADER = [
+    "timestamp", "pair_id", "market_id", "market_title", "underlying",
+    "market_type", "yes_entry", "no_entry", "combined_cost",
+    "yes_spread", "no_spread",
+    "funding_rate", "yes_depth_share", "loser_confidence_score",
+    "yes_sell_price_placed", "no_sell_price_placed",
+    "loser_leg", "loser_fill_price", "loser_fill_time_secs", "winner_exit_price",
+]
+
 # Minimum seconds between entry evaluations for the same market on the hot WS path.
 # Both YES and NO tokens map to the same condition_id; without this debounce, every
 # WS batch fires _evaluate_entry twice (once per token), and "too_expensive" markets
 # generate a signal on every tick because they never add to _entering_markets.
 _ENTRY_EVAL_DEBOUNCE_SECS: float = 1.0
+
+
+# ── ON-02: fills CSV helpers (module-level so they need no self reference) ───
+
+def _ensure_on_fills_csv() -> None:
+    """Create on_fills.csv with header if it doesn't exist; migrate on schema change."""
+    _DATA_DIR.mkdir(exist_ok=True)
+    if not _ON_FILLS_CSV.exists():
+        with _ON_FILLS_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(_ON_FILLS_HEADER)
+        return
+    with _ON_FILLS_CSV.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        try:
+            existing_header = next(reader)
+        except StopIteration:
+            existing_header = []
+    if existing_header != _ON_FILLS_HEADER:
+        from datetime import datetime, timezone as _tz
+        ts = datetime.now(_tz.utc).strftime("%Y%m%d_%H%M%S")
+        backup = _ON_FILLS_CSV.with_name(f"on_fills_{ts}.csv.bak")
+        _ON_FILLS_CSV.rename(backup)
+        with _ON_FILLS_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(_ON_FILLS_HEADER)
+
+
+def _write_on_fills_row(row: dict) -> None:
+    """Append one completed pair row to on_fills.csv."""
+    try:
+        with _ON_FILLS_CSV.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_ON_FILLS_HEADER, extrasaction="ignore")
+            writer.writerow(row)
+    except Exception as exc:  # pylint: disable=broad-except
+        # Non-fatal: log and continue so a CSV write failure never aborts a trade.
+        import logging
+        logging.getLogger(__name__).error("on_fills.csv write failed", exc_info=exc)
+
+
+def _update_on_fills_winner_exit(pair_id: str, exit_price: float) -> None:
+    """Backfill winner_exit_price in the on_fills.csv row for the given pair_id.
+
+    Reads the file, updates the matching row in-place, and rewrites it.
+    No-op if the file doesn't exist or no matching row is found.
+    """
+    if not _ON_FILLS_CSV.exists():
+        return
+    try:
+        rows: list[dict] = []
+        updated = False
+        with _ON_FILLS_CSV.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("pair_id") == pair_id:
+                    row["winner_exit_price"] = exit_price
+                    updated = True
+                rows.append(row)
+        if updated:
+            with _ON_FILLS_CSV.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=_ON_FILLS_HEADER, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+    except Exception as exc:  # pylint: disable=broad-except
+        import logging
+        logging.getLogger(__name__).error("on_fills.csv winner backfill failed", exc_info=exc)
 
 
 class OpeningNeutralScanner(BaseStrategy):
@@ -123,11 +204,27 @@ class OpeningNeutralScanner(BaseStrategy):
         # Guards against duplicate timer tasks when _refresh_pending_markets fires
         # multiple times before the market opens.
         self._scheduled_entry_market_ids: set[str] = set()
+        # ON-01/ON-02: spread cache and fills CSV state.
+        # _entry_spread_cache: market_id → (yes_spread, no_spread) stored at
+        # evaluation time, consumed by _register_pair.
+        self._entry_spread_cache: dict[str, tuple] = {}
+        # _pair_csv_data: pair_id → row dict, populated at _register_pair,
+        # updated and written to CSV when the loser fills.
+        self._pair_csv_data: dict[str, dict] = {}
+        # ON-01: cumulative gate skip counters (per bot session, reset on restart).
+        self._skipped_cold_book: int = 0
+        self._skipped_no_spread: int = 0
+        # ON-02: winner_exit_price backfill.
+        # _winner_pending: "market_id:side" → pair_id  (populated in _on_exit_fill).
+        # _winner_pos_refs: pair_id → Position  (kept so stop() can flush exit prices).
+        self._winner_pending: dict[str, str] = {}
+        self._winner_pos_refs: dict[str, Any] = {}
 
     # ── BaseStrategy interface ────────────────────────────────────────────────
 
     async def start(self) -> None:
         self._running = True
+        _ensure_on_fills_csv()
         log.info(
             "OpeningNeutralScanner started",
             market_types=config.OPENING_NEUTRAL_MARKET_TYPES,
@@ -146,6 +243,30 @@ class OpeningNeutralScanner(BaseStrategy):
 
     async def stop(self) -> None:
         self._running = False
+        # Flush winner_exit_price for any winners that resolved in this session.
+        for _key, _pair_id in list(self._winner_pending.items()):
+            _wpos = self._winner_pos_refs.get(_pair_id)
+            if _wpos is not None and _wpos.is_closed and _wpos.size > 0:
+                # Approximate exit price from realized P&L (fees negligible for logging).
+                _approx_exit = round(
+                    _wpos.entry_price + _wpos.realized_pnl / _wpos.size, 4
+                )
+                _update_on_fills_winner_exit(_pair_id, _approx_exit)
+                self._winner_pending.pop(_key, None)
+                self._winner_pos_refs.pop(_pair_id, None)
+
+    def notify_winner_closed(self, market_id: str, side: str, exit_price: float) -> None:
+        """Backfill winner_exit_price in on_fills.csv for a completed pair.
+
+        Called externally (e.g. main.py) when a promoted winner position closes so
+        the exact fill price is captured rather than the stop()-approximation.
+        Safe to call even if this market_id:side was not from an opening-neutral pair.
+        """
+        _key = f"{market_id}:{side}"
+        _pair_id = self._winner_pending.pop(_key, None)
+        if _pair_id is not None:
+            self._winner_pos_refs.pop(_pair_id, None)
+            _update_on_fills_winner_exit(_pair_id, round(exit_price, 4))
 
     def get_signals(self) -> list[dict]:
         """Return snapshot of recent opening-neutral signal attempts."""
@@ -221,6 +342,8 @@ class OpeningNeutralScanner(BaseStrategy):
             "recent_signals":  list(self._signals[-20:]),
             "tracked_markets": tracked,
             "entry_window_secs": config.OPENING_NEUTRAL_MARKET_WINDOW_SECS,
+            "skipped_cold_book":  self._skipped_cold_book,
+            "skipped_no_spread":  self._skipped_no_spread,
         }
 
     # ── WS subscription refresh loop ─────────────────────────────────────────
@@ -566,7 +689,17 @@ class OpeningNeutralScanner(BaseStrategy):
                 if mon_pos is not None and mon_side is not None:
                     book = self._pm.get_book(token_id)
                     best_bid = book.best_bid if book is not None else None
-                    if best_bid is not None and best_bid <= config.OPENING_NEUTRAL_LOSER_EXIT_PRICE:
+                    if best_bid is not None and best_bid <= config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER:
+                        # ── Min-hold gate ────────────────────────────────────
+                        # Do not declare a loser until enough time has elapsed
+                        # since entry.  At T+1s YES/NO bids are statistically
+                        # indistinguishable; T+30s is where true losers diverge.
+                        _min_hold = config.OPENING_NEUTRAL_MIN_HOLD_SECS
+                        if _min_hold > 0:
+                            _entry_ts = pair.get("entry_ts", 0.0)
+                            if time.time() - _entry_ts < _min_hold:
+                                return  # still in hold window — re-check on next tick
+                        # ── Fire loser exit ──────────────────────────────────
                         self._exiting_legs.add(token_id)
                         asyncio.create_task(
                             self._execute_loser_exit(pair_id, mon_side, token_id, mon_pos, best_bid),
@@ -649,6 +782,14 @@ class OpeningNeutralScanner(BaseStrategy):
                 self._pm.fetch_book_rest(market.token_id_yes),
                 self._pm.fetch_book_rest(market.token_id_no),
             )
+            # Re-check entry guard: the WS path may have entered this market
+            # while the REST fetch was awaiting (asyncio yield point).
+            if market_id in self._entered_market_ids:
+                log.debug(
+                    "OpeningNeutral: timer aborted — WS path entered during REST fetch",
+                    market_id=market_id[:22],
+                )
+                return
         else:
             _yes_book = self._pm.get_book(market.token_id_yes)
             _no_book  = self._pm.get_book(market.token_id_no)
@@ -681,6 +822,13 @@ class OpeningNeutralScanner(BaseStrategy):
             return
 
         combined = round(yes_ask + no_ask, 6)
+        # ON-01: compute spreads for gate check and CSV logging.
+        # Always compute regardless of whether the gate is enabled so calibration
+        # data is available in signals even when the gate is off.
+        yes_bid = _yes_book.best_bid if _yes_book is not None else None
+        no_bid  = _no_book.best_bid  if _no_book  is not None else None
+        yes_spread = round(yes_ask - yes_bid, 4) if yes_bid is not None else None
+        no_spread  = round(no_ask  - no_bid,  4) if no_bid  is not None else None
         diag: dict = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "market_id": market_id,
@@ -694,6 +842,8 @@ class OpeningNeutralScanner(BaseStrategy):
             "threshold": config.OPENING_NEUTRAL_COMBINED_COST_MAX,
             "tte_secs": round(tte_secs),
             "elapsed_secs": round(elapsed),
+            "yes_spread": yes_spread,
+            "no_spread": no_spread,
         }
 
         if combined > config.OPENING_NEUTRAL_COMBINED_COST_MAX:
@@ -728,11 +878,45 @@ class OpeningNeutralScanner(BaseStrategy):
             )
             return
 
+        # ON-01: cold-book spread gate.
+        if config.OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD_ENABLED:
+            if yes_spread is None or no_spread is None:
+                self._skipped_no_spread += 1
+                diag["result"] = "no_spread"
+                self._signals.append(diag)
+                if len(self._signals) > 200:
+                    self._signals = self._signals[-100:]
+                log.warning(
+                    "OpeningNeutral: entry skipped — missing bid (cold book)",
+                    market=getattr(market, "title", "")[:60],
+                    yes_spread=yes_spread,
+                    no_spread=no_spread,
+                )
+                return
+            max_spread = config.OPENING_NEUTRAL_MAX_INDIVIDUAL_SPREAD
+            if yes_spread > max_spread or no_spread > max_spread:
+                self._skipped_cold_book += 1
+                diag["result"] = "cold_book"
+                self._signals.append(diag)
+                if len(self._signals) > 200:
+                    self._signals = self._signals[-100:]
+                log.warning(
+                    "OpeningNeutral: entry skipped — cold book spread",
+                    market=getattr(market, "title", "")[:60],
+                    yes_spread=yes_spread,
+                    no_spread=no_spread,
+                    max_spread=max_spread,
+                )
+                return
+
         # Entry qualifies — spawn entry task (non-blocking).
         diag["result"] = "entry_attempt"
         self._signals.append(diag)
         if len(self._signals) > 200:
             self._signals = self._signals[-100:]
+
+        # ON-02: cache spreads so _register_pair can store them in the fills row.
+        self._entry_spread_cache[market_id] = (yes_spread, no_spread)
 
         # Mark as entered NOW (before the order is in-flight) so re-evaluation
         # is blocked for the rest of this market's window regardless of whether
@@ -1244,6 +1428,33 @@ class OpeningNeutralScanner(BaseStrategy):
             "no_pos": no_pos,
             "yes_exit_order_id": "",
             "no_exit_order_id":  "",
+            "entry_ts": time.time(),  # used by min-hold gate in _on_price_event
+        }
+
+        # ON-02: initialise fills CSV row for this pair.
+        _yes_spread, _no_spread = self._entry_spread_cache.pop(market_id, (None, None))
+        self._pair_csv_data[pair_id] = {
+            "timestamp":             datetime.now(timezone.utc).isoformat(),
+            "pair_id":               pair_id,
+            "market_id":             market_id,
+            "market_title":          market_title[:80],
+            "underlying":            getattr(market, "underlying", ""),
+            "market_type":           getattr(market, "market_type", ""),
+            "yes_entry":             round(yes_pos.entry_price, 4),
+            "no_entry":              round(no_pos.entry_price, 4),
+            "combined_cost":         round(yes_pos.entry_price + no_pos.entry_price, 6),
+            "yes_spread":            _yes_spread,
+            "no_spread":             _no_spread,
+            "funding_rate":          None,
+            "yes_depth_share":       None,
+            "loser_confidence_score": None,
+            "yes_sell_price_placed": config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
+            "no_sell_price_placed":  config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
+            "loser_leg":             "none",
+            "loser_fill_price":      None,
+            "loser_fill_time_secs":  None,
+            "winner_exit_price":     None,
+            "_entry_ts":             time.time(),   # internal only — popped before write
         }
 
         # Remove from pending now that entry is registered.
@@ -1630,6 +1841,19 @@ class OpeningNeutralScanner(BaseStrategy):
             exit_price,
             side=filled_side,
         )
+
+        # ON-02: write fills CSV row now that we have the loser exit data.
+        _csv_row = self._pair_csv_data.pop(pair_id, None)
+        if _csv_row is not None:
+            _entry_ts = _csv_row.pop("_entry_ts", time.time())
+            _csv_row["loser_leg"]           = filled_side
+            _csv_row["loser_fill_price"]    = round(exit_price, 4)
+            _csv_row["loser_fill_time_secs"] = round(time.time() - _entry_ts, 1)
+            _write_on_fills_row(_csv_row)
+        # ON-02: arm winner backfill so notify_winner_closed() or stop() can
+        # fill in winner_exit_price via an in-place CSV row update.
+        self._winner_pending[f"{winner_pos.market_id}:{winner_pos.side}"] = pair_id
+        self._winner_pos_refs[pair_id] = winner_pos
 
         if config.OPENING_NEUTRAL_PROMOTE_TO_MOMENTUM:
             # ── Set strike for delta-SL ───────────────────────────────────────

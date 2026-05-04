@@ -25,7 +25,7 @@ import {
   grossPnl,
   pnlColor,
   buildGroups,
-} from "./Trades";
+} from "./tradesUtils";
 
 // ── Mock the API hook ─────────────────────────────────────────────────────────
 // Prevents HTTP requests; tests control returned data directly.
