@@ -24,6 +24,11 @@ from risk import Position
 from strategies.base import BaseStrategy
 from strategies.Momentum.event_log import emit as _emit_event
 from strategies.Momentum.market_utils import _is_updown_market
+from strategies.Momentum.scanner import (
+    MOMENTUM_FILLS_CSV,
+    MOMENTUM_FILLS_HEADER,
+    _ensure_momentum_fills_csv,
+)
 
 log = get_bot_logger(__name__)
 
@@ -32,7 +37,7 @@ _DATA_DIR = Path(__file__).parent.parent.parent / "data"
 _ON_FILLS_CSV = _DATA_DIR / "on_fills.csv"
 # on_fills.csv schema — v1 (Phase 0: cold-book guard + entry context logging).
 # Increment this comment and add migration in _ensure_on_fills_csv() whenever
-# columns are added or removed.
+# columns are added or removed.  Schema version: 2 (added clob_yes_* + deribit_iv)
 _ON_FILLS_HEADER = [
     "timestamp", "pair_id", "market_id", "market_title", "underlying",
     "market_type", "yes_entry", "no_entry", "combined_cost",
@@ -40,6 +45,10 @@ _ON_FILLS_HEADER = [
     "funding_rate", "yes_depth_share", "loser_confidence_score",
     "yes_sell_price_placed", "no_sell_price_placed",
     "loser_leg", "loser_fill_price", "loser_fill_time_secs", "winner_exit_price",
+    # CLOB snapshot at entry time (from live PM order book WS cache)
+    "clob_yes_best_bid", "clob_yes_best_ask", "clob_yes_spread", "clob_yes_bid_depth_5",
+    # Deribit ATM IV at entry (fraction; None for non-options markets)
+    "deribit_iv",
 ]
 
 # Minimum seconds between entry evaluations for the same market on the hot WS path.
@@ -709,6 +718,29 @@ class OpeningNeutralScanner(BaseStrategy):
                             _entry_ts = pair.get("entry_ts", 0.0)
                             if time.time() - _entry_ts < _min_hold:
                                 return  # still in hold window — re-check on next tick
+                        # ── Winner confirmation gate (ON-07) ─────────────────
+                        # Require the OTHER token's best bid to be at or above
+                        # OPENING_NEUTRAL_WINNER_CONFIRM_FLOOR before declaring a
+                        # loser.  When both bids are still ~$0.50 the market hasn't
+                        # resolved direction — the dip is transient noise.
+                        _confirm_floor = getattr(
+                            config, "OPENING_NEUTRAL_WINNER_CONFIRM_FLOOR", 0.0
+                        )
+                        if _confirm_floor > 0.0:
+                            _other_pos = no_pos if mon_side == "YES" else yes_pos
+                            _other_token_id = getattr(_other_pos, "token_id", "") if _other_pos else ""
+                            _other_book = self._pm.get_book(_other_token_id) if _other_token_id else None
+                            _other_bid = _other_book.best_bid if _other_book is not None else None
+                            if _other_bid is None or _other_bid < _confirm_floor:
+                                log.debug(
+                                    "OpeningNeutral: loser exit suppressed — winner bid below confirm floor",
+                                    pair_id=pair_id[:12],
+                                    loser_side=mon_side,
+                                    loser_bid=best_bid,
+                                    winner_bid=_other_bid,
+                                    confirm_floor=_confirm_floor,
+                                )
+                                return  # suppress — winner hasn't diverged yet
                         # ── Oracle delta gate (ON-06) ─────────────────────────
                         # Suppress loser exit when the oracle confirms this leg is
                         # still winning.  CLOB bids collapse at settlement as market
@@ -1514,6 +1546,21 @@ class OpeningNeutralScanner(BaseStrategy):
             market, _funding, _depth_share
         )
 
+        # CLOB snapshot from live WS-cached order book for YES token
+        _yes_book = self._pm.get_book(yes_token_id)
+        _clob_bid = _yes_book.best_bid if _yes_book else None
+        _clob_ask = _yes_book.best_ask if _yes_book else None
+        _clob_spread = (
+            round(_clob_ask - _clob_bid, 4)
+            if _clob_bid is not None and _clob_ask is not None
+            else None
+        )
+        _clob_depth = (
+            round(sum(p * s for p, s in _yes_book.bids[:5]), 2)
+            if _yes_book and _yes_book.bids
+            else None
+        )
+
         self._pair_csv_data[pair_id] = {
             "timestamp":             datetime.now(timezone.utc).isoformat(),
             "pair_id":               pair_id,
@@ -1535,6 +1582,13 @@ class OpeningNeutralScanner(BaseStrategy):
             "loser_fill_price":      None,
             "loser_fill_time_secs":  None,
             "winner_exit_price":     None,
+            # CLOB snapshot at entry
+            "clob_yes_best_bid":     _clob_bid,
+            "clob_yes_best_ask":     _clob_ask,
+            "clob_yes_spread":       _clob_spread,
+            "clob_yes_bid_depth_5":  _clob_depth,
+            # Deribit IV: ON strategy is a pair trade; record None (binary markets have no strike)
+            "deribit_iv":            None,
             "_entry_ts":             time.time(),   # internal only — popped before write
         }
 
@@ -2000,6 +2054,69 @@ class OpeningNeutralScanner(BaseStrategy):
                 entry=winner_pos.entry_price,
                 prob_sl_threshold=winner_pos.prob_sl_threshold,
             )
+
+            # ── Log the promoted winner to momentum_fills.csv ─────────────────
+            # Feature builder joins momentum_fills.csv by market_id to populate
+            # mom_* features.  Without this row, ON-promoted trades have all
+            # mom_* features null — making Model A unable to learn from them.
+            try:
+                _ensure_momentum_fills_csv()
+                _tte_s = round(winner_pos.tte_years * 31_557_600, 1) if getattr(winner_pos, "tte_years", 0) else None
+                _on_funding = _csv_row.get("funding_rate") if _csv_row else None
+                _on_depth = _csv_row.get("yes_depth_share") if _csv_row else None
+                _winner_book = self._pm.get_book(winner_pos.token_id) if winner_pos.token_id else None
+                _w_bid = _winner_book.best_bid if _winner_book is not None else None
+                _w_ask = _winner_book.best_ask if _winner_book is not None else None
+                _handover_row = {
+                    "timestamp":           datetime.now(timezone.utc).isoformat(),
+                    "market_id":           winner_pos.market_id,
+                    "market_title":        winner_pos.market_title[:80],
+                    "underlying":          winner_pos.underlying,
+                    "market_type":         winner_pos.market_type,
+                    "side":                winner_pos.side,
+                    "signal_price":        round(winner_pos.entry_price, 6),
+                    "order_price":         round(winner_pos.entry_price, 6),
+                    "fill_price":          round(winner_pos.entry_price, 6),
+                    "fill_size":           round(winner_pos.size, 6),
+                    "slippage_pct":        0.0,
+                    "signal_delta_pct":    None,
+                    "signal_obs_z":        None,
+                    "signal_sigma_ann":    None,
+                    "tte_seconds":         _tte_s,
+                    "ask_depth_usd":       None,
+                    "fill_from_ws":        True,
+                    "kelly_win_prob":      None,
+                    "kelly_payout_b":      None,
+                    "kelly_f":             None,
+                    "kelly_fraction_cfg":  None,
+                    "kelly_multiplier":    None,
+                    "kelly_size_usd":      round(winner_pos.entry_cost_usd, 4),
+                    "row_type":            "on_promoted",
+                    "funding_rate":        _on_funding,
+                    "yes_depth_share":     _on_depth,
+                    "hour_utc":            datetime.now(timezone.utc).hour,
+                    "effective_z":         None,
+                    "funding_gate_applied": False,
+                    "streak_key":          "",
+                    "twap_dev_bps":        None,
+                    "vol_regime":          None,
+                    "clob_yes_best_bid":   _w_bid,
+                    "clob_yes_best_ask":   _w_ask,
+                    "clob_yes_spread":     (
+                        round(_w_ask - _w_bid, 4)
+                        if _w_bid is not None and _w_ask is not None else None
+                    ),
+                    "clob_yes_bid_depth_5": (
+                        round(sum(p * s for p, s in _winner_book.bids[:5]), 2)
+                        if _winner_book and _winner_book.bids else None
+                    ),
+                    "deribit_iv":          None,
+                }
+                with MOMENTUM_FILLS_CSV.open("a", newline="") as _mf:
+                    _mw = csv.DictWriter(_mf, fieldnames=MOMENTUM_FILLS_HEADER, extrasaction="ignore")
+                    _mw.writerow(_handover_row)
+            except Exception as _mex:
+                log.debug("ON→momentum handover: momentum_fills.csv write error", exc=str(_mex))
 
             # ── Arm take-profit price for the promoted winner ─────────────────
             # Rather than a resting SELL order (which would create orphan-position

@@ -6,6 +6,7 @@ import {
   useHealth, usePnl, usePositions, useLauncherStatus,
   startBotProcess, stopBotProcess, usePerformance, useInventory, useConfig, updateConfig,
   useMomentumSignals, useMomentumScanSummary, useOpeningNeutralStatus, usePipelineHealth,
+  useModelTrainStatus, triggerModelTrain,
 } from "../api/client";
 import type { Position, PipelineStatus } from "../api/client";
 
@@ -886,6 +887,124 @@ function PipelineStatusCard() {
   );
 }
 
+function ModelChip({ exists, label, href }: { exists: boolean; label: string; href: string }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        padding: "5px 12px",
+        borderRadius: 6,
+        border: `1px solid ${exists ? "#166534" : "#374151"}`,
+        background: exists ? "#052e16" : "#111827",
+        color: exists ? "#22c55e" : "#6b7280",
+        fontSize: 13,
+        fontWeight: 600,
+        textDecoration: "none",
+        cursor: exists ? "pointer" : "default",
+        pointerEvents: exists ? undefined : "none",
+      }}
+    >
+      <span style={{ fontSize: 10 }}>{exists ? "●" : "○"}</span>
+      {label}
+    </a>
+  );
+}
+
+function ModelTrainingCard() {
+  const { data } = useModelTrainStatus();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const running = data?.running ?? false;
+
+  function ageLabel(ts: number | null): string {
+    if (ts === null) return "never";
+    const age = Math.round(Date.now() / 1000 - ts);
+    if (age < 60) return `${age}s ago`;
+    if (age < 3600) return `${Math.round(age / 60)}m ago`;
+    return `${Math.round(age / 3600)}h ago`;
+  }
+
+  async function handleTrain() {
+    setErr(null);
+    setBusy(true);
+    try {
+      await triggerModelTrain();
+    } catch (e: any) {
+      setErr(e.message ?? "Failed to start training");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const exitOk = data?.last_exit_code === 0 || data?.last_exit_code === null;
+  const lastRun = data?.last_finished_ts ?? null;
+
+  return (
+    <div className="card">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+        <h3 style={{ margin: 0 }}>ML Models</h3>
+        {running ? (
+          <span style={{ fontSize: 12, color: "#f59e0b", fontWeight: 600 }}>⟳ Training…</span>
+        ) : lastRun !== null ? (
+          <span style={{ fontSize: 12, color: "#6b7280" }}>
+            Last trained {ageLabel(lastRun)}
+            {data?.last_exit_code !== null && data?.last_exit_code !== undefined && (
+              <span style={{ marginLeft: 6, color: exitOk ? "#22c55e" : "#ef4444" }}>
+                · exit {data.last_exit_code}
+              </span>
+            )}
+          </span>
+        ) : (
+          <span style={{ fontSize: 12, color: "#6b7280" }}>Not yet trained</span>
+        )}
+      </div>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+        <ModelChip
+          exists={data?.model_b_exists ?? false}
+          label="Model B — CLOB trust"
+          href="http://localhost:8080/reports/model_b_v0_shap.html"
+        />
+        <ModelChip
+          exists={data?.model_a_exists ?? false}
+          label="Model A — entry quality"
+          href="http://localhost:8080/reports/model_a_v0_shap.html"
+        />
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <button
+          onClick={handleTrain}
+          disabled={busy || running}
+          style={{
+            padding: "7px 18px",
+            borderRadius: 6,
+            border: "none",
+            cursor: busy || running ? "not-allowed" : "pointer",
+            fontWeight: 600,
+            fontSize: "0.85rem",
+            background: running ? "#374151" : "#4f46e5",
+            color: running ? "#6b7280" : "#fff",
+            opacity: busy || running ? 0.7 : 1,
+            transition: "opacity 0.15s",
+          }}
+        >
+          {running ? "Training…" : "↺ Retrain"}
+        </button>
+        {err && (
+          <span style={{ color: "#ef4444", fontSize: 12 }}>{err}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   return (
     <div className="page">
@@ -899,6 +1018,7 @@ export default function Dashboard() {
       <OpeningNeutralCard />
       <PositionsCard />
       <PipelineStatusCard />
+      <ModelTrainingCard />
       <HealthCard />
     </div>
   );

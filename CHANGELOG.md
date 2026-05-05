@@ -2,7 +2,95 @@
 
 All notable changes to this repository are documented in this file.
 
-## [2026-05-05] - ML Adaptive Signal Engine (Phase 0-2); delta SL grace + token-price veto; ON oracle delta gate; hedge management loop; pipeline health dashboard
+## [2026-05-05] - ON-07 winner confirmation gate; ML training pipeline; ON→momentum fill logging; feature_builder vol_regime_high fix; PMClobWS dashboard fix
+
+### Feature — ON-07 winner confirmation gate (`strategies/OpeningNeutral/scanner.py`, `config.py`, `config_overrides.json`, `api_server.py`, `webapp/src/pages/Settings.tsx`, `webapp/src/api/client.ts`)
+
+Addresses the root cause of 32% wrong-loser identification in Opening Neutral (19/59 pairs,
+−$37.12 total loss): both YES and NO bids oscillate near $0.50 for the first 60–90 seconds
+after entry and a transient dip on one leg fires a premature loser exit before the market
+has picked a direction.
+
+**Gate logic** (inserted between min-hold gate and oracle-delta gate in `_on_price_event`):
+Before declaring a loser, the *other* leg's live WS best bid must be ≥
+`OPENING_NEUTRAL_WINNER_CONFIRM_FLOOR`.  If the winner hasn't diverged yet, the exit is
+suppressed and re-evaluated on the next tick.
+
+**New config key:**
+```
+OPENING_NEUTRAL_WINNER_CONFIRM_FLOOR: float = 0.0   # disabled by default
+# config_overrides.json live value: 0.60
+```
+
+Wired end-to-end: `config.py` default → `config_overrides.json` live override (0.60) →
+`api_server.py` `_SETTINGS_MAP` + `ConfigPatch` → webapp `client.ts` interface field →
+Settings page `FloatInput` "Winner Confirm Floor" control (ON section, after Min Hold).
+
+---
+
+### Feature — ML model training pipeline (`api_server.py`, `webapp/src/pages/Dashboard.tsx`, `webapp/src/api/client.ts`)
+
+**Auto-train on startup** (`api_server.py`)
+New `@app.on_event("startup")` hook checks whether `model_a_v0.pkl` / `model_b_v0.pkl`
+exist on disk.  If either is missing, automatically triggers the training pipeline
+(`feature_builder.py` → `train_model.py`) as a background asyncio task so models are
+rebuilt without manual intervention after a clean deploy.
+
+**`/model/train` endpoints** (`api_server.py`)
+- `POST /model/train` — triggers feature build + model train subprocess; 409 if already running.
+- `GET /model/train/status` — returns `{running, last_started_ts, last_finished_ts, last_exit_code, last_log_lines, model_b_exists, model_a_exists}`.
+
+**`ModelTrainingCard` webapp widget** (`Dashboard.tsx`)
+New card on the Dashboard showing:
+- Model A and Model B presence chips (green ✅ / grey ⭕), linked to their SHAP HTML reports.
+- Last run timestamp and exit code.
+- "Train" button (POST `/model/train`); disabled while training is running with spinner label.
+- PMClobWS pipeline health detail fixed: no longer shows "heartbeat_age=None" when no
+  maker orders are active — now shows "WS connected · no maker orders (heartbeat idle — normal)".
+
+---
+
+### Fix — ON→momentum handover logs to `momentum_fills.csv` (`strategies/OpeningNeutral/scanner.py`)
+
+ON-promoted winner positions were never logged to `momentum_fills.csv`, leaving all `mom_*`
+ML features as −999 sentinel for the 75 promoted trades in the training set (89% null
+coverage).  Model A would train on garbage even when 300 rows are reached.
+
+**Fix:** `_on_exit_fill()` now appends a `row_type="on_promoted"` row to `momentum_fills.csv`
+immediately after promotion, capturing: `market_id`, `side`, `entry_price`, `entry_cost_usd`,
+`tte_seconds`, `funding_rate`, `yes_depth_share` (from the `_csv_row` captured at ON entry),
+and a live CLOB snapshot of the winner book at handover time.  Fields unavailable at handover
+time (z-score, Kelly, vol_regime) are written as `None` — handled by the −999 sentinel fill
+in `_prepare_features`.
+
+Imports `MOMENTUM_FILLS_CSV`, `MOMENTUM_FILLS_HEADER`, `_ensure_momentum_fills_csv` from
+`strategies.Momentum.scanner` (no circular import — ON scanner already imports Momentum
+utilities).
+
+---
+
+### Fix — `momentum_fills.csv` CLOB + Deribit IV columns (`strategies/Momentum/scanner.py`)
+
+Added five columns to `MOMENTUM_FILLS_HEADER` and the fill-row writer:
+`clob_yes_best_bid`, `clob_yes_best_ask`, `clob_yes_spread`, `clob_yes_bid_depth_5`,
+`deribit_iv`.  Captures the live WS order-book snapshot at the moment of fill confirmation.
+`deribit_iv` is only populated when `signal.vol_source == "deribit_atm"`.
+
+---
+
+### Fix — `vol_regime_high` missing from training parquet (`analysis/feature_builder.py`)
+
+`vol_regime_high` was listed as a Model A feature in `train_model.py` but was never written
+to `training_data.parquet` — `_prepare_features` fell back to all-NaN silently.
+
+**Fix:** Added `vol_regime_high` to `_make_empty_schema()` column list.  Added a post-merge
+derivation step (step 5, applied to the **full df** including existing rows so old parquet
+rows are backfilled): `HIGH → 1.0`, `LOW/UNKNOWN → 0.0`, absent/None string → NaN.
+Uses `np.where` on the `.str.upper()` of `mom_vol_regime`.
+
+---
+
+
 
 ### Feature — ML Adaptive Signal Engine, Phase 0–2 (`models/`, `main.py`, `api_server.py`, `config.py`, `requirements.txt`)
 

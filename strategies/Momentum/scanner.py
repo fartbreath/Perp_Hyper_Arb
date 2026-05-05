@@ -122,6 +122,12 @@ MOMENTUM_FILLS_HEADER = [
     "streak_key",          # reserved, always empty string
     "twap_dev_bps",        # oracle TWAP deviation in bps at scan time (M-14)
     "vol_regime",          # volatility regime at scan time: HIGH | LOW | UNKNOWN (M-14)
+    # ── CLOB snapshot at fill time (from live PM order book WS cache) ──────
+    "clob_yes_best_bid",   # YES token best bid at fill time
+    "clob_yes_best_ask",   # YES token best ask at fill time
+    "clob_yes_spread",     # best_ask - best_bid
+    "clob_yes_bid_depth_5",# sum(p*s) for top-5 bid levels in USDC
+    "deribit_iv",          # Deribit ATM mark IV (fraction, e.g. 0.85); None if source != deribit_atm
 ]
 
 
@@ -1858,6 +1864,23 @@ class MomentumScanner(BaseStrategy):
                 "streak_key":          "",
                 "twap_dev_bps":        round(signal.entry_twap_dev_bps, 2) if signal.entry_twap_dev_bps is not None else None,
                 "vol_regime":          signal.entry_vol_regime,
+                # CLOB snapshot from live WS-cached order book at fill time
+                "clob_yes_best_bid":   book.best_bid,
+                "clob_yes_best_ask":   book.best_ask,
+                "clob_yes_spread":     (
+                    round(book.best_ask - book.best_bid, 4)
+                    if book.best_bid is not None and book.best_ask is not None
+                    else None
+                ),
+                "clob_yes_bid_depth_5": (
+                    round(sum(p * s for p, s in book.bids[:5]), 2)
+                    if book.bids else None
+                ),
+                # Deribit ATM IV: only populated when vol source is Deribit
+                "deribit_iv":          (
+                    round(signal.sigma_ann, 6)
+                    if signal.vol_source == "deribit_atm" else None
+                ),
             }
             with MOMENTUM_FILLS_CSV.open("a", newline="") as _f:
                 _writer = csv.DictWriter(_f, fieldnames=MOMENTUM_FILLS_HEADER, extrasaction="ignore")

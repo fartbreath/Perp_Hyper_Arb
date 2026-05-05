@@ -646,6 +646,8 @@ export interface ConfigData {
   // ON-05 — Loser confidence scoring
   opening_neutral_loser_confidence_enabled?: boolean;
   opening_neutral_loser_confidence_tighten?: number;
+  // ON-07 — Winner confirmation gate
+  opening_neutral_winner_confirm_floor?: number;
 }
 
 export interface InventoryData {
@@ -840,6 +842,28 @@ export const useModelStatus = () =>
 
 export const useModelShadowLog = (decisionType: string = "all") =>
   usePolling<ShadowLogData>(`/model/shadow_log?limit=50&decision_type=${decisionType}`, 10_000);
+
+export interface ModelTrainStatus {
+  running: boolean;
+  last_started_ts: number | null;
+  last_finished_ts: number | null;
+  last_exit_code: number | null;
+  model_b_exists: boolean;
+  model_a_exists: boolean;
+  log_tail: string[];
+}
+
+export const useModelTrainStatus = () =>
+  usePolling<ModelTrainStatus>("/model/train_status", 3_000);
+
+export async function triggerModelTrain(): Promise<{ status: string }> {
+  const res = await fetch(`${BASE_URL}/model/train`, { method: "POST" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail ?? `HTTP ${res.status}`);
+  }
+  return res.json();
+}
 
 export interface WalletPosition {
   token_id: string;

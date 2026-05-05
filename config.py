@@ -427,6 +427,16 @@ OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN: float = 0.02
 OPENING_NEUTRAL_ORACLE_DELTA_GATE_ENABLED: bool = True
 OPENING_NEUTRAL_ORACLE_DELTA_GATE_FALLBACK: str = "allow_exit"  # "allow_exit" | "suppress"
 
+# ── Winner confirmation gate (ON-07) ──────────────────────────────────────────
+# Before firing a loser exit, the OTHER leg's best bid must be at or above
+# this floor to confirm it is the genuine winner.  When both tokens are still
+# near $0.50 (market hasn't decided direction) a trigger-below-floor dip is
+# noise — wait for the next tick.
+# Set to 0.0 to disable (matches pre-gate behaviour).
+# Recommended live value: 0.60 (requires the winner to have diverged by at
+# least 10 cents from neutral before the loser exit fires).
+OPENING_NEUTRAL_WINNER_CONFIRM_FLOOR: float = 0.0
+
 # DRY_RUN: when True all order placements are skipped (no real orders sent).
 # Signals, pair tracking, and all logic run normally — only the pm_client calls
 # are suppressed.  Safe to deploy inactive; set False after validation.``

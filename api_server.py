@@ -394,6 +394,16 @@ def require_auth(authorization: str = Header(default="")) -> None:
 
 app = FastAPI(title="Perp Hyper Arb API", version="1.0.0")
 
+
+@app.on_event("startup")
+async def _auto_train_if_missing() -> None:
+    """Auto-start training at server startup if either model file is absent."""
+    _refresh_model_exists()
+    if not _train_state.model_b_exists or not _train_state.model_a_exists:
+        log.info("[api] Model files missing — auto-starting training pipeline")
+        asyncio.create_task(_run_training())
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.API_CORS_ORIGINS,
@@ -609,6 +619,7 @@ _MUTABLE_CONFIG = {
     "opening_neutral_winner_sell_buffer":          ("OPENING_NEUTRAL_WINNER_SELL_BUFFER",            float),
     "opening_neutral_loser_confidence_enabled":    ("OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED",      bool),
     "opening_neutral_loser_confidence_tighten":    ("OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN",      float),
+    "opening_neutral_winner_confirm_floor":        ("OPENING_NEUTRAL_WINNER_CONFIRM_FLOOR",          float),
 }
 
 
@@ -867,6 +878,7 @@ class ConfigPatch(BaseModel):
     opening_neutral_winner_sell_buffer: float | None = None
     opening_neutral_loser_confidence_enabled: bool | None = None
     opening_neutral_loser_confidence_tighten: float | None = None
+    opening_neutral_winner_confirm_floor: float | None = None
 
 
 @app.get("/config")
@@ -1517,22 +1529,26 @@ def health_pipelines() -> dict:
         })
 
     # ── PMClobWS ──────────────────────────────────────────────────────────────
-    hb_age = (now - state.last_heartbeat_ts) if state.last_heartbeat_ts > 0 else None
+    # _ws_connected = True means at least one orderbook WS shard is alive.
+    # _last_heartbeat_ts is the CLOB API keepalive for open maker orders — it
+    # only fires when maker orders are active, so "never" is normal otherwise.
     if not state.pm_ws_connected:
         pm_status = "ERROR"
-    elif hb_age is None:
-        pm_status = "NOT_STARTED"
-    elif hb_age < 15:
-        pm_status = "LIVE"
-    elif hb_age < 120:
-        pm_status = "STALE"
+        pm_detail = "WS disconnected — bot offline or PM unreachable"
     else:
-        pm_status = "ERROR"
+        pm_status = "LIVE"
+        hb_age = (now - state.last_heartbeat_ts) if state.last_heartbeat_ts > 0 else None
+        if hb_age is None:
+            pm_detail = "WS connected · no maker orders (heartbeat idle — normal)"
+        elif hb_age < 15:
+            pm_detail = f"WS connected · maker heartbeat {round(hb_age, 1)}s ago"
+        else:
+            pm_detail = f"WS connected · maker heartbeat stale ({round(hb_age, 0):.0f}s)"
     pipelines.append({
         "name": "PMClobWS",
         "status": pm_status,
         "last_update_ts": state.last_heartbeat_ts if state.last_heartbeat_ts > 0 else None,
-        "detail": f"heartbeat_age={round(hb_age, 1)}s" if hb_age is not None else None,
+        "detail": pm_detail,
     })
 
     # ── ModelAgent ────────────────────────────────────────────────────────────
@@ -1588,6 +1604,100 @@ def model_shadow_log(
     if ma is None:
         return {"rows": [], "total": 0}
     return ma.get_shadow_log(limit=limit, decision_type=decision_type)
+
+
+# ── Model training (ML-03) ────────────────────────────────────────────────────
+# Runs feature_builder.py then train_model.py as a subprocess.
+# Only one training run may be active at a time.
+
+_ANALYSIS_DIR = Path(__file__).parent / "analysis"
+
+@dataclass
+class _TrainState:
+    running: bool = False
+    last_started_ts: Optional[float] = None
+    last_finished_ts: Optional[float] = None
+    last_exit_code: Optional[int] = None
+    last_log_lines: list[str] = field(default_factory=list)
+    model_b_exists: bool = False
+    model_a_exists: bool = False
+
+_train_state = _TrainState()
+
+
+def _refresh_model_exists() -> None:
+    _train_state.model_b_exists = (_ANALYSIS_DIR / "model_b_v0.pkl").is_file()
+    _train_state.model_a_exists = (_ANALYSIS_DIR / "model_a_v0.pkl").is_file()
+
+
+async def _run_training() -> None:
+    """Run feature_builder then train_model in a subprocess, capture output."""
+    import sys as _sys
+    _train_state.running = True
+    _train_state.last_started_ts = time.time()
+    _train_state.last_log_lines = []
+    lines: list[str] = []
+
+    async def _run_script(script: str) -> int:
+        proc = await asyncio.create_subprocess_exec(
+            _sys.executable, script,
+            cwd=str(_ANALYSIS_DIR),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"},
+        )
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            lines.append(line)
+            _train_state.last_log_lines = lines[-200:]  # rolling 200 lines
+        await proc.wait()
+        return proc.returncode or 0
+
+    try:
+        rc1 = await _run_script(str(_ANALYSIS_DIR / "feature_builder.py"))
+        if rc1 != 0:
+            lines.append(f"[api] feature_builder.py exited with code {rc1}")
+            _train_state.last_exit_code = rc1
+            return
+        rc2 = await _run_script(str(_ANALYSIS_DIR / "train_model.py"))
+        _train_state.last_exit_code = rc2
+    except Exception as exc:
+        lines.append(f"[api] Training error: {exc}")
+        _train_state.last_exit_code = -1
+    finally:
+        _train_state.running = False
+        _train_state.last_finished_ts = time.time()
+        _train_state.last_log_lines = lines[-200:]
+        _refresh_model_exists()
+
+
+@app.get("/model/train_status")
+def model_train_status() -> dict:
+    """Training pipeline status: running flag, model existence, last log tail."""
+    _refresh_model_exists()
+    return {
+        "running": _train_state.running,
+        "last_started_ts": _train_state.last_started_ts,
+        "last_finished_ts": _train_state.last_finished_ts,
+        "last_exit_code": _train_state.last_exit_code,
+        "model_b_exists": _train_state.model_b_exists,
+        "model_a_exists": _train_state.model_a_exists,
+        "log_tail": _train_state.last_log_lines[-20:],
+    }
+
+
+@app.post("/model/train", dependencies=[Depends(require_auth)])
+async def model_train_start() -> dict:
+    """Kick off a training run (feature_builder + train_model).
+
+    Returns immediately; poll /model/train_status for progress.
+    Only one run may be active at a time.
+    """
+    if _train_state.running:
+        raise HTTPException(status_code=409, detail="Training already in progress")
+    asyncio.create_task(_run_training())
+    return {"status": "started"}
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
@@ -3289,11 +3399,13 @@ def market_pnl_single(market_id: str) -> dict:
 _REPORTS_DIR = Path(__file__).parent / "analysis" / "reports"
 
 @app.get("/reports/{filename}")
-def get_report(filename: str) -> FileResponse:
+def get_report(filename: str):
     """Serve a static HTML report from analysis/reports/.
 
-    Allowed extension: .html only.  Returns 404 if the file does not exist.
+    Allowed extension: .html only.  Returns a styled HTML placeholder when
+    the file does not exist yet (rather than a raw JSON 404 error).
     """
+    from fastapi.responses import HTMLResponse
     if not filename.endswith(".html"):
         raise HTTPException(status_code=400, detail="Only .html reports are served")
     path = (_REPORTS_DIR / filename).resolve()
@@ -3301,7 +3413,45 @@ def get_report(filename: str) -> FileResponse:
     if not str(path).startswith(str(_REPORTS_DIR.resolve())):
         raise HTTPException(status_code=400, detail="Invalid path")
     if not path.is_file():
-        raise HTTPException(status_code=404, detail=f"{filename} not found — run train_model.py first")
+        report_name = filename.replace("_", " ").removesuffix(".html")
+        html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{report_name} — not available</title>
+  <style>
+    body {{
+      margin: 0; font-family: system-ui, sans-serif;
+      background: #0f172a; color: #e2e8f0;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh;
+    }}
+    .box {{
+      text-align: center; max-width: 420px; padding: 40px 32px;
+      background: #1e293b; border-radius: 12px;
+      border: 1px solid #334155;
+    }}
+    h2 {{ margin: 0 0 12px; font-size: 1.25rem; color: #f8fafc; }}
+    p  {{ margin: 0 0 8px; color: #94a3b8; font-size: 0.9rem; line-height: 1.5; }}
+    code {{ background: #0f172a; padding: 2px 6px; border-radius: 4px;
+             font-size: 0.85rem; color: #7dd3fc; }}
+    .badge {{ display: inline-block; margin-top: 20px;
+              background: #1e3a5f; color: #93c5fd;
+              padding: 4px 14px; border-radius: 20px; font-size: 0.8rem; }}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>Report not available yet</h2>
+    <p><strong>{report_name}</strong> has not been generated.</p>
+    <p>Go to the <strong>Dashboard</strong> and click <em>Train Models</em>
+       to run the ML training pipeline.</p>
+    <p>The report will appear here once training completes successfully.</p>
+    <span class="badge">ML-03 · train_model.py</span>
+  </div>
+</body>
+</html>"""
+        return HTMLResponse(content=html, status_code=404)
     return FileResponse(path, media_type="text/html")
 
 

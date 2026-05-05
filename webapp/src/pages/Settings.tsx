@@ -559,6 +559,17 @@ export default function Settings() {
         {GAP}
 
         <FloatInput
+          label="Winner Confirm Floor"
+          description="ON-07: Before declaring a loser, the OTHER token's bid must be at or above this price. Prevents wrong-loser exits when both bids are still near $0.50 (market hasn't decided). Set to 0.00 to disable. Recommended: $0.60."
+          value={data.opening_neutral_winner_confirm_floor ?? 0}
+          step={0.01}
+          unit="$"
+          onSubmit={(v) => apply({ opening_neutral_winner_confirm_floor: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
           label="Loser Exit Price"
           description="Resting GTC SELL price placed on both legs immediately after entry. Whichever leg fills first is declared the loser. Net pair P&L = exit_price + $1.00 − 2×entry."
           value={data.opening_neutral_loser_exit_price ?? 0.35}
