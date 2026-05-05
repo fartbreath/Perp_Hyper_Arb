@@ -78,6 +78,8 @@ from market_data.chainlink_streams_client import ChainlinkStreamsClient
 from market_data.spot_oracle import SpotOracle
 from market_data.funding_rate_cache import FundingRateCache
 from market_data.oracle_tick_tracker import OracleTickTracker
+from models.clob_feature_buffer import CLOBFeatureBuffer
+from models.model_agent import ModelAgent
 from risk import RiskEngine, Position
 from strategies.maker.strategy import MakerStrategy
 from strategies.mispricing.strategy import MispricingScanner
@@ -789,11 +791,17 @@ async def main() -> None:
         """
         momentum_scanner.record_stop_loss_close(market_id, tte_remaining)
 
+    def _on_closed_full(market_id: str, side: str, exit_price: float, strategy: str) -> None:
+        """Backfill winner_exit_price in on_fills.csv when a promoted winner closes."""
+        if opening_neutral_scanner is not None and strategy == "momentum":
+            opening_neutral_scanner.notify_winner_closed(market_id, side, exit_price)
+
     monitor = PositionMonitor(
         pm, risk_engine,
         spot_client=spot_oracle,
         on_close_callback=_on_position_close,
         on_stop_loss_callback=_on_momentum_stop_loss,
+        on_closed_full_callback=_on_closed_full,
         oracle_tracker=oracle_tracker,
     )
     fill_sim = FillSimulator(pm, maker, risk_engine, monitor)
@@ -809,6 +817,23 @@ async def main() -> None:
     # ── Connect clients ──────────────────────────────────────────────────────
     log.info("Connecting PM client…")
     await pm.start()
+
+    # ML-01: CLOB Feature Buffer — registers on_price_change callback after pm.start()
+    # so the WS shards are already running and books will start filling immediately.
+    clob_buffer = CLOBFeatureBuffer()
+    clob_buffer.register(pm)
+
+    # ML-04: ModelAgent shadow logger — must be instantiated after all connectors are ready
+    model_agent = ModelAgent(
+        spot_oracle=spot_oracle,
+        hl_client=hl,
+        pm_client=pm,
+        funding_cache=funding_cache,
+        oracle_tracker=oracle_tracker,
+        vol_fetcher=vol_fetcher,
+        clob_buffer=clob_buffer,
+    )
+    api_state.model_agent_ref = model_agent
 
     log.info("Connecting HL client…")
     await hl.start()
@@ -852,6 +877,7 @@ async def main() -> None:
             get_ledger().reconcile_loop(pm),
             name="acct_reconcile",
         ),
+        asyncio.create_task(model_agent.run(), name="model_agent"),
     ]
     if config.PAPER_TRADING:
         tasks.append(asyncio.create_task(fill_sim.start(), name="fill_simulator"))

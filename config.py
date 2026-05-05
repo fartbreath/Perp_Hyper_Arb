@@ -408,6 +408,25 @@ OPENING_NEUTRAL_WINNER_SELL_BUFFER: float = 0.03
 OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED: bool = True
 OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN: float = 0.02
 
+# ── Oracle delta gate (ON-06) ─────────────────────────────────────────────────
+# When enabled, the bid-monitor loser exit is only allowed to fire when the
+# oracle spot confirms the position is losing (delta ≤ 0).  Suppresses
+# false-positive exits caused by CLOB book-drain at settlement: market makers
+# pull bids in the final seconds, collapsing best_bid to 0.29–0.38 on both
+# legs simultaneously regardless of which side will win.
+#
+# Oracle delta for bucket UP/DOWN markets:
+#   YES/UP: delta = (spot - strike) / strike * 100  — positive = YES winning
+#   NO/DOWN: delta = (strike - spot) / strike * 100 — positive = NO winning
+#
+# Fallback policy when oracle is unavailable (spot=None) or strike=0:
+#   allow_exit — fire loser exit as before (safe: avoids holding true losers
+#                to $0 if oracle is stale at settlement).
+#   suppress   — hold; risky if oracle is perpetually stale.
+# Default: allow_exit (conservative, matches pre-gate behaviour on oracle failure).
+OPENING_NEUTRAL_ORACLE_DELTA_GATE_ENABLED: bool = True
+OPENING_NEUTRAL_ORACLE_DELTA_GATE_FALLBACK: str = "allow_exit"  # "allow_exit" | "suppress"
+
 # DRY_RUN: when True all order placements are skipped (no real orders sent).
 # Signals, pair tracking, and all logic run normally — only the pm_client calls
 # are suppressed.  Safe to deploy inactive; set False after validation.``
@@ -577,7 +596,14 @@ MOMENTUM_UPFRAC_EXIT_ENABLED: bool = True
 MOMENTUM_UPFRAC_EXIT_THRESHOLD: float = 0.40    # exit YES when frac < this; exit NO when frac > (1 - this)
 MOMENTUM_UPFRAC_EXIT_WINDOWS: int = 2            # consecutive below-threshold windows before exit fires
 MOMENTUM_UPFRAC_WINDOW_SECONDS: int = 5          # duration of each measurement window in seconds
+MOMENTUM_UPFRAC_EWMA_ALPHA: float = 0.3          # smoothing factor for up-fraction EWMA (higher = more reactive)
 MOMENTUM_UPFRAC_SUPPRESS_UNTIL_ENTRY_WINDOW: bool = True  # when True: upfrac exit is suppressed while TTE > MOMENTUM_MIN_TTE_SECONDS[market_type] (guards against stale pre-promotion EWMA on ON-promoted positions)
+
+# Delta SL post-open grace window (seconds).  Delta SL is suppressed while BOTH
+# the position age is below this threshold AND TTE is above the entry window.
+# Whichever condition clears first ends the suppression.  Caps the blind spot for
+# ON-promoted positions at 60s instead of the previous TTE-based 300-400s gap.
+MOMENTUM_DELTA_SL_GRACE_SECS: int = 60
 
 # Order type: "limit" = taker limit at ask+0.5c (ensures fill); "market" = immediate cross.
 MOMENTUM_ORDER_TYPE: str = "limit"
@@ -588,6 +614,13 @@ MOMENTUM_ORDER_TYPE: str = "limit"
 # strike for YES, or 0.05% above strike for NO).
 MOMENTUM_DELTA_STOP_LOSS_PCT: float = 0.01  # protective buffer: exit when delta (in-the-money %) drops BELOW this threshold (fires before strike is crossed)
 MOMENTUM_DELTA_SL_MIN_TICKS: int = 3        # hysteresis: delta SL only fires after this many consecutive below-threshold ticks (prevents single-tick noise from triggering exit)
+# Token price veto for delta SL: if the held token's CLOB mid is still above this
+# price when the oracle delta retreats below the threshold, the delta SL is suppressed.
+# Rationale: when the CLOB crowd has not moved (token still ~0.55+) but the oracle
+# shows a transient sub-threshold tick, the move is likely noise.  This is a veto
+# (suppression), not a trigger — the SL still fires if the token also reprices down.
+# Set to 0.0 to disable.  Only applied when current_token_price is available.
+MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR: float = 0.0  # disabled by default; set via override
 MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
 # High-probability taker-exit suppression: when the held token's CLOB mid is AT OR
 # ABOVE this price all stop-loss taker exits (delta SL, near-expiry time stop, prob
@@ -595,7 +628,7 @@ MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above thi
 # (MOMENTUM_TAKE_PROFIT ≈ 0.999) is never suppressed.
 # Rationale: at 90c+ the crowd has priced a near-certain win; any taker exit forfeits
 # expected value.  Set to 0.0 to disable.
-MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE: float = 0.90
+MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE: float = 0.87
 # How long to wait for PM API to confirm settlement before falling back to the
 # resolution oracle.  PM can take 1–10 min to flip closed=True on the CLOB API
 # for short-duration (5m/15m) bucket markets.  After this many seconds past
@@ -712,6 +745,19 @@ MOMENTUM_PRESUB_LOOKAHEAD: int = 4
 # window so we can watch markets that are "near certain" but not yet in the
 # maker's quoting horizon.  Increase if 76% no_book persists after market refresh.
 MOMENTUM_MAX_TTE_DAYS: int = 7
+
+# GTD hedge order management (gap-closing reprice + near-expiry cancel).
+# MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS: if TTE ≤ this when the monitor sweeps,
+#   and the held token's CLOB mid is above 0.50 (winning), cancel the open
+#   hedge order to prevent an adverse fill at expiry.  0 = disabled.
+MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS: int = 5
+# MOMENTUM_HEDGE_MIN_RETAIN_USD: when repricing a hedge, ensure the notional
+#   cost of the new order does not exceed (projected_pnl - min_retain_usd).
+#   Prevents paying more for the hedge than the expected net profit.
+MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.50
+# MOMENTUM_HEDGE_CLOB_LOG_ENABLED: verbose per-sweep CLOB ask logging for
+#   hedge orders.  Disable in tests and low-noise environments.
+MOMENTUM_HEDGE_CLOB_LOG_ENABLED: bool = True
 
 # ── Range markets (sub-strategy of Momentum) ─────────────────────────────────
 # "Will BTC be between $X and $Y?" — YES resolves $1 if spot inside [lo, hi],
@@ -869,6 +915,21 @@ SCORE_WEIGHT_EDGE: float = 1.0
 SCORE_WEIGHT_SOURCE: float = 1.0
 SCORE_WEIGHT_TIMING: float = 1.0
 SCORE_WEIGHT_LIQUIDITY: float = 1.0
+
+# ── ML Adaptive Signal Engine ────────────────────────────────────────────────
+# Phase 0 — CLOB Feature Buffer (ML-01)
+# Subscribes to PMClient on_price_change; maintains a per-token in-memory
+# rolling deque of CLOB book snapshots.  No raw ticks are written to disk.
+# All model flags default False — set True only after each phase is validated.
+CLOB_FEATURE_BUFFER_ENABLED: bool = False   # ML-01: enable real-time CLOB buffer
+CLOB_BUFFER_MAXLEN: int = 600               # ticks per token (~10 min at 1 tick/s)
+
+# Phase 2 — ModelAgent shadow logging (ML-04)
+MODEL_AGENT_ENABLED: bool = False           # ML-04: enable shadow logging
+MODEL_A_PATH: str = str(Path(__file__).parent / "analysis" / "model_a_v0.pkl")
+MODEL_B_PATH: str = str(Path(__file__).parent / "analysis" / "model_b_v0.pkl")
+MODEL_A_SCORE_THRESHOLD: float = 0.5       # Phase 3: entry gate threshold
+MODEL_B_SCORE_THRESHOLD: float = 0.5       # Phase 3: exit suppress threshold
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
 AGENT_MODEL: str = "qwen2.5:7b"     # Ollama model name

@@ -30,7 +30,7 @@ from typing import Any, Optional
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Header, Query, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -93,6 +93,7 @@ class BotState:
     risk_ref: Any = None      # RiskEngine — used by manual-close endpoint
     funding_cache_ref: Any = None   # FundingRateCache — set once at startup by main.py
     oracle_tracker_ref: Any = None  # OracleTickTracker — set once at startup by main.py
+    model_agent_ref: Any = None     # ModelAgent — set once at startup by main.py (ML-04)
 
 
 # Module-level singleton — main.py populates this
@@ -555,6 +556,8 @@ _MUTABLE_CONFIG = {
     "momentum_upfrac_suppress_until_entry_window": ("MOMENTUM_UPFRAC_SUPPRESS_UNTIL_ENTRY_WINDOW", bool),
     # Stop-loss hysteresis
     "momentum_delta_sl_min_ticks":           ("MOMENTUM_DELTA_SL_MIN_TICKS",           int),
+    "momentum_delta_sl_grace_secs":          ("MOMENTUM_DELTA_SL_GRACE_SECS",          int),
+    "momentum_delta_sl_token_veto_floor":    ("MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR",    float),
     # Range markets (sub-strategy of Momentum)
     "momentum_range_enabled":              ("MOMENTUM_RANGE_ENABLED",              bool),
     "momentum_range_price_band_low":       ("MOMENTUM_RANGE_PRICE_BAND_LOW",       float),
@@ -805,6 +808,8 @@ class ConfigPatch(BaseModel):
     momentum_upfrac_suppress_until_entry_window: bool | None = None
     # Stop-loss hysteresis
     momentum_delta_sl_min_ticks: int | None = None
+    momentum_delta_sl_grace_secs: int | None = None
+    momentum_delta_sl_token_veto_floor: float | None = None
     momentum_kelly_multiplier_5m: float | None = None
     momentum_kelly_multiplier_15m: float | None = None
     momentum_kelly_multiplier_1h: float | None = None
@@ -1063,6 +1068,8 @@ def get_config() -> dict:
         "momentum_upfrac_suppress_until_entry_window": config.MOMENTUM_UPFRAC_SUPPRESS_UNTIL_ENTRY_WINDOW,
         # Stop-loss hysteresis
         "momentum_delta_sl_min_ticks":           config.MOMENTUM_DELTA_SL_MIN_TICKS,
+        "momentum_delta_sl_grace_secs":          config.MOMENTUM_DELTA_SL_GRACE_SECS,
+        "momentum_delta_sl_token_veto_floor":    config.MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR,
         "momentum_kelly_multiplier_5m":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_5m",    1.0),
         "momentum_kelly_multiplier_15m":          config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_15m",   1.0),
         "momentum_kelly_multiplier_1h":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_1h",    1.0),
@@ -1528,7 +1535,59 @@ def health_pipelines() -> dict:
         "detail": f"heartbeat_age={round(hb_age, 1)}s" if hb_age is not None else None,
     })
 
+    # ── ModelAgent ────────────────────────────────────────────────────────────
+    ma = state.model_agent_ref
+    if ma is None or not config.MODEL_AGENT_ENABLED:
+        pipelines.append({
+            "name": "ModelAgent",
+            "status": "DISABLED",
+            "last_update_ts": None,
+            "detail": "MODEL_AGENT_ENABLED=False",
+        })
+    else:
+        ma_status_dict = ma.get_status()
+        ma_status = ma_status_dict.get("status", "DISABLED")
+        ma_last_ts = ma_status_dict.get("last_decision_ts")
+        ma_agreement = ma_status_dict.get("agreement_rate_last_20")
+        detail = f"agreement={ma_agreement:.0%}" if ma_agreement is not None else "no decisions yet"
+        pipelines.append({
+            "name": "ModelAgent",
+            "status": ma_status,
+            "last_update_ts": ma_last_ts,
+            "detail": detail,
+        })
+
     return {"pipelines": pipelines, "timestamp": now}
+
+
+# ── Model Agent (ML-04) ───────────────────────────────────────────────────────
+
+@app.get("/model/status")
+def model_status() -> dict:
+    """ModelAgent runtime status: enabled flag, last decision ts, agreement rate."""
+    ma = state.model_agent_ref
+    if ma is None:
+        return {
+            "enabled": config.MODEL_AGENT_ENABLED,
+            "status": "DISABLED",
+            "last_decision_ts": None,
+            "agreement_rate_last_20": None,
+            "total_decisions": 0,
+            "pending_outcomes": 0,
+        }
+    return ma.get_status()
+
+
+@app.get("/model/shadow_log")
+def model_shadow_log(
+    limit: int = Query(default=50, ge=1, le=200),
+    decision_type: str = Query(default="all", pattern="^(all|entry|exit)$"),
+) -> dict:
+    """Last N rows of the ModelAgent shadow log, newest first."""
+    ma = state.model_agent_ref
+    if ma is None:
+        return {"rows": [], "total": 0}
+    return ma.get_shadow_log(limit=limit, decision_type=decision_type)
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
@@ -3223,6 +3282,27 @@ def market_pnl_single(market_id: str) -> dict:
     if state.risk_ref is None:
         raise HTTPException(status_code=503, detail="Risk engine not yet initialised")
     return state.risk_ref.market_pnl(market_id)
+
+
+# ── ML reports ───────────────────────────────────────────────────────────────
+
+_REPORTS_DIR = Path(__file__).parent / "analysis" / "reports"
+
+@app.get("/reports/{filename}")
+def get_report(filename: str) -> FileResponse:
+    """Serve a static HTML report from analysis/reports/.
+
+    Allowed extension: .html only.  Returns 404 if the file does not exist.
+    """
+    if not filename.endswith(".html"):
+        raise HTTPException(status_code=400, detail="Only .html reports are served")
+    path = (_REPORTS_DIR / filename).resolve()
+    # Guard against path traversal
+    if not str(path).startswith(str(_REPORTS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"{filename} not found — run train_model.py first")
+    return FileResponse(path, media_type="text/html")
 
 
 # ── Server entry point ────────────────────────────────────────────────────────

@@ -5,9 +5,9 @@ import { useState } from "react";
 import {
   useHealth, usePnl, usePositions, useLauncherStatus,
   startBotProcess, stopBotProcess, usePerformance, useInventory, useConfig, updateConfig,
-  useMomentumSignals, useMomentumScanSummary, useOpeningNeutralStatus,
+  useMomentumSignals, useMomentumScanSummary, useOpeningNeutralStatus, usePipelineHealth,
 } from "../api/client";
-import type { Position } from "../api/client";
+import type { Position, PipelineStatus } from "../api/client";
 
 // P3-G: WCAG-compliant status indicator (role="img" + text-based symbol for screen reader)
 function StatusDot({ ok, label }: { ok: boolean; label?: string }) {
@@ -840,6 +840,52 @@ function OpeningNeutralCard() {
   );
 }
 
+function PipelineStatusCard() {
+  const { data, error } = usePipelineHealth();
+  if (error || !data) return null; // hide if bot offline
+
+  const now = Date.now() / 1000;
+
+  function statusColor(s: PipelineStatus["status"]): string {
+    if (s === "LIVE")        return "#22c55e";
+    if (s === "STALE")       return "#f59e0b";
+    if (s === "ERROR")       return "#ef4444";
+    return "#64748b"; // NOT_STARTED
+  }
+
+  function ageLabel(ts: number | null): string {
+    if (ts === null) return "never";
+    const age = Math.round(now - ts);
+    if (age < 60) return `${age}s ago`;
+    if (age < 3600) return `${Math.round(age / 60)}m ago`;
+    return `${Math.round(age / 3600)}h ago`;
+  }
+
+  return (
+    <div className="card">
+      <h3>Data Pipelines</h3>
+      <table className="kv-table">
+        <tbody>
+          {data.pipelines.map(p => (
+            <tr key={p.name}>
+              <td>{p.name}</td>
+              <td>
+                <span style={{ color: statusColor(p.status), fontWeight: 700, marginRight: 6 }}>
+                  {p.status}
+                </span>
+                <span style={{ color: "#94a3b8", fontSize: "0.8rem" }}>
+                  {ageLabel(p.last_update_ts)}
+                  {p.detail ? ` · ${p.detail}` : ""}
+                </span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   return (
     <div className="page">
@@ -852,6 +898,7 @@ export default function Dashboard() {
       <MomentumCard />
       <OpeningNeutralCard />
       <PositionsCard />
+      <PipelineStatusCard />
       <HealthCard />
     </div>
   );

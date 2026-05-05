@@ -576,6 +576,8 @@ export interface ConfigData {
   momentum_upfrac_suppress_until_entry_window?: boolean;
   // Stop-loss hysteresis
   momentum_delta_sl_min_ticks?: number;
+  momentum_delta_sl_grace_secs?: number;
+  momentum_delta_sl_token_veto_floor?: number;
   // Kelly extensions (COB)
   momentum_kelly_min_tte_seconds?: number;
   momentum_min_entry_usd?: number;
@@ -789,6 +791,55 @@ export const useMomentumScanSummary = () =>
 // Slow/expensive hooks — keep REST polling at relaxed intervals:
 export const useConfig = () => usePolling<ConfigData>("/config", 30_000);
 export const usePnl = () => useSSE<PnlData>("pnl", "/pnl");   // SSE-updated every 30 s by backend
+
+// ── Pipeline health (M-09) ────────────────────────────────────────────────────
+export interface PipelineStatus {
+  name: string;
+  status: "LIVE" | "STALE" | "ERROR" | "NOT_STARTED";
+  last_update_ts: number | null;
+  detail: string | null;
+}
+export interface PipelineHealthData {
+  pipelines: PipelineStatus[];
+}
+export const usePipelineHealth = () =>
+  usePolling<PipelineHealthData>("/health/pipelines", 10_000);
+
+// ── Model Agent (ML-04) ───────────────────────────────────────────────────────
+
+export interface ModelStatusData {
+  enabled: boolean;
+  status: "RUNNING" | "DISABLED" | "ERROR";
+  last_decision_ts: number | null;
+  agreement_rate_last_20: number | null;
+  total_decisions: number;
+  pending_outcomes: number;
+}
+
+export interface ShadowLogRow {
+  timestamp: string;
+  market_id: string;
+  market_type: string;
+  decision_type: string;
+  rules_decision: string;
+  model_a_score: string;
+  model_b_score: string;
+  model_decision: string;
+  agreed: string;
+  actual_outcome: string;
+  features_snapshot: string;
+}
+
+export interface ShadowLogData {
+  rows: ShadowLogRow[];
+  total: number;
+}
+
+export const useModelStatus = () =>
+  usePolling<ModelStatusData>("/model/status", 5_000);
+
+export const useModelShadowLog = (decisionType: string = "all") =>
+  usePolling<ShadowLogData>(`/model/shadow_log?limit=50&decision_type=${decisionType}`, 10_000);
 
 export interface WalletPosition {
   token_id: string;

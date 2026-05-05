@@ -16,6 +16,7 @@ Files isolated (module-level constants → tmp_path):
   monitor.HEDGE_CLOB_TICKS_CSV                 → hedge_clob_ticks.csv
   logger file handlers                         → bot.log / errors.log
 """
+import asyncio
 import logging
 import logging.handlers as _log_handlers
 import sys
@@ -25,6 +26,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 import config
+import accounting as _accounting_mod
+import api_server as _api_server_mod
 import fill_simulator as _fill_sim_mod
 import monitor as _monitor_mod
 import risk
@@ -182,6 +185,14 @@ def _reset_production_limits():
         # False for live trading, which causes tests relying on paper mode to
         # break when run in isolation (get_token_balance is awaited in live mode).
         "PAPER_TRADING",
+        # SL hysteresis — config_overrides.json tunes these for production; tests
+        # must run against the code-defined defaults (veto disabled, 60 s grace).
+        "MOMENTUM_DELTA_SL_GRACE_SECS",
+        "MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR",
+        # Hedge order management — tests set these explicitly; reset to defaults.
+        "MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS",
+        "MOMENTUM_HEDGE_MIN_RETAIN_USD",
+        "MOMENTUM_HEDGE_CLOB_LOG_ENABLED",
     )
     saved = {k: getattr(config, k) for k in _keys}
 
@@ -198,8 +209,63 @@ def _reset_production_limits():
     config.MAKER_SPREAD_SIZE_MIN          = 125.0
     config.MAKER_SPREAD_SIZE_NEW_MARKET   = 100.0
     config.PAPER_TRADING                  = True  # tests operate in paper mode by default
+    config.MOMENTUM_DELTA_SL_GRACE_SECS        = 60   # code default (overridden to 120 in prod)
+    config.MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR  = 0.0  # disabled by default (overridden to 0.55 in prod)
+    config.MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS   = 5
+    config.MOMENTUM_HEDGE_MIN_RETAIN_USD        = 0.50
+    config.MOMENTUM_HEDGE_CLOB_LOG_ENABLED      = False  # suppress verbose per-sweep logging in tests
+
+    # Prevent state pollution from test_main_wiring.py → test_startup_smoke.py:
+    # state_sync_loop stores getattr(MagicMock(), "sub_rejected_count", 0) which
+    # auto-creates a MagicMock attribute (not 0), causing health() TypeError.
+    _api_server_mod.state.data_quality = {}
 
     yield
 
     for k, v in saved.items():
         setattr(config, k, v)
+
+
+@pytest.fixture(autouse=True)
+def _reset_event_loop():
+    """Ensure a fresh event loop exists before each test.
+
+    asyncio.run() (used by test_model_agent.py and other files) closes the
+    running loop after completion and sets the thread's current loop to None.
+    In Python 3.10+, asyncio.get_event_loop() raises RuntimeError when no loop
+    exists, breaking any downstream test that calls it.  This fixture installs
+    a new loop before every test and tears it down after.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    yield
+    try:
+        loop.close()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_accounting_ledger(tmp_path):
+    """Redirect accounting.LEDGER_CSV, FILLS_JSONL, and POSITIONS_JSON to temp files.
+
+    accounting.get_ledger() returns a module-level singleton.  We patch the
+    path constants AND reset the singleton so each test gets a fresh ledger
+    backed by isolated temp files.
+    """
+    orig_ledger_csv     = _accounting_mod.LEDGER_CSV
+    orig_fills_jsonl    = _accounting_mod.FILLS_JSONL
+    orig_positions_json = _accounting_mod.POSITIONS_JSON
+    orig_singleton      = _accounting_mod._ledger  # type: ignore[attr-defined]
+
+    _accounting_mod.LEDGER_CSV     = tmp_path / "acct_ledger.csv"
+    _accounting_mod.FILLS_JSONL    = tmp_path / "acct_fills.jsonl"
+    _accounting_mod.POSITIONS_JSON = tmp_path / "acct_positions.json"
+    _accounting_mod._ledger = None  # force fresh singleton next call
+
+    yield
+
+    _accounting_mod.LEDGER_CSV     = orig_ledger_csv
+    _accounting_mod.FILLS_JSONL    = orig_fills_jsonl
+    _accounting_mod.POSITIONS_JSON = orig_positions_json
+    _accounting_mod._ledger = orig_singleton

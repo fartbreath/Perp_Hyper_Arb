@@ -1902,6 +1902,28 @@ export default function Settings() {
               onSubmit={(v) => apply({ momentum_delta_sl_min_ticks: v })}
             />
 
+            {GAP}
+
+            <NumberInput
+              label="Delta SL Grace Window (s)"
+              description="Seconds after a position opens during which the delta stop-loss is suppressed. Prevents early SL fires on ON-promoted WINNERs that arrive near-ATM. Grace is also gated by min TTE — the SL re-arms early if TTE drops below the bucket minimum regardless."
+              value={data.momentum_delta_sl_grace_secs ?? 120}
+              step={10}
+              unit="s"
+              onSubmit={(v) => apply({ momentum_delta_sl_grace_secs: v })}
+            />
+
+            {GAP}
+
+            <FloatInput
+              label="Delta SL Token Price Veto Floor"
+              description="If the held token's CLOB mid is still above this price when the oracle delta retreats below the SL threshold, the SL is suppressed. The CLOB crowd not repricing indicates the oracle move is likely noise. Set to 0.0 to disable. Recommended: 0.55."
+              value={data.momentum_delta_sl_token_veto_floor ?? 0.0}
+              step={0.01}
+              unit=""
+              onSubmit={(v) => apply({ momentum_delta_sl_token_veto_floor: v })}
+            />
+
             <SectionHead title="Per-Coin Stop-Loss Overrides" />
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
               Higher-IV coins need wider stops — a single DOGE/SOL oracle tick routinely exceeds the global 0.04% stop.

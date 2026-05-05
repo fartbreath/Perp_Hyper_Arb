@@ -168,6 +168,8 @@ def _make_scanner(
     pm.place_market = AsyncMock(return_value="ord_002")
     pm.cancel_order = AsyncMock(return_value=None)
     pm.register_fill_future = MagicMock()
+    pm.get_depth_share = MagicMock(return_value=None)
+    pm.fetch_price_to_beat = AsyncMock(return_value=None)
 
     risk = MagicMock()
     risk.get_open_positions.return_value = open_positions or []
@@ -895,6 +897,8 @@ def test_on_exit_fill_idempotent():
             pm._paper_mode = True
             pm.cancel_order = AsyncMock(return_value=None)
             pm.register_fill_future = MagicMock()
+            pm.get_markets = MagicMock(return_value={})
+            pm.fetch_price_to_beat = AsyncMock(return_value=None)
             spot = MagicMock()
             vol  = MagicMock()
 

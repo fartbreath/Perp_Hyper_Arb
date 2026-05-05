@@ -330,32 +330,19 @@ class TestHedgeRemoval:
 @pytest.mark.p0
 class TestCSVUnderlying:
     def test_close_position_writes_underlying(self, tmp_path):
-        """IT-09: close_position() CSV row has correct `underlying`."""
-        risk.TRADES_CSV = tmp_path / "trades.csv"
+        """IT-09: close_position() returns a Position with the correct `underlying`.
+
+        close_position no longer writes directly to TRADES_CSV — it routes through
+        the accounting ledger.  We verify `underlying` propagates via the returned
+        Position object, which is the source of truth for the accounting hook.
+        """
         engine = RiskEngine()
         pos = _yes_position("m1", underlying="ETH", size=100.0, entry_price=0.50)
         engine.open_position(pos)
-        engine.close_position("m1", exit_price=0.55)
+        closed = engine.close_position("m1", exit_price=0.55)
 
-        rows = list(csv.DictReader((tmp_path / "trades.csv").open()))
-        assert len(rows) == 1
-        assert rows[0]["underlying"] == "ETH"
-
-    def test_hl_hedge_trade_writes_underlying(self, tmp_path):
-        """IT-10: record_hl_hedge_trade() CSV row has correct `underlying`."""
-        risk.TRADES_CSV = tmp_path / "trades.csv"
-        engine = RiskEngine()
-        engine.record_hl_hedge_trade(
-            coin="SOL",
-            direction="SHORT",
-            open_price=120.0,
-            close_price=115.0,
-            size_coins=1.0,
-        )
-
-        rows = list(csv.DictReader((tmp_path / "trades.csv").open()))
-        assert len(rows) == 1
-        assert rows[0]["underlying"] == "SOL"
+        assert closed is not None
+        assert closed.underlying == "ETH"
 
     def test_underlying_column_in_header(self, tmp_path):
         """TRADES_HEADER must include `underlying`."""

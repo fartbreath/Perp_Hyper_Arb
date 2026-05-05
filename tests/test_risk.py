@@ -1036,30 +1036,23 @@ class TestMarketPnl:
 
 
 class TestRecordHedgeFill:
-    """Tests for RiskEngine.record_hedge_fill()."""
+    """Tests for RiskEngine.record_hedge_fill().
 
-    def setup_method(self):
-        import risk as risk_module
-        self._orig_csv = risk_module.TRADES_CSV
-        # Redirect writes to a temp file — each test gets an isolated fresh file.
-        import tempfile, os
-        self._tmp = tempfile.mkdtemp()
-        self._tmp_csv = Path(self._tmp) / "trades.csv"
-        risk_module.TRADES_CSV = self._tmp_csv
-        self.engine = RiskEngine()
-
-    def teardown_method(self):
-        import risk as risk_module
-        risk_module.TRADES_CSV = self._orig_csv
-
-    def _read_csv_rows(self):
-        import csv as csv_mod
-        with self._tmp_csv.open(newline="") as f:
-            return list(csv_mod.DictReader(f))
+    Note: record_hedge_fill no longer writes directly to TRADES_CSV — it routes
+    through the accounting ledger (accounting.py).  The pnl computation and
+    realized_pnl accounting remain in risk.py and are tested directly here.
+    The accounting position metadata (strategy, market_id) is verified via the
+    ledger singleton.
+    """
 
     def test_winner_pnl_is_correct(self):
-        """Hedge BUY at 0.04, fill_size=10, settled at 1.0 → pnl = (1.0-0.04)*10 = 9.6."""
-        self.engine.record_hedge_fill(
+        """Hedge BUY at 0.04, fill_size=10, settled at 1.0 → pnl = (1.0-0.04)*10 = 9.6.
+
+        Also verifies accounting position carries correct strategy and market_id.
+        """
+        from accounting import get_ledger
+        engine = RiskEngine()
+        engine.record_hedge_fill(
             parent_market_id="mkt_momentum",
             parent_market_title="Will BTC reach $110k?",
             hedge_token_id="tok_up_xyz",
@@ -1067,17 +1060,18 @@ class TestRecordHedgeFill:
             fill_size=10.0,
             settled_price=1.0,
         )
-        rows = self._read_csv_rows()
-        assert len(rows) == 1
-        row = rows[0]
-        assert abs(float(row["pnl"]) - 9.6) < 1e-6
-        assert row["resolved_outcome"] == "WIN"
-        assert row["strategy"] == "momentum_hedge"
-        assert row["market_id"] == "mkt_momentum"
+        assert abs(engine.realized_pnl - 9.6) < 1e-6
+        ledger = get_ledger()
+        pos_id = ledger._token_index.get("tok_up_xyz")
+        assert pos_id is not None, "accounting position must be created for hedge fill"
+        pos = ledger._positions[pos_id]
+        assert pos.strategy == "momentum_hedge"
+        assert pos.market_id == "mkt_momentum"
 
     def test_loser_pnl_is_correct(self):
-        """Hedge settled at 0.0 → pnl = (0.0 - 0.04) * 10 = -0.4."""
-        self.engine.record_hedge_fill(
+        """Hedge settled at 0.0 → realized_pnl decreases by 0.4 (loss path)."""
+        engine = RiskEngine()
+        engine.record_hedge_fill(
             parent_market_id="mkt_momentum",
             parent_market_title="Will BTC reach $110k?",
             hedge_token_id="tok_up_xyz",
@@ -1085,16 +1079,13 @@ class TestRecordHedgeFill:
             fill_size=10.0,
             settled_price=0.0,
         )
-        rows = self._read_csv_rows()
-        assert len(rows) == 1
-        row = rows[0]
-        assert abs(float(row["pnl"]) - (-0.4)) < 1e-6
-        assert row["resolved_outcome"] == "LOSS"
+        assert abs(engine.realized_pnl - (-0.4)) < 1e-6
 
     def test_pnl_added_to_realized_pnl(self):
         """record_hedge_fill must increment the engine's realized P&L counter."""
-        before = self.engine.realized_pnl
-        self.engine.record_hedge_fill(
+        engine = RiskEngine()
+        before = engine.realized_pnl
+        engine.record_hedge_fill(
             parent_market_id="mkt_momentum",
             parent_market_title="",
             hedge_token_id="tok_up_xyz",
@@ -1102,23 +1093,7 @@ class TestRecordHedgeFill:
             fill_size=10.0,
             settled_price=1.0,
         )
-        assert abs(self.engine.realized_pnl - before - 9.6) < 1e-6
-
-    def test_csv_columns_are_correct(self):
-        """Every column in TRADES_HEADER must be present in the written row."""
-        from risk import TRADES_HEADER
-        self.engine.record_hedge_fill(
-            parent_market_id="mkt_x",
-            parent_market_title="title",
-            hedge_token_id="tok_h",
-            fill_price=0.05,
-            fill_size=5.0,
-            settled_price=1.0,
-        )
-        rows = self._read_csv_rows()
-        assert rows, "CSV must have a data row"
-        for col in TRADES_HEADER:
-            assert col in rows[0], f"Column {col!r} missing from hedge fill CSV row"
+        assert abs(engine.realized_pnl - before - 9.6) < 1e-6
 
 
 # ── replace_hedge_order ────────────────────────────────────────────────────────

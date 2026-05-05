@@ -2,7 +2,193 @@
 
 All notable changes to this repository are documented in this file.
 
-## [2026-05-04b] - M-13 upfrac refactor; delta SL bucket-market fix; ON sell-trigger improvements; accounting exit_reason; bug fixes
+## [2026-05-05] - ML Adaptive Signal Engine (Phase 0-2); delta SL grace + token-price veto; ON oracle delta gate; hedge management loop; pipeline health dashboard
+
+### Feature — ML Adaptive Signal Engine, Phase 0–2 (`models/`, `main.py`, `api_server.py`, `config.py`, `requirements.txt`)
+
+Implements the first three phases of the ML Adaptive Signal Engine.  All ML flags default
+`False`; the bot behaves identically to the prior release unless they are explicitly enabled.
+
+**Phase 0 — CLOB Feature Buffer (ML-01)** (`models/clob_feature_buffer.py`)  
+Registers an `on_price_change` callback on `PMClient` after the WS shards start.  Maintains
+a per-token in-memory rolling deque of CLOB book snapshots (`CLOB_BUFFER_MAXLEN = 600` ticks
+≈ 10 min at 1 tick/s).  No disk writes.  Enabled via `CLOB_FEATURE_BUFFER_ENABLED = True`.
+
+**Feature snapshot builder** (`models/feature_snapshot.py`)  
+Assembles the real-time feature vector at signal time from CLOB buffer, oracle, funding,
+and vol inputs.  Used by both the shadow logger and future live model gate.
+
+**Phase 2 — ModelAgent shadow logger (ML-04)** (`models/model_agent.py`, `main.py`)  
+Loads pre-trained Model A (entry) and Model B (exit) from pickles; intercepts every entry
+and exit decision; logs rule/model agreement to an in-memory deque without affecting any
+live trade logic.  `model_agent.run()` coroutine is started as a named asyncio task.
+
+**New config keys:**
+```
+CLOB_FEATURE_BUFFER_ENABLED: bool = False   # ML-01
+CLOB_BUFFER_MAXLEN: int = 600
+MODEL_AGENT_ENABLED: bool = False           # ML-04
+MODEL_A_PATH: str = ".../analysis/model_a_v0.pkl"
+MODEL_B_PATH: str = ".../analysis/model_b_v0.pkl"
+MODEL_A_SCORE_THRESHOLD: float = 0.5
+MODEL_B_SCORE_THRESHOLD: float = 0.5
+```
+
+**New API endpoints** (`api_server.py`):
+- `GET /model/status` — ModelAgent runtime status: enabled flag, last decision ts, agreement rate.
+- `GET /model/shadow_log?limit=50&decision_type=all` — last N shadow log rows.
+- `GET /reports/{filename}.html` — serves static HTML reports from `analysis/reports/` (path-traversal guarded).
+
+`BotState.model_agent_ref` field wired in `api_server.py`; set at startup by `main.py`.
+
+**New dependencies** (`requirements.txt`): `pyarrow`, `xgboost`, `shap`, `scikit-learn`, `matplotlib`.
+
+**New tests** (5 files):
+- `test_clob_feature_buffer.py` — buffer subscribe/tick/evict/unsubscribe.
+- `test_feature_builder.py` — feature snapshot field coverage and types.
+- `test_model_agent.py` — shadow log accumulation, agreement rate, get_status().
+- `test_shadow_evaluator.py` — outcome backfill and agreement scoring.
+- `test_train_model.py` — smoke tests: model A/B train, SHAP report generation.
+
+**New webapp page** (`webapp/src/pages/ModelAgent.tsx`, `webapp/src/App.tsx`):  
+`/model` route added to nav. Displays ModelAgent status card and scrollable shadow log table.
+Report links (Model A/B SHAP HTML) added to nav sidebar.
+
+---
+
+### Feature — Delta SL grace window + token-price veto (`monitor.py`, `config.py`, `webapp/src/pages/Settings.tsx`)
+
+Two new stop-loss quality guards that reduce false-positive delta SL exits.
+
+**Grace window** — `MOMENTUM_DELTA_SL_GRACE_SECS: int = 60`  
+The delta SL is suppressed while _both_ the position age is below this threshold _and_
+TTE is still above the bucket minimum entry window.  Whichever condition clears first
+re-arms the SL.  Fixes a blind-spot regression for ON-promoted winners (15m bucket,
+promotion at TTE=520s) where the previous TTE-only gate left the SL disabled for up
+to 340 s after promotion.  The grace cap limits the blind spot to 60 s regardless of
+TTE.  Also added to the Settings UI as "Delta SL Grace Window (s)".
+
+**Token-price veto** — `MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR: float = 0.0` (disabled by default)  
+If the held token's CLOB mid is still above this floor when the oracle delta retreats below
+the SL threshold, the SL is suppressed.  Rationale: when the CLOB crowd has not repriced
+the token the oracle move is likely transient noise.  Set via override (recommended: 0.55).
+Also added to the Settings UI as "Delta SL Token Price Veto Floor".
+
+---
+
+### Feature — GTD hedge management loop (`monitor.py`, `config.py`)
+
+`PositionMonitor._manage_open_hedge_orders()` runs every `_check_all_positions` cycle,
+independently of the position loop.  Two sub-features:
+
+1. **Near-expiry cancel** — if `TTE ≤ MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS` (default 5 s) and
+   the held token's CLOB mid is above 0.50 (winning), the hedge is cancelled to prevent an
+   adverse fill at settlement.  Calls `risk.finalize_hedge(..., HedgeStatus.CANCELLED)`.
+
+2. **Gap-closing reprice** — tracks `HedgeOrder.last_clob_ask` sweep-over-sweep.  When the
+   opposite token's ask falls, cancels the existing order and reposts at `best_bid + $0.01`.
+   Respects `price_cap` (set at placement) and a `MOMENTUM_HEDGE_MIN_RETAIN_USD = 0.50`
+   PnL floor.  Calls `risk.replace_hedge_order(old_id, new_id, new_price, new_size)`.
+
+**Cancel on take-profit** — `_exit_position` now fires `asyncio.create_task(pm.cancel_order(hedge_order_id))`
+when the exit reason is `PROFIT_TARGET` or `MOMENTUM_TAKE_PROFIT`.  SL/near-expiry exits
+deliberately keep the hedge alive as the recovery leg.
+
+**New config keys:**
+```
+MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS: int = 5
+MOMENTUM_HEDGE_MIN_RETAIN_USD: float = 0.50
+MOMENTUM_HEDGE_CLOB_LOG_ENABLED: bool = True
+```
+
+**Coverage:** 17 new tests across `TestHedgeGapClosingReprice`, `TestHedgeNearExpiryCancel`,
+`TestHedgeRepriceSizing`, and `TestGtdHedgeCancelOnClose` in `test_monitor.py`.
+
+---
+
+### Feature — ON oracle delta gate (ON-06) (`strategies/OpeningNeutral/scanner.py`, `config.py`)
+
+When `OPENING_NEUTRAL_ORACLE_DELTA_GATE_ENABLED = True`, the bid-monitor loser exit is
+only allowed to fire when the oracle spot confirms the leg is losing (`delta ≤ 0`).
+Suppresses false-positive exits caused by CLOB book-drain at settlement (market makers
+withdraw bids on both legs simultaneously in the final seconds, collapsing `best_bid` to
+0.29–0.38 regardless of which side will win).
+
+Fallback policy when oracle is unavailable:
+- `allow_exit` (default): fire the loser exit as before — safe against perpetually-stale oracle.
+- `suppress`: hold — risky if oracle is never available.
+
+**New config keys:**
+```
+OPENING_NEUTRAL_ORACLE_DELTA_GATE_ENABLED: bool = True
+OPENING_NEUTRAL_ORACLE_DELTA_GATE_FALLBACK: str = "allow_exit"
+```
+
+---
+
+### Feature — Pipeline health dashboard card (`webapp/src/pages/Dashboard.tsx`, `webapp/src/api/client.ts`)
+
+New `PipelineStatusCard` component on the Dashboard page polls `/health/pipelines` every
+10 s and renders a status table with colour-coded LIVE/STALE/ERROR/NOT_STARTED indicators
+and age labels for each data pipeline (RTDS, Chainlink, HL WS, PM WS, ModelAgent, etc.).
+
+New `usePipelineHealth()` hook and `PipelineStatus` / `PipelineHealthData` types added to
+`client.ts`.
+
+---
+
+### Feature — Kelly size signal-strength scaling (`strategies/Momentum/scanner.py`)
+
+`_compute_kelly_size_usd` now scales the edge premium by signal strength:
+`strength = delta_pct / threshold_pct`.  At `strength = 1.0` (barely at gate) the alpha
+premium is zero; at `strength = 2.0` (twice the threshold) the full premium is claimed.
+Corrects flat-premium overconfidence observed in the 0.90–0.95 kelly_win_prob band
+(47.6% actual win rate vs 92.5% expected).
+
+---
+
+### Feature — PositionMonitor `on_closed_full_callback` (`monitor.py`, `main.py`)
+
+`PositionMonitor` accepts a new `on_closed_full_callback(market_id, side, exit_price, strategy)`
+parameter.  `main.py` passes `_on_closed_full` which calls
+`opening_neutral_scanner.notify_winner_closed(...)` to backfill `winner_exit_price` in
+`on_fills.csv` when a promoted momentum winner closes.
+
+---
+
+### Fix — Test suite tech-debt resolved (`tests/conftest.py`, `tests/test_monitor.py`, `tests/test_opening_neutral.py`, `tests/test_risk.py`, `tests/test_integration.py`)
+
+24 pre-existing test failures fixed; suite now passes 1,298 tests with 0 failures.
+
+- **Event loop poisoning** (`conftest.py`): `_reset_event_loop` autouse fixture installs a
+  fresh `asyncio` event loop before each test.  `asyncio.run()` in `test_model_agent.py`
+  closed the loop; Python 3.10 `get_event_loop()` then raised `RuntimeError` for 193+ tests.
+
+- **Stale CSV tests** (`test_risk.py`, `test_integration.py`): `record_hedge_fill` and
+  `close_position` now route through the accounting ledger, not `TRADES_CSV`.  Three tests
+  rewritten to assert on `engine.realized_pnl` and `get_ledger()` state; one dead test removed.
+
+- **SL config override leaking into tests** (`conftest.py`): `_reset_production_limits` now
+  resets `MOMENTUM_DELTA_SL_GRACE_SECS`, `MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR`,
+  `MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS`, `MOMENTUM_HEDGE_MIN_RETAIN_USD`, and
+  `MOMENTUM_HEDGE_CLOB_LOG_ENABLED` to code defaults so `config_overrides.json` production
+  values don't break test assertions.
+
+- **`state.data_quality` pollution** (`conftest.py`): `api_server.state.data_quality = {}`
+  added to the autouse reset.  `test_main_wiring.py` stores `MagicMock` values in
+  `data_quality` which caused `health()` to raise `TypeError` in `test_startup_smoke.py`.
+
+- **Removed `TestPendingResolutionHedgeBackfill`** (`test_monitor.py`): called
+  `monitor._record_pending_resolution_hedge()` which no longer exists.
+
+- **OpeningNeutral mock completeness** (`test_opening_neutral.py`): added
+  `pm.get_depth_share = MagicMock(return_value=None)` and
+  `pm.fetch_price_to_beat = AsyncMock(return_value=None)` to `_make_scanner()` and the
+  local pm in `test_on_exit_fill_idempotent`.
+
+---
+
+
 
 ### Fix — Delta SL dip/reach misclassification for bucket-market NO positions (`monitor.py`, `tests/test_monitor.py`)
 

@@ -2026,13 +2026,22 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     _edge_premium = config.MOMENTUM_KELLY_EDGE_PREMIUM
     _win_prob_cap = config.MOMENTUM_KELLY_WIN_PROB_CAP
 
-    # Component 1: CLOB ask + our alpha over the market's settlement probability.
-    win_prob_clob = min(token_p + _edge_premium, _win_prob_cap)
+    # Signal strength: how many multiples above the entry threshold the delta is.
+    # strength=1.0 → exactly at threshold; strength=2.0 → twice the threshold.
+    _strength = signal.delta_pct / max(signal.threshold_pct, 1e-9)
+
+    # Component 1: CLOB ask + signal-scaled alpha.
+    # Edge premium scales linearly from 0 (at threshold, strength=1) to the full
+    # configured value (at 2× threshold, strength=2).  A signal barely at the
+    # entry gate claims no alpha over the market price; a strong signal earns the
+    # full premium.  This corrects the flat-premium overconfidence observed in
+    # the 0.90–0.95 kelly_win_prob band (47.6% actual vs 92.5% expected).
+    _edge_scale = max(0.0, min(1.0, _strength - 1.0))
+    win_prob_clob = min(token_p + _edge_premium * _edge_scale, _win_prob_cap)
 
     # Component 2: oracle-delta strength. strength=1 → right at threshold (0.50
     # baseline); each multiple above adds ORACLE_SENSITIVITY to win_prob, capped
     # at 0.95. Only depends on oracle spot vs strike — robust near expiry.
-    _strength = signal.delta_pct / max(signal.threshold_pct, 1e-9)
     win_prob_oracle = min(
         0.95,
         0.50 + max(0.0, (_strength - 1.0) * config.MOMENTUM_KELLY_ORACLE_SENSITIVITY),

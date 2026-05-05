@@ -119,7 +119,7 @@ def open_position_from_fill(
     )
 
     rebate_usd = 0.0
-    if market.fees_enabled and market.rebate_pct > 0.0:
+    if not config.PAPER_TRADING and market.fees_enabled and market.rebate_pct > 0.0:
         token_price = fill_price  # actual token price for both YES and NO
         rebate_usd = round(
             actual_filled * config.PM_FEE_COEFF

@@ -462,19 +462,39 @@ def should_exit(
             # crosses and Polymarket resolves against the position.
             _sl = delta_sl_pct if delta_sl_pct is not None else config.MOMENTUM_DELTA_STOP_LOSS_PCT
             _oracle_delta_pct = current_delta_pct  # capture for prob-SL gate below
-            # Suppress delta SL until the Momentum entry window opens for this bucket.
-            # OpeningNeutral-promoted positions are handed over at T+15s of a fresh
-            # bucket — spot barely above/below strike → delta is tiny → delta SL
-            # fires immediately on every promotion.  Gate: delta SL is meaningless
-            # before the near-expiry window where momentum positions are calibrated.
-            # Prob-SL (prob_sl_threshold) still fires during this window.
+            # Suppress delta SL while the position is in the post-open grace window
+            # OR while TTE is still above the entry threshold — whichever ends first.
+            # Using purely TTE-based suppression created a blind spot of up to 400s
+            # for ON-promoted positions (entry at TTE=520s kept delta SL disabled
+            # until TTE=120s).  The grace cap ensures that even a late-bucket
+            # promotion is only unprotected for at most MOMENTUM_DELTA_SL_GRACE_SECS
+            # seconds, while still avoiding false fires at the moment of promotion
+            # when spot is barely across the strike.
+            # Example (5m, promotion at TTE=170s, min_tte=120s):
+            #   Old: suppressed 50s (until TTE=120s)
+            #   New: suppressed until min(60s elapsed, TTE<120s) = 50s — same here.
+            # Example (15m, promotion at TTE=520s, min_tte=180s):
+            #   Old: suppressed 340s (until TTE=180s) — 340s blind spot.
+            #   New: suppressed 60s — blind spot capped at 60s.
             _min_tte = config.MOMENTUM_MIN_TTE_SECONDS.get(
                 pos.market_type, config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
             ) if isinstance(config.MOMENTUM_MIN_TTE_SECONDS, dict) else config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
-            _outside_entry_window = (
-                tte_seconds is not None and tte_seconds >= _min_tte
-            )
-            if not _suppress_taker_exits and not _outside_entry_window and current_delta_pct < _sl:
+            _delta_sl_grace_secs = getattr(config, "MOMENTUM_DELTA_SL_GRACE_SECS", 60)
+            _in_grace = (now - pos.opened_at).total_seconds() < _delta_sl_grace_secs
+            _above_min_tte = tte_seconds is not None and tte_seconds >= _min_tte
+            _suppress_delta_sl = _in_grace and _above_min_tte
+            # Token price veto: if the CLOB token mid is still above the veto floor,
+            # the oracle retreat is likely a transient noise tick (crowd not repricing).
+            # Only applied when current_token_price is available; floor=0.0 disables.
+            _token_veto_floor = getattr(config, "MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR", 0.0)
+            if (
+                not _suppress_delta_sl
+                and _token_veto_floor > 0.0
+                and current_token_price is not None
+                and current_token_price > _token_veto_floor
+            ):
+                _suppress_delta_sl = True
+            if not _suppress_taker_exits and not _suppress_delta_sl and current_delta_pct < _sl:
                 return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
             # Near-expiry: only exit if spot has already crossed the strike
             # (delta < 0).  Avoids premature exits from CLOB price collapse.
@@ -634,6 +654,7 @@ class PositionMonitor:
         on_close_callback: Optional[Callable[[str], None]] = None,
         on_stop_loss_callback: Optional[Callable[[str, float], None]] = None,
         oracle_tracker: Optional[OracleTickTracker] = None,
+        on_closed_full_callback: Optional[Callable[[str, str, float, str], None]] = None,
     ) -> None:
         self._pm = pm
         self._risk = risk
@@ -642,6 +663,9 @@ class PositionMonitor:
         # Called with market_id whenever a position is successfully closed.
         # Used by MispricingScanner to reset the per-market cooldown clock.
         self._on_close_callback = on_close_callback
+        # Called with (market_id, side, exit_price, strategy) whenever a position closes.
+        # Used by OpeningNeutralScanner to backfill winner_exit_price in on_fills.csv.
+        self._on_closed_full_callback = on_closed_full_callback
         # Called with (market_id, tte_remaining) when a momentum stop-loss fires.
         # Used by MomentumScanner to block re-entry for the remainder of TTE.
         self._on_stop_loss_callback = on_stop_loss_callback
@@ -1553,6 +1577,122 @@ class PositionMonitor:
             except Exception as exc:
                 log.error("Error checking position", market_id=pos.market_id, exc=str(exc))
 
+        # ── GTD hedge order management loop ────────────────────────────────────
+        # Runs independently of the position loop so it keeps working even when
+        # the parent position's market is not yet in the PM market cache.
+        # Two sub-features per open hedge order:
+        #   1. Near-expiry cancel: if TTE ≤ MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS and the
+        #      held token's CLOB mid is above 0.50 (winning), cancel to prevent adverse fill.
+        #   2. Gap-closing reprice: if the CLOB best_ask FELL since the last sweep,
+        #      cancel + repost at current_bid + $0.01 to chase liquidity.
+        await self._manage_open_hedge_orders()
+
+    async def _manage_open_hedge_orders(self) -> None:
+        """Process all open hedge orders: near-expiry cancel + gap-closing reprice."""
+        from risk import HedgeStatus
+        now_dt = datetime.now(timezone.utc)
+        expiry_cancel_secs = getattr(config, "MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS", 0)
+        min_retain_usd    = getattr(config, "MOMENTUM_HEDGE_MIN_RETAIN_USD", 0.50)
+
+        for ho in self._risk.get_open_hedge_orders():
+            try:
+                # ── 1. Near-expiry cancel ─────────────────────────────────────
+                if expiry_cancel_secs > 0:
+                    hedge_market = self._pm._markets.get(ho.market_id)
+                    if hedge_market is not None and getattr(hedge_market, "end_date", None) is not None:
+                        tte_s = (hedge_market.end_date - now_dt).total_seconds()
+                        if tte_s <= expiry_cancel_secs:
+                            # Only cancel when we are winning (held-token mid > 0.50).
+                            _parent_pos = self._risk.get_position_for_hedge(ho.order_id)
+                            _held_mid: Optional[float] = None
+                            if _parent_pos is not None and _parent_pos.token_id:
+                                _held_book = self._pm._books.get(_parent_pos.token_id)
+                                if _held_book is not None:
+                                    _held_mid = _held_book.mid
+                            if _held_mid is not None and _held_mid > 0.50:
+                                ok = await self._pm.cancel_order(ho.order_id)
+                                if ok:
+                                    self._risk.finalize_hedge(
+                                        ho.order_id,
+                                        settled_price=0.0,
+                                        hedge_status=HedgeStatus.CANCELLED,
+                                    )
+                                continue  # skip reprice check this sweep
+
+                # ── 2. Gap-closing reprice ────────────────────────────────────
+                book = self._pm._books.get(ho.token_id)
+                if book is None or getattr(book, "best_ask", None) is None:
+                    # No live ask data — clear baseline so next sweep starts fresh.
+                    ho.last_clob_ask = None
+                    continue
+
+                curr_ask = book.best_ask
+                if ho.last_clob_ask is None:
+                    # First sweep for this order: store baseline, no action.
+                    ho.last_clob_ask = curr_ask
+                    continue
+
+                if curr_ask >= ho.last_clob_ask:
+                    # Ask flat or rising: no reprice needed.
+                    ho.last_clob_ask = curr_ask
+                    continue
+
+                # Ask fell → gap-closing reprice opportunity.
+                best_bid = getattr(book, "best_bid", None) or 0.0
+                new_bid  = round(best_bid + 0.01, 6)
+
+                if ho.price_cap > 0.0 and new_bid > ho.price_cap:
+                    # Price cap exceeded: repricing would erode projected P&L.
+                    ho.last_clob_ask = curr_ask
+                    continue
+
+                ok = await self._pm.cancel_order(ho.order_id)
+                if not ok:
+                    # Order already filled — skip placement.
+                    ho.last_clob_ask = curr_ask
+                    continue
+
+                # Compute reprice size.
+                remaining = round(ho.order_size - ho.size_filled, 8)
+                pm_min_contracts = round(1.0 / new_bid, 6) if new_bid > 0 else remaining
+                new_size = round(max(remaining, pm_min_contracts), 6)
+
+                # PnL ceiling: notional ≤ projected_pnl − min_retain.
+                if ho.projected_pnl_usd > 0.0:
+                    budget   = ho.projected_pnl_usd - min_retain_usd
+                    ceiling  = round(budget / new_bid, 6) if new_bid > 0 else new_size
+                    new_size = round(min(new_size, ceiling), 6)
+
+                new_order_id = await self._pm.place_limit(
+                    token_id=ho.token_id,
+                    side="BUY",
+                    price=new_bid,
+                    size=new_size,
+                )
+                if new_order_id is None:
+                    # Placement failed: mark old order as cancelled.
+                    self._risk.finalize_hedge(
+                        ho.order_id,
+                        settled_price=0.0,
+                        hedge_status=HedgeStatus.CANCELLED,
+                    )
+                else:
+                    self._risk.replace_hedge_order(
+                        ho.order_id,
+                        new_order_id,
+                        new_bid,
+                        new_order_size=new_size,
+                    )
+
+                ho.last_clob_ask = curr_ask
+
+            except Exception as exc:
+                log.warning(
+                    "Hedge management loop error",
+                    order_id=ho.order_id[:20],
+                    exc=str(exc),
+                )
+
     async def _check_position(
         self,
         pos: Position,
@@ -2238,11 +2378,12 @@ class PositionMonitor:
         #   RESOLVED    — auto-distribution, no trade → zero fees/rebates.
         #   post-only   — we are the maker on exit: earn rebate, pay no taker fee.
         #   force_taker — market order: we are the taker, pay full fee, earn no rebate.
+        #   PAPER_TRADING — always zero fees/rebates to keep PnL as pure price delta.
         fee_base = (
             pos.size * exit_price * config.PM_FEE_COEFF * (1.0 - exit_price)
-            if market.fees_enabled else 0.0
+            if market.fees_enabled and not config.PAPER_TRADING else 0.0
         )
-        if reason == ExitReason.RESOLVED or not market.fees_enabled:
+        if reason == ExitReason.RESOLVED or not market.fees_enabled or config.PAPER_TRADING:
             exit_fees = 0.0
             total_rebates = 0.0
         elif force_taker:
@@ -2502,6 +2643,12 @@ class PositionMonitor:
                     (datetime.now(timezone.utc) - pos.opened_at).total_seconds(), 1
                 ),
             )
+            # Cancel the GTD hedge order on TP exits only.  On SL/near-expiry exits
+            # the hedge is the recovery leg and must stay alive.  On RESOLVED exits
+            # PM auto-expires orders so we never send an explicit cancel.
+            _hedge_cancel_on_win = {ExitReason.PROFIT_TARGET, ExitReason.MOMENTUM_TAKE_PROFIT}
+            if closed.hedge_order_id and reason in _hedge_cancel_on_win:
+                asyncio.create_task(self._pm.cancel_order(closed.hedge_order_id))
             _emit_event(
                 "SELL_CLOSE",
                 market_id=pos.market_id,
@@ -2523,6 +2670,13 @@ class PositionMonitor:
                         asyncio.create_task(result)
                 except Exception as exc:
                     log.warning("on_close_callback raised", exc=str(exc))
+            if self._on_closed_full_callback is not None:
+                try:
+                    self._on_closed_full_callback(
+                        pos.market_id, pos.side, exit_price, pos.strategy
+                    )
+                except Exception as exc:
+                    log.warning("on_closed_full_callback raised", exc=str(exc))
             if reason == ExitReason.MOMENTUM_STOP_LOSS and self._on_stop_loss_callback is not None:
                 try:
                     _tte_rem = (

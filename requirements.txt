@@ -12,3 +12,8 @@ ollama
 pytest
 pytest-asyncio
 psutil
+pyarrow
+xgboost
+shap
+scikit-learn
+matplotlib

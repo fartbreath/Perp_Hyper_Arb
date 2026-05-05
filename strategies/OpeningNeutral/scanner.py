@@ -709,6 +709,58 @@ class OpeningNeutralScanner(BaseStrategy):
                             _entry_ts = pair.get("entry_ts", 0.0)
                             if time.time() - _entry_ts < _min_hold:
                                 return  # still in hold window — re-check on next tick
+                        # ── Oracle delta gate (ON-06) ─────────────────────────
+                        # Suppress loser exit when the oracle confirms this leg is
+                        # still winning.  CLOB bids collapse at settlement as market
+                        # makers withdraw — this makes a winning leg look like a loser.
+                        # The oracle is unaffected by CLOB liquidity and is the correct
+                        # signal at expiry.
+                        # Fallback: if oracle is unavailable, apply the configured
+                        # fallback policy (default: allow_exit — safe against stale oracle).
+                        if getattr(config, "OPENING_NEUTRAL_ORACLE_DELTA_GATE_ENABLED", False):
+                            _oracle_delta: Optional[float] = None
+                            _underlying = getattr(mon_pos, "underlying", "") or ""
+                            _market_type = getattr(mon_pos, "market_type", "") or ""
+                            _strike = getattr(mon_pos, "strike", 0.0) or 0.0
+                            if self._spot is not None and _underlying and _market_type and _strike > 0:
+                                _spot_mid = self._spot.get_mid(_underlying, _market_type)
+                                if _spot_mid is not None:
+                                    if mon_pos.side in ("YES", "UP"):
+                                        _oracle_delta = (_spot_mid - _strike) / _strike * 100
+                                    else:
+                                        _oracle_delta = (_strike - _spot_mid) / _strike * 100
+                            if _oracle_delta is not None:
+                                if _oracle_delta > 0:
+                                    # Oracle says this leg is winning — CLOB collapse is noise.
+                                    log.debug(
+                                        "OpeningNeutral: loser exit suppressed — oracle delta positive",
+                                        pair_id=pair_id[:12],
+                                        side=mon_side,
+                                        best_bid=best_bid,
+                                        oracle_delta_pct=round(_oracle_delta, 3),
+                                    )
+                                    return  # suppress — recheck on next tick
+                                # delta <= 0: oracle confirms loser — allow exit below
+                            else:
+                                # Oracle unavailable — apply fallback policy
+                                _fallback = getattr(
+                                    config, "OPENING_NEUTRAL_ORACLE_DELTA_GATE_FALLBACK", "allow_exit"
+                                )
+                                if _fallback == "suppress":
+                                    log.debug(
+                                        "OpeningNeutral: loser exit suppressed — oracle unavailable (fallback=suppress)",
+                                        pair_id=pair_id[:12],
+                                        side=mon_side,
+                                        best_bid=best_bid,
+                                    )
+                                    return  # suppress — recheck on next tick
+                                # fallback=allow_exit: fall through and fire
+                                log.debug(
+                                    "OpeningNeutral: oracle unavailable — allowing loser exit (fallback=allow_exit)",
+                                    pair_id=pair_id[:12],
+                                    side=mon_side,
+                                    best_bid=best_bid,
+                                )
                         # ── Fire loser exit ──────────────────────────────────
                         self._exiting_legs.add(token_id)
                         asyncio.create_task(

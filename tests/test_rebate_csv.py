@@ -4,11 +4,11 @@ tests/test_rebate_csv.py — QA regression tests for rebate_usd and fills-CSV sc
 Gaps closed  (session /qa — depth-gate + rebate_usd changes):
   R1.  FillResult.rebate_usd == 0 when fees_enabled=False
   R2.  FillResult.rebate_usd == 0 when rebate_pct == 0
-  R3.  FillResult.rebate_usd > 0 when fees_enabled=True and rebate_pct > 0
+  R3.  FillResult.rebate_usd == 0 when PAPER_TRADING=True (fees/rebates suppressed in paper mode)
   R3b. FillResult is None (not partially computed) when risk gate blocks the fill
   R4a. FILLS_HEADER ends with "rebate_usd"
   R4b. Paper fill CSV row contains rebate_usd == 0 when fees disabled
-  R4c. Paper fill CSV row contains rebate_usd > 0 when fees enabled
+  R4c. Paper fill CSV row contains rebate_usd == 0 even when fees enabled (PAPER_TRADING=True)
   R5.  Live fill CSV row contains rebate_usd column
   R6.  _ensure_fills_csv creates new file with current FILLS_HEADER
   R7.  _ensure_fills_csv backs up stale-schema file and writes current header
@@ -129,26 +129,22 @@ class TestFillResultRebateUsd:
         assert result is not None
         assert result.rebate_usd == pytest.approx(0.0)
 
-    def test_rebate_usd_positive_when_fees_enabled(self):
-        """R3: fees_enabled=True + rebate_pct=0.5, price=0.40, size=50 → rebate_usd > 0.
+    def test_rebate_usd_zero_in_paper_mode(self):
+        """R3: PAPER_TRADING=True → rebate_usd == 0 even when fees_enabled=True + rebate_pct > 0.
 
-        Expected:  50 * 0.0175 * 0.40 * 0.60 * 0.50 * 0.25 = 0.02625
+        Paper fills suppress fees/rebates so PnL is a pure price delta.
         """
         result, _ = self._run(fees_enabled=True, rebate_pct=0.50, price=0.40, size=50.0)
         assert result is not None
-        assert result.rebate_usd == pytest.approx(0.02625, rel=1e-4)
+        assert result.rebate_usd == pytest.approx(0.0)
 
-    def test_rebate_usd_is_zero_for_no_side(self):
-        """R3 (NO side): SELL quote → position_side=NO, token_price=1-fill_price.
-
-        Expected:  50 * 0.0175 * 0.60 * 0.40 * 0.50 * 0.25 = 0.02625  (symmetric)
-        """
+    def test_rebate_usd_zero_for_no_side_in_paper_mode(self):
+        """R3 (NO side): PAPER_TRADING=True → rebate_usd == 0 for SELL (NO) quotes too."""
         result, _ = self._run(
             fees_enabled=True, rebate_pct=0.50, side="SELL", price=0.40, size=50.0
         )
         assert result is not None
-        # token_price for NO = 1 - fill_price = 0.60; still > 0
-        assert result.rebate_usd > 0.0
+        assert result.rebate_usd == pytest.approx(0.0)
 
     def test_fillresult_is_none_when_risk_gate_blocks(self):
         """R3b: If risk gate rejects the fill, FillResult is None (no partial rebate side-effects)."""
@@ -222,8 +218,8 @@ class TestPaperFillsCsvRebateUsd:
         finally:
             fsim_module.FILLS_CSV = orig_csv
 
-    def test_paper_fill_writes_nonzero_rebate_when_fees_enabled(self, tmp_path):
-        """R4c: fees_enabled=True + rebate_pct=0.5 → rebate_usd == 0.02625 in CSV row."""
+    def test_paper_fill_writes_zero_rebate_when_fees_enabled(self, tmp_path):
+        """R4c: PAPER_TRADING=True → rebate_usd == 0 in CSV even when fees_enabled=True."""
         import fill_simulator as fsim_module
 
         fake_csv = tmp_path / "fills.csv"
@@ -244,7 +240,7 @@ class TestPaperFillsCsvRebateUsd:
             with fake_csv.open() as f:
                 rows = list(csv.DictReader(f))
             assert len(rows) == 1
-            assert float(rows[0]["rebate_usd"]) == pytest.approx(0.02625, rel=1e-4)
+            assert float(rows[0]["rebate_usd"]) == pytest.approx(0.0)
         finally:
             fsim_module.FILLS_CSV = orig_csv
 
