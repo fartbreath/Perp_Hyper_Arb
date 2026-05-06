@@ -1712,13 +1712,34 @@ class OpeningNeutralScanner(BaseStrategy):
             else None
         )
 
-        # price_to_beat: Chainlink oracle strike at market open from Gamma API.
-        # Fetched here so we have the spot-vs-strike signal in on_fills.csv for
-        # loser-leg identification before any leg is sold.  Non-blocking: returns
-        # None on network failure, which is safe — the position is already open.
+        # Deribit ATM IV at entry — meaningful for bucket markets since they
+        # have an explicit strike (price_to_beat) and the IV tells us how much
+        # the underlying is expected to move over the TTE window.
+        # Uses the same VolFetcher cache as Momentum (TTL=5min) — no extra round-trip.
+        _deribit_iv: Optional[float] = None
+        if self._vol is not None and _underlying:
+            try:
+                _vol_result = await self._vol.get_sigma_ann(_underlying)
+                if _vol_result is not None and _vol_result[1] == "deribit_atm":
+                    _deribit_iv = round(_vol_result[0], 6)
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+        # price_to_beat: Chainlink oracle strike at market open.
+        # Primary: crypto-price API (populated immediately when the window opens).
+        # Fallback: Gamma eventMetadata.priceToBeat (may lag at entry time).
+        # Non-blocking: None on failure — position is already open.
+        _event_start_time = getattr(market, "event_start_time", "")
         _market_slug = getattr(market, "market_slug", "")
         _price_to_beat: Optional[float] = None
-        if _market_slug:
+        try:
+            if _underlying and _event_start_time and market.end_date is not None:
+                _price_to_beat = await self._pm.fetch_crypto_price_ptb(
+                    _underlying, _event_start_time, market.end_date
+                )
+        except Exception:  # pylint: disable=broad-except
+            pass
+        if _price_to_beat is None and _market_slug:
             try:
                 _price_to_beat = await self._pm.fetch_price_to_beat(_market_slug)
             except Exception:  # pylint: disable=broad-except
@@ -1751,8 +1772,9 @@ class OpeningNeutralScanner(BaseStrategy):
             "clob_yes_spread":       _clob_spread,
             "clob_yes_bid_depth_5":  _clob_depth,
             "clob_no_bid_depth_5":   _clob_no_depth,
-            # Deribit IV: ON strategy is a pair trade; record None (binary markets have no strike)
-            "deribit_iv":            None,
+            # Deribit ATM IV — populated for BTC/ETH/SOL/XRP (Deribit-supported coins).
+            # None for coins without Deribit options (uses realized vol fallback).
+            "deribit_iv":            _deribit_iv,
             # Loser-identification signals (v3)
             "price_to_beat":         _price_to_beat,
             "hl_mark_price":         round(_hl_mark, 4) if _hl_mark is not None else None,

@@ -1916,12 +1916,10 @@ class TestGtdHedgeRedeemIntercept:
         from pathlib import Path
         import tempfile
         self._risk_module = risk_module
-        self._orig_csv = risk_module.TRADES_CSV
         self._tmp = tempfile.mkdtemp()
-        risk_module.TRADES_CSV = Path(self._tmp) / "trades.csv"
 
     def teardown_method(self):
-        self._risk_module.TRADES_CSV = self._orig_csv
+        pass
 
     def _make_pm(self, token_id, redeemable, cur_price, condition_id="mkt_001",
                  title="BTC > 100k", size=10.0):

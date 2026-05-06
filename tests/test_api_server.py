@@ -130,51 +130,80 @@ class TestPositions:
         assert r.json()["count"] == 2
 
 
-# ── /trades ───────────────────────────────────────────────────────────────────
+# ── /acct/ledger (replaces /trades) ──────────────────────────────────────────
 
 class TestTrades:
     def setup_method(self):
         _reset_state()
 
     def _patch_trades(self, rows):
-        return patch("api_server._load_trades_csv", return_value=rows)
+        """Write rows to a temp CSV and patch ACCT_LEDGER_CSV to point to it."""
+        import contextlib
+        import io
+
+        @contextlib.contextmanager
+        def _ctx():
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".csv", delete=False, newline="", encoding="utf-8"
+            ) as f:
+                tmp_path = Path(f.name)
+                if rows:
+                    fieldnames = list(rows[0].keys())
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows)
+            try:
+                with patch("api_server.ACCT_LEDGER_CSV", tmp_path):
+                    yield
+            finally:
+                tmp_path.unlink(missing_ok=True)
+
+        return _ctx()
 
     def test_empty_trades(self):
-        with self._patch_trades([]):
-            r = client.get("/trades")
-        assert r.status_code == 200
-        assert r.json()["total"] == 0
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, newline="", encoding="utf-8"
+        ) as f:
+            tmp_path = Path(f.name)
+            csv.writer(f).writerow(["market_id", "underlying", "strategy"])
+        try:
+            with patch("api_server.ACCT_LEDGER_CSV", tmp_path):
+                r = client.get("/acct/ledger")
+            assert r.status_code == 200
+            assert r.json()["total"] == 0
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     def test_trades_returned(self):
         rows = _make_trade_rows(n=3)
         with self._patch_trades(rows):
-            r = client.get("/trades")
+            r = client.get("/acct/ledger")
         assert r.json()["total"] == 3
 
     def test_pagination_limit(self):
         rows = _make_trade_rows(n=20)
         with self._patch_trades(rows):
-            r = client.get("/trades?limit=5")
-        assert len(r.json()["trades"]) == 5
+            r = client.get("/acct/ledger?limit=5")
+        assert len(r.json()["rows"]) == 5
 
     def test_pagination_offset(self):
         rows = _make_trade_rows(n=10)
         with self._patch_trades(rows):
-            r = client.get("/trades?limit=5&offset=5")
+            r = client.get("/acct/ledger?limit=5&offset=5")
         assert r.json()["offset"] == 5
 
     def test_filter_by_strategy(self):
         rows = _make_trade_rows(n=5)
         rows[0]["strategy"] = "mispricing"
         with self._patch_trades(rows):
-            r = client.get("/trades?strategy=mispricing")
+            r = client.get("/acct/ledger?strategy=mispricing")
         assert r.json()["total"] == 1
 
     def test_filter_by_underlying(self):
         rows = _make_trade_rows(n=5)
         rows[2]["underlying"] = "ETH"
         with self._patch_trades(rows):
-            r = client.get("/trades?underlying=ETH")
+            r = client.get("/acct/ledger?underlying=ETH")
         assert r.json()["total"] == 1
 
 

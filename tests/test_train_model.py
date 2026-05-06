@@ -341,9 +341,10 @@ class TestTrainSmoke:
             from analysis.train_model import train
 
             # AUC on random labels will be near 0.5, below MODEL_B_MIN_AUC=0.60
-            # BUT: with only 9 test rows, roc_auc_score might not be exactly 0.5
-            # We override the threshold for this test to guarantee failure detection
-            with patch("analysis.train_model.MODEL_B_MIN_AUC", 0.99):
+            # BUT: with only 9 test rows, the guard requires >= MODEL_B_MIN_TEST_ROWS
+            # Override both thresholds to guarantee failure detection
+            with patch("analysis.train_model.MODEL_B_MIN_AUC", 0.99), \
+                 patch("analysis.train_model.MODEL_B_MIN_TEST_ROWS", 1):
                 with pytest.raises(SystemExit) as exc_info:
                     train(
                         parquet_path=path,

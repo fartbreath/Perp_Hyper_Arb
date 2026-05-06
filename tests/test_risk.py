@@ -934,16 +934,10 @@ class TestMarketPnl:
     """Tests for RiskEngine.market_pnl()."""
 
     def _make_engine(self):
-        import risk as risk_module
-        self._orig_csv = risk_module.TRADES_CSV
-        tmp_dir = tempfile.mkdtemp()
-        risk_module.TRADES_CSV = Path(tmp_dir) / "trades.csv"
-        self._risk_module = risk_module
         return RiskEngine()
 
     def teardown_method(self):
-        if hasattr(self, "_risk_module"):
-            self._risk_module.TRADES_CSV = self._orig_csv
+        pass
 
     def test_empty_market_returns_zeros(self):
         engine = self._make_engine()

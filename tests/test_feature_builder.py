@@ -73,9 +73,29 @@ def _make_clob_session(coin: str, capture_offset_s: float = 0.0) -> pd.DataFrame
 
 
 def _make_trades_csv(tmp_dir: Path, rows: list[dict]) -> None:
-    """Write a trades.csv to tmp_dir."""
-    df = pd.DataFrame(rows)
-    df.to_csv(tmp_dir / "trades.csv", index=False)
+    """Write an acct_ledger.csv to tmp_dir (format expected by _load_trades)."""
+    mapped = []
+    for r in rows:
+        row = dict(r)
+        # Rename columns to match acct_ledger.csv schema
+        if "entry_timestamp" in row and "entry_time" not in row:
+            row["entry_time"] = row.pop("entry_timestamp")
+        if "timestamp" in row and "exit_time" not in row:
+            row["exit_time"] = row.pop("timestamp")
+        if "spot_price" in row and "spot_entry" not in row:
+            row["spot_entry"] = row.pop("spot_price")
+        if "pnl" in row and "net_pnl" not in row:
+            row["net_pnl"] = row.pop("pnl")
+        # tte_years → tte_seconds (builder checks tte_years first, then converts from tte_seconds)
+        if "tte_years" in row and "tte_seconds" not in row:
+            tte_years = row.pop("tte_years")
+            row["tte_seconds"] = (tte_years * 31_557_600) if tte_years is not None else None
+        # fill_type required so _load_trades includes the row
+        if "fill_type" not in row:
+            row["fill_type"] = "MAIN"
+        mapped.append(row)
+    df = pd.DataFrame(mapped)
+    df.to_csv(tmp_dir / "acct_ledger.csv", index=False)
 
 
 def _make_empty_csvs(tmp_dir: Path) -> None:
