@@ -47,6 +47,7 @@ _SHADOW_LOG_PATH = _ANALYSIS_DIR / "shadow_log.csv"
 _ON_FILLS_PATH = _DATA_DIR / "on_fills.csv"
 _MOMENTUM_FILLS_PATH = _DATA_DIR / "momentum_fills.csv"
 _TRADES_PATH = _DATA_DIR / "trades.csv"
+_PAPER_TRADES_PATH = _ANALYSIS_DIR / "model_paper_trades.csv"  # ML-08
 
 # ── Shadow log schema ─────────────────────────────────────────────────────────
 
@@ -66,6 +67,26 @@ _SHADOW_COLS = [
 
 POLL_INTERVAL_SECS: float = 10.0
 _SENTINEL = -999.0
+
+# ── ML-08: paper trades schema (model_paper_trades.csv) ──────────────────────
+# Written exclusively by _independent_scan_loop; never touches rules-bot files.
+_PAPER_COLS = [
+    "timestamp",
+    "market_id",
+    "market_title",
+    "underlying",
+    "market_type",
+    "side",
+    "entry_price",
+    "size_usd",
+    "model_a_score",
+    "features_json",
+    "status",                   # proposed | closed
+    "exit_price",               # resolved YES price: 1.0 (WIN) | 0.0 (LOSS)
+    "pnl",                      # exit_price - entry_price per contract
+    "would_rules_have_entered", # true | false
+    "tte_seconds_at_entry",
+]
 
 
 # ── ModelAgent ────────────────────────────────────────────────────────────────
@@ -119,6 +140,12 @@ class ModelAgent:
 
         # File lock for CSV writes
         self._write_lock = asyncio.Lock()
+
+        # ML-08: independent entry scan state
+        self._momentum_scanner: Any = None          # injected by main.py after scanner creation
+        self._paper_positions: dict[str, dict] = {} # market_id → open proposed row
+        self._paper_rows: list[dict] = []           # in-memory ring buffer (last 200 rows)
+        self._paper_write_lock = asyncio.Lock()
 
     # ── Public scoring API ────────────────────────────────────────────────────
 
@@ -184,6 +211,84 @@ class ModelAgent:
         sliced = rows[-limit:][::-1]  # newest first
         return {"rows": sliced, "total": len(rows)}
 
+    async def log_model_b_suppression(
+        self,
+        market_id: str,
+        market_type: str,
+        score: float,
+        context: Optional[dict],
+    ) -> None:
+        """
+        ML-06: Write a shadow_log row for a Model-B-suppressed exit.
+
+        Called from ON scanner when MODEL_B_ENABLED=True and score < threshold.
+        decision_type='model_b_suppressed', rules_decision='exit', agreed='false'.
+        Never raises — all exceptions logged at WARNING.
+        """
+        try:
+            import json as _json
+            features: dict = {}
+            try:
+                from models.feature_snapshot import build_exit_snapshot
+                features = build_exit_snapshot(context or {})
+            except Exception:
+                pass
+            shadow_row = {
+                "timestamp": str(time.time()),
+                "market_id": market_id,
+                "market_type": market_type,
+                "decision_type": "model_b_suppressed",
+                "rules_decision": "exit",
+                "model_a_score": "",
+                "model_b_score": f"{score:.4f}",
+                "model_decision": "suppress",
+                "agreed": "false",
+                "actual_outcome": "PENDING",
+                "features_snapshot": _json.dumps(features),
+            }
+            await self._write_shadow_row(shadow_row)
+            if market_id:
+                self._pending[market_id] = len(self._shadow_rows) - 1
+        except Exception as exc:
+            log.warning("ModelAgent.log_model_b_suppression error", market_id=market_id, exc=str(exc))
+
+    def get_paper_trades(self, limit: int = 100, independent_only: bool = False) -> dict:
+        """
+        Return ML-08 paper trades and win-rate summary for GET /model/paper_trades.
+
+        independent_only=True filters to rows where would_rules_have_entered=false,
+        i.e. the genuine additive-alpha set.
+        """
+        rows = self._paper_rows
+        if independent_only:
+            rows = [r for r in rows if r.get("would_rules_have_entered") == "false"]
+        sliced = list(reversed(rows[-limit:]))  # newest first
+
+        def _win_rate(subset: list[dict]) -> Optional[float]:
+            if not subset:
+                return None
+            wins = sum(1 for r in subset if _safe_float_str(r.get("pnl")) > 0)
+            return round(wins / len(subset), 4)
+
+        def _safe_float_str(v: Any) -> float:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return -999.0
+
+        closed = [r for r in self._paper_rows if r.get("status") == "closed"]
+        model_only_closed = [r for r in closed if r.get("would_rules_have_entered") == "false"]
+        rules_eligible_closed = [r for r in closed if r.get("would_rules_have_entered") == "true"]
+
+        return {
+            "rows": sliced,
+            "total": len(self._paper_rows),
+            "open": len(self._paper_positions),
+            "closed": len(closed),
+            "model_only_win_rate": _win_rate(model_only_closed),
+            "rules_eligible_win_rate": _win_rate(rules_eligible_closed),
+        }
+
     # ── Main async loop ───────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -203,6 +308,9 @@ class ModelAgent:
 
         # Seed already-processed rows so we don't re-log existing fill history
         await self._seed_processed_keys()
+
+        # ML-08: start independent scan as a sibling task (runs while shadow loop runs)
+        asyncio.create_task(self._independent_scan_loop(), name="model_independent_scan")
 
         while True:
             try:
@@ -473,3 +581,309 @@ class ModelAgent:
         self._shadow_rows.append(row)
         if len(self._shadow_rows) > 1000:
             self._shadow_rows = self._shadow_rows[-1000:]
+
+    # ── ML-08: independent entry scan (paper trades) ──────────────────────────
+
+    async def _independent_scan_loop(self) -> None:
+        """
+        ML-08 independent entry scan loop.
+
+        Evaluates ALL PM markets via score_entry() without the rules pre-filters
+        (no z-score gate, no funding gate, no TWAP gate).  When
+        MODEL_A_INDEPENDENT_ENABLED=True and score > MODEL_A_INDEPENDENT_ENTRY_THRESHOLD,
+        logs a paper trade to analysis/model_paper_trades.csv.
+
+        Runs at the same tick frequency as the Momentum scanner.
+        Does nothing when MODEL_AGENT_ENABLED=False.
+        """
+        if self._pm_client is None:
+            log.info("ML-08: pm_client not wired — independent scan loop exiting")
+            return
+
+        await self._ensure_paper_trades_header()
+        await self._seed_paper_positions()
+        log.info("ML-08: independent scan loop started")
+
+        while True:
+            try:
+                if getattr(config, "MODEL_A_INDEPENDENT_ENABLED", False):
+                    await self._run_independent_scan_tick()
+                    await self._resolve_paper_outcomes()
+            except asyncio.CancelledError:
+                log.info("ML-08: independent scan cancelled")
+                raise
+            except Exception as exc:
+                log.warning("ML-08: scan tick error", exc=str(exc))
+
+            scan_interval = float(getattr(config, "MOMENTUM_SCAN_INTERVAL", 10))
+            await asyncio.sleep(scan_interval)
+
+    async def _run_independent_scan_tick(self) -> None:
+        """Score all PM markets and propose paper entries above the threshold."""
+        import datetime as _dt
+
+        now_ts = time.time()
+        now_dt = _dt.datetime.utcnow()
+        max_open = getattr(config, "MODEL_A_MAX_OPEN_POSITIONS", 5)
+        threshold = getattr(config, "MODEL_A_INDEPENDENT_ENTRY_THRESHOLD", 0.7)
+        min_tte = getattr(config, "MODEL_A_MIN_TTE_SECS", 30)
+
+        if len(self._paper_positions) >= max_open:
+            log.debug("ML-08: paper cap reached — skipping tick", open=len(self._paper_positions))
+            return
+
+        # Snapshot Momentum scanner diags for would_rules_have_entered determination.
+        # Markets with effective_gap_pct >= 0 passed the rules delta gate this tick.
+        _diag_by_market: dict[str, dict] = {}
+        ms = self._momentum_scanner
+        if ms is not None:
+            for d in getattr(ms, "_last_scan_diags", []):
+                mid = d.get("market_id")
+                if mid:
+                    _diag_by_market[mid] = d
+
+        proposed_this_tick = 0
+        _state_skips = frozenset({
+            "concurrent_cap", "duplicate_position", "cooldown",
+            "stop_loss_block", "opening_neutral_active",
+        })
+
+        for market in list(self._pm_client.get_markets().values()):
+            if len(self._paper_positions) + proposed_this_tick >= max_open:
+                break
+
+            if market.condition_id in self._paper_positions:
+                continue
+
+            # TTE gate — hard minimum, no model override
+            if market.end_date is None:
+                continue
+            tte_secs = market.end_date.timestamp() - now_ts
+            if tte_secs < min_tte:
+                continue
+
+            # Build context from diag data + live enrichment
+            diag = _diag_by_market.get(market.condition_id, {})
+            _funding_rate = None
+            _twap_dev_bps = diag.get("twap_dev_bps")
+            _vol_regime = diag.get("vol_regime")
+
+            if self._funding_cache is not None and market.underlying:
+                try:
+                    _funding_rate = self._funding_cache.get(market.underlying)
+                except Exception:
+                    pass
+
+            if self._oracle_tracker is not None and market.underlying:
+                try:
+                    if _twap_dev_bps is None:
+                        _twap_dev_bps = self._oracle_tracker.get_twap_deviation_bps(market.underlying)
+                    if not _vol_regime or _vol_regime == "UNKNOWN":
+                        _vol_regime = self._oracle_tracker.get_vol_regime(market.underlying)
+                except Exception:
+                    pass
+
+            context: dict = {
+                "signal_obs_z":     diag.get("observed_z"),
+                "signal_sigma_ann": diag.get("sigma_ann"),
+                "oracle_delta_pct": diag.get("delta_pct"),
+                "signal_delta_pct": diag.get("delta_pct"),
+                "tte_seconds":      round(tte_secs),
+                "tte_seconds_at_entry": round(tte_secs),
+                "timestamp":        now_ts,
+                "funding_rate":     _funding_rate,
+                "twap_dev_bps":     _twap_dev_bps,
+                "vol_regime":       _vol_regime,
+                "hour_utc":         now_dt.hour,
+                "day_of_week":      now_dt.weekday(),
+            }
+
+            score = self.score_entry(market.condition_id, context)
+            if score <= threshold:
+                continue
+
+            # would_rules_have_entered: True iff the market passed the delta gate
+            # in the rules scanner's last tick (state-based skips do not count against it).
+            _passed_delta = (
+                "effective_gap_pct" in diag
+                and float(diag.get("effective_gap_pct", -999)) >= 0
+            )
+            _skip = diag.get("skip_reason")
+            would_rules = _passed_delta and (_skip is None or _skip == "" or _skip in _state_skips)
+
+            # Current YES ask as paper entry price
+            entry_price: float = 0.0
+            try:
+                book = self._pm_client.get_book(market.token_id_yes)
+                if book is not None:
+                    p = book.best_ask or book.mid
+                    if p is not None:
+                        entry_price = round(float(p), 4)
+            except Exception:
+                pass
+
+            features_json = "{}"
+            try:
+                from models.feature_snapshot import build_entry_snapshot
+                features_json = json.dumps(build_entry_snapshot(context))
+            except Exception:
+                pass
+
+            paper_row: dict = {
+                "timestamp":               str(now_ts),
+                "market_id":               market.condition_id,
+                "market_title":            market.title[:80],
+                "underlying":              market.underlying,
+                "market_type":             market.market_type,
+                "side":                    "YES",
+                "entry_price":             str(entry_price),
+                "size_usd":                "0.0",
+                "model_a_score":           str(round(score, 4)),
+                "features_json":           features_json,
+                "status":                  "proposed",
+                "exit_price":              "",
+                "pnl":                     "",
+                "would_rules_have_entered": "true" if would_rules else "false",
+                "tte_seconds_at_entry":    str(round(tte_secs)),
+            }
+            await self._write_paper_trade_row(paper_row)
+            self._paper_positions[market.condition_id] = paper_row
+            proposed_this_tick += 1
+
+            log.info(
+                "ML-08: paper trade proposed",
+                market=market.title[:50],
+                market_id=market.condition_id[:16],
+                score=round(score, 3),
+                threshold=threshold,
+                would_rules=would_rules,
+                tte_secs=round(tte_secs),
+                entry_price=entry_price,
+            )
+
+        if proposed_this_tick:
+            log.info(
+                "ML-08: scan tick",
+                proposed=proposed_this_tick,
+                total_open=len(self._paper_positions),
+            )
+
+    async def _resolve_paper_outcomes(self) -> None:
+        """
+        For each open paper position whose expected resolution time has elapsed,
+        call fetch_market_resolution() (CLOB winner flag) to get the outcome.
+        Updates exit_price, pnl, and status=closed in both CSV and in-memory rows.
+        """
+        if not self._paper_positions or self._pm_client is None:
+            return
+
+        now_ts = time.time()
+        to_resolve: list[str] = []
+
+        for mid, row in self._paper_positions.items():
+            try:
+                entry_ts = float(row.get("timestamp", 0))
+                tte_at_entry = float(row.get("tte_seconds_at_entry", 0))
+                if now_ts > entry_ts + tte_at_entry:
+                    to_resolve.append(mid)
+            except (TypeError, ValueError):
+                pass
+
+        for mid in to_resolve:
+            try:
+                resolved_yes = await self._pm_client.fetch_market_resolution(mid)
+                if resolved_yes is None:
+                    continue  # not settled yet — retry on next tick
+
+                row = self._paper_positions[mid]
+                entry_price_f = float(row.get("entry_price") or 0)
+                exit_price_f = resolved_yes       # 1.0 = YES won, 0.0 = NO won
+                pnl_f = round(exit_price_f - entry_price_f, 4)
+
+                await self._update_paper_trade_closed(mid, exit_price_f, pnl_f)
+                del self._paper_positions[mid]
+
+                log.info(
+                    "ML-08: paper trade closed",
+                    market_id=mid[:16],
+                    exit_price=exit_price_f,
+                    pnl=pnl_f,
+                    would_rules=row.get("would_rules_have_entered"),
+                )
+            except Exception as exc:
+                log.warning("ML-08: error resolving paper trade", market_id=mid[:16], exc=str(exc))
+
+    async def _ensure_paper_trades_header(self) -> None:
+        """Create analysis/model_paper_trades.csv with header if it does not exist."""
+        if not _PAPER_TRADES_PATH.exists():
+            _PAPER_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            async with self._paper_write_lock:
+                with open(_PAPER_TRADES_PATH, "w", newline="", encoding="utf-8") as fh:
+                    csv.DictWriter(fh, fieldnames=_PAPER_COLS).writeheader()
+
+    async def _seed_paper_positions(self) -> None:
+        """Load existing proposed positions from model_paper_trades.csv on restart."""
+        if not _PAPER_TRADES_PATH.exists():
+            return
+        try:
+            with open(_PAPER_TRADES_PATH, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    self._paper_rows.append(row)
+                    if row.get("status") == "proposed" and row.get("market_id"):
+                        self._paper_positions[row["market_id"]] = row
+            if len(self._paper_rows) > 200:
+                self._paper_rows = self._paper_rows[-200:]
+            log.info(
+                "ML-08: seeded paper positions",
+                open=len(self._paper_positions),
+                total_rows=len(self._paper_rows),
+            )
+        except Exception as exc:
+            log.warning("ML-08: error seeding paper positions", exc=str(exc))
+
+    async def _write_paper_trade_row(self, row: dict) -> None:
+        """Append one row to model_paper_trades.csv and update in-memory list."""
+        async with self._paper_write_lock:
+            with open(_PAPER_TRADES_PATH, "a", newline="", encoding="utf-8") as fh:
+                csv.DictWriter(fh, fieldnames=_PAPER_COLS, extrasaction="ignore").writerow(row)
+        self._paper_rows.append(row)
+        if len(self._paper_rows) > 200:
+            self._paper_rows = self._paper_rows[-200:]
+
+    async def _update_paper_trade_closed(
+        self, market_id: str, exit_price: float, pnl: float
+    ) -> None:
+        """Rewrite model_paper_trades.csv updating the closed row for market_id."""
+        if not _PAPER_TRADES_PATH.exists():
+            return
+        try:
+            with open(_PAPER_TRADES_PATH, newline="", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+
+            changed = False
+            for row in rows:
+                if row.get("market_id") == market_id and row.get("status") == "proposed":
+                    row["exit_price"] = str(round(exit_price, 4))
+                    row["pnl"] = str(pnl)
+                    row["status"] = "closed"
+                    changed = True
+
+            if not changed:
+                return
+
+            async with self._paper_write_lock:
+                with open(_PAPER_TRADES_PATH, "w", newline="", encoding="utf-8") as fh:
+                    writer = csv.DictWriter(fh, fieldnames=_PAPER_COLS, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(rows)
+
+            # Mirror update into in-memory list
+            for r in self._paper_rows:
+                if r.get("market_id") == market_id and r.get("status") == "proposed":
+                    r["exit_price"] = str(round(exit_price, 4))
+                    r["pnl"] = str(pnl)
+                    r["status"] = "closed"
+        except Exception as exc:
+            log.warning(
+                "ML-08: error updating paper trade", market_id=market_id[:16], exc=str(exc)
+            )

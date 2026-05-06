@@ -25,15 +25,18 @@ class FundingRateCache:
             else float(getattr(config, "FUNDING_STALE_THRESHOLD_S", 120))
         )
         self._rates: dict[str, float] = {}
+        self._marks: dict[str, float] = {}   # coin → HL mark price (from webData2)
         self._timestamps: dict[str, float] = {}
         self._history: dict[str, deque] = {}  # coin → deque[(ts, rate), maxlen=10]
 
     # ── Write path ─────────────────────────────────────────────────────────────
 
-    def on_ws_update(self, coin: str, funding_rate: float, ts: float) -> None:
+    def on_ws_update(self, coin: str, funding_rate: float, ts: float, mark_px: Optional[float] = None) -> None:
         """Called by HLClient on every webData2 push. Single-threaded asyncio — no locks."""
         self._rates[coin] = funding_rate
         self._timestamps[coin] = ts
+        if mark_px is not None:
+            self._marks[coin] = mark_px
         if coin not in self._history:
             self._history[coin] = deque(maxlen=10)
         self._history[coin].append((ts, funding_rate))
@@ -45,6 +48,12 @@ class FundingRateCache:
         if self.is_stale(coin):
             return None
         return self._rates.get(coin)
+
+    def get_mark(self, coin: str) -> Optional[float]:
+        """HL mark price; None if stale or never received."""
+        if self.is_stale(coin):
+            return None
+        return self._marks.get(coin)
 
     def get_direction(self, coin: str) -> Optional[str]:
         """'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | None (if stale)."""

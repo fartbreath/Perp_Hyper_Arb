@@ -214,7 +214,20 @@ Key parameters:
 
 ## Recent Changes
 
-### 2026-05-03 — M-series momentum upgrades; Opening Neutral promote flag; startup smoke tests
+### 2026-05-06 — ML Phase 3+4; WINNER-fill delta SL; risk.py CSV removal; HL mark price; SPA catch-all
+
+- **ML Phase 3 — Model B exit gate (ML-06)** (`strategies/OpeningNeutral/scanner.py`, `models/model_agent.py`): Model B suppression gate inserted after ON-06 oracle delta gate. When `MODEL_B_ENABLED=True` and `model_b_score < MODEL_B_SUPPRESS_THRESHOLD` (default 0.5), the loser exit is suppressed. Two bugs fixed: `implied_prob` was sourced from stale entry price instead of current `best_bid` (BUG-ML-06a); suppressed exits were never written to `shadow_log.csv` — `log_model_b_suppression()` method added to `ModelAgent` (BUG-ML-06b).
+- **ML Phase 3 — Model A sizing scale (ML-07)** (`strategies/OpeningNeutral/scanner.py`, `strategies/Momentum/scanner.py`): Scale formula `scale = MODEL_A_MIN_SCALE + score × (MODEL_A_MAX_SCALE − MODEL_A_MIN_SCALE)` applied at Kelly sizing step in both scanners. Two bugs fixed: scale block was entirely absent from ON scanner (BUG-ML-07a); `model_a_score`/`model_a_scale` missing from `_ON_FILLS_HEADER` blocking `feature_builder.py` from reading them — schema bumped to v4 (BUG-ML-07b).
+- **ML Phase 4 — Independent entry scan + paper ledger (ML-08, ML-09)** (`models/model_agent.py`): `_independent_scan_loop()` evaluates all PM markets via `score_entry()` without rules pre-filters. Proposed entries logged to `analysis/model_paper_trades.csv` (isolated ledger — no interaction with `risk.py` or live trade CSVs). `would_rules_have_entered` determined via `_momentum_scanner._last_scan_diags`. Outcome resolution writes `exit_price`, `pnl`, `status=closed` on CLOB `winner` flag.
+- **ML scanner wiring** (`main.py`): `model_agent` injected into both scanners for gate/scale decisions; `momentum_scanner` back-wired into `model_agent` for `would_rules_have_entered`.
+- **Webapp SPA catch-all** (`api_server.py`): `@app.get("/{full_path:path}")` catch-all added as the last route, serving `webapp/dist/index.html`. Fixes 404 on direct navigation to `/model-paper`. `StaticFiles` mount for `/assets` added before the catch-all.
+- **Webapp Settings ML section** (`webapp/src/pages/Settings.tsx`): "Model Agent (ML)" card with all 10 ML config controls. All 10 fields added to `_SETTINGS_MAP`, `ConfigPatch`, and `GET /config` in `api_server.py`; `ConfigData` interface updated in `client.ts`. Webapp dist rebuilt.
+- **WINNER-fill delta SL** (`risk.py`, `monitor.py`): `Position.fill_type = "MAIN"` field added; ON-promoted winners set `fill_type = "WINNER"`. `should_exit()` applies `MOMENTUM_WINNER_DELTA_SL_MULTIPLIER` (default 0.5) and `MOMENTUM_WINNER_DELTA_SL_GRACE_SECS` (default 150 s) for WINNER positions, preventing mid-bucket false stops.
+- **HL mark price propagation** (`hl_client.py`, `market_data/funding_rate_cache.py`): `HLClient._fire_funding()` passes `mark_px` from `webData2`. `FundingRateCache` caches it; new `get_mark(coin)` accessor added.
+- **`risk.py` CSV removal**: `TRADES_CSV`, `TRADES_HEADER`, and all CSV write infrastructure removed from `risk.py` (540-line reduction). Trade recording fully in `accounting.py`. `_pm_reconcile_loop()` removed from `monitor.py`.
+- **Test infrastructure fix** (`tests/conftest.py`, `tests/test_opening_neutral.py`): `_isolate_trades_csv` fixture updated with `hasattr(risk, "TRADES_CSV")` guard; stale `risk.TRADES_CSV` references removed from two test bodies. Restores 58/58 passing tests.
+
+### 2026-05-05 — ON-07 winner confirmation gate; ML training pipeline; ON→momentum fill logging; feature_builder vol_regime_high fix; PMClobWS dashboard fix
 
 - **`FundingRateCache`** (`market_data/funding_rate_cache.py`): push-fed HL funding rate module updated by `HLClient` WebSocket `webData2` handler. No polling; staleness is measured from last push timestamp.
 - **`OracleTickTracker`** (`market_data/oracle_tick_tracker.py`): per-coin oracle analytics tracking EWMA up-fraction, TWAP deviation, and volatility regime (`HIGH`/`LOW`/`UNKNOWN`). Integrated into `monitor.py` and `MomentumScanner`.
@@ -336,7 +349,7 @@ The React dashboard at `http://localhost:5173` gives real-time visibility into e
 
 | Page | What you see |
 |------|-------------|
-| **Dashboard** | Bot status, P&L summary, open positions, system health |
+| **Dashboard** | Bot status, P&L summary, open positions, system health, ML training card |
 | **Trades** | Full trade history with search / filter; each leg shows entry & exit spot prices (RTDS) |
 | **Positions** | Open positions, momentum positions, range positions, recently closed spreads, and settlement/redemption state |
 | **Performance** | Analytics breakdowns by market type, underlying, and strategy leg |
@@ -345,7 +358,9 @@ The React dashboard at `http://localhost:5173` gives real-time visibility into e
 | **Markets** | All monitored markets with quoting status and signal scores |
 | **Fills** | Paper fill events with adversity highlighting |
 | **Logs** | Live stream plus Error History (long-lived WARNING/ERROR buffer) |
-| **Settings** | Runtime config editor, including full momentum strategy controls |
+| **Model** | ModelAgent status (RUNNING/DISABLED/ERROR), agreement rate, shadow decision log table with entry/exit filter |
+| **Model Paper Trades** | Independent paper trade ledger (`model_paper_trades.csv`): model score, entry/exit price, PnL, `would_rules_have_entered` flag |
+| **Settings** | Runtime config editor, including full momentum strategy controls and ML agent (Model B gate, Model A sizing, independent scan) |
 
 ---
 

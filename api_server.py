@@ -31,6 +31,7 @@ import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Header, Query, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -347,8 +348,6 @@ def build_live_state() -> dict:
     return bundle
 
 
-# Path to trades CSV — use absolute path like risk.py to avoid CWD issues
-TRADES_CSV = Path(__file__).parent / "data" / "trades.csv"
 # Accounting module data files (written by accounting.py)
 ACCT_LEDGER_CSV = Path(__file__).parent / "data" / "acct_ledger.csv"
 ACCT_POSITIONS_JSON = Path(__file__).parent / "data" / "acct_positions.json"
@@ -568,6 +567,9 @@ _MUTABLE_CONFIG = {
     "momentum_delta_sl_min_ticks":           ("MOMENTUM_DELTA_SL_MIN_TICKS",           int),
     "momentum_delta_sl_grace_secs":          ("MOMENTUM_DELTA_SL_GRACE_SECS",          int),
     "momentum_delta_sl_token_veto_floor":    ("MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR",    float),
+    # WINNER-fill-type SL tuning
+    "momentum_winner_delta_sl_grace_secs":   ("MOMENTUM_WINNER_DELTA_SL_GRACE_SECS",   int),
+    "momentum_winner_delta_sl_multiplier":   ("MOMENTUM_WINNER_DELTA_SL_MULTIPLIER",   float),
     # Range markets (sub-strategy of Momentum)
     "momentum_range_enabled":              ("MOMENTUM_RANGE_ENABLED",              bool),
     "momentum_range_price_band_low":       ("MOMENTUM_RANGE_PRICE_BAND_LOW",       float),
@@ -620,6 +622,17 @@ _MUTABLE_CONFIG = {
     "opening_neutral_loser_confidence_enabled":    ("OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED",      bool),
     "opening_neutral_loser_confidence_tighten":    ("OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN",      float),
     "opening_neutral_winner_confirm_floor":        ("OPENING_NEUTRAL_WINNER_CONFIRM_FLOOR",          float),
+    # ML / Model Agent (Phase 3–4)
+    "model_agent_enabled":                        ("MODEL_AGENT_ENABLED",                           bool),
+    "model_b_enabled":                            ("MODEL_B_ENABLED",                               bool),
+    "model_b_suppress_threshold":                 ("MODEL_B_SUPPRESS_THRESHOLD",                    float),
+    "model_a_enabled":                            ("MODEL_A_ENABLED",                               bool),
+    "model_a_min_scale":                          ("MODEL_A_MIN_SCALE",                             float),
+    "model_a_max_scale":                          ("MODEL_A_MAX_SCALE",                             float),
+    "model_a_independent_enabled":                ("MODEL_A_INDEPENDENT_ENABLED",                   bool),
+    "model_a_independent_entry_threshold":        ("MODEL_A_INDEPENDENT_ENTRY_THRESHOLD",           float),
+    "model_a_min_tte_secs":                       ("MODEL_A_MIN_TTE_SECS",                          int),
+    "model_a_max_open_positions":                 ("MODEL_A_MAX_OPEN_POSITIONS",                    int),
 }
 
 
@@ -821,6 +834,9 @@ class ConfigPatch(BaseModel):
     momentum_delta_sl_min_ticks: int | None = None
     momentum_delta_sl_grace_secs: int | None = None
     momentum_delta_sl_token_veto_floor: float | None = None
+    # WINNER-fill-type SL tuning
+    momentum_winner_delta_sl_grace_secs: int | None = None
+    momentum_winner_delta_sl_multiplier: float | None = None
     momentum_kelly_multiplier_5m: float | None = None
     momentum_kelly_multiplier_15m: float | None = None
     momentum_kelly_multiplier_1h: float | None = None
@@ -879,6 +895,17 @@ class ConfigPatch(BaseModel):
     opening_neutral_loser_confidence_enabled: bool | None = None
     opening_neutral_loser_confidence_tighten: float | None = None
     opening_neutral_winner_confirm_floor: float | None = None
+    # ML / Model Agent (Phase 3–4)
+    model_agent_enabled: bool | None = None
+    model_b_enabled: bool | None = None
+    model_b_suppress_threshold: float | None = None
+    model_a_enabled: bool | None = None
+    model_a_min_scale: float | None = None
+    model_a_max_scale: float | None = None
+    model_a_independent_enabled: bool | None = None
+    model_a_independent_entry_threshold: float | None = None
+    model_a_min_tte_secs: int | None = None
+    model_a_max_open_positions: int | None = None
 
 
 @app.get("/config")
@@ -1082,6 +1109,9 @@ def get_config() -> dict:
         "momentum_delta_sl_min_ticks":           config.MOMENTUM_DELTA_SL_MIN_TICKS,
         "momentum_delta_sl_grace_secs":          config.MOMENTUM_DELTA_SL_GRACE_SECS,
         "momentum_delta_sl_token_veto_floor":    config.MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR,
+        # WINNER-fill-type SL tuning
+        "momentum_winner_delta_sl_grace_secs":   config.MOMENTUM_WINNER_DELTA_SL_GRACE_SECS,
+        "momentum_winner_delta_sl_multiplier":   config.MOMENTUM_WINNER_DELTA_SL_MULTIPLIER,
         "momentum_kelly_multiplier_5m":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_5m",    1.0),
         "momentum_kelly_multiplier_15m":          config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_15m",   1.0),
         "momentum_kelly_multiplier_1h":           config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE.get("bucket_1h",    1.0),
@@ -1139,6 +1169,17 @@ def get_config() -> dict:
         "opening_neutral_winner_sell_buffer":          config.OPENING_NEUTRAL_WINNER_SELL_BUFFER,
         "opening_neutral_loser_confidence_enabled":    config.OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED,
         "opening_neutral_loser_confidence_tighten":    config.OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN,
+        # ML / Model Agent (Phase 3–4)
+        "model_agent_enabled":                        config.MODEL_AGENT_ENABLED,
+        "model_b_enabled":                            getattr(config, "MODEL_B_ENABLED", False),
+        "model_b_suppress_threshold":                 getattr(config, "MODEL_B_SUPPRESS_THRESHOLD", 0.5),
+        "model_a_enabled":                            getattr(config, "MODEL_A_ENABLED", False),
+        "model_a_min_scale":                          getattr(config, "MODEL_A_MIN_SCALE", 0.5),
+        "model_a_max_scale":                          getattr(config, "MODEL_A_MAX_SCALE", 1.0),
+        "model_a_independent_enabled":                getattr(config, "MODEL_A_INDEPENDENT_ENABLED", False),
+        "model_a_independent_entry_threshold":        getattr(config, "MODEL_A_INDEPENDENT_ENTRY_THRESHOLD", 0.7),
+        "model_a_min_tte_secs":                       getattr(config, "MODEL_A_MIN_TTE_SECS", 30),
+        "model_a_max_open_positions":                 getattr(config, "MODEL_A_MAX_OPEN_POSITIONS", 5),
         "timestamp":            time.time(),
     }
 
@@ -1604,6 +1645,27 @@ def model_shadow_log(
     if ma is None:
         return {"rows": [], "total": 0}
     return ma.get_shadow_log(limit=limit, decision_type=decision_type)
+
+
+@app.get("/model/paper_trades")
+def model_paper_trades(
+    limit: int = Query(default=100, ge=1, le=500),
+    independent_only: bool = Query(default=False),
+) -> dict:
+    """
+    ML-08 paper trades proposed by the independent entry scan.
+
+    Returns all rows plus summary stats:
+    - model_only_win_rate: win rate for would_rules_have_entered=false trades
+    - rules_eligible_win_rate: win rate for would_rules_have_entered=true trades
+    """
+    ma = state.model_agent_ref
+    if ma is None:
+        return {
+            "rows": [], "total": 0, "open": 0, "closed": 0,
+            "model_only_win_rate": None, "rules_eligible_win_rate": None,
+        }
+    return ma.get_paper_trades(limit=limit, independent_only=independent_only)
 
 
 # ── Model training (ML-03) ────────────────────────────────────────────────────
@@ -2263,49 +2325,6 @@ async def redeem_position_endpoint(req: RedeemRequest) -> dict:
         }
 
 
-# ── Trades ────────────────────────────────────────────────────────────────────
-
-@app.get("/trades")
-def trades(
-    limit: int = Query(default=100, ge=1, le=5000),
-    offset: int = Query(default=0, ge=0),
-    strategy: Optional[str] = Query(default=None),
-    underlying: Optional[str] = Query(default=None),
-) -> dict:
-    """Paginated trade history from data/trades.csv."""
-    rows = _load_trades_csv()
-
-    # Filter
-    if strategy:
-        rows = [r for r in rows if r.get("strategy", "").lower() == strategy.lower()]
-    if underlying:
-        # Main rows: filter by underlying as usual.
-        # Hedge rows (strategy="momentum_hedge") are recorded with underlying="" so they
-        # would always be dropped by the filter, causing the per-coin P&L to appear wrong
-        # (all losses) while "All" shows positive (hedge P&L included).
-        # Fix: after identifying the matching main rows, also include any momentum_hedge
-        # rows whose market_id is in that set.
-        main_rows = [r for r in rows if r.get("underlying", "").upper() == underlying.upper()]
-        main_market_ids = {r["market_id"] for r in main_rows}
-        hedge_rows = [
-            r for r in rows
-            if r.get("strategy") == "momentum_hedge"
-            and r.get("market_id") in main_market_ids
-            and r.get("underlying", "").upper() != underlying.upper()  # avoid duplicates if underlying was set
-        ]
-        rows = main_rows + hedge_rows
-
-    total = len(rows)
-    page = rows[offset: offset + limit]
-    return {
-        "trades": page,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "timestamp": time.time(),
-    }
-
-
 # ── Accounting endpoints (accounting.py / acct_ledger.csv / acct_positions.json) ──
 
 @app.get("/acct/ledger")
@@ -2447,30 +2466,6 @@ async def pm_history_endpoint(
     except Exception as exc:
         log.error("PM history fetch failed", exc=str(exc))
         raise HTTPException(status_code=502, detail="Failed to fetch PM history")
-
-
-@app.post("/reconcile", dependencies=[Depends(require_auth)])
-async def reconcile_endpoint() -> dict:
-    """Reconcile trades.csv against Polymarket Data API (source of truth).
-
-    Fetches actual fill prices from data-api.polymarket.com/activity and patches
-    trades.csv rows where the bot's recorded prices diverge from PM's on-chain data.
-
-    Fixes two known recording bugs:
-      1. Entry price stored as order price instead of actual CLOB fill price.
-      2. TP-sell exits recorded as WIN at $1.00 when the position was actually
-         sold early at a taker price (e.g. 43¢) — often a loss.
-
-    Paper-trading runs are skipped (no PM on-chain activity to reference).
-    Returns:
-        { "status": "ok"|"skipped", "patched": int, "markets": [...], "errors": [...] }
-    """
-    if config.PAPER_TRADING:
-        return {"status": "skipped", "reason": "paper trading — no PM source of truth", "patched": 0}
-
-    from pm_reconcile import reconcile_trades_csv
-    result = await reconcile_trades_csv(config.POLY_FUNDER)
-    return {"status": "ok", **result}
 
 
 # ── Order event log ───────────────────────────────────────────────────────────
@@ -3215,28 +3210,6 @@ def _load_acct_ledger_trades() -> list[dict]:
     return trades
 
 
-def _load_trades_csv() -> list[dict]:
-    """Load all rows from data/trades.csv. Returns [] if missing."""
-    if not TRADES_CSV.exists():
-        return []
-    try:
-        with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-        # Guard against headerless CSVs: if the CSV was written without a header,
-        # DictReader uses the first data row as field names, producing garbage.
-        # Detect this and re-read with explicit fieldnames from risk.py.
-        if rows and "timestamp" not in rows[0]:
-            log.warning("trades.csv missing header row — re-reading with explicit fieldnames")
-            from risk import TRADES_HEADER as _TRADES_HDR
-            with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-                rows = list(csv.DictReader(f, fieldnames=_TRADES_HDR))
-        return rows
-    except Exception as exc:
-        log.error("Failed to read trades CSV", exc=str(exc))
-        return []
-
-
 def _load_fills_csv() -> list[dict]:
     """Load all rows from data/fills.csv in reverse-chronological order. Returns [] if missing."""
     if not FILLS_CSV.exists():
@@ -3453,6 +3426,23 @@ def get_report(filename: str):
 </html>"""
         return HTMLResponse(content=html, status_code=404)
     return FileResponse(path, media_type="text/html")
+
+
+# ── Webapp static assets + SPA catch-all ─────────────────────────────────────
+_WEBAPP_DIST = Path(__file__).parent / "webapp" / "dist"
+_WEBAPP_ASSETS = _WEBAPP_DIST / "assets"
+
+if _WEBAPP_ASSETS.exists():
+    app.mount("/assets", StaticFiles(directory=str(_WEBAPP_ASSETS)), name="webapp_assets")
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def spa_fallback(full_path: str) -> FileResponse:
+    """Serve the React SPA index for all non-API routes (HTML5 history mode)."""
+    index = _WEBAPP_DIST / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
+    raise HTTPException(status_code=404, detail="Webapp not built — run: cd webapp && npm run build")
 
 
 # ── Server entry point ────────────────────────────────────────────────────────

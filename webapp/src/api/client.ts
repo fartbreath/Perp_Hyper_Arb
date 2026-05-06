@@ -578,6 +578,9 @@ export interface ConfigData {
   momentum_delta_sl_min_ticks?: number;
   momentum_delta_sl_grace_secs?: number;
   momentum_delta_sl_token_veto_floor?: number;
+  // WINNER-fill-type SL tuning
+  momentum_winner_delta_sl_grace_secs?: number;
+  momentum_winner_delta_sl_multiplier?: number;
   // Kelly extensions (COB)
   momentum_kelly_min_tte_seconds?: number;
   momentum_min_entry_usd?: number;
@@ -648,6 +651,17 @@ export interface ConfigData {
   opening_neutral_loser_confidence_tighten?: number;
   // ON-07 — Winner confirmation gate
   opening_neutral_winner_confirm_floor?: number;
+  // ML / Model Agent (Phase 3–4)
+  model_agent_enabled?: boolean;
+  model_b_enabled?: boolean;
+  model_b_suppress_threshold?: number;
+  model_a_enabled?: boolean;
+  model_a_min_scale?: number;
+  model_a_max_scale?: number;
+  model_a_independent_enabled?: boolean;
+  model_a_independent_entry_threshold?: number;
+  model_a_min_tte_secs?: number;
+  model_a_max_open_positions?: number;
 }
 
 export interface InventoryData {
@@ -864,6 +878,41 @@ export async function triggerModelTrain(): Promise<{ status: string }> {
   }
   return res.json();
 }
+
+// ── ML-08: model paper trades ─────────────────────────────────────────────────
+
+export interface PaperTradeRow {
+  timestamp: string;
+  market_id: string;
+  market_title: string;
+  underlying: string;
+  market_type: string;
+  side: string;
+  entry_price: string;
+  size_usd: string;
+  model_a_score: string;
+  features_json: string;
+  status: string;           // "proposed" | "closed"
+  exit_price: string;
+  pnl: string;
+  would_rules_have_entered: string; // "true" | "false"
+  tte_seconds_at_entry: string;
+}
+
+export interface PaperTradesData {
+  rows: PaperTradeRow[];
+  total: number;
+  open: number;
+  closed: number;
+  model_only_win_rate: number | null;
+  rules_eligible_win_rate: number | null;
+}
+
+export const useModelPaperTrades = (independentOnly: boolean = false) =>
+  usePolling<PaperTradesData>(
+    `/model/paper_trades?limit=100&independent_only=${independentOnly}`,
+    15_000,
+  );
 
 export interface WalletPosition {
   token_id: string;

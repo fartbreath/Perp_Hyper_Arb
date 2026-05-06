@@ -34,6 +34,10 @@ MODEL_B_FEATURES: list[str] = [
     "on_combined_cost",
     "clob_yes_best_bid",
     "clob_yes_bid_depth_5",
+    # ON-only (v3) — -999 sentinel for Momentum rows
+    "on_price_to_beat",
+    "on_clob_no_bid_depth_5",
+    "on_hl_mark_price",
 ]
 
 # Model A — entry quality / sizing
@@ -48,8 +52,12 @@ MODEL_A_FEATURES: list[str] = [
     "deribit_iv",
     "mom_yes_depth_share",
     "on_yes_depth_share",
+    # ON-only (v3) — -999 sentinel for pure Momentum rows
+    "on_clob_no_bid_depth_5",
     "mom_funding_rate",
     "on_funding_rate",
+    "on_price_to_beat",
+    "on_hl_mark_price",
     "mom_tte_seconds",
     "tte_seconds_at_entry",
     "hour_utc",
@@ -112,6 +120,10 @@ def build_exit_snapshot(row: dict) -> dict[str, float]:
         "on_combined_cost":         row.get("on_combined_cost") or row.get("combined_cost"),
         "clob_yes_best_bid":        row.get("clob_yes_best_bid"),
         "clob_yes_bid_depth_5":     row.get("clob_yes_bid_depth_5"),
+        # ON-only features (v3)
+        "on_price_to_beat":         row.get("on_price_to_beat") or row.get("price_to_beat"),
+        "on_clob_no_bid_depth_5":   row.get("on_clob_no_bid_depth_5") or row.get("clob_no_bid_depth_5"),
+        "on_hl_mark_price":         row.get("on_hl_mark_price") or row.get("hl_mark_price"),
     }
 
     return {feat: _safe_float(feature_map.get(feat)) for feat in MODEL_B_FEATURES}
@@ -171,6 +183,10 @@ def build_entry_snapshot(row: dict) -> dict[str, float]:
         "vol_regime_high":      vol_regime_high,
         "mom_twap_dev_bps":     row.get("twap_dev_bps"),
         "mom_signal_delta_pct": row.get("signal_delta_pct"),
+        # ON-only features (v3) — populated when the entry was an ON-promoted trade
+        "on_clob_no_bid_depth_5": row.get("on_clob_no_bid_depth_5") or row.get("clob_no_bid_depth_5"),
+        "on_price_to_beat":       row.get("on_price_to_beat") or row.get("price_to_beat"),
+        "on_hl_mark_price":       row.get("on_hl_mark_price") or row.get("hl_mark_price"),
     }
 
     return {feat: _safe_float(feature_map.get(feat)) for feat in MODEL_A_FEATURES}

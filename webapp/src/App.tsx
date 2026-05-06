@@ -13,6 +13,7 @@ import Pending from "./pages/Pending";
 import Fills from "./pages/Fills";
 import Events from "./pages/Events";
 import ModelAgentPage from "./pages/ModelAgent";
+import ModelPaperTradesPage from "./pages/ModelPaperTrades";
 import "./App.css";
 
 const NAV_LINKS = [
@@ -27,6 +28,7 @@ const NAV_LINKS = [
   { to: "/fills", label: "Fills" },
   { to: "/events", label: "Events" },
   { to: "/model", label: "Model" },
+  { to: "/model-paper", label: "Paper Trades" },
   { to: "/logs", label: "Logs" },
   { to: "/settings", label: "⚙️ Settings" },
 ];
@@ -76,6 +78,7 @@ export default function App() {
           <Route path="/fills" element={<Fills />} />
           <Route path="/events" element={<Events />} />
           <Route path="/model" element={<ModelAgentPage />} />
+          <Route path="/model-paper" element={<ModelPaperTradesPage />} />
           <Route path="/logs" element={<Logs />} />
         </Routes>
       </main>

@@ -461,6 +461,13 @@ def should_exit(
             # SL_PCT=0.1 the bot exits when still 0.1% ahead, before the oracle
             # crosses and Polymarket resolves against the position.
             _sl = delta_sl_pct if delta_sl_pct is not None else config.MOMENTUM_DELTA_STOP_LOSS_PCT
+            # WINNER-fill-type positions (ON-promoted) use a looser SL threshold to avoid
+            # false stops on mid-bucket oscillation.  MOMENTUM_WINNER_DELTA_SL_MULTIPLIER
+            # is applied to the per-coin threshold (e.g. 0.5 → BTC 1% → 0.5%).
+            _is_winner = getattr(pos, "fill_type", "MAIN") == "WINNER"
+            if _is_winner:
+                _winner_mult = getattr(config, "MOMENTUM_WINNER_DELTA_SL_MULTIPLIER", 1.0)
+                _sl = _sl * _winner_mult
             _oracle_delta_pct = current_delta_pct  # capture for prob-SL gate below
             # Suppress delta SL while the position is in the post-open grace window
             # OR while TTE is still above the entry threshold — whichever ends first.
@@ -479,7 +486,12 @@ def should_exit(
             _min_tte = config.MOMENTUM_MIN_TTE_SECONDS.get(
                 pos.market_type, config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
             ) if isinstance(config.MOMENTUM_MIN_TTE_SECONDS, dict) else config.MOMENTUM_MIN_TTE_SECONDS_DEFAULT
-            _delta_sl_grace_secs = getattr(config, "MOMENTUM_DELTA_SL_GRACE_SECS", 60)
+            _delta_sl_grace_secs = (
+                getattr(config, "MOMENTUM_WINNER_DELTA_SL_GRACE_SECS",
+                        getattr(config, "MOMENTUM_DELTA_SL_GRACE_SECS", 60))
+                if _is_winner
+                else getattr(config, "MOMENTUM_DELTA_SL_GRACE_SECS", 60)
+            )
             _in_grace = (now - pos.opened_at).total_seconds() < _delta_sl_grace_secs
             _above_min_tte = tte_seconds is not None and tte_seconds >= _min_tte
             _suppress_delta_sl = _in_grace and _above_min_tte
@@ -737,8 +749,6 @@ class PositionMonitor:
             self._spot.on_chainlink_update(self._on_spot_update)
         log.info("PositionMonitor started (event-driven)")
         asyncio.create_task(self._auto_redeem_loop())
-        if not config.PAPER_TRADING:
-            asyncio.create_task(self._pm_reconcile_loop())
         # Rare backstop sweep: catches resolved markets that PM WS never echoes
         # (e.g. resolution during a transient disconnect) and any other edge-case
         # positions that slipped through.  self._interval is acceptable for
@@ -962,35 +972,6 @@ class PositionMonitor:
                 except Exception as exc:
                     log.error("Auto-redeem loop error", exc=str(exc))
             await asyncio.sleep(config.REDEEM_POLL_INTERVAL)
-
-    # ── PM reconciliation ─────────────────────────────────────────────────────
-
-    async def _pm_reconcile_loop(self) -> None:
-        """Periodically reconcile trades.csv against Polymarket Data API.
-
-        Runs every 5 minutes in live mode.  Patches trades.csv with actual fill
-        prices and PnL from data-api.polymarket.com/activity — correcting the two
-        known recording bugs:
-          1. Entry price stored as order price instead of actual CLOB fill price.
-          2. TP-sell exits recorded as WIN at $1 when the position was sold early.
-        """
-        # Initial delay: let startup restore and first trades settle
-        await asyncio.sleep(90)
-        while self._running:
-            try:
-                from pm_reconcile import reconcile_trades_csv
-                result = await reconcile_trades_csv(config.POLY_FUNDER)
-                if result.get("patched", 0) > 0:
-                    log.info(
-                        "PM reconciliation: trades.csv patched",
-                        patched=result["patched"],
-                        markets=[m["market_title"][:40] for m in result.get("markets", [])],
-                    )
-                if result.get("errors"):
-                    log.warning("PM reconciliation errors", errors=result["errors"])
-            except Exception as exc:
-                log.error("PM reconcile loop error", exc=str(exc))
-            await asyncio.sleep(300)  # every 5 minutes
 
     async def _fetch_hedge_resolve_spot(self, parent_pos: "Position") -> float:
         """Return the settlement spot price for parent_pos's market.

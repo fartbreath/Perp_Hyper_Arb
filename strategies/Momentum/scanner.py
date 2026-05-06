@@ -128,6 +128,9 @@ MOMENTUM_FILLS_HEADER = [
     "clob_yes_spread",     # best_ask - best_bid
     "clob_yes_bid_depth_5",# sum(p*s) for top-5 bid levels in USDC
     "deribit_iv",          # Deribit ATM mark IV (fraction, e.g. 0.85); None if source != deribit_atm
+    # ── Model A sizing (ML-07, Phase 3) ────────────────────────────────────
+    "model_a_score",       # ModelAgent score_entry() output (0–1); None if disabled
+    "model_a_scale",       # Kelly scale factor applied: MODEL_A_MIN..MAX_SCALE
 ]
 
 
@@ -177,6 +180,7 @@ class MomentumScanner(BaseStrategy):
         on_signal: Any = None,
         funding_cache: Any = None,
         oracle_tracker: Any = None,
+        model_agent: Any = None,
     ) -> None:
         self._pm = pm
         self._hl = hl
@@ -187,6 +191,7 @@ class MomentumScanner(BaseStrategy):
         self._on_signal: Any = on_signal  # optional callback(signal_dict) for API state
         self._funding_cache = funding_cache   # M-06 FundingRateCache (Phase 1)
         self._oracle_tracker = oracle_tracker  # M-08 OracleTickTracker (Phase 1)
+        self._model_agent = model_agent        # ML-07: ModelAgent (Phase 3, default None)
         # Per-market cooldown after any open/close/failed entry
         self._market_cooldown: dict[str, float] = {}   # market_id → unix timestamp of last touch
         # Persist cooldowns to disk so restarts honour the full cooldown window.
@@ -1404,6 +1409,57 @@ class MomentumScanner(BaseStrategy):
             )
             return False
 
+        # ── Model A entry sizing scale (ML-07) ────────────────────────────────
+        # Downscale Kelly position when Model A signals low entry confidence.
+        # Upscaling (> 1.0×) is disabled in Phase 3 (MODEL_A_MAX_SCALE = 1.0).
+        # On any error the unscaled size is used (fail-open).
+        _model_a_score: Optional[float] = None
+        _model_a_scale: float = 1.0
+        if getattr(config, "MODEL_A_ENABLED", False) and self._model_agent is not None:
+            try:
+                _min_tte = float(config.MOMENTUM_KELLY_MIN_TTE_SECONDS)
+                _obs_z_now = signal.delta_pct / (
+                    signal.sigma_ann * math.sqrt(
+                        max(signal.tte_seconds, _min_tte) / 31_536_000
+                    ) * 100 + 1e-9
+                )
+                _ma_context = {
+                    "signal_obs_z":     _obs_z_now,
+                    "effective_z":      _kelly_debug.get("kelly_z_total"),
+                    "signal_sigma_ann": signal.sigma_ann,
+                    "kelly_f":          _kelly_debug.get("kelly_f"),
+                    "kelly_win_prob":   _kelly_debug.get("kelly_win_prob"),
+                    "kelly_multiplier": _kelly_debug.get("kelly_fraction_cfg"),
+                    "oracle_delta_pct": signal.delta_pct,
+                    "deribit_iv":       signal.sigma_ann if signal.vol_source == "deribit_atm" else None,
+                    "yes_depth_share":  signal.entry_yes_depth_share,
+                    "tte_seconds":      signal.tte_seconds,
+                    "timestamp":        signal.timestamp,
+                    "vol_regime":       signal.entry_vol_regime,
+                    "twap_dev_bps":     signal.entry_twap_dev_bps,
+                    "signal_delta_pct": signal.delta_pct,
+                    "funding_rate":     signal.entry_funding_rate,
+                }
+                _model_a_score = self._model_agent.score_entry(signal.market_id, _ma_context)
+                _min_sc = config.MODEL_A_MIN_SCALE
+                _max_sc = config.MODEL_A_MAX_SCALE
+                _model_a_scale = max(_min_sc, min(_max_sc, _min_sc + _model_a_score * (_max_sc - _min_sc)))
+                size_usd = round(size_usd * _model_a_scale, 2)
+                log.info(
+                    "Momentum: Model A size scale applied",
+                    market=signal.market_title[:50],
+                    side=signal.side,
+                    model_a_score=round(_model_a_score, 3),
+                    model_a_scale=round(_model_a_scale, 3),
+                    size_usd=size_usd,
+                )
+            except Exception as _ma_exc:
+                log.warning(
+                    "Momentum: Model A inference error — using unscaled Kelly",
+                    market=signal.market_title[:50],
+                    exc=str(_ma_exc),
+                )
+
         # ── Order placement with cancel-and-retry (Item 2) ──────────────────
         # In live mode: wait MOMENTUM_ORDER_CANCEL_SEC for a fill WS event;
         # on timeout cancel the unfilled order and retry at a higher price.
@@ -1881,6 +1937,9 @@ class MomentumScanner(BaseStrategy):
                     round(signal.sigma_ann, 6)
                     if signal.vol_source == "deribit_atm" else None
                 ),
+                # Model A sizing (ML-07, Phase 3)
+                "model_a_score": round(_model_a_score, 4) if _model_a_score is not None else None,
+                "model_a_scale": round(_model_a_scale, 4),
             }
             with MOMENTUM_FILLS_CSV.open("a", newline="") as _f:
                 _writer = csv.DictWriter(_f, fieldnames=MOMENTUM_FILLS_HEADER, extrasaction="ignore")

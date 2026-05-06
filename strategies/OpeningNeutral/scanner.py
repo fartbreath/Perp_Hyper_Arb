@@ -37,7 +37,7 @@ _DATA_DIR = Path(__file__).parent.parent.parent / "data"
 _ON_FILLS_CSV = _DATA_DIR / "on_fills.csv"
 # on_fills.csv schema — v1 (Phase 0: cold-book guard + entry context logging).
 # Increment this comment and add migration in _ensure_on_fills_csv() whenever
-# columns are added or removed.  Schema version: 2 (added clob_yes_* + deribit_iv)
+# columns are added or removed.  Schema version: 4 (added model_a_score, model_a_scale)
 _ON_FILLS_HEADER = [
     "timestamp", "pair_id", "market_id", "market_title", "underlying",
     "market_type", "yes_entry", "no_entry", "combined_cost",
@@ -47,8 +47,16 @@ _ON_FILLS_HEADER = [
     "loser_leg", "loser_fill_price", "loser_fill_time_secs", "winner_exit_price",
     # CLOB snapshot at entry time (from live PM order book WS cache)
     "clob_yes_best_bid", "clob_yes_best_ask", "clob_yes_spread", "clob_yes_bid_depth_5",
+    # NO-leg depth at entry (raw sum of top-5 NO bid levels in USDC)
+    "clob_no_bid_depth_5",
     # Deribit ATM IV at entry (fraction; None for non-options markets)
     "deribit_iv",
+    # Loser-identification signals added v3
+    "price_to_beat",      # Chainlink oracle strike at market open (from Gamma API)
+    "hl_mark_price",      # HL perp mark price for underlying at entry
+    # ML-07: Model A sizing columns (written even when MODEL_A_ENABLED=False; value=None)
+    "model_a_score",      # Model A entry quality score (0–1), None when disabled
+    "model_a_scale",      # Resulting size multiplier applied to OPENING_NEUTRAL_SIZE_USD
 ]
 
 # Minimum seconds between entry evaluations for the same market on the hot WS path.
@@ -149,6 +157,7 @@ class OpeningNeutralScanner(BaseStrategy):
         on_close_callback=None,
         on_open_callback=None,
         funding_cache=None,
+        model_agent=None,
     ) -> None:
         self._pm = pm
         self._risk = risk
@@ -158,6 +167,7 @@ class OpeningNeutralScanner(BaseStrategy):
         self._on_close_callback = on_close_callback
         self._on_open_callback = on_open_callback
         self._funding_cache = funding_cache   # ON-04/05: FundingRateCache (Phase 1)
+        self._model_agent = model_agent       # ML-06: ModelAgent (Phase 3, default None)
 
         self._running: bool = False
         # Markets currently being entered (guards against double-entry).
@@ -219,6 +229,9 @@ class OpeningNeutralScanner(BaseStrategy):
         # _entry_spread_cache: market_id → (yes_spread, no_spread) stored at
         # evaluation time, consumed by _register_pair.
         self._entry_spread_cache: dict[str, tuple] = {}
+        # ML-07: model_a score cache — pair_id → (score, scale) computed in
+        # _enter_pair, consumed by _register_pair to write to on_fills.csv.
+        self._pending_ma_scores: dict[str, tuple] = {}
         # _pair_csv_data: pair_id → row dict, populated at _register_pair,
         # updated and written to CSV when the loser fills.
         self._pair_csv_data: dict[str, dict] = {}
@@ -265,6 +278,14 @@ class OpeningNeutralScanner(BaseStrategy):
                 _update_on_fills_winner_exit(_pair_id, _approx_exit)
                 self._winner_pending.pop(_key, None)
                 self._winner_pos_refs.pop(_pair_id, None)
+        # Flush any CSV rows that were never written (pairs still open at shutdown).
+        # These are partial rows — loser_leg stays "none" so the analysis script
+        # knows the pair did not complete a loser exit in this session.
+        for _pid, _csv_row in list(self._pair_csv_data.items()):
+            _csv_row.pop("_entry_ts", None)
+            _write_on_fills_row(_csv_row)
+            log.info("OpeningNeutral: on_fills row flushed at shutdown", pair_id=_pid[:12])
+        self._pair_csv_data.clear()
 
     def notify_winner_closed(self, market_id: str, side: str, exit_price: float) -> None:
         """Backfill winner_exit_price in on_fills.csv for a completed pair.
@@ -526,6 +547,18 @@ class OpeningNeutralScanner(BaseStrategy):
             })
             if len(self._closed_pairs) > 20:
                 self._closed_pairs = self._closed_pairs[-20:]
+            # ON-02: flush CSV row for pairs that resolved without a loser exit
+            # (both legs closed by monitor.py / settlement — _on_exit_fill was
+            # never called so the row is still in _pair_csv_data).
+            _csv_row = self._pair_csv_data.pop(pid, None)
+            if _csv_row is not None:
+                _csv_row.pop("_entry_ts", None)
+                # loser_leg already set to "none" at initialisation — no change needed.
+                _write_on_fills_row(_csv_row)
+                log.info(
+                    "OpeningNeutral: on_fills row flushed at resolution (no loser exit)",
+                    pair_id=pid[:12],
+                )
             log.info(
                 "OpeningNeutral: pair pruned (both legs closed)",
                 pair_id=pid[:12],
@@ -792,6 +825,61 @@ class OpeningNeutralScanner(BaseStrategy):
                                     pair_id=pair_id[:12],
                                     side=mon_side,
                                     best_bid=best_bid,
+                                )
+                        # ── Model B exit gate (ML-06) ────────────────────────
+                        # Suppress the loser exit when Model B determines the
+                        # CLOB bid collapse is settlement drain, not informed
+                        # selling.  Model B can only suppress — it cannot force
+                        # an exit the rules threshold has not triggered.
+                        if getattr(config, "MODEL_B_ENABLED", False) and self._model_agent is not None:
+                            try:
+                                _entry_csv = self._pair_csv_data.get(pair_id, {})
+                                _tte_secs = round(mon_pos.tte_years * 365.25 * 24 * 3600) if mon_pos.tte_years else None
+                                _mb_context = {
+                                    "oracle_delta_pct":          _oracle_delta,
+                                    "deribit_iv":                _entry_csv.get("deribit_iv"),
+                                    "implied_prob":              best_bid,  # current CLOB bid — what triggered the exit check
+                                    "on_yes_depth_share":        _entry_csv.get("yes_depth_share"),
+                                    "on_loser_confidence_score": _entry_csv.get("loser_confidence_score"),
+                                    "on_loser_fill_price":       _entry_csv.get("loser_fill_price") or mon_pos.entry_price,
+                                    "on_loser_fill_time_secs":   _entry_csv.get("loser_fill_time_secs"),
+                                    "tte_seconds_at_entry":      _tte_secs,
+                                    "timestamp":                 pair.get("entry_ts"),
+                                    "on_funding_rate":           _entry_csv.get("funding_rate"),
+                                    "on_combined_cost":          _entry_csv.get("combined_cost"),
+                                    "clob_yes_best_bid":         best_bid,
+                                    "clob_yes_bid_depth_5":      _entry_csv.get("clob_yes_bid_depth_5"),
+                                    # ON-only v3 features
+                                    "on_price_to_beat":          _entry_csv.get("price_to_beat"),
+                                    "on_clob_no_bid_depth_5":    _entry_csv.get("clob_no_bid_depth_5"),
+                                    "on_hl_mark_price":          _entry_csv.get("hl_mark_price"),
+                                }
+                                _mb_score = self._model_agent.score_exit(pair_id, _mb_context)
+                                if _mb_score < config.MODEL_B_SUPPRESS_THRESHOLD:
+                                    log.info(
+                                        "OpeningNeutral: Model B suppressed exit",
+                                        market_id=pair.get("market_id", "")[:16],
+                                        pair_id=pair_id[:12],
+                                        side=mon_side,
+                                        model_b_score=round(_mb_score, 3),
+                                        threshold=config.MODEL_B_SUPPRESS_THRESHOLD,
+                                    )
+                                    # ML-06: write suppression to shadow_log for audit trail
+                                    asyncio.create_task(
+                                        self._model_agent.log_model_b_suppression(
+                                            market_id=pair.get("market_id", ""),
+                                            market_type=_entry_csv.get("market_type", ""),
+                                            score=_mb_score,
+                                            context=_mb_context,
+                                        ),
+                                        name=f"mb_shadow_{pair_id[:12]}",
+                                    )
+                                    return  # suppress — recheck on next tick
+                            except Exception as _mb_exc:
+                                log.warning(
+                                    "OpeningNeutral: Model B inference error — allowing exit",
+                                    pair_id=pair_id[:12],
+                                    exc=str(_mb_exc),
                                 )
                         # ── Fire loser exit ──────────────────────────────────
                         self._exiting_legs.add(token_id)
@@ -1064,6 +1152,53 @@ class OpeningNeutralScanner(BaseStrategy):
         try:
             pair_id = uuid.uuid4().hex
             size_usd = config.OPENING_NEUTRAL_SIZE_USD
+
+            # ── ML-07: Model A sizing scale ──────────────────────────────────
+            # Apply Model A score as a size multiplier so capital exposure is
+            # proportional to signal quality.  Gate is off by default
+            # (MODEL_A_ENABLED=False) and fails open to unscaled base size.
+            _ma_score_on: Optional[float] = None
+            _ma_scale_on: float = 1.0
+            if getattr(config, "MODEL_A_ENABLED", False) and self._model_agent is not None:
+                try:
+                    import datetime as _dt
+                    _now_dt = _dt.datetime.utcnow()
+                    _tte_secs_on: Optional[float] = None
+                    if hasattr(market, "end_date") and market.end_date is not None:
+                        _tte_secs_on = market.end_date.timestamp() - time.time()
+                    _on_funding_ma: Optional[float] = None
+                    if self._funding_cache is not None and getattr(market, "underlying", None):
+                        try:
+                            _on_funding_ma = self._funding_cache.get(market.underlying)
+                        except Exception:
+                            pass
+                    _ma_context_on: dict = {
+                        "on_funding_rate":      _on_funding_ma,
+                        "tte_seconds_at_entry": round(_tte_secs_on) if _tte_secs_on is not None else None,
+                        "hour_utc":             _now_dt.hour,
+                        "day_of_week":          _now_dt.weekday(),
+                    }
+                    _ma_score_on = self._model_agent.score_entry(market_id, _ma_context_on)
+                    _min_scale = getattr(config, "MODEL_A_MIN_SCALE", 0.5)
+                    _max_scale = getattr(config, "MODEL_A_MAX_SCALE", 1.0)
+                    _ma_scale_on = max(_min_scale, min(_max_scale,
+                                        _min_scale + _ma_score_on * (_max_scale - _min_scale)))
+                    size_usd = round(size_usd * _ma_scale_on, 2)
+                    log.debug(
+                        "OpeningNeutral: Model A sizing applied",
+                        market_id=market_id[:16],
+                        score=round(_ma_score_on, 3),
+                        scale=round(_ma_scale_on, 3),
+                        size_usd=size_usd,
+                    )
+                except Exception as _ma_exc:
+                    log.warning(
+                        "OpeningNeutral: Model A inference error — using unscaled size",
+                        market_id=market_id[:16],
+                        exc=str(_ma_exc),
+                    )
+            # Store for _register_pair to persist in on_fills.csv
+            self._pending_ma_scores[pair_id] = (_ma_score_on, _ma_scale_on)
 
             log.info(
                 "OpeningNeutral: entering pair",
@@ -1561,6 +1696,34 @@ class OpeningNeutralScanner(BaseStrategy):
             else None
         )
 
+        # CLOB snapshot for NO token (raw depth of top-5 bid levels in USDC)
+        _no_book = self._pm.get_book(no_token_id)
+        _clob_no_depth = (
+            round(sum(p * s for p, s in _no_book.bids[:5]), 2)
+            if _no_book and _no_book.bids
+            else None
+        )
+
+        # HL perp mark price for underlying at entry (from FundingRateCache webData2)
+        _underlying = getattr(market, "underlying", "")
+        _hl_mark = (
+            self._funding_cache.get_mark(_underlying)
+            if self._funding_cache is not None
+            else None
+        )
+
+        # price_to_beat: Chainlink oracle strike at market open from Gamma API.
+        # Fetched here so we have the spot-vs-strike signal in on_fills.csv for
+        # loser-leg identification before any leg is sold.  Non-blocking: returns
+        # None on network failure, which is safe — the position is already open.
+        _market_slug = getattr(market, "market_slug", "")
+        _price_to_beat: Optional[float] = None
+        if _market_slug:
+            try:
+                _price_to_beat = await self._pm.fetch_price_to_beat(_market_slug)
+            except Exception:  # pylint: disable=broad-except
+                pass
+
         self._pair_csv_data[pair_id] = {
             "timestamp":             datetime.now(timezone.utc).isoformat(),
             "pair_id":               pair_id,
@@ -1587,10 +1750,18 @@ class OpeningNeutralScanner(BaseStrategy):
             "clob_yes_best_ask":     _clob_ask,
             "clob_yes_spread":       _clob_spread,
             "clob_yes_bid_depth_5":  _clob_depth,
+            "clob_no_bid_depth_5":   _clob_no_depth,
             # Deribit IV: ON strategy is a pair trade; record None (binary markets have no strike)
             "deribit_iv":            None,
+            # Loser-identification signals (v3)
+            "price_to_beat":         _price_to_beat,
+            "hl_mark_price":         round(_hl_mark, 4) if _hl_mark is not None else None,
             "_entry_ts":             time.time(),   # internal only — popped before write
         }
+        # ML-07: inject Model A score/scale from _enter_pair cache into the CSV row
+        _ma_pair = self._pending_ma_scores.pop(pair_id, (None, 1.0))
+        self._pair_csv_data[pair_id]["model_a_score"] = round(_ma_pair[0], 4) if _ma_pair[0] is not None else None
+        self._pair_csv_data[pair_id]["model_a_scale"] = round(_ma_pair[1], 4)
 
         # ON-04/05: store per-pair triggers in _active_pairs so _on_price_event
         # can check each leg against its individual threshold.

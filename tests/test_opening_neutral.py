@@ -876,57 +876,46 @@ def test_on_exit_fill_idempotent():
     _on_exit_fill is idempotent: when called a second time after the loser is
     already closed, it returns silently without calling close_position again.
     """
-    import risk as risk_module
-    from pathlib import Path
-    import tempfile, os
-
     # Use a real RiskEngine so is_closed is properly set on the first call.
-    with tempfile.TemporaryDirectory() as td:
-        temp_csv = Path(td) / "trades.csv"
-        orig = risk_module.TRADES_CSV
-        risk_module.TRADES_CSV = temp_csv
-        try:
-            real_risk = RiskEngine()
-            pair_id = "pair_idem"
-            yes_pos = _make_position("cond_idem_001", "YES", 0.50, pair_id)
-            no_pos  = _make_position("cond_idem_001", "NO",  0.50, pair_id)
-            real_risk.open_position(yes_pos)
-            real_risk.open_position(no_pos)
+    real_risk = RiskEngine()
+    pair_id = "pair_idem"
+    yes_pos = _make_position("cond_idem_001", "YES", 0.50, pair_id)
+    no_pos  = _make_position("cond_idem_001", "NO",  0.50, pair_id)
+    real_risk.open_position(yes_pos)
+    real_risk.open_position(no_pos)
 
-            pm = MagicMock()
-            pm._paper_mode = True
-            pm.cancel_order = AsyncMock(return_value=None)
-            pm.register_fill_future = MagicMock()
-            pm.get_markets = MagicMock(return_value={})
-            pm.fetch_price_to_beat = AsyncMock(return_value=None)
-            spot = MagicMock()
-            vol  = MagicMock()
+    pm = MagicMock()
+    pm._paper_mode = True
+    pm.cancel_order = AsyncMock(return_value=None)
+    pm.register_fill_future = MagicMock()
+    pm.get_markets = MagicMock(return_value={})
+    pm.fetch_price_to_beat = AsyncMock(return_value=None)
+    spot = MagicMock()
+    vol  = MagicMock()
 
-            scanner = OpeningNeutralScanner(pm=pm, risk=real_risk, spot_client=spot, vol_fetcher=vol)
-            scanner._running = True
-            scanner._active_pairs[pair_id] = {
-                "market_id": "cond_idem_001",
-                "market_title": "Test",
-                "yes_pos": yes_pos,
-                "no_pos": no_pos,
-            }
+    scanner = OpeningNeutralScanner(pm=pm, risk=real_risk, spot_client=spot, vol_fetcher=vol)
+    scanner._running = True
+    scanner._active_pairs[pair_id] = {
+        "market_id": "cond_idem_001",
+        "market_title": "Test",
+        "yes_pos": yes_pos,
+        "no_pos": no_pos,
+    }
 
-            with (
-                patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
-                patch.object(config, "MOMENTUM_PROB_SL_ENABLED", False),
-            ):
-                # First call — closes NO (loser)
-                _run(scanner._on_exit_fill(pair_id, "NO", exit_price=0.35))
-                assert no_pos.is_closed is True
-                # Second call — loser already closed; must return silently
-                _run(scanner._on_exit_fill(pair_id, "NO", exit_price=0.35))
+    with (
+        patch.object(config, "OPENING_NEUTRAL_LOSER_EXIT_PRICE", 0.35),
+        patch.object(config, "MOMENTUM_PROB_SL_ENABLED", False),
+    ):
+        # First call — closes NO (loser)
+        _run(scanner._on_exit_fill(pair_id, "NO", exit_price=0.35))
+        assert no_pos.is_closed is True
+        # Second call — loser already closed; must return silently
+        _run(scanner._on_exit_fill(pair_id, "NO", exit_price=0.35))
 
-            # Winner must remain open after the idempotent second call
-            assert yes_pos.is_closed is False, (
-                "Winner must remain open after idempotent second _on_exit_fill call"
-            )
-        finally:
-            risk_module.TRADES_CSV = orig
+    # Winner must remain open after the idempotent second call
+    assert yes_pos.is_closed is False, (
+        "Winner must remain open after idempotent second _on_exit_fill call"
+    )
 
 
 # ── E2E: real RiskEngine — loser exit trade recorded correctly ─────────────────
@@ -948,9 +937,6 @@ def test_e2e_loser_exit_records_trade_correctly(tmp_path, monkeypatch):
       - winner strategy not promoted, or prob_sl_threshold not set
     """
     import risk as risk_module
-
-    temp_csv = tmp_path / "trades.csv"
-    monkeypatch.setattr(risk_module, "TRADES_CSV", temp_csv)
 
     real_risk = RiskEngine()
 

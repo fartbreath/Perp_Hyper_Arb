@@ -835,6 +835,17 @@ async def main() -> None:
     )
     api_state.model_agent_ref = model_agent
 
+    # ML Phase 3: inject model_agent into scanners for gate/scale decisions.
+    # Scanners were created before model_agent; direct attribute assignment is
+    # safe here because asyncio tasks have not started yet (single-threaded).
+    momentum_scanner._model_agent = model_agent
+    if opening_neutral_scanner is not None:
+        opening_neutral_scanner._model_agent = model_agent
+
+    # ML Phase 4 (ML-08): wire momentum_scanner into model_agent so the
+    # independent scan can check would_rules_have_entered via _last_scan_diags.
+    model_agent._momentum_scanner = momentum_scanner
+
     log.info("Connecting HL client…")
     await hl.start()
 

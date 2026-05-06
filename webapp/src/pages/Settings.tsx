@@ -708,6 +708,49 @@ export default function Settings() {
         )}
       </div>
 
+      {/* ── 2d. Momentum — WINNER Position SL Tuning ─────────────────── */}
+      <div className="card">
+        <h3>Momentum — Winner SL Tuning</h3>
+        <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+          ON-promoted positions (<code>fill_type=WINNER</code>) are promoted mid-bucket
+          (avg t+47s into a 5m bucket) and have full remaining TTE ahead of them.
+          The standard per-coin delta SL threshold fires on normal mid-bucket oscillation
+          rather than genuine reversals. These controls give WINNER positions a wider grace
+          window and a looser SL threshold — separate from the MAIN (direct entry) path.
+        </p>
+
+        <NumberInput
+          label="WINNER Grace Period"
+          description="Delta SL grace window for ON-promoted WINNER positions (seconds). Wider than MAIN grace because promotion happens mid-bucket with full TTE remaining. Recommended: 150s."
+          value={data.momentum_winner_delta_sl_grace_secs ?? 150}
+          step={10}
+          unit="s"
+          onSubmit={(v) => apply({ momentum_winner_delta_sl_grace_secs: Math.round(v) })}
+        />
+
+        {GAP}
+
+        <NumberInput
+          label="MAIN Grace Period"
+          description="Delta SL grace window for direct Momentum entries (seconds). Reduced from 120s to close the protection gap before near-expiry. Recommended: 90s."
+          value={data.momentum_delta_sl_grace_secs ?? 90}
+          step={10}
+          unit="s"
+          onSubmit={(v) => apply({ momentum_delta_sl_grace_secs: Math.round(v) })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="WINNER SL Multiplier"
+          description="Multiplier applied to the per-coin delta SL threshold for WINNER positions. 0.5 = halve the threshold (e.g. BTC 1% → 0.5%). 1.0 = no change (same as MAIN)."
+          value={data.momentum_winner_delta_sl_multiplier ?? 0.5}
+          step={0.05}
+          unit="×"
+          onSubmit={(v) => apply({ momentum_winner_delta_sl_multiplier: v })}
+        />
+      </div>
+
       {/* ── 3. Market Types ──────────────────────────────────────────── */}
       <div className="card">
         <h3>
@@ -2860,6 +2903,118 @@ export default function Settings() {
           </>
         )}
       </StrategySection>
+
+      {/* ── Model Agent (ML) ─────────────────────────────────── */}
+      <div className="card" style={{ margin: "1.5rem 0" }}>
+        <h3>Model Agent (ML)</h3>
+        <p className="settings-desc">
+          Shadow-mode ML agent that scores every entry and exit.{" "}
+          <strong>MODEL_AGENT_ENABLED and Independent Entry Scan require a bot restart.</strong>{" "}
+          Model B gate and Model A scale apply immediately when toggled.
+        </p>
+
+        {GAP}
+
+        <Toggle
+          label="Model Agent Enabled"
+          description="Start shadow logging and load XGBoost models. Requires bot restart. When disabled, all gates below are inactive regardless of their toggle state."
+          value={data.model_agent_enabled ?? false}
+          onChange={(v) => apply({ model_agent_enabled: v })}
+        />
+
+        {GAP}
+
+        <Toggle
+          label="Model B Exit Gate"
+          description="Suppress ON loser-exits when Model B score < threshold. Fail-open: any inference error allows the exit. Only fires after rules threshold is already met."
+          value={data.model_b_enabled ?? false}
+          onChange={(v) => apply({ model_b_enabled: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="Model B Suppress Threshold"
+          description="Loser-exit suppressed when Model B score is below this value. 0.5 = suppress roughly half. Lower = suppress more."
+          value={data.model_b_suppress_threshold ?? 0.5}
+          step={0.05}
+          unit=""
+          onSubmit={(v) => apply({ model_b_suppress_threshold: v })}
+        />
+
+        {GAP}
+
+        <Toggle
+          label="Model A Sizing Scale"
+          description="Scale entry size on low-confidence entries. Min×=0.5 at score 0; Max×=1.0 at score 1. Upscaling >1× disabled until ≥200 live-validated trades."
+          value={data.model_a_enabled ?? false}
+          onChange={(v) => apply({ model_a_enabled: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="Model A Min Scale"
+          description="Minimum size multiplier when model score ≈ 0. 0.5 = half-size on lowest-confidence entries."
+          value={data.model_a_min_scale ?? 0.5}
+          step={0.05}
+          unit="×"
+          onSubmit={(v) => apply({ model_a_min_scale: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="Model A Max Scale"
+          description="Maximum size multiplier when model score ≈ 1. Keep ≤ 1.0 until ≥ 200 live-validated trades."
+          value={data.model_a_max_scale ?? 1.0}
+          step={0.05}
+          unit="×"
+          onSubmit={(v) => apply({ model_a_max_scale: v })}
+        />
+
+        {GAP}
+
+        <Toggle
+          label="Independent Entry Scan"
+          description="Evaluate ALL PM markets with Model A — no z-score/funding/TWAP pre-filters. Records to analysis/model_paper_trades.csv. Requires Model Agent Enabled + bot restart."
+          value={data.model_a_independent_enabled ?? false}
+          onChange={(v) => apply({ model_a_independent_enabled: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="Independent Entry Threshold"
+          description="Minimum Model A score to open a paper trade in the independent scan. 0.7 = high-confidence only."
+          value={data.model_a_independent_entry_threshold ?? 0.7}
+          step={0.05}
+          unit=""
+          onSubmit={(v) => apply({ model_a_independent_entry_threshold: v })}
+        />
+
+        {GAP}
+
+        <NumberInput
+          label="Min TTE (s)"
+          description="Minimum time-to-expiry for independent scan paper trades. Markets resolving sooner are skipped."
+          value={data.model_a_min_tte_secs ?? 30}
+          step={5}
+          unit="s"
+          onSubmit={(v) => apply({ model_a_min_tte_secs: v })}
+        />
+
+        {GAP}
+
+        <NumberInput
+          label="Max Open Paper Positions"
+          description="Cap on simultaneously open paper positions from the independent scan."
+          value={data.model_a_max_open_positions ?? 5}
+          step={1}
+          unit=""
+          onSubmit={(v) => apply({ model_a_max_open_positions: v })}
+        />
+      </div>
 
       {/* ── Position Monitor ─────────────────────────────────── */}
       <div className="card" style={{ margin: "1.5rem 0" }}>

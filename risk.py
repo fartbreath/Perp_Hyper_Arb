@@ -1,12 +1,9 @@
 """
 risk.py — Position sizing, exposure tracking, P&L, and hard stop logic.
-
-All state is in-memory (fast) and mirrored to data/trades.csv on every update.
 """
 from __future__ import annotations
 
 import asyncio
-import csv
 import dataclasses
 import json
 import math
@@ -23,37 +20,9 @@ log = get_bot_logger(__name__)
 # ── Data directory ─────────────────────────────────────────────────────────────
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
-TRADES_CSV = DATA_DIR / "trades.csv"
 OPEN_POSITIONS_JSON = DATA_DIR / "open_positions.json"
 PAPER_HEDGE_FILLS_JSON = DATA_DIR / "paper_hedge_fills.json"
 HEDGE_ORDERS_JSON = DATA_DIR / "hedge_orders.json"
-TRADES_HEADER = [
-    "timestamp", "entry_timestamp", "market_id", "market_title", "market_type", "underlying", "side", "size", "price",
-    "fees_paid", "rebates_earned", "hl_hedge_size", "hl_entry_price",
-    "strategy", "spread_id", "pnl",
-    # Signal context — populated for mispricing strategy; 0.0 for maker
-    "entry_deviation",  # |pm_price - N(d2)| at signal time
-    "implied_prob",     # Deribit N(d2) value
-    "deribit_iv",       # annualised IV used in model
-    "tte_years",        # time-to-expiry at entry (years)
-    "spot_price",       # underlying spot price at entry (Pyth oracle)
-    "exit_spot_price",  # underlying spot price at exit (Pyth oracle; 0.0 if unrecorded)
-    "strike",           # parsed target price from market title
-    "kalshi_price",     # matched Kalshi YES price at signal time (0.0 = no match)
-    "signal_source",    # "kalshi_confirmed" | "kalshi_only" | "nd2_only"
-    "signal_score",     # quality score 0–100 at signal time
-    "resolved_outcome", # WIN | LOSS | "" (empty = early exit / paper / unknown)
-    # GTD hedge fields (momentum strategy only; empty for maker/mispricing)
-    "hedge_order_id",       # PM CLOB order ID of the resting opposite-token bid
-    "hedge_token_id",       # CLOB token_id of the opposite (hedged) token
-    "hedge_price",          # limit price the hedge bid was placed at
-    "hedge_size_usd",       # USD size of the hedge order
-    "hedge_status",         # "filled_won" | "filled_lost" | "unfilled" | "cancelled" | "filled_exited" | "rejected_price" | "" (main rows)
-    "spot_resolve_price",   # oracle spot at market resolution (hedge rows only; 0.0 otherwise)
-    "hedge_size_filled",    # contracts actually filled (empty for non-hedge rows)
-    "hedge_avg_fill_price", # VWAP of all fills (empty for non-hedge rows)
-    "exit_reason",          # ExitReason string: momentum_stop_loss | upfrac_exit | time_stop | resolved | etc.
-]
 
 
 # ── Fee model ─────────────────────────────────────────────────────────────────
@@ -279,6 +248,11 @@ class Position:
     # Cleared on the winner when it converts to strategy='momentum'.
     neutral_pair_id: str = ""
 
+    # Fill type: MAIN for direct Momentum entries, WINNER for ON-promoted positions.
+    # Used by the monitor to apply a wider grace window and looser delta SL threshold
+    # to WINNER positions — which are promoted mid-bucket and need more latitude.
+    fill_type: str = "MAIN"
+
     @property
     def pm_delta_notional(self) -> float:
         """Signed notional exposure: positive = net long YES/UP (first token)."""
@@ -313,8 +287,6 @@ class RiskEngine:
         # Persisted token_id → strategy mapping so position restores after restart
         # assign the correct strategy regardless of which strategies are enabled.
         self._token_strategy: dict[str, str] = self._load_token_strategy()
-        # Lock protecting CSV file writes (used by _write_csv_row in thread pool).
-        self._csv_write_lock = threading.Lock()
         # Paper-mode GTD hedge fills simulated by FillSimulator._sweep_hedges().
         # keyed by hedge_token_id; value = {"fill_price": float, "fill_size": float, "ts": str}
         # Persisted to PAPER_HEDGE_FILLS_JSON so fills survive bot restarts.
@@ -322,355 +294,18 @@ class RiskEngine:
         # First-class HedgeOrder entities keyed by order_id.
         # Persisted to HEDGE_ORDERS_JSON on every state change.
         self._hedge_orders: dict[str, HedgeOrder] = self._load_hedge_orders()
-        self._ensure_csv()
 
-    # ── CSV ────────────────────────────────────────────────────────────────────
-
-    def _ensure_csv(self) -> None:
-        if not TRADES_CSV.exists():
-            with TRADES_CSV.open("w", newline="") as f:
-                csv.writer(f).writerow(TRADES_HEADER)
-            return
-        # If the file exists but the header is stale (schema changed), either:
-        # 1. Migrate in-place (additive change: old header is a prefix of new header).
-        # 2. Back up and start fresh (column removed/reordered — incompatible change).
-        with TRADES_CSV.open("r", newline="") as f:
-            reader = csv.reader(f)
-            try:
-                existing_header = next(reader)
-            except StopIteration:
-                existing_header = []
-        if existing_header == TRADES_HEADER:
-            return  # nothing to do
-        n = len(existing_header)
-        if existing_header == TRADES_HEADER[:n]:
-            # Additive schema change: append new empty columns to every existing row.
-            new_cols = TRADES_HEADER[n:]
-            lines = TRADES_CSV.read_bytes().splitlines(keepends=True)
-            out = []
-            for i, line in enumerate(lines):
-                stripped = line.rstrip(b"\r\n")
-                suffix = b"," + b",".join(b"" for _ in new_cols)
-                if i == 0:
-                    # Update header
-                    suffix = b"," + b",".join(c.encode() for c in new_cols)
-                out.append(stripped + suffix + b"\n")
-            TRADES_CSV.write_bytes(b"".join(out))
-            log.info(
-                "trades.csv schema migrated (additive)",
-                new_columns=new_cols,
-            )
-        else:
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            backup = TRADES_CSV.with_name(f"trades_{ts}.csv.bak")
-            TRADES_CSV.rename(backup)
-            log.info("trades.csv schema changed — backed up old file", backup=str(backup))
-            with TRADES_CSV.open("w", newline="") as f:
-                csv.writer(f).writerow(TRADES_HEADER)
-
-    def _append_csv(self, row: dict) -> None:
-        """Schedule a CSV row append.  Off-loads to a thread-pool worker when the
-        asyncio event loop is running so the hot path (event loop thread) is not
-        blocked by file I/O.  Falls back to a synchronous write otherwise (startup,
-        unit tests).
-        """
-        try:
-            loop = asyncio.get_running_loop()
-            # Fire-and-forget: the row is a plain dict, no shared mutable state.
-            loop.run_in_executor(None, self._write_csv_row, row)
-        except RuntimeError:
-            # No running event loop.
-            self._write_csv_row(row)
-
-    def _write_csv_row(self, row: dict) -> None:
-        """Write a single row to trades.csv.  Thread-safe via _csv_write_lock."""
-        with self._csv_write_lock:
-            with TRADES_CSV.open("a", newline="") as f:
-                csv.DictWriter(f, fieldnames=TRADES_HEADER).writerow(row)
-
-    def patch_trade_outcome(
-        self,
-        market_id: str,
-        resolved_yes_price: float,
-        *,
-        force: bool = False,
-    ) -> int:
-        """Correct resolved_outcome (and optionally pnl) for trades.csv records.
-
-        For each record with a matching market_id, derives the correct outcome from
-        resolved_yes_price + the record's side:
-            YES / UP   → WIN if resolved_yes_price == 1.0
-            NO  / DOWN → WIN if resolved_yes_price == 0.0
-
-        force=False (default, SL/taker exits):
-            Only patches records where resolved_outcome is blank / "nan" /  "None".
-            pnl is NOT changed — it already reflects the actual CLOB fill price.
-            resolved_outcome is set for informational purposes (did the market
-            ultimately resolve in the direction we bet on?).
-
-        force=True (RESOLVED exits with wrong outcome):
-            Also corrects records where the stored outcome contradicts
-            resolved_yes_price (e.g., bot recorded WIN but PM settled as LOSS).
-            exit_price is reset to the settlement value (1.0 or 0.0) and pnl is
-            recomputed as (exit_price − entry_price) × size − fees + rebates.
-
-        Returns the number of records changed.
-        """
-        return 0  # stub – accounting.py tracks outcomes in acct_positions.json / acct_ledger.csv
-        _blank = {"", "nan", "None", "none"}
-        _yes_sides = {"YES", "UP", "BUY_YES"}
-
-        with self._csv_write_lock:
-            if not TRADES_CSV.exists():
-                return 0
-            try:
-                with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    rows = list(reader)
-                # Guard against headerless CSVs: if the first row's keys don't
-                # include "timestamp" the CSV was written without a header row
-                # (DictReader misused the first data row as fieldnames).
-                # Re-read with explicit fieldnames from TRADES_HEADER.
-                if rows and "timestamp" not in rows[0]:
-                    log.warning("patch_trade_outcome: headerless trades.csv — re-reading with explicit fieldnames")
-                    with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-                        rows = list(csv.DictReader(f, fieldnames=TRADES_HEADER))
-            except Exception as exc:
-                log.error("patch_trade_outcome: read failed", exc=str(exc))
-                return 0
-
-            patched = 0
-            for row in rows:
-                if row.get("market_id") != market_id:
-                    continue
-                # momentum_hedge rows have their own P&L semantics (settled_price of
-                # the hedge token, not the main position token).  patch_trade_outcome
-                # only knows about main-position YES/NO direction and would compute
-                # the wrong settlement value for the hedge side.  Always skip them.
-                if row.get("strategy") == "momentum_hedge":
-                    continue
-                side = row.get("side", "")
-                is_yes_side = side in _yes_sides
-                # Settlement value of the token held by this record (0.0 or 1.0)
-                settlement = resolved_yes_price if is_yes_side else (1.0 - resolved_yes_price)
-                correct_outcome = "WIN" if settlement >= 0.5 else "LOSS"
-                stored = (row.get("resolved_outcome") or "").strip()
-
-                if stored in _blank:
-                    # SL/taker exit missing an outcome: fill in resolved_outcome.
-                    # Also correct PnL if we recorded a loss on a WIN outcome — this
-                    # indicates the GTC floor-fallback path reported the order's limit
-                    # price (e.g. 0.50) rather than the actual PM settlement price.
-                    # PM API is the source of truth: settlement = 1.0 (WIN) / 0.0 (LOSS).
-                    row["resolved_outcome"] = correct_outcome
-                    patched += 1
-                    _pnl_corrected = False
-                    if correct_outcome == "WIN":
-                        try:
-                            entry = float(row.get("price", 0) or 0)
-                            size  = float(row.get("size",  0) or 0)
-                            fees  = float(row.get("fees_paid",      0) or 0)
-                            reb   = float(row.get("rebates_earned", 0) or 0)
-                            old_pnl = float(row.get("pnl", 0) or 0)
-                            if size > 0 and old_pnl < 0:
-                                new_pnl = (settlement - entry) * size - fees + reb
-                                row["pnl"] = str(round(new_pnl, 10))
-                                _pnl_corrected = True
-                                log.info(
-                                    "patch_trade_outcome: pnl corrected (GTC floor WIN mismatch)",
-                                    market_id=market_id[:20],
-                                    side=side,
-                                    new_outcome=correct_outcome,
-                                    old_pnl=round(old_pnl, 4),
-                                    new_pnl=round(new_pnl, 4),
-                                    settlement=settlement,
-                                )
-                        except (ValueError, TypeError) as exc:
-                            log.warning("patch_trade_outcome: pnl correction parse error", exc=str(exc))
-                    if not _pnl_corrected:
-                        log.info(
-                            "patch_trade_outcome: resolved_outcome filled (SL exit)",
-                            market_id=market_id[:20],
-                            side=side,
-                            new_outcome=correct_outcome,
-                        )
-                elif force and stored != correct_outcome:
-                    # RESOLVED exit with wrong outcome: update outcome AND recompute pnl.
-                    try:
-                        entry   = float(row.get("price",          0) or 0)
-                        size    = float(row.get("size",           0) or 0)
-                        fees    = float(row.get("fees_paid",      0) or 0)
-                        rebates = float(row.get("rebates_earned", 0) or 0)
-                        new_pnl = (settlement - entry) * size - fees + rebates
-                        row["resolved_outcome"] = correct_outcome
-                        row["pnl"]              = str(round(new_pnl, 10))
-                        patched += 1
-                        log.info(
-                            "patch_trade_outcome: outcome+pnl corrected (RESOLVED wrong)",
-                            market_id=market_id[:20],
-                            side=side,
-                            old_outcome=stored,
-                            new_outcome=correct_outcome,
-                            new_pnl=round(new_pnl, 4),
-                        )
-                    except (ValueError, TypeError) as exc:
-                        log.warning("patch_trade_outcome: numeric parse error", exc=str(exc))
-                elif force and correct_outcome == "WIN":
-                    # force=True: outcome already correct but PnL may be wrong due to
-                    # GTC floor-fallback recording the limit price instead of settlement.
-                    # Correct if PnL is negative on a WIN outcome.
-                    try:
-                        entry   = float(row.get("price",          0) or 0)
-                        size    = float(row.get("size",           0) or 0)
-                        fees    = float(row.get("fees_paid",      0) or 0)
-                        rebates = float(row.get("rebates_earned", 0) or 0)
-                        old_pnl = float(row.get("pnl",            0) or 0)
-                        if size > 0 and old_pnl < 0:
-                            new_pnl = (settlement - entry) * size - fees + rebates
-                            row["pnl"] = str(round(new_pnl, 10))
-                            patched += 1
-                            log.info(
-                                "patch_trade_outcome: pnl corrected (GTC floor WIN mismatch, force)",
-                                market_id=market_id[:20],
-                                side=side,
-                                old_pnl=round(old_pnl, 4),
-                                new_pnl=round(new_pnl, 4),
-                                settlement=settlement,
-                            )
-                    except (ValueError, TypeError) as exc:
-                        log.warning("patch_trade_outcome: pnl correction parse error", exc=str(exc))
-
-            if patched == 0:
-                return 0
-
-            # Atomically rewrite the whole file via a .tmp sibling
-            try:
-                tmp = TRADES_CSV.with_suffix(".tmp")
-                with tmp.open("w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=TRADES_HEADER)
-                    writer.writeheader()
-                    writer.writerows(rows)
-                tmp.replace(TRADES_CSV)
-            except Exception as exc:
-                log.error("patch_trade_outcome: rewrite failed", exc=str(exc))
-                return 0
-
-            return patched
+    def patch_trade_outcome(self, market_id: str, resolved_yes_price: float, *, force: bool = False) -> int:
+        """Deprecated — accounting.py / acct_ledger.csv is the source of truth. Always returns 0."""
+        return 0
 
     def patch_exit_spot_price(self, market_id: str, spot_price: float) -> int:
-        """Update exit_spot_price for trades.csv records where it is 0.0.
-
-        Called by _check_pending_resolutions once the Gamma API has the settlement
-        close price available (typically a few minutes after market resolution).
-        Only patches rows where exit_spot_price == 0.0 — never overwrites a valid
-        price that was recorded at exit time.
-        Returns the number of records changed.
-        """
-        return 0  # stub – accounting.py tracks spot_exit in acct_positions.json
-        if spot_price <= 0:  # noqa: unreachable
-            return 0
-        with self._csv_write_lock:
-            if not TRADES_CSV.exists():
-                return 0
-            try:
-                with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    rows = list(reader)
-                if rows and "timestamp" not in rows[0]:
-                    with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-                        rows = list(csv.DictReader(f, fieldnames=TRADES_HEADER))
-            except Exception as exc:
-                log.error("patch_exit_spot_price: read failed", exc=str(exc))
-                return 0
-            patched = 0
-            for row in rows:
-                if row.get("market_id") != market_id:
-                    continue
-                try:
-                    current = float(row.get("exit_spot_price", 0) or 0)
-                except (ValueError, TypeError):
-                    current = 0.0
-                if current == 0.0:
-                    row["exit_spot_price"] = str(round(spot_price, 4))
-                    patched += 1
-            if patched == 0:
-                return 0
-            try:
-                tmp = TRADES_CSV.with_suffix(".tmp")
-                with tmp.open("w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=TRADES_HEADER)
-                    writer.writeheader()
-                    writer.writerows(rows)
-                tmp.replace(TRADES_CSV)
-            except Exception as exc:
-                log.error("patch_exit_spot_price: rewrite failed", exc=str(exc))
-                return 0
-            log.info(
-                "patch_exit_spot_price: settlement spot filled",
-                market_id=market_id[:20],
-                spot_price=round(spot_price, 4),
-                records=patched,
-            )
-            return patched
+        """Deprecated — accounting.py tracks spot_exit in acct_positions.json. Always returns 0."""
+        return 0
 
     def patch_hedge_spot_price(self, market_id: str, spot_price: float) -> int:
-        """Update spot_resolve_price for momentum_hedge rows in trades.csv where it is 0.0.
-
-        Called by _check_pending_resolutions once the Gamma API has the settlement
-        close price available (typically a few minutes after market resolution).
-        Mirrors patch_exit_spot_price but targets the spot_resolve_price column on
-        rows where strategy == 'momentum_hedge'.  Never overwrites a valid price
-        that was recorded at the time the hedge was settled.
-        Returns the number of records changed.
-        """
-        return 0  # stub – accounting.py tracks spot_exit on hedge positions
-        if spot_price <= 0:  # noqa: unreachable
-            return 0
-        with self._csv_write_lock:
-            if not TRADES_CSV.exists():
-                return 0
-            try:
-                with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    rows = list(reader)
-                if rows and "timestamp" not in rows[0]:
-                    with TRADES_CSV.open(newline="", encoding="utf-8") as f:
-                        rows = list(csv.DictReader(f, fieldnames=TRADES_HEADER))
-            except Exception as exc:
-                log.error("patch_hedge_spot_price: read failed", exc=str(exc))
-                return 0
-            patched = 0
-            for row in rows:
-                if row.get("market_id") != market_id:
-                    continue
-                if row.get("strategy") != "momentum_hedge":
-                    continue
-                try:
-                    current = float(row.get("spot_resolve_price", 0) or 0)
-                except (ValueError, TypeError):
-                    current = 0.0
-                if current == 0.0:
-                    row["spot_resolve_price"] = str(round(spot_price, 4))
-                    patched += 1
-            if patched == 0:
-                return 0
-            try:
-                tmp = TRADES_CSV.with_suffix(".tmp")
-                with tmp.open("w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=TRADES_HEADER)
-                    writer.writeheader()
-                    writer.writerows(rows)
-                tmp.replace(TRADES_CSV)
-            except Exception as exc:
-                log.error("patch_hedge_spot_price: rewrite failed", exc=str(exc))
-                return 0
-            log.info(
-                "patch_hedge_spot_price: settlement spot filled for hedge row",
-                market_id=market_id[:20],
-                spot_price=round(spot_price, 4),
-                records=patched,
-            )
-            return patched
+        """Deprecated — accounting.py tracks spot_exit on hedge positions. Always returns 0."""
+        return 0
 
     def _load_token_strategy(self) -> dict[str, str]:
         """Load persisted token_id → strategy map from disk."""
@@ -980,8 +615,8 @@ class RiskEngine:
     ) -> None:
         """Record that a hedge placement was attempted but rejected (e.g. priced out).
 
-        This causes close_position() to write hedge_status='rejected_price' in
-        trades.csv so the webapp can surface the failure.
+        This causes close_position() to record hedge_status='rejected_price' in
+        acct_ledger.csv so the webapp can surface the failure.
         - hedge_price is repurposed to store max_price (what the bot was willing to pay).
         - hedge_opp_best_ask stores the opposite-token best ask at failure time.
         """
@@ -1380,7 +1015,6 @@ class RiskEngine:
 
         Returns the finalized HedgeOrder or None if unknown.
         """
-        _csv_row: Optional[dict] = None
         with self._lock:
             ho = self._hedge_orders.get(order_id)
             if ho is None:
@@ -1420,43 +1054,6 @@ class RiskEngine:
             ) if ho.parent_side else None
             _hedge_spread_id = (_parent_pos.spread_id or "") if _parent_pos else ""
 
-            _csv_row = {
-                "timestamp":            datetime.now(timezone.utc).isoformat(),
-                "entry_timestamp":      "",
-                "market_id":            ho.market_id,
-                "market_title":         (ho.market_title or "")[:60],
-                "market_type":          "momentum_hedge",
-                "underlying":           ho.underlying,
-                "side":                 "hedge",
-                "size":                 round(fill_size, 6),
-                "price":                round(fill_price, 4),
-                "fees_paid":            0.0,
-                "rebates_earned":       0.0,
-                "hl_hedge_size":        0.0,
-                "hl_entry_price":       0.0,
-                "strategy":             "momentum_hedge",
-                "spread_id":            _hedge_spread_id,
-                "pnl":                  pnl,
-                "entry_deviation":      0.0,
-                "implied_prob":         0.0,
-                "deribit_iv":           0.0,
-                "tte_years":            0.0,
-                "spot_price":           0.0,
-                "exit_spot_price":      settled_price,
-                "strike":               0.0,
-                "kalshi_price":         0.0,
-                "signal_source":        "gtd_hedge",
-                "signal_score":         0.0,
-                "resolved_outcome":     "WIN" if settled_price >= 0.5 else "LOSS",
-                "hedge_order_id":       order_id,
-                "hedge_token_id":       ho.token_id,
-                "hedge_price":          round(ho.order_price, 4),
-                "hedge_size_usd":       round(ho.order_size_usd, 6),
-                "hedge_status":         hedge_status,
-                "spot_resolve_price":   round(spot_at_resolution, 4),
-                "hedge_size_filled":    round(fill_size, 6),
-                "hedge_avg_fill_price": round(fill_price, 6),
-            }
             log.info(
                 "HedgeOrder finalized",
                 order_id=order_id[:20],
@@ -1636,7 +1233,6 @@ class RiskEngine:
             spot_resolve_price:  oracle spot at market resolution time.
         """
         pnl = round((settled_price - fill_price) * fill_size, 6)
-        _csv_row: dict = {}
         with self._lock:
             self._realized_pnl += pnl
             # Inherit spread_id from the parent momentum position.  Search by
@@ -1651,43 +1247,6 @@ class RiskEngine:
                     if _p.market_id == parent_market_id and _p.spread_id:
                         _parent_spread_id = _p.spread_id
                         break
-            _csv_row = {
-                "timestamp":        datetime.now(timezone.utc).isoformat(),
-                "entry_timestamp":  "",
-                "market_id":        parent_market_id,
-                "market_title":     (parent_market_title or "")[:60],
-                "market_type":      "momentum_hedge",
-                "underlying":       underlying,
-                "side":             "hedge",
-                "size":             round(fill_size, 6),
-                "price":            round(fill_price, 4),
-                "fees_paid":        0.0,
-                "rebates_earned":   0.0,
-                "hl_hedge_size":    0.0,
-                "hl_entry_price":   0.0,
-                "strategy":         "momentum_hedge",
-                "spread_id":        _parent_spread_id,
-                "pnl":              pnl,
-                "entry_deviation":  0.0,
-                "implied_prob":     0.0,
-                "deribit_iv":       0.0,
-                "tte_years":        0.0,
-                "spot_price":       0.0,
-                "exit_spot_price":  settled_price,
-                "strike":           0.0,
-                "kalshi_price":     0.0,
-                "signal_source":      "gtd_hedge",
-                "signal_score":       0.0,
-                "resolved_outcome":   "WIN" if settled_price >= 0.5 else "LOSS",
-                "hedge_order_id":     "",
-                "hedge_token_id":     hedge_token_id,
-                "hedge_price":        round(fill_price, 4),
-                "hedge_size_usd":     round(fill_size * fill_price, 6),
-                "hedge_status":       hedge_status,
-                "spot_resolve_price": round(spot_resolve_price, 4),
-                "hedge_size_filled":    round(fill_size, 6),
-                "hedge_avg_fill_price": round(fill_price, 6),
-            }
             log.info(
                 "GTD hedge fill recorded",
                 parent_market_id=parent_market_id[:20],
@@ -1810,9 +1369,8 @@ class RiskEngine:
         rebates_earned: float = 0.0,
         resolved_outcome: str = "",
         exit_spot_price: float = 0.0,   # underlying spot (BTC/ETH/…) at exit time
-        exit_reason: str = "",          # ExitReason string for trades.csv (e.g. "upfrac_exit")
+        exit_reason: str = "",
     ) -> Optional[Position]:
-        _csv_row: Optional[dict] = None
         _closed_pos: Optional[Position] = None
         with self._lock:
             pos = self._positions.get(self._pos_key(market_id, side))
@@ -1848,46 +1406,6 @@ class RiskEngine:
                     threshold=-config.HARD_STOP_DRAWDOWN,
                 )
 
-            _csv_row = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "entry_timestamp": pos.opened_at.isoformat() if pos.opened_at else "",
-                "market_id": market_id,
-                "market_title": pos.market_title,
-                "market_type": pos.market_type,
-                "underlying": pos.underlying,
-                "side": pos.side,
-                "size": pos.size,
-                "price": pos.entry_price,  # actual token fill price for both YES and NO
-                "fees_paid": fees_paid,
-                "rebates_earned": total_rebates_earned,
-                "hl_hedge_size": pos.hl_hedge_size,
-                "hl_entry_price": pos.hl_entry_price,
-                "strategy": pos.strategy,
-                "spread_id": pos.spread_id or "",
-                "pnl": pnl,
-                "entry_deviation": pos.entry_deviation,
-                "implied_prob": pos.implied_prob,
-                "deribit_iv": pos.deribit_iv,
-                "tte_years": round(pos.tte_years, 6),
-                "spot_price": pos.spot_price,
-                "exit_spot_price": exit_spot_price,
-                "strike": pos.strike,
-                "kalshi_price": pos.kalshi_price,
-                "signal_source": pos.signal_source,
-                "signal_score": pos.signal_score,
-                "resolved_outcome": resolved_outcome,
-                "hedge_order_id": pos.hedge_order_id,
-                "hedge_token_id": pos.hedge_token_id,
-                "hedge_price": pos.hedge_price,
-                "hedge_size_usd": pos.hedge_size_usd,
-                "hedge_status": "rejected_price" if pos.hedge_fail_reason else "",
-                # For rejected_price rows: repurpose spot_resolve_price to store opp_best_ask
-                # so the UI can show "Max: Xc · Ask: Yc" tooltip.
-                "spot_resolve_price": pos.hedge_opp_best_ask if pos.hedge_fail_reason else 0.0,
-                "hedge_size_filled": "",
-                "hedge_avg_fill_price": "",
-                "exit_reason": exit_reason,
-            }
             _closed_pos = pos
             log.info(
                 "Position closed",
@@ -1935,6 +1453,7 @@ class RiskEngine:
             if pos is None or pos.is_closed:
                 return
             pos.strategy = new_strategy
+            pos.fill_type = "WINNER"
             if pos.token_id:
                 self._token_strategy[pos.token_id] = new_strategy
                 self._save_token_strategy()
@@ -1975,33 +1494,6 @@ class RiskEngine:
 
         with self._lock:
             self._realized_pnl += pnl
-            _csv_row = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "entry_timestamp": "",
-                "market_id": f"hl_{coin}",
-                "market_title": f"HL {coin} perp hedge",
-                "market_type": "hl_perp",
-                "underlying": coin,
-                "side": direction,
-                "size": round(size_coins, 6),
-                "price": round(open_price, 4),
-                "fees_paid": total_fees,
-                "rebates_earned": 0.0,
-                "hl_hedge_size": round(size_coins, 6),
-                "hl_entry_price": round(open_price, 4),
-                "strategy": "maker_hedge",
-                "pnl": pnl,
-                "entry_deviation": 0.0,
-                "implied_prob": 0.0,
-                "deribit_iv": 0.0,
-                "tte_years": 0.0,
-                "spot_price": round(close_price, 4),
-                "strike": 0.0,
-                "kalshi_price": 0.0,
-                "signal_source": "hl_hedge",
-                "signal_score": 0.0,
-                "resolved_outcome": "",
-            }
             log.info(
                 "HL hedge trade recorded",
                 coin=coin, direction=direction,

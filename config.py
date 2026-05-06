@@ -615,6 +615,16 @@ MOMENTUM_UPFRAC_SUPPRESS_UNTIL_ENTRY_WINDOW: bool = True  # when True: upfrac ex
 # ON-promoted positions at 60s instead of the previous TTE-based 300-400s gap.
 MOMENTUM_DELTA_SL_GRACE_SECS: int = 60
 
+# WINNER-fill-type (ON-promoted) positions use a wider grace window and a looser
+# delta SL threshold.  WINNER positions are promoted mid-bucket (avg t+47s) and
+# have full remaining TTE — the standard 1% per-coin SL fires on normal mid-bucket
+# oscillation rather than genuine reversals.
+# MOMENTUM_WINNER_DELTA_SL_GRACE_SECS: grace window (seconds) for WINNER positions.
+# MOMENTUM_WINNER_DELTA_SL_MULTIPLIER: fraction applied to the per-coin SL threshold.
+#   e.g. 0.5 → BTC WINNER SL = 1% × 0.5 = 0.5% (vs 1% for MAIN positions).
+MOMENTUM_WINNER_DELTA_SL_GRACE_SECS: int = 60  # set to 150 in config_overrides.json
+MOMENTUM_WINNER_DELTA_SL_MULTIPLIER: float = 1.0  # set to 0.5 in config_overrides.json
+
 # Order type: "limit" = taker limit at ask+0.5c (ensures fill); "market" = immediate cross.
 MOMENTUM_ORDER_TYPE: str = "limit"
 
@@ -940,6 +950,21 @@ MODEL_A_PATH: str = str(Path(__file__).parent / "analysis" / "model_a_v0.pkl")
 MODEL_B_PATH: str = str(Path(__file__).parent / "analysis" / "model_b_v0.pkl")
 MODEL_A_SCORE_THRESHOLD: float = 0.5       # Phase 3: entry gate threshold
 MODEL_B_SCORE_THRESHOLD: float = 0.5       # Phase 3: exit suppress threshold
+
+# Phase 3 — Model-assisted mode (ML-06, ML-07)
+# All default False — enable only after Phase 2 shadow validation criteria are met.
+MODEL_B_ENABLED: bool = False              # ML-06: Model B exit suppression gate
+MODEL_B_SUPPRESS_THRESHOLD: float = 0.5   # ML-06: suppress loser exit if score < this
+MODEL_A_ENABLED: bool = False              # ML-07: Model A entry sizing scale
+MODEL_A_MIN_SCALE: float = 0.5            # ML-07: minimum Kelly scale (50% of base)
+MODEL_A_MAX_SCALE: float = 1.0            # ML-07: maximum Kelly scale (no upscale in Phase 3)
+
+# Phase 4 — Independent Entry Evaluation (ML-08, ML-09)
+# All default False / conservative until Phase 3 acceptance criteria are met.
+MODEL_A_INDEPENDENT_ENABLED: bool = False         # ML-08: run model-only entry scan loop
+MODEL_A_INDEPENDENT_ENTRY_THRESHOLD: float = 0.7 # ML-08: paper trade when score exceeds this
+MODEL_A_MIN_TTE_SECS: int = 30                   # ML-08: skip markets with TTE < this
+MODEL_A_MAX_OPEN_POSITIONS: int = 5              # ML-08: max concurrent paper positions
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
 AGENT_MODEL: str = "qwen2.5:7b"     # Ollama model name

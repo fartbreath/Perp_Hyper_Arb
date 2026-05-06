@@ -46,7 +46,10 @@ def _isolate_momentum_fills_csv(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _isolate_trades_csv(tmp_path):
-    """Patch risk.TRADES_CSV to a per-test temp file."""
+    """Patch risk.TRADES_CSV to a per-test temp file (no-op if removed from risk.py)."""
+    if not hasattr(risk, "TRADES_CSV"):
+        yield
+        return
     original = risk.TRADES_CSV
     risk.TRADES_CSV = tmp_path / "trades.csv"
     yield

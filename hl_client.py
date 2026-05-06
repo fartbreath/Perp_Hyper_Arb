@@ -109,9 +109,12 @@ class HLClient:
             except Exception as exc:
                 log.error("bbo callback error", exc=str(exc))
 
-    def _fire_funding(self, coin: str, rate: float, ts: float) -> None:
+    def _fire_funding(self, coin: str, rate: float, ts: float, mark_px: Optional[float] = None) -> None:
         for cb in self._funding_update_callbacks:
             try:
+                cb(coin, rate, ts, mark_px)
+            except TypeError:
+                # Backward-compat: callbacks registered before mark_px was added
                 cb(coin, rate, ts)
             except Exception as exc:
                 log.error("funding callback error", exc=str(exc))
@@ -269,6 +272,8 @@ class HLClient:
                 if not coin or coin not in config.HL_PERP_COINS:
                     continue
                 rate = float(ctx.get("funding") or 0)
+                mark_px_raw = ctx.get("markPx")
+                mark_px = float(mark_px_raw) if mark_px_raw is not None else None
                 # Update legacy FundingSnapshot cache so get_fundings_snapshot() still works
                 self._fundings[coin] = FundingSnapshot(
                     coin=coin,
@@ -276,7 +281,7 @@ class HLClient:
                     timestamp=ts,
                 )
                 # Fire registered callbacks (e.g. FundingRateCache.on_ws_update)
-                self._fire_funding(coin, rate, ts)
+                self._fire_funding(coin, rate, ts, mark_px=mark_px)
 
     # ── Funding rates ──────────────────────────────────────────────────────────
     # NOTE: _funding_poll_loop has been removed. Funding data now arrives via

@@ -2,6 +2,145 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-06] — ML Phase 3+4 (model-assisted exits + paper trading); WINNER-fill delta SL; risk.py CSV removal; HL mark price; SPA catch-all
+
+### Feature — ML Phase 3: Model B exit gate (ML-06) (`strategies/OpeningNeutral/scanner.py`, `models/model_agent.py`, `config.py`)
+
+Implements the Model B exit suppression gate for Opening Neutral.  After ON-06 passes, Model B
+scores the CLOB context; if `model_b_score < MODEL_B_SUPPRESS_THRESHOLD` the loser exit is
+suppressed and the rules bot continues holding.
+
+**Config keys added:** `MODEL_B_ENABLED = False`, `MODEL_B_SUPPRESS_THRESHOLD = 0.5`
+
+**Bugs fixed:**
+- **BUG-ML-06a (High):** `implied_prob` in the Model B feature context was sourced from
+  `mon_pos.entry_price` (stale 0.5 pair-open price) instead of `best_bid` (the current CLOB
+  bid that triggered the exit check).  Model B was being scored on the wrong signal.
+- **BUG-ML-06b (Medium):** Suppressed exits were never written to `shadow_log.csv`.
+  `log_model_b_suppression()` async method added to `ModelAgent`; scanner suppression path
+  now spawns `asyncio.create_task(self._model_agent.log_model_b_suppression(...))`.
+
+---
+
+### Feature — ML Phase 3: Model A sizing scale (ML-07) (`strategies/OpeningNeutral/scanner.py`, `strategies/Momentum/scanner.py`, `config.py`)
+
+Model A scale applied at the Kelly sizing step in both Momentum and Opening Neutral scanners.
+Formula: `scale = MODEL_A_MIN_SCALE + score × (MODEL_A_MAX_SCALE − MODEL_A_MIN_SCALE)`, clamped
+to `[MODEL_A_MIN_SCALE, MODEL_A_MAX_SCALE]`.  Phase 3: upscaling disabled (`MODEL_A_MAX_SCALE = 1.0`).
+On inference exception sizing falls back to unscaled base Kelly.
+
+**Config keys added:** `MODEL_A_ENABLED = False`, `MODEL_A_MIN_SCALE = 0.5`, `MODEL_A_MAX_SCALE = 1.0`
+
+**Bugs fixed:**
+- **BUG-ML-07a (High):** Model A scale was entirely absent from
+  `strategies/OpeningNeutral/scanner.py`.  PRD requires scale in both strategies — only Momentum
+  had it.  Added full Model A scale block in `_enter_pair()`.  `_pending_ma_scores[pair_id]`
+  dict added as staging cache for CSV injection.
+- **BUG-ML-07b (Medium):** `model_a_score` and `model_a_scale` absent from `_ON_FILLS_HEADER`.
+  `feature_builder.py` cannot pick up these columns for training.  Added both columns to
+  `_ON_FILLS_HEADER` (schema bumped to v4).  `_register_pair()` injects values from
+  `_pending_ma_scores`.
+
+---
+
+### Feature — ML Phase 4: Independent entry scan + paper ledger (ML-08, ML-09) (`models/model_agent.py`, `config.py`)
+
+**ML-08:** `ModelAgent` extended with `_independent_scan_loop()` that evaluates all PM markets
+via `score_entry()` without applying z-score, funding gate, or TWAP gate pre-filters.  When
+`MODEL_A_INDEPENDENT_ENABLED=True` and `model_a_score > MODEL_A_INDEPENDENT_ENTRY_THRESHOLD`, a
+proposed entry is logged to `analysis/model_paper_trades.csv` with `status=proposed`.
+`would_rules_have_entered` determined via `_momentum_scanner._last_scan_diags`.  Hard limits:
+TTE ≥ `MODEL_A_MIN_TTE_SECS`, open paper positions < `MODEL_A_MAX_OPEN_POSITIONS`.
+
+**ML-09:** Paper trades written exclusively to `analysis/model_paper_trades.csv` via
+`_write_paper_trade_row()`.  On resolution, `_resolve_paper_outcomes()` writes `exit_price`,
+`pnl`, `status=closed` using CLOB `winner` flag.  No interaction with `trades.csv`,
+`on_fills.csv`, `momentum_fills.csv`, or `risk.py` position tracking.
+`analysis/model_paper_trades.csv` added to `.gitignore`.
+
+**Config keys added:** `MODEL_A_INDEPENDENT_ENABLED = False`,
+`MODEL_A_INDEPENDENT_ENTRY_THRESHOLD = 0.7`, `MODEL_A_MIN_TTE_SECS = 30`,
+`MODEL_A_MAX_OPEN_POSITIONS = 5`
+
+---
+
+### Feature — ML scanner wiring (`main.py`)
+
+`model_agent` injected into both scanners post-construction
+(`momentum_scanner._model_agent`, `opening_neutral_scanner._model_agent`) for gate/scale
+decisions.  `momentum_scanner` back-wired into `model_agent._momentum_scanner` for
+`would_rules_have_entered` determination.  All assignments happen after connector startup but
+before asyncio tasks start (safe single-threaded window).
+
+---
+
+### Feature — Webapp SPA catch-all + ML Settings section (`api_server.py`, `webapp/src/pages/Settings.tsx`, `webapp/src/api/client.ts`)
+
+**SPA catch-all:** `@app.get("/{full_path:path}")` added as the last route in `api_server.py`,
+serving `webapp/dist/index.html` for all non-API paths.  `StaticFiles` mount for `/assets`
+added before the catch-all.  Fixes 404 on direct navigation to `/model-paper`.
+
+**Model Paper Trades page** (`webapp/src/pages/ModelPaperTrades.tsx`): new page at route
+`/model-paper` showing the paper trade ledger table (timestamp, market_id, model score,
+entry/exit price, PnL, `would_rules_have_entered`).  Filterable by `would_rules_have_entered`.
+Added to `App.tsx` nav.
+
+**Settings ML section:** "Model Agent (ML)" card added to Settings page with all 10 ML
+config controls: `MODEL_AGENT_ENABLED` (restart-required), `MODEL_B_ENABLED`,
+`MODEL_B_SUPPRESS_THRESHOLD`, `MODEL_A_ENABLED`, `MODEL_A_MIN_SCALE`, `MODEL_A_MAX_SCALE`,
+`MODEL_A_INDEPENDENT_ENABLED` (restart-required), `MODEL_A_INDEPENDENT_ENTRY_THRESHOLD`,
+`MODEL_A_MIN_TTE_SECS`, `MODEL_A_MAX_OPEN_POSITIONS`.
+
+`api_server.py` `_SETTINGS_MAP`, `ConfigPatch`, and `GET /config` updated with all 10 ML
+fields.  `webapp/src/api/client.ts` `ConfigData` interface updated.  Webapp dist rebuilt.
+
+---
+
+### Feature — WINNER-fill delta SL (`risk.py`, `monitor.py`, `config.py`)
+
+`Position.fill_type: str = "MAIN"` field added; Opening Neutral scanner sets
+`fill_type = "WINNER"` on ON-promoted positions.  `should_exit()` reads `fill_type`:
+- WINNER positions multiply `_sl` by `MOMENTUM_WINNER_DELTA_SL_MULTIPLIER` (default 0.5 →
+  half the per-coin threshold).
+- WINNER positions use `MOMENTUM_WINNER_DELTA_SL_GRACE_SECS` (default 150 s) instead of
+  the standard `MOMENTUM_DELTA_SL_GRACE_SECS` (90 s).
+
+Prevents ON-promoted winners mid-bucket from being stopped out on transient oscillation.
+
+**Config keys added:** `MOMENTUM_WINNER_DELTA_SL_MULTIPLIER = 0.5`,
+`MOMENTUM_WINNER_DELTA_SL_GRACE_SECS = 150`
+
+---
+
+### Feature — HL mark price propagation (`hl_client.py`, `market_data/funding_rate_cache.py`)
+
+`HLClient._fire_funding()` now passes `mark_px` extracted from the `webData2` `markPx` field.
+`FundingRateCache.on_ws_update()` accepts and caches `mark_px`; new `get_mark(coin) → Optional[float]`
+accessor added.  Backward-compatible: old callbacks without `mark_px` handled via `TypeError` catch.
+
+---
+
+### Refactor — `risk.py` CSV removal (`risk.py`, `monitor.py`)
+
+`TRADES_CSV`, `TRADES_HEADER`, `_ensure_csv()`, `_append_csv()`, `_write_csv_row()`, and
+`_csv_write_lock` removed from `risk.py`.  Trade recording fully managed by `accounting.py`
+(`acct_ledger.csv`).  540-line net reduction.
+
+`_pm_reconcile_loop()` removed from `monitor.py` — it was the background loop that patched
+`trades.csv` from the PM Data API; no longer needed now that trades are in the accounting ledger.
+
+---
+
+### Fix — Test infrastructure (`tests/conftest.py`, `tests/test_opening_neutral.py`)
+
+`_isolate_trades_csv` autouse fixture in `conftest.py` referenced `risk.TRADES_CSV` which had
+been removed from `risk.py`; fixture updated with `hasattr` guard.  Two test bodies in
+`test_opening_neutral.py` that directly referenced `risk.TRADES_CSV` as a temp-dir redirect
+had those references removed (neither test asserts CSV content).  Restores **58/58 tests**
+passing in `test_opening_neutral.py` + `test_model_agent.py`.
+
+---
+
 ## [2026-05-05] - ON-07 winner confirmation gate; ML training pipeline; ON→momentum fill logging; feature_builder vol_regime_high fix; PMClobWS dashboard fix
 
 ### Feature — ON-07 winner confirmation gate (`strategies/OpeningNeutral/scanner.py`, `config.py`, `config_overrides.json`, `api_server.py`, `webapp/src/pages/Settings.tsx`, `webapp/src/api/client.ts`)
