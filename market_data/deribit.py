@@ -58,7 +58,7 @@ class DeribitFetcher:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=4)
                 ) as resp:
                     data = await resp.json()
                     return data.get("result", [])
@@ -95,7 +95,7 @@ class DeribitFetcher:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=4)
                 ) as resp:
                     data = await resp.json()
                     result = data.get("result", {})
