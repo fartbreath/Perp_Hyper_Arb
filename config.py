@@ -299,6 +299,8 @@ STRATEGY_MAKER_ENABLED: bool = False        # Strategy 1: PM market making + HL 
 STRATEGY_MOMENTUM_ENABLED: bool = False     # Strategy 3: Momentum / price-confirmation taker
 STRATEGY_SPREAD_ENABLED: bool = False       # Strategy 4: Calendar spread / relative-value
 OPENING_NEUTRAL_ENABLED: bool = False       # Strategy 5: Opening neutral (simultaneous YES+NO entry)
+REVERSE_OPENING_NEUTRAL_ENABLED: bool = False  # Strategy 5b: Reverse ON — paper experiment; mirrors ON entry, sells winner for TP, holds loser
+RON_DOUBLE_DOWN_USD: float = 0.0  # Strategy 5b: additional USDC to simulate buying more of the LOSER at winner TP time; 0=disabled
 
 # ── Strategy 5 — Opening Neutral ──────────────────────────────────────────
 # Market types the scanner watches for simultaneous YES+NO entry opportunities.

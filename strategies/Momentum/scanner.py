@@ -1360,6 +1360,14 @@ class MomentumScanner(BaseStrategy):
         Performs a final pre-execution price re-check to guard against fast moves
         between signal detection and order placement.
         """
+        # ── Hard stop gate ────────────────────────────────────────────────────
+        if self._risk.hard_stop_triggered:
+            log.warning(
+                "Momentum: entry blocked — hard stop active",
+                market=signal.market_title[:60],
+            )
+            return False
+
         # ── Final duplicate re-check (race condition guard) ──────────────────
         if any(p.market_id == market.condition_id
                for p in self._risk.get_open_positions()):

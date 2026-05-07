@@ -63,7 +63,7 @@ class DeribitFetcher:
                     data = await resp.json()
                     return data.get("result", [])
         except Exception as exc:
-            log.error("Deribit instruments fetch failed", exc=str(exc))
+            log.error("Deribit instruments fetch failed", exc=str(exc), exc_type=type(exc).__name__)
             return []
 
     def _find_nearest(
@@ -102,5 +102,5 @@ class DeribitFetcher:
                     iv = result.get("mark_iv", 0.0)
                     return float(iv) / 100.0  # Deribit returns IV as percentage
         except Exception as exc:
-            log.error("Deribit mark_iv fetch failed", exc=str(exc), instrument=instrument_name)
+            log.error("Deribit mark_iv fetch failed", exc=str(exc), exc_type=type(exc).__name__, instrument=instrument_name)
             return 0.0

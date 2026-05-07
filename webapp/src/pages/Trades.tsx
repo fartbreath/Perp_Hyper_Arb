@@ -20,7 +20,7 @@ import type { LedgerGroup } from "./tradesUtils";
 export type { LedgerGroup } from "./tradesUtils";
 
 const UNDERLYINGS = ["", "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE", "other"];
-const STRATEGIES  = ["", "maker", "mispricing", "momentum", "range", "opening_neutral", "momentum_hedge"];
+const STRATEGIES  = ["", "maker", "mispricing", "momentum", "range", "opening_neutral", "reverse_opening_neutral", "momentum_hedge"];
 const OUTCOMES    = [
   { value: "",     label: "All" },
   { value: "WIN",  label: "Win" },
@@ -63,7 +63,7 @@ function TypeBadge({ type }: { type: string }) {
 function StratBadge({ strat }: { strat: string }) {
   const colors: Record<string, string> = {
     maker: "#14532d", mispricing: "#1e3a8a", momentum: "#312e81",
-    opening_neutral: "#065f46", momentum_hedge: "#1a1a2e", range: "#374151",
+    opening_neutral: "#065f46", reverse_opening_neutral: "#164e3d", momentum_hedge: "#1a1a2e", range: "#374151",
   };
   return (
     <span style={{

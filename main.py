@@ -87,6 +87,7 @@ from strategies.mispricing.signals import MispricingSignal
 from strategies.Momentum.scanner import MomentumScanner
 from strategies.Momentum.vol_fetcher import VolFetcher
 from strategies.OpeningNeutral import OpeningNeutralScanner
+from strategies.ReverseOpenNeutral import ReverseOpenNeutralScanner
 from accounting import get_ledger
 from agent import AgentDecisionLayer, AgentDecision
 from monitor import PositionMonitor, compute_unrealised_pnl
@@ -531,6 +532,9 @@ async def state_sync_loop(
                     "hl_size_coins": round(hedge["size"], 6),
                 }
             api_state.positions = positions_raw
+            # Yield to allow HTTP requests / WS keepalives to run before the
+            # O(markets) loop below.
+            await asyncio.sleep(0)
             markets_raw = {}
             for cid, mkt in markets_snap.items():
                 book_yes = pm.get_book(mkt.token_id_yes)
@@ -617,8 +621,12 @@ async def state_sync_loop(
             # ── Broadcast SSE + event-driven sleep ────────────────────────────
             # Push a state bundle to all connected SSE clients so the frontend
             # receives live updates without polling individual REST endpoints.
+            # build_live_state() iterates ~4000 markets and is CPU-bound; run in
+            # a thread so the asyncio event loop stays free for HTTP requests and
+            # WS keepalive pings during the computation.
             try:
-                await api_server.broadcast_sse(api_server.build_live_state())
+                _state_bundle = await asyncio.to_thread(api_server.build_live_state)
+                await api_server.broadcast_sse(_state_bundle)
             except Exception as _sse_exc:
                 log.debug("SSE broadcast error", exc=str(_sse_exc))
 
@@ -764,6 +772,17 @@ async def main() -> None:
             funding_cache=funding_cache,
         )
 
+    reverse_opening_neutral_scanner: ReverseOpenNeutralScanner | None = None
+    if getattr(config, "REVERSE_OPENING_NEUTRAL_ENABLED", False):
+        reverse_opening_neutral_scanner = ReverseOpenNeutralScanner(
+            pm, risk_engine, spot_oracle, vol_fetcher,
+            momentum_scanner=momentum_scanner,
+            on_close_callback=None,  # patched below
+            on_open_callback=notify_state_changed,
+            funding_cache=funding_cache,
+            on_scanner=opening_neutral_scanner,
+        )
+
     def _on_position_close(market_id: str) -> None:
         """Notify both strategy scanners when any position closes.
 
@@ -781,6 +800,8 @@ async def main() -> None:
     # Patch opening_neutral on_close_callback now that _on_position_close exists.
     if opening_neutral_scanner is not None:
         opening_neutral_scanner._on_close_callback = _on_position_close
+    if reverse_opening_neutral_scanner is not None:
+        reverse_opening_neutral_scanner._on_close_callback = _on_position_close
 
     def _on_momentum_stop_loss(market_id: str, tte_remaining: float) -> None:
         """Block re-entry into a market for the rest of its window after a stop-loss.
@@ -813,6 +834,7 @@ async def main() -> None:
     api_state.risk_ref = risk_engine
     api_state.momentum_ref = momentum_scanner
     api_state.opening_neutral_ref = opening_neutral_scanner
+    api_state.reverse_opening_neutral_ref = reverse_opening_neutral_scanner
 
     # ── Connect clients ──────────────────────────────────────────────────────
     log.info("Connecting PM client…")
@@ -841,6 +863,8 @@ async def main() -> None:
     momentum_scanner._model_agent = model_agent
     if opening_neutral_scanner is not None:
         opening_neutral_scanner._model_agent = model_agent
+    if reverse_opening_neutral_scanner is not None:
+        reverse_opening_neutral_scanner._model_agent = model_agent
 
     # ML Phase 4 (ML-08): wire momentum_scanner into model_agent so the
     # independent scan can check would_rules_have_entered via _last_scan_diags.
@@ -871,6 +895,8 @@ async def main() -> None:
         asyncio.create_task(momentum_scanner.start(), name="momentum"),
         *([asyncio.create_task(opening_neutral_scanner.start(), name="opening_neutral")]
           if opening_neutral_scanner is not None else []),
+        *([asyncio.create_task(reverse_opening_neutral_scanner.start(), name="reverse_opening_neutral")]
+          if reverse_opening_neutral_scanner is not None else []),
         asyncio.create_task(
             agent_loop(pm, agent, monitor, risk_engine),
             name="agent_loop",

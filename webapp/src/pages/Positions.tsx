@@ -501,7 +501,7 @@ export default function Positions() {
   const momentumPositions = pmPositions.filter((p) => p.strategy === "momentum" && !p.is_closed);
   const rangePositions = pmPositions.filter((p) => p.strategy === "range" && !p.is_closed);
   const hedgeFilledPositions = pmPositions.filter((p) => p.strategy === "momentum_hedge" && !p.is_closed);
-  const neutralPositions = pmPositions.filter((p) => p.strategy === "opening_neutral" && !p.is_closed);
+  const neutralPositions = pmPositions.filter((p) => (p.strategy === "opening_neutral" || p.strategy === "reverse_opening_neutral") && !p.is_closed);
   const unknownPositions = pmPositions.filter((p) => p.strategy === "unknown" && !p.is_closed);
 
   // Group opening_neutral positions by neutral_pair_id (fall back to condition_id)
@@ -527,7 +527,7 @@ export default function Positions() {
   }
 
   // ── Aggregate stats for summary bar ─────────────────────────────────────
-  const allOpenPm = [...makerPositions.filter(p => !p.is_closed), ...mispricingPositions, ...momentumPositions, ...rangePositions, ...hedgeFilledPositions, ...neutralPositions];
+  const allOpenPm = [...makerPositions.filter(p => !p.is_closed), ...mispricingPositions, ...momentumPositions, ...rangePositions, ...hedgeFilledPositions, ...neutralPositions]; // neutralPositions includes both opening_neutral and reverse_opening_neutral
   const totalDeployed     = allOpenPm.reduce((s, p) => s + (p.entry_cost_usd ?? 0), 0);
   const totalUnrealized   = allOpenPm.reduce((s, p) => s + (p.unrealised_pnl_usd ?? 0), 0);
   const totalRebates      = allOpenPm.reduce((s, p) => s + (p.pm_rebates_earned ?? 0), 0);
@@ -797,9 +797,9 @@ export default function Positions() {
       {neutralPairs.size > 0 && (
         <>
           <h3 style={{ marginTop: "2rem", marginBottom: "0.5rem", fontSize: "0.9rem", color: "#38bdf8" }}>
-            Opening Neutral Pairs
+            Opening Neutral / Reverse ON Pairs
             <span style={{ fontWeight: 400, marginLeft: "0.5rem", fontSize: "0.8rem", color: "#94a3b8" }}>
-              — YES + NO legs entered together; loser exits after sigma_tau move, winner converts to momentum
+              — YES + NO legs entered together; ON: loser exits, winner promotes to momentum · RON: winner TP'd, loser held to resolution
             </span>
           </h3>
           <table className="data-table">
