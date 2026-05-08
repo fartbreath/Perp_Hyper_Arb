@@ -34,7 +34,7 @@ log = get_bot_logger(__name__)
 
 # Coins for which Deribit has liquid options (primary vol source).
 # XRP has Deribit options and SOL is well-covered; BTC/ETH are always available.
-_DERIBIT_SUPPORTED = frozenset({"BTC", "ETH", "SOL", "XRP"})
+_DERIBIT_SUPPORTED = frozenset({"BTC", "ETH"})  # SOL/XRP/BNB have no active options; DOGE/HYPE are unknown currencies
 
 # Rolling-vol buffer: max samples per coin and max age in seconds.
 _MAX_SAMPLES = 2000

@@ -2,6 +2,95 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-08] — WebSocket stability: PM shard 1006 fix; RTDS staleness reconnect; Chainlink Streams HA phase-shift; event-loop yield
+
+### Fix — PM WS shard mass-disconnect (code 1006) (`pm_client.py`)
+
+**Root cause:** `update_tokens()` was closing every shard's WebSocket on every market-refresh cycle
+(~30 s). With 16+ shards reconnecting simultaneously, the PM server dropped connections with code
+1006. Additionally, `create_task` per WS message at startup flooded the event loop with ~10 800
+concurrent tasks, starving server-pong handlers.
+
+**Changes:**
+- `update_tokens()` no longer forces a WS reconnect — the `_close_ws()` path and
+  `asyncio.ensure_future` call removed entirely. New tokens are picked up on the shard's next
+  natural reconnect.
+- Receive loop: `await self._on_message(raw)` + `await asyncio.sleep(0)` replaces
+  `asyncio.create_task(...)` per message. Keeps ready-task count ~18 + callbacks instead of 10k+.
+- `ping_interval=None, ping_timeout=None` — PM server does not respond to client pings; server
+  owns keepalive.
+- Startup stagger: shard `i` waits `i × 1.0 s` before first connect so 16 shards do not flood
+  the server simultaneously.
+- Reconnect stagger: `backoff + (shard_id % 8) × 0.5 s` prevents a mass-disconnect wave
+  collapsing back into simultaneous reconnects.
+
+**Result:** Zero server-initiated 1006 disconnects observed after fix.
+
+---
+
+### Fix — RTDS stale-price reconnect (`market_data/rtds_client.py`)
+
+**Root cause:** The RTDS server occasionally kept the TCP connection alive (responding to pings)
+while silently stopping price pushes. The 15 s recv timeout never fired because pings/pongs
+kept the socket alive. Spot prices went stale indefinitely.
+
+**Changes:**
+- `_reconnect_requested: bool` flag added (set by health loop, cleared by recv loop).
+- Health loop now detects when ALL tracked coins are stale ≥ 120 s and sets
+  `_reconnect_requested = True` instead of calling `ws.close()` (which could race with the recv
+  loop on Windows).
+- Recv loop checks the flag at the top of every cycle and breaks cleanly to trigger reconnect.
+- `recv()` timeout tightened from 15 s → 10 s (pings fire every 5 s so 10 s is still generous).
+
+**Result:** Bot reconnects within one health-loop cycle (~60 s) when RTDS stops delivering prices.
+
+---
+
+### Fix — Chainlink Streams HA phase-shift (`market_data/chainlink_streams_client.py`)
+
+**Root cause:** The Chainlink Mercury infrastructure enforces a ~30 s session TTL per WebSocket,
+RST-ing both HA origins within ~2 s of each other. Because the two origins share the same
+connect/reconnect timing, they converge back into phase after every dual-RST cycle, causing
+brief windows where `active_connections=0`.
+
+**Changes:**
+- **Partial reconnect delay:** when one origin drops while the other is still alive, the
+  reconnect loop waits `_WS_SILENCE_TIMEOUT_S / 2 + random.uniform(0, 2)` ≈ 15-17 s before
+  reconnecting. This keeps the two origins permanently ~15 s out of phase.
+- **Full reconnect (both down):** reconnects immediately with original backoff + jitter (fast
+  recovery path). Emits a `WARNING` log.
+- **Startup stagger:** origin `'002'` starts `_ORIGIN_STAGGER_S = 15 s` after `'001'` via
+  `initial_delay` in `_conn_loop()`.
+- `ping_interval=None, ping_timeout=None` — server owns keepalive; client pings were not
+  needed and had no effect on session TTL.
+- Routine connect/disconnect log lines demoted to `DEBUG`. Only `full_reconnects` emit `WARNING`.
+- `ConnectionClosed` and `(AttributeError, OSError)` catch blocks added with descriptive
+  `DEBUG` log messages instead of silent `break`.
+
+**Result:** Every reconnect now shows `active_connections=2`. Zero "all connections down" warnings
+observed in live run after fix.
+
+---
+
+### Fix — ModelAgent independent scan event-loop yield (`models/model_agent.py`)
+
+**Root cause:** Iterating ~4 000 PM markets with `sklearn.predict_proba` per market blocked the
+asyncio event loop for 8-20 s. This starved WS keepalive pong handlers and was the root cause
+of WS disconnects observed during the investigation.
+
+**Change:** `await asyncio.sleep(0)` inserted every 50 markets in `_independent_scan_loop()` so
+the event loop can process I/O (WebSocket pongs, RTDS data, etc.) between batches.
+
+---
+
+### Cleanup — Remove asyncio debug mode from `main.py`
+
+Temporary `asyncio.run(main(), debug=True)`, `loop.slow_callback_duration = 0.5`, and
+`logging.getLogger("asyncio").setLevel(DEBUG)` removed now that the blocking operation was
+identified (ModelAgent scan loop) and fixed.
+
+---
+
 ## [2026-05-06] — ML Phase 3+4 (model-assisted exits + paper trading); WINNER-fill delta SL; risk.py CSV removal; HL mark price; SPA catch-all
 
 ### Feature — ML Phase 3: Model B exit gate (ML-06) (`strategies/OpeningNeutral/scanner.py`, `models/model_agent.py`, `config.py`)

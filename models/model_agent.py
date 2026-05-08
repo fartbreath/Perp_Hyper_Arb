@@ -648,7 +648,14 @@ class ModelAgent:
             "stop_loss_block", "opening_neutral_active",
         })
 
-        for market in list(self._pm_client.get_markets().values()):
+        for _scan_i, market in enumerate(list(self._pm_client.get_markets().values())):
+            # Yield every 50 markets so websocket keepalive pings (Chainlink
+            # ping_interval=2s, ping_timeout=20s) can be processed.  Without
+            # this yield, iterating ~4000 markets × ~2-5ms sklearn predict_proba
+            # blocks the asyncio loop for 8-20s, starving pong handlers and
+            # triggering reconnect cycles.
+            if _scan_i % 50 == 0:
+                await asyncio.sleep(0)
             if len(self._paper_positions) + proposed_this_tick >= max_open:
                 break
 
