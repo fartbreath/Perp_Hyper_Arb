@@ -243,6 +243,14 @@ class OpeningNeutralScanner(BaseStrategy):
         # _winner_pos_refs: pair_id → Position  (kept so stop() can flush exit prices).
         self._winner_pending: dict[str, str] = {}
         self._winner_pos_refs: dict[str, Any] = {}
+        # RON mirror hook: coroutines registered via register_pair_callback() are
+        # fired (as asyncio tasks) after every successful _register_pair call.
+        self._on_pair_registered_callbacks: list = []
+
+    def register_pair_callback(self, cb) -> None:
+        """Register a coroutine cb(market, on_pair_id, yes_pos, no_pos) fired after
+        each successful pair registration.  Used by ReverseOpenNeutralScanner."""
+        self._on_pair_registered_callbacks.append(cb)
 
     # ── BaseStrategy interface ────────────────────────────────────────────────
 
@@ -882,6 +890,31 @@ class OpeningNeutralScanner(BaseStrategy):
                                     exc=str(_mb_exc),
                                 )
                         # ── Fire loser exit ──────────────────────────────────
+                        # ON-05 audit: log which leg the tightened trigger fired on
+                        # when score=±2, so we can verify the tighten hits the loser
+                        # not the winner.
+                        _base_trigger = config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER
+                        _conf_score = self._pair_csv_data.get(pair_id, {}).get("loser_confidence_score")
+                        _tightened = (
+                            _conf_score is not None
+                            and abs(_conf_score) >= 2
+                            and abs(_bid_threshold - _base_trigger) >= 0.001
+                        )
+                        log.info(
+                            "OpeningNeutral: loser exit firing",
+                            pair_id=pair_id[:12],
+                            loser_side=mon_side,
+                            best_bid=round(best_bid, 4),
+                            trigger=round(_bid_threshold, 4),
+                            base_trigger=round(_base_trigger, 4),
+                            tightened=_tightened,
+                            loser_confidence_score=_conf_score,
+                            predicted_loser="YES" if (_conf_score or 0) > 0 else ("NO" if (_conf_score or 0) < 0 else "none"),
+                            trigger_hit_predicted_loser=(
+                                mon_side == "YES" if (_conf_score or 0) > 0 else
+                                mon_side == "NO"  if (_conf_score or 0) < 0 else None
+                            ),
+                        )
                         self._exiting_legs.add(token_id)
                         asyncio.create_task(
                             self._execute_loser_exit(pair_id, mon_side, token_id, mon_pos, best_bid),
@@ -900,6 +933,10 @@ class OpeningNeutralScanner(BaseStrategy):
         by the `elapsed < 0` gate.  All other gates are unchanged.
         """
         if not config.OPENING_NEUTRAL_ENABLED:
+            return
+
+        # ── Hard stop gate ────────────────────────────────────────────────────
+        if self._risk.hard_stop_triggered:
             return
 
         market_id = getattr(market, "condition_id", None)
@@ -1851,6 +1888,9 @@ class OpeningNeutralScanner(BaseStrategy):
             pair_id=pair_id[:12],
             exit_threshold=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
         )
+        # Notify any registered mirrors (e.g. RON) about the new pair.
+        for _cb in self._on_pair_registered_callbacks:
+            asyncio.create_task(_cb(market, pair_id, yes_pos, no_pos))
 
     async def _handle_one_leg_fill(
         self,

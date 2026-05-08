@@ -112,6 +112,7 @@ class RTDSClient:
         self._tracked_coins: set[str] = set()
         self._ws: Any = None
         self._running = False
+        self._reconnect_requested: bool = False  # set by health loop; cleared by _ws_loop
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -196,8 +197,9 @@ class RTDSClient:
     # ── WebSocket loop ────────────────────────────────────────────────────────
 
     async def _health_log_loop(self) -> None:
-        """Every 60 s log RTDS feed health."""
-        RTDS_STALE_THRESH = 30.0   # seconds — exchange-aggregated should be very active
+        """Every 60 s log RTDS feed health; reconnect if prices are stale too long."""
+        RTDS_STALE_THRESH      = 30.0    # seconds — exchange-aggregated should be active
+        RTDS_STALE_RECONNECT_S = 120.0   # force reconnect if all tracked coins stale this long
         await asyncio.sleep(60)
         while self._running:
             rtds_ages = {
@@ -211,6 +213,20 @@ class RTDSClient:
                     rtds_stale=rtds_stale,
                     rtds_fresh={c: a for c, a in rtds_ages.items() if c not in rtds_stale},
                 )
+                # If all tracked coins are stale beyond the reconnect threshold, the
+                # RTDS server has stopped pushing data while responding to our PINGs
+                # (keeping the 15 s recv-timeout alive).  Force a reconnect by closing
+                # the WS so _ws_loop re-subscribes and gets a fresh price batch.
+                if (
+                    rtds_ages
+                    and all(a >= RTDS_STALE_RECONNECT_S for a in rtds_ages.values() if a != float("inf"))
+                    and self._ws is not None
+                ):
+                    log.warning(
+                        "RTDSClient: all prices stale — forcing reconnect",
+                        stale_secs=RTDS_STALE_RECONNECT_S,
+                    )
+                    self._reconnect_requested = True
             else:
                 log.info(
                     "RTDSClient: spot prices OK",
@@ -240,13 +256,19 @@ class RTDSClient:
                         # Use an explicit timeout on each recv() so that a zombie
                         # connection (dead TCP, no close frame) is detected and
                         # causes a reconnect.  We PING every 5 s so we expect at
-                        # least a PONG back within 15 s in steady state.
+                        # least a PONG back within 10 s in steady state.
+                        # _reconnect_requested is set by _health_log_loop when prices
+                        # are stale; checked every recv cycle (~5 s) for fast response.
                         while True:
+                            if self._reconnect_requested:
+                                self._reconnect_requested = False
+                                log.info("RTDSClient: reconnect requested — re-subscribing")
+                                break
                             try:
-                                frame = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                                frame = await asyncio.wait_for(ws.recv(), timeout=10.0)
                             except asyncio.TimeoutError:
                                 log.warning(
-                                    "RTDSClient: no message received in 15 s — "
+                                    "RTDSClient: no message received in 10 s — "
                                     "zombie connection, forcing reconnect"
                                 )
                                 break

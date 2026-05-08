@@ -78,6 +78,7 @@ class BotState:
 
     # Opening neutral signals and live instance
     opening_neutral_ref: Any = None  # live OpeningNeutralScanner instance; set by main.py
+    reverse_opening_neutral_ref: Any = None  # live ReverseOpenNeutralScanner instance; set by main.py
 
     # Agent shadow log (filled by agent)
     agent_shadow_log: list = field(default_factory=list)
@@ -357,6 +358,8 @@ FILLS_CSV = Path(__file__).parent / "data" / "fills.csv"
 ORDERS_CSV = Path(__file__).parent / "data" / "orders.csv"
 # Path to market outcomes file written by monitor.py
 MARKET_OUTCOMES_JSON = Path(__file__).parent / "data" / "market_outcomes.json"
+# Path to RON paper-fill log written by ReverseOpenNeutralScanner
+RON_FILLS_CSV = Path(__file__).parent / "data" / "ron_fills.csv"
 # Path to persisted config overrides — survives bot restarts
 _OVERRIDES_FILE = Path(__file__).parent / "config_overrides.json"
 
@@ -602,6 +605,7 @@ _MUTABLE_CONFIG = {
     "momentum_resolved_force_close_sec":   ("MOMENTUM_RESOLVED_FORCE_CLOSE_SEC",    int),
     # Strategy 5 — Opening Neutral
     "opening_neutral_enabled":                     ("OPENING_NEUTRAL_ENABLED",                     bool),
+    "reverse_opening_neutral_enabled":             ("REVERSE_OPENING_NEUTRAL_ENABLED",             bool),
     "opening_neutral_dry_run":                     ("OPENING_NEUTRAL_DRY_RUN",                     bool),
     "opening_neutral_tp_enabled":                  ("OPENING_NEUTRAL_TP_ENABLED",                   bool),
     "opening_neutral_tp_profit_pct":               ("OPENING_NEUTRAL_TP_PROFIT_PCT",                float),
@@ -875,6 +879,7 @@ class ConfigPatch(BaseModel):
     momentum_resolved_force_close_sec: int | None = None
     # Strategy 5 — Opening Neutral
     opening_neutral_enabled: bool | None = None
+    reverse_opening_neutral_enabled: bool | None = None
     opening_neutral_dry_run: bool | None = None
     opening_neutral_tp_enabled: bool | None = None
     opening_neutral_tp_profit_pct: float | None = None
@@ -909,7 +914,7 @@ class ConfigPatch(BaseModel):
 
 
 @app.get("/config")
-def get_config() -> dict:
+async def get_config() -> dict:
     """Return all mutable runtime config values."""
     return {
         "paper_trading":        config.PAPER_TRADING,
@@ -1150,6 +1155,7 @@ def get_config() -> dict:
         "momentum_resolved_force_close_sec":   config.MOMENTUM_RESOLVED_FORCE_CLOSE_SEC,
         # Strategy 5 — Opening Neutral
         "opening_neutral_enabled":                     config.OPENING_NEUTRAL_ENABLED,
+        "reverse_opening_neutral_enabled":             getattr(config, "REVERSE_OPENING_NEUTRAL_ENABLED", False),
         "opening_neutral_dry_run":                     config.OPENING_NEUTRAL_DRY_RUN,
         "opening_neutral_tp_enabled":                  config.OPENING_NEUTRAL_TP_ENABLED,
         "opening_neutral_tp_profit_pct":               config.OPENING_NEUTRAL_TP_PROFIT_PCT,
@@ -1185,7 +1191,7 @@ def get_config() -> dict:
 
 
 @app.post("/config", dependencies=[Depends(require_auth)])
-def patch_config(patch: ConfigPatch) -> dict:
+async def patch_config(patch: ConfigPatch) -> dict:
     """
     Update one or more mutable config values at runtime.
     Changes take effect immediately (module-level variables are mutated).
@@ -1336,7 +1342,7 @@ def patch_config(patch: ConfigPatch) -> dict:
         _save_overrides(attr_changes)
     return {
         "updated": updated,
-        "current": get_config(),
+        "current": await get_config(),
     }
 
 
@@ -2023,7 +2029,7 @@ async def positions_live() -> dict:
 
 
 @app.post("/positions/ghost/dismiss")
-async def dismiss_ghost_position(body: dict) -> dict:
+def dismiss_ghost_position(body: dict) -> dict:
     """
     Force-close a ghost position — one the bot tracks but PM wallet no longer holds
     (market resolved, tokens redeemed/expired, or position closed externally).
@@ -2863,7 +2869,7 @@ async def momentum_scan_summary() -> dict:
 
 
 @app.get("/momentum/events")
-async def get_momentum_events(n: int = 200) -> dict:
+def get_momentum_events(n: int = 200) -> dict:
     """Return the last *n* events from data/momentum_events.jsonl (newest first).
 
     Events are written by the scanner and monitor whenever key trading
@@ -2876,6 +2882,50 @@ async def get_momentum_events(n: int = 200) -> dict:
 
 
 # ── Opening Neutral ───────────────────────────────────────────────────────────
+
+@app.get("/reverse_opening_neutral/status")
+def reverse_opening_neutral_status() -> dict:
+    """Strategy 5b (Reverse Opening Neutral) runtime status."""
+    if state.reverse_opening_neutral_ref is None:
+        return {
+            "enabled": getattr(config, "REVERSE_OPENING_NEUTRAL_ENABLED", False),
+            "dry_run": config.OPENING_NEUTRAL_DRY_RUN,
+            "active_pairs": 0,
+            "pairs": [],
+            "recent_signals": [],
+            "scanner_running": False,
+            "timestamp": time.time(),
+        }
+    status = state.reverse_opening_neutral_ref.get_status()
+    status["scanner_running"] = getattr(state.reverse_opening_neutral_ref, "_running", False)
+    status["timestamp"] = time.time()
+    return status
+
+
+@app.get("/ron/fills")
+def ron_fills(limit: int = Query(default=200, ge=1, le=2000)) -> dict:
+    """Completed RON paper trades from data/ron_fills.csv.
+
+    Returns:
+      fills   — list of row dicts, most-recent first, up to `limit`
+      total   — total rows in the CSV (excluding header)
+      timestamp — unix epoch
+    """
+    rows: list[dict] = []
+    if RON_FILLS_CSV.exists():
+        try:
+            with RON_FILLS_CSV.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.error("Failed to read ron_fills.csv", exc=str(exc))
+    rows.reverse()  # most-recent first
+    return {
+        "fills": rows[:limit],
+        "total": len(rows),
+        "timestamp": time.time(),
+    }
+
 
 @app.get("/opening_neutral/status")
 def opening_neutral_status() -> dict:

@@ -621,6 +621,37 @@ class _Ledger:
             pos_id=pos_id[:12],
         )
 
+    def on_ron_exit(self, winner_token_id: str, loser_token_id: str) -> None:
+        """
+        Called by ReverseOpenNeutralScanner when the exit trigger fires.
+
+        Retags both legs so acct_ledger records them as reverse_opening_neutral
+        (not opening_neutral), keeping them separate in the Performance breakdown:
+          - winner leg: strategy="reverse_opening_neutral", fill_type="WINNER"
+          - loser leg:  strategy="reverse_opening_neutral", fill_type="MAIN"
+        """
+        with self._lock:
+            changed = False
+            for token_id, fill_type in (
+                (winner_token_id, "WINNER"),
+                (loser_token_id,  "MAIN"),
+            ):
+                pos_id = self._token_index.get(token_id)
+                if pos_id is None:
+                    log.warning("acct: on_ron_exit — no position for token_id", token_id=token_id[:16])
+                    continue
+                pos = self._positions[pos_id]
+                pos.strategy  = "reverse_opening_neutral"
+                pos.fill_type = fill_type
+                changed = True
+            if changed:
+                _save_positions(self._positions)
+        log.info(
+            "acct: RON exit — positions retagged as reverse_opening_neutral",
+            winner_token_id=winner_token_id[:16],
+            loser_token_id=loser_token_id[:16],
+        )
+
     def add_fees(self, token_id: str, fees_usd: float, rebates_usd: float = 0.0) -> None:
         """Accumulate fees/rebates on an existing position."""
         with self._lock:

@@ -474,6 +474,26 @@ export default function Settings() {
           value={data.opening_neutral_enabled ?? false}
           onChange={(v) => apply({ opening_neutral_enabled: v })}
         />
+
+        {GAP}
+
+        <Toggle
+          label="Reverse Opening Neutral (Strategy 5b)"
+          description="Same entry as Opening Neutral but exits the WINNER at market-TP price, then holds the LOSER to resolution. Parallel experiment alongside Strategy 5. Restart required to activate/deactivate."
+          value={data.reverse_opening_neutral_enabled ?? false}
+          onChange={(v) => apply({ reverse_opening_neutral_enabled: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="RON Double-Down USD"
+          description="When RON takes the winner TP, simulate buying this additional USD amount of the LOSER. 0 = disabled. Paper-only — no real order is placed."
+          value={data.ron_double_down_usd ?? 0}
+          step={0.5}
+          unit="$"
+          onSubmit={(v) => apply({ ron_double_down_usd: v })}
+        />
       </div>
 
       {/* ── 2b. Opening Neutral Settings ────────────────────────────── */}

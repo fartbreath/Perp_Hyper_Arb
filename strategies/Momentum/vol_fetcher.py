@@ -34,12 +34,15 @@ log = get_bot_logger(__name__)
 
 # Coins for which Deribit has liquid options (primary vol source).
 # XRP has Deribit options and SOL is well-covered; BTC/ETH are always available.
-_DERIBIT_SUPPORTED = frozenset({"BTC", "ETH", "SOL", "XRP"})
+_DERIBIT_SUPPORTED = frozenset({"BTC", "ETH"})  # SOL/XRP/BNB have no active options; DOGE/HYPE are unknown currencies
 
 # Rolling-vol buffer: max samples per coin and max age in seconds.
 _MAX_SAMPLES = 2000
 _MAX_AGE_SECS = 86_400          # 24 hours
 _MIN_SAMPLES_FOR_VOL = 10       # require at least 10 log-returns
+
+# How long to back off before retrying Deribit after a failure.
+_DERIBIT_FAIL_BACKOFF_SECS = 60.0
 
 
 class VolFetcher:
@@ -57,6 +60,11 @@ class VolFetcher:
 
         # Deribit IV cache: coin → (sigma_ann, expires_at, source_tag)
         self._cache: dict[str, tuple[float, float, str]] = {}
+
+        # Deribit failure backoff: coin → retry_after_timestamp
+        # After a failed Deribit fetch, we skip retrying for _DERIBIT_FAIL_BACKOFF_SECS
+        # to avoid hammering the API and blocking the scanner on repeated timeouts.
+        self._deribit_backoff: dict[str, float] = {}
 
         # HL rolling mid buffer: coin → deque[(timestamp, mid)]
         self._mid_history: dict[str, deque] = defaultdict(
@@ -121,16 +129,34 @@ class VolFetcher:
 
         # Primary: Deribit ATM IV
         if underlying in _DERIBIT_SUPPORTED:
-            iv = await self._fetch_deribit_atm_iv(underlying)
-            if iv is not None and iv > 0:
-                expires = now + config.MOMENTUM_VOL_CACHE_TTL
-                self._cache[underlying] = (iv, expires, "deribit_atm")
+            backoff_until = self._deribit_backoff.get(underlying, 0.0)
+            if now >= backoff_until:
+                iv = await self._fetch_deribit_atm_iv(underlying)
+                if iv is not None and iv > 0:
+                    expires = now + config.MOMENTUM_VOL_CACHE_TTL
+                    self._cache[underlying] = (iv, expires, "deribit_atm")
+                    # Clear any prior backoff on success
+                    self._deribit_backoff.pop(underlying, None)
+                    log.debug(
+                        "VolFetcher: Deribit IV fetched",
+                        underlying=underlying,
+                        sigma_ann=round(iv, 4),
+                    )
+                    return iv, "deribit_atm"
+                else:
+                    # Deribit returned nothing — back off before retrying
+                    self._deribit_backoff[underlying] = now + _DERIBIT_FAIL_BACKOFF_SECS
+                    log.warning(
+                        "VolFetcher: Deribit fetch returned no IV, backing off",
+                        underlying=underlying,
+                        retry_in_secs=_DERIBIT_FAIL_BACKOFF_SECS,
+                    )
+            else:
                 log.debug(
-                    "VolFetcher: Deribit IV fetched",
+                    "VolFetcher: Deribit backoff active, using fallback",
                     underlying=underlying,
-                    sigma_ann=round(iv, 4),
+                    retry_in_secs=round(backoff_until - now, 1),
                 )
-                return iv, "deribit_atm"
 
         # Fallback: RTDS rolling realized vol
         rv = self._compute_rolling_vol(underlying)

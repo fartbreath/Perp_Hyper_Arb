@@ -5,7 +5,7 @@ import { useState } from "react";
 import {
   useHealth, usePnl, usePositions, useLauncherStatus,
   startBotProcess, stopBotProcess, usePerformance, useInventory, useConfig, updateConfig,
-  useMomentumSignals, useMomentumScanSummary, useOpeningNeutralStatus, usePipelineHealth,
+  useMomentumSignals, useMomentumScanSummary, useOpeningNeutralStatus, useReverseOpeningNeutralStatus, useRonFills, usePipelineHealth,
   useModelTrainStatus, triggerModelTrain,
 } from "../api/client";
 import type { Position, PipelineStatus } from "../api/client";
@@ -841,6 +841,151 @@ function OpeningNeutralCard() {
   );
 }
 
+function ReverseOpeningNeutralCard() {
+  const { data } = useReverseOpeningNeutralStatus();
+  const { data: fillsData } = useRonFills();
+  if (!data) return null;
+
+  const enabled = data.enabled;
+  const dryRun = data.dry_run;
+  const pairs = data.pairs ?? [];
+  const fills = fillsData?.fills ?? [];
+  const totalFills = fillsData?.total ?? 0;
+
+  // Compute simple win stats from fills: winner_sold_price > 0.5 = profit on the winner sale
+  const completedFills = fills.filter(f => f.winner_sold_price);
+  const avgWinnerPrice = completedFills.length > 0
+    ? completedFills.reduce((s, f) => s + parseFloat(f.winner_sold_price), 0) / completedFills.length
+    : null;
+
+  return (
+    <div className="card">
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginBottom: "0.6rem" }}>
+        <h3 style={{ margin: 0 }}>Reverse Opening Neutral</h3>
+        <span style={{
+          padding: "2px 8px", borderRadius: 999, fontSize: "0.72rem", fontWeight: 700,
+          background: enabled ? "#0c2a3d" : "#1f2937",
+          color: enabled ? "#38bdf8" : "#64748b",
+        }}>
+          {enabled ? "● Active" : "○ Disabled"}
+        </span>
+        {dryRun && (
+          <span style={{ padding: "2px 8px", borderRadius: 999, fontSize: "0.72rem",
+            fontWeight: 700, background: "#451a03", color: "#fb923c" }}>
+            DRY RUN
+          </span>
+        )}
+        <span style={{ padding: "2px 6px", borderRadius: 999, fontSize: "0.68rem",
+          background: "#1e293b", color: "#94a3b8" }}>
+          5b: sell winner, hold loser to resolution
+        </span>
+      </div>
+
+      {/* Stats row */}
+      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "0.75rem" }}>
+        <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 120 }}>
+          <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Active loser pairs</div>
+          <div style={{ fontFamily: "monospace", fontWeight: 600, color: data.active_pairs > 0 ? "#38bdf8" : "#94a3b8" }}>
+            {data.active_pairs}
+          </div>
+        </div>
+        <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 120 }}>
+          <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Completed pairs</div>
+          <div style={{ fontFamily: "monospace", fontWeight: 600, color: totalFills > 0 ? "#e2e8f0" : "#94a3b8" }}>
+            {totalFills}
+          </div>
+        </div>
+        {avgWinnerPrice !== null && (
+          <div style={{ background: "#1e293b", borderRadius: 8, padding: "0.5rem 0.75rem", minWidth: 140 }}>
+            <div style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: 2 }}>Avg winner TP price</div>
+            <div style={{ fontFamily: "monospace", fontWeight: 600,
+              color: avgWinnerPrice >= 0.6 ? "#22c55e" : avgWinnerPrice >= 0.5 ? "#f59e0b" : "#f87171" }}>
+              {avgWinnerPrice.toFixed(3)}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Active pairs */}
+      {pairs.length > 0 && (
+        <div style={{ marginBottom: "0.75rem" }}>
+          <div style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.4rem" }}>Active loser pairs</div>
+          {pairs.map(pair => (
+            <div key={pair.pair_id} style={{
+              display: "flex", alignItems: "center", gap: "0.75rem",
+              background: "#1e293b", borderRadius: 6, padding: "0.4rem 0.75rem",
+              marginBottom: "0.3rem", fontSize: "0.8rem",
+            }}>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}
+                title={pair.market_title}>
+                {pair.market_title}
+              </span>
+              <span style={{ color: "#22c55e", fontFamily: "monospace" }}>
+                YES {pair.yes_entry != null ? pair.yes_entry.toFixed(2) : "—"}
+              </span>
+              <span style={{ color: "#f87171", fontFamily: "monospace" }}>
+                NO {pair.no_entry != null ? pair.no_entry.toFixed(2) : "—"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Completed fills history */}
+      {fills.length > 0 && (
+        <div>
+          <div style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.4rem" }}>
+            Recent completed pairs{totalFills > fills.length ? ` (showing ${fills.length} of ${totalFills})` : ""}
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.78rem" }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid #1e293b", color: "#64748b", textAlign: "left" }}>
+                  <th style={{ padding: "0.3rem 0.5rem" }}>Market</th>
+                  <th style={{ padding: "0.3rem 0.5rem" }}>Loser</th>
+                  <th style={{ padding: "0.3rem 0.5rem" }}>Winner TP</th>
+                  <th style={{ padding: "0.3rem 0.5rem" }}>Trigger bid</th>
+                  <th style={{ padding: "0.3rem 0.5rem" }}>Hold secs</th>
+                </tr>
+              </thead>
+              <tbody>
+                {fills.map(f => {
+                  const winnerPrice = parseFloat(f.winner_sold_price);
+                  const triggerBid  = parseFloat(f.loser_trigger_bid);
+                  return (
+                    <tr key={f.pair_id} style={{ borderBottom: "1px solid #1e293b" }}>
+                      <td style={{ padding: "0.3rem 0.5rem", maxWidth: 200, overflow: "hidden",
+                        textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                        title={f.market_title}>
+                        <span style={{ color: "#94a3b8", fontSize: "0.7rem" }}>{f.underlying}</span>
+                        {" "}{f.market_title.replace(/.*- /, "")}
+                      </td>
+                      <td style={{ padding: "0.3rem 0.5rem", fontFamily: "monospace",
+                        color: f.loser_leg === "YES" ? "#22c55e" : "#f87171" }}>
+                        {f.loser_leg}
+                      </td>
+                      <td style={{ padding: "0.3rem 0.5rem", fontFamily: "monospace",
+                        color: winnerPrice >= 0.6 ? "#22c55e" : winnerPrice >= 0.5 ? "#f59e0b" : "#f87171" }}>
+                        {winnerPrice.toFixed(3)}
+                      </td>
+                      <td style={{ padding: "0.3rem 0.5rem", fontFamily: "monospace", color: "#94a3b8" }}>
+                        {triggerBid.toFixed(3)}
+                      </td>
+                      <td style={{ padding: "0.3rem 0.5rem", fontFamily: "monospace", color: "#64748b" }}>
+                        {parseFloat(f.winner_sold_time_secs).toFixed(0)}s
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PipelineStatusCard() {
   const { data, error } = usePipelineHealth();
   if (error || !data) return null; // hide if bot offline
@@ -1016,6 +1161,7 @@ export default function Dashboard() {
       </div>
       <MomentumCard />
       <OpeningNeutralCard />
+      <ReverseOpeningNeutralCard />
       <PositionsCard />
       <PipelineStatusCard />
       <ModelTrainingCard />

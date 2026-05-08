@@ -343,10 +343,10 @@ class _WSShard:
     never forwarded.
 
     Token assignment is stable: once a token is assigned to a shard it stays
-    there until explicitly removed via update_tokens(). Calling update_tokens()
-    with a changed token set closes the current WS so _loop() reconnects with
-    the fresh set — matching the GroupSocket reconnect-on-update pattern from
-    the @ultralumao/poly-websockets library.
+    there until explicitly removed via update_tokens(). update_tokens() only
+    triggers a WS reconnect when NEW tokens are added to the subscription
+    (removals are handled silently — the server keeps sending updates that
+    are ignored since expired tokens' books are cleared in _update_shards).
     """
 
     def __init__(
@@ -379,30 +379,37 @@ class _WSShard:
             self._task.cancel()
 
     def update_tokens(self, tokens: set[str]) -> None:
-        """Replace the token set.  If the WS is open, close it so _loop()
-        reconnects with the updated subscription list.
+        """Replace the token set.
+
+        Never forces a WS reconnect — just updates the in-memory token list.
+        New tokens are subscribed on the shard's next natural reconnect
+        (GroupSocket pattern).  Forcing immediate reconnects was the root
+        cause of mass-shard drops: the subscription refresh called this every
+        ~30 s, triggering 17 simultaneous close+reconnect cycles that
+        overloaded the Polymarket server and caused it to drop connections
+        with code 1006.
         """
         if tokens == self._tokens:
             return
         self._tokens = set(tokens)
-        if self._ws is not None and self.connected:
-            asyncio.ensure_future(self._close_ws())
-
-    async def _close_ws(self) -> None:
-        if self._ws:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
 
     async def _loop(self) -> None:
+        # Stagger the initial connection attempt by shard_id seconds so that
+        # all 16 shards do NOT connect simultaneously.  Without staggering,
+        # every shard receives the PM server's first keepalive ping at the
+        # same moment (~60 s after connect), flooding the event loop with 16
+        # simultaneous pong-response tasks and starving it into a 1011 / 1006
+        # cascade.  With a 1 s stagger, shard pings arrive in a 16-second
+        # rolling window instead of a single burst.
+        if self.shard_id > 0:
+            await asyncio.sleep(self.shard_id * 1.0)
         backoff = 1.0
         while self._running:
             try:
                 async with websockets.connect(
                     config.PM_WS_URL,
-                    ping_interval=config.PM_WS_PING_INTERVAL,
-                    ping_timeout=20,
+                    ping_interval=None,   # PM server does not respond to client PINGs;
+                    ping_timeout=None,    # server-side keepalive is handled by the server.
                 ) as ws:
                     self._ws = ws
                     self.connected = True
@@ -435,7 +442,26 @@ class _WSShard:
                                 log.debug("PM WS shard non-JSON",
                                           shard_id=self.shard_id, preview=raw[:80])
                             continue
-                        await self._on_message(raw)
+                        # Process this message SEQUENTIALLY (not create_task) so the
+                        # total number of ready tasks in the event loop stays low.
+                        #
+                        # With create_task: 18 shards × 100 book events = 1800 tasks at
+                        # startup; each fires 6 price-callback tasks → 10800 tasks.
+                        # RTDS and PM server-pong handling are buried at the end of
+                        # that queue and starve for 8+ minutes.
+                        #
+                        # With sequential await: max ~18 receive-loop tasks + ~108
+                        # price-callback tasks at any moment.  _fire_price_change still
+                        # uses create_task for its callbacks so a slow callback (e.g.
+                        # monitor REST exit) never blocks this receive loop.
+                        # The sleep(0) after each message yields to let those tasks and
+                        # I/O (server pong, RTDS data) run before the next message.
+                        try:
+                            await self._on_message(raw)
+                        except Exception as exc:
+                            log.error("PM WS msg processing error",
+                                      shard_id=self.shard_id, exc=str(exc))
+                        await asyncio.sleep(0)
 
             except ConnectionClosed as exc:
                 log.warning("PM WS shard disconnected",
@@ -447,9 +473,14 @@ class _WSShard:
                 self.connected = False
 
             if self._running:
+                # Re-apply a per-shard stagger on reconnect so that a mass-
+                # disconnect wave doesn't collapse back into simultaneous
+                # reconnects (which would recreate the same ping-flood problem).
+                # Group shards into 8 buckets (0-3.5 s spread) on top of backoff.
+                stagger = (self.shard_id % 8) * 0.5
                 log.info("PM WS shard reconnecting",
                          shard_id=self.shard_id, backoff=backoff)
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(backoff + stagger)
                 backoff = min(backoff * 2, 30)
 
     @property
@@ -1180,6 +1211,9 @@ class PMClient:
 
     async def _handle_ws_message(self, raw: str) -> None:
         try:
+            # Each call runs as an independent asyncio task (see _loop),
+            # so json.loads blocking here does not stall the receive loop
+            # or any other shard's keepalive processing.
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             log.debug("PM WS JSON decode error", preview=raw[:80])

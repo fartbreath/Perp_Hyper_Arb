@@ -175,6 +175,7 @@ def _make_scanner(
     risk.get_open_positions.return_value = open_positions or []
     risk.open_position = MagicMock()
     risk.close_position = MagicMock()
+    risk.hard_stop_triggered = False
 
     spot = MagicMock()
     spot.get_price = MagicMock(return_value=70000.0)
@@ -1103,6 +1104,7 @@ def _make_scanner_custom_books(yes_ask, no_ask, yes_bid, no_bid, markets):
     risk.get_open_positions.return_value = []
     risk.open_position = MagicMock()
     risk.close_position = MagicMock()
+    risk.hard_stop_triggered = False
     spot = MagicMock()
     vol  = MagicMock()
 

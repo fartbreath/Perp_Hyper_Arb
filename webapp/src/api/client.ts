@@ -30,6 +30,9 @@ const POLL_INTERVAL_MS = 5_000;
 type SSECallback<T> = (data: T) => void;
 
 const _sseCallbacks = new Map<string, Set<SSECallback<unknown>>>();
+// Cache the last value received per SSE key.  New component mounts skip the
+// REST fallback fetch and render immediately with the cached value.
+const _sseCache = new Map<string, unknown>();
 let _sseSource: EventSource | null = null;
 
 function _ensureSSE() {
@@ -43,6 +46,7 @@ function _ensureSSE() {
       const bundle = JSON.parse(ev.data) as Record<string, unknown>;
       for (const [key, callbacks] of _sseCallbacks.entries()) {
         if (bundle[key] !== undefined) {
+          _sseCache.set(key, bundle[key]); // warm the cache for new mounts
           callbacks.forEach(cb => (cb as SSECallback<unknown>)(bundle[key]));
         }
       }
@@ -628,6 +632,8 @@ export interface ConfigData {
   // Strategy 5 — Opening Neutral
   opening_neutral_enabled?: boolean;
   opening_neutral_dry_run?: boolean;
+  reverse_opening_neutral_enabled?: boolean;
+  ron_double_down_usd?: number;
   opening_neutral_tp_enabled?: boolean;
   opening_neutral_tp_profit_pct?: number;
   // ON-01 — Cold-book spread gate
@@ -690,7 +696,14 @@ export async function updateConfig(patch: ConfigPatch): Promise<ConfigData> {
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
-  return json.current as ConfigData;
+  const updated = json.current as ConfigData;
+  // Push the server's authoritative response straight into the shared cache so
+  // every component (Dashboard, Settings, Positions, Signals) sees the change
+  // immediately — no need to wait for the next 30 s poll tick.
+  _configCache.data = updated;
+  _configCache.error = null;
+  _configSubs.forEach((fn) => fn());
+  return updated;
 }
 
 // ── Generic polling hook (kept for slow/expensive endpoints) ──────────────────
@@ -702,8 +715,11 @@ function usePolling<T>(
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const inflightRef = useRef(false);
 
   const fetchData = useCallback(async () => {
+    if (inflightRef.current) return; // skip tick if previous fetch still running
+    inflightRef.current = true;
     try {
       const res = await fetch(`${BASE_URL}${path}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -714,6 +730,7 @@ function usePolling<T>(
       setError(e instanceof Error ? e.message : "fetch error");
     } finally {
       setLoading(false);
+      inflightRef.current = false;
     }
   }, [path]);
 
@@ -734,9 +751,11 @@ function useSSE<T>(
   sseKey: string,
   restPath: string,
 ): { data: T | null; error: string | null; loading: boolean; refresh: () => void } {
-  const [data, setData] = useState<T | null>(null);
+  // Initialise from the module-level cache so pages load instantly when the
+  // SSE stream has already delivered data (e.g. Dashboard → Positions).
+  const [data, setData] = useState<T | null>(() => (_sseCache.get(sseKey) as T) ?? null);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !_sseCache.has(sseKey));
 
   // Keep a stable ref to setData so the SSE callback closure stays current
   const setDataRef = useRef<(v: T) => void>(setData);
@@ -757,7 +776,8 @@ function useSSE<T>(
   }, [restPath]);
 
   useEffect(() => {
-    fetchData(); // populate immediately before first SSE push
+    // Skip REST fallback if SSE cache already has data for this key
+    if (!_sseCache.has(sseKey)) fetchData();
 
     const unregister = _registerSSE<T>(sseKey, (pushed) => {
       setDataRef.current(pushed);
@@ -804,9 +824,104 @@ export interface MomentumScanSummary {
 export const useMomentumScanSummary = () =>
   usePolling<MomentumScanSummary>("/momentum/scan_summary", 15_000);
 
-// Slow/expensive hooks — keep REST polling at relaxed intervals:
-export const useConfig = () => usePolling<ConfigData>("/config", 30_000);
+// ── Global config cache — shared across all components ───────────────────────
+// Instead of each component creating its own independent poll, one module-level
+// cache holds the data and notifies all subscribers.  This means navigating to
+// Settings returns data instantly (no skeleton) because Dashboard already warmed
+// the cache, and only one HTTP request is made every 30 s regardless of how many
+// components call useConfig().
+interface _ConfigCache { data: ConfigData | null; error: string | null }
+const _configCache: _ConfigCache = { data: null, error: null };
+const _configSubs = new Set<() => void>();
+let _configTimerId: ReturnType<typeof setInterval> | null = null;
+
+let _configInflight = false;
+async function _refreshConfig(): Promise<void> {
+  if (_configInflight) return;
+  _configInflight = true;
+  try {
+    const res = await fetch(`${BASE_URL}/config`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    _configCache.data = (await res.json()) as ConfigData;
+    _configCache.error = null;
+  } catch (e: unknown) {
+    _configCache.error = e instanceof Error ? e.message : "fetch error";
+  } finally {
+    _configInflight = false;
+  }
+  _configSubs.forEach((fn) => fn());
+}
+
+function _ensureConfigPolling(): void {
+  if (_configTimerId !== null) return;
+  _refreshConfig(); // immediate first fetch
+  _configTimerId = setInterval(_refreshConfig, 30_000);
+}
+
+export function useConfig(): {
+  data: ConfigData | null;
+  error: string | null;
+  loading: boolean;
+  refresh: () => void;
+} {
+  _ensureConfigPolling();
+  const [, rerender] = useState(0);
+  useEffect(() => {
+    const notify = () => rerender((n) => n + 1);
+    _configSubs.add(notify);
+    return () => { _configSubs.delete(notify); };
+  }, []);
+  const loading = _configCache.data === null && _configCache.error === null;
+  return { data: _configCache.data, error: _configCache.error, loading, refresh: _refreshConfig };
+}
+
 export const usePnl = () => useSSE<PnlData>("pnl", "/pnl");   // SSE-updated every 30 s by backend
+
+// ── Generic singleton poll-cache factory ─────────────────────────────────────
+// Creates a module-level cache + subscriber set for a fixed URL so that any
+// number of components share one HTTP request per interval instead of each
+// launching their own independent timer.
+function _makeSingletonHook<T>(path: string, intervalMs: number) {
+  const _c: { data: T | null; error: string | null } = { data: null, error: null };
+  const _s = new Set<() => void>();
+  let _tid: ReturnType<typeof setInterval> | null = null;
+  let _inflight = false;
+
+  async function refresh(): Promise<void> {
+    if (_inflight) return; // don't stack requests if backend is slow
+    _inflight = true;
+    try {
+      const res = await fetch(`${BASE_URL}${path}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      _c.data = (await res.json()) as T;
+      _c.error = null;
+    } catch (e: unknown) {
+      _c.error = e instanceof Error ? e.message : "fetch error";
+    } finally {
+      _inflight = false;
+    }
+    _s.forEach(fn => fn());
+  }
+
+  function ensure(): void {
+    if (_tid !== null) return;
+    refresh();
+    _tid = setInterval(refresh, intervalMs);
+  }
+
+  function useHook(): { data: T | null; error: string | null; loading: boolean; refresh: () => void } {
+    ensure();
+    const [, rerender] = useState(0);
+    useEffect(() => {
+      const notify = () => rerender(n => n + 1);
+      _s.add(notify);
+      return () => { _s.delete(notify); };
+    }, []);
+    return { data: _c.data, error: _c.error, loading: _c.data === null && _c.error === null, refresh };
+  }
+
+  return useHook;
+}
 
 // ── Pipeline health (M-09) ────────────────────────────────────────────────────
 export interface PipelineStatus {
@@ -1076,8 +1191,16 @@ export const usePmHistory = (limit = 50) =>
 export const useMarketOutcomes = () =>
   usePolling<Record<string, { resolved_yes_price: number }>>("/market_outcomes", 60_000);
 
-export const usePerformance = (period: "7d" | "30d" | "all" = "all") =>
-  usePolling<PerformanceData>(`/performance?period=${period}`, 30_000);
+// Performance — singleton caches per period so Dashboard ("all") warms the
+// cache before the user navigates to the Performance page (also defaults "all").
+const _perfHooks: Partial<Record<"7d" | "30d" | "all", () => { data: PerformanceData | null; error: string | null; loading: boolean; refresh: () => void }>> = {};
+export function usePerformance(period: "7d" | "30d" | "all" = "all") {
+  if (!_perfHooks[period]) {
+    _perfHooks[period] = _makeSingletonHook<PerformanceData>(`/performance?period=${period}`, 30_000);
+  }
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+  return _perfHooks[period]!();
+}
 export const useInventory = () => usePolling<InventoryData>("/maker/inventory");
 
 // ── Market P&L ────────────────────────────────────────────────────────────────
@@ -1448,5 +1571,40 @@ export interface OpeningNeutralStatus {
   timestamp: number;
 }
 
-export const useOpeningNeutralStatus = () =>
-  usePolling<OpeningNeutralStatus>("/opening_neutral/status", 1_000);
+// Singleton at 3 s — Dashboard + Signals both consume this; one timer is enough.
+// 3 s is sufficient for the live-tracking display; 1 s was overloading the thread pool.
+export const useOpeningNeutralStatus =
+  _makeSingletonHook<OpeningNeutralStatus>("/opening_neutral/status", 3_000);
+
+export const useReverseOpeningNeutralStatus =
+  _makeSingletonHook<OpeningNeutralStatus>("/reverse_opening_neutral/status", 3_000);
+
+// ── RON fills (ron_fills.csv) ─────────────────────────────────────────────────
+export interface RonFill {
+  timestamp: string;
+  pair_id: string;
+  on_pair_id: string;
+  market_id: string;
+  market_title: string;
+  underlying: string;
+  market_type: string;
+  yes_entry: string;
+  no_entry: string;
+  combined_cost: string;
+  loser_leg: string;
+  loser_trigger_bid: string;
+  winner_side: string;
+  winner_sold_price: string;
+  winner_sold_time_secs: string;
+  double_down_size: string;
+  double_down_price: string;
+}
+
+export interface RonFillsData {
+  fills: RonFill[];
+  total: number;
+  timestamp: number;
+}
+
+export const useRonFills =
+  _makeSingletonHook<RonFillsData>("/ron/fills?limit=50", 10_000);
