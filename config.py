@@ -67,8 +67,10 @@ PM_USER_WS_URL: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 PM_DATA_API_URL: str = "https://data-api.polymarket.com"
 PM_HEARTBEAT_INTERVAL: float = 5.0   # seconds — must be < 15s hard limit
 PM_WS_PING_INTERVAL: float = 10.0    # seconds
-# Community-derived server-side limit: ~100 tokens per WS session before PM
-# returns "INVALID OPERATION" and stops delivering book events for that chunk.
+# Empirically confirmed server-side limit: 100 tokens per WS session triggers
+# INVALID OPERATION ("shard_tokens=100 shard_rejected=6" observed in prod).
+# Set to 50 to stay well within the limit and allow headroom for incremental
+# subscriptions added mid-session without crossing the rejection threshold.
 PM_WS_MAX_MARKETS_PER_WS: int = 100
 
 # ── Hyperliquid ─────────────────────────────────────────────────────────────
@@ -693,7 +695,7 @@ MOMENTUM_MIN_TTE_SECONDS_DEFAULT: int = 120
 
 # Staleness guards: discard signals if price data is older than these thresholds.
 MOMENTUM_SPOT_MAX_AGE_SECS: float = 30.0   # HL BBO age (seconds)
-MOMENTUM_BOOK_MAX_AGE_SECS: float = 30.0   # PM book age gate: skip market if book is older than this (WS shard outage).
+MOMENTUM_BOOK_MAX_AGE_SECS: float = 120.0  # PM book age gate: skip market if book is older than this (WS shard outage).
 
 # Volatility source / threshold config.
 # MOMENTUM_VOL_CACHE_TTL: Deribit ATM IV is cached this many seconds before re-fetch.
@@ -1032,6 +1034,38 @@ EXIT_DAYS_BEFORE_RESOLUTION: int = 3
 # Applies to maker and mispricing positions only.  Momentum is event-driven — exits
 # fire immediately on WS ticks; no hold floor is applied.
 MIN_HOLD_SECONDS: int = 60
+
+# ── Institutional Grade — Gate Audit Logging (S1) ────────────────────────────
+# Number of consecutive suppressions on the same gate+entity before the log
+# level escalates to WARNING.  At threshold and power-of-2 multiples thereafter
+# (threshold, 2×, 4×, …).  Set to 0 to always log at WARNING.
+GATE_LOG_CONSECUTIVE_THRESHOLD: int = 10
+
+# ── Institutional Grade — Position Data Safety (S2) ──────────────────────────
+# S2.2 — Oracle REST fallback: when oracle is stale for this many seconds AND
+# a position is open for that coin, trigger a one-shot REST price fetch to
+# top-up the oracle cache.  0 = disabled.
+ORACLE_STALE_POSITION_FALLBACK_SECS: int = 60
+
+# S2.3 — PM book REST refresh: when a priority token's book is older than this,
+# trigger a REST book refresh from PMClient.fetch_book_rest().  0 = disabled.
+# Priority tokens are registered automatically when a position is opened.
+POSITION_BOOK_FALLBACK_AGE_SECS: int = 45
+
+# S2.4 — Near-expiry hard exit on stale oracle: if TTE < MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
+# AND oracle has been stale for longer than this threshold AND the token is not
+# clearly winning (below MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE), fire a taker exit
+# rather than holding blind to resolution.  0 = disabled.
+ORACLE_STALE_NEAR_EXPIRY_HARD_EXIT_SECS: int = 60
+
+# ── Institutional Grade — Feed Health (S3) ────────────────────────────────────
+# S3.3 — Chainlink reconnect rate alerting: warn when the rolling-1h reconnect
+# count for any Chainlink origin exceeds this threshold.
+CHAINLINK_MAX_RECONNECTS_1H: int = 10
+
+# S3.4 — HL WebSocket mark price staleness threshold: warn when the mark price
+# age for a coin with open hedges exceeds this many seconds.
+HL_WS_STALE_SECS: int = 30
 
 # ── Runtime overrides (persisted across restarts) ───────────────────────────
 # When api_server patches a config value it writes config_overrides.json.

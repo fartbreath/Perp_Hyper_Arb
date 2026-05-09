@@ -620,3 +620,165 @@ class TestStreamStats:
         assert s.full_reconnects == 0
         assert s.configured_connections == 0
         assert s.active_connections == 0
+
+
+# ── 13. Phase stagger on full reconnect ──────────────────────────────────────
+
+class TestPhaseStaggerOnFullReconnect:
+    """Tests for the origin_index stagger fix (Fix B).
+
+    When all connections drop simultaneously (full_reconnect), origin N must
+    wait N * _HA_RECONNECT_STAGGER_S extra seconds before reconnecting.
+    This ensures the two HA connections are never back in phase after a full
+    outage, preventing them from dropping simultaneously again.
+    """
+
+    def test_origin_0_has_no_stagger(self):
+        """origin_index=0 → stagger=0, wait ≈ backoff+jitter only."""
+        from market_data.chainlink_streams_client import (
+            _HA_RECONNECT_STAGGER_S, _HA_RECONNECT_MIN_S
+        )
+
+        client = ChainlinkStreamsClient()
+        client._active_feeds   = {"BTC": _FEED_ID_HEX}
+        client._feedid_to_coin = {_FEED_ID_LOW: "BTC"}
+        client._running = True
+
+        sleep_calls = []
+
+        async def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            # Stop the loop after the first reconnect sleep.
+            client._running = False
+
+        ws = AsyncMock()
+        ws.close = AsyncMock()
+
+        from websockets.exceptions import ConnectionClosed as WsConnectionClosed
+
+        async def fake_recv():
+            raise WsConnectionClosed(None, None)
+
+        ws.recv = fake_recv
+
+        async def run():
+            with patch("asyncio.sleep", side_effect=fake_sleep):
+                with patch("websockets.connect") as mock_connect:
+                    mock_connect.return_value.__aenter__ = AsyncMock(return_value=ws)
+                    mock_connect.return_value.__aexit__ = AsyncMock(return_value=False)
+                    try:
+                        await client._conn_loop("001", origin_index=0)
+                    except Exception:
+                        pass
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run())
+        finally:
+            loop.close()
+
+        # The reconnect sleep (after full disconnect, origin_index=0) must be
+        # less than _HA_RECONNECT_STAGGER_S (no stagger for origin 0).
+        reconnect_sleeps = [s for s in sleep_calls if s < _HA_RECONNECT_STAGGER_S]
+        assert reconnect_sleeps, (
+            "Expected a short reconnect sleep (origin 0 has no stagger); "
+            f"got sleep_calls={sleep_calls}"
+        )
+
+    def test_origin_1_has_stagger(self):
+        """origin_index=1 → stagger=_HA_RECONNECT_STAGGER_S, wait ≈ backoff + jitter + stagger."""
+        from market_data.chainlink_streams_client import (
+            _HA_RECONNECT_STAGGER_S, _HA_RECONNECT_MIN_S
+        )
+
+        client = ChainlinkStreamsClient()
+        client._active_feeds   = {"BTC": _FEED_ID_HEX}
+        client._feedid_to_coin = {_FEED_ID_LOW: "BTC"}
+        client._running = True
+
+        sleep_calls = []
+
+        async def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            client._running = False
+
+        ws = AsyncMock()
+        ws.close = AsyncMock()
+
+        from websockets.exceptions import ConnectionClosed as WsConnectionClosed
+
+        async def fake_recv():
+            raise WsConnectionClosed(None, None)
+
+        ws.recv = fake_recv
+
+        async def run():
+            with patch("asyncio.sleep", side_effect=fake_sleep):
+                with patch("websockets.connect") as mock_connect:
+                    mock_connect.return_value.__aenter__ = AsyncMock(return_value=ws)
+                    mock_connect.return_value.__aexit__ = AsyncMock(return_value=False)
+                    try:
+                        await client._conn_loop("002", origin_index=1)
+                    except Exception:
+                        pass
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run())
+        finally:
+            loop.close()
+
+        # The reconnect sleep for origin 1 must include the stagger.
+        # wait = backoff(1.0) + jitter(≤0.3) + stagger(_HA_RECONNECT_STAGGER_S)
+        reconnect_sleeps = [s for s in sleep_calls if s >= _HA_RECONNECT_STAGGER_S]
+        assert reconnect_sleeps, (
+            f"Expected at least one reconnect sleep ≥ {_HA_RECONNECT_STAGGER_S}s (origin 1 stagger); "
+            f"got sleep_calls={sleep_calls}"
+        )
+        # Verify the stagger is at least _HA_RECONNECT_MIN_S + _HA_RECONNECT_STAGGER_S
+        assert any(s >= _HA_RECONNECT_MIN_S + _HA_RECONNECT_STAGGER_S for s in reconnect_sleeps)
+
+    def test_start_passes_origin_index_to_conn_loop(self):
+        """start() passes origin_index=i to each _conn_loop task."""
+        client = ChainlinkStreamsClient()
+        client._active_feeds   = {"BTC": _FEED_ID_HEX}
+        client._feedid_to_coin = {_FEED_ID_LOW: "BTC"}
+
+        conn_loop_calls = []
+
+        async def fake_conn_loop(origin, initial_delay=0.0, origin_index=0):
+            conn_loop_calls.append({"origin": origin, "origin_index": origin_index})
+
+        async def run():
+            with patch.object(client, "_fetch_origins", return_value=["001", "002"]):
+                with patch.object(client, "_conn_loop", side_effect=fake_conn_loop):
+                    with patch("asyncio.create_task") as mock_create_task:
+                        # create_task is called with coroutines; capture them
+                        coros = []
+
+                        def capture_coro(coro, **kwargs):
+                            coros.append(coro)
+                            return MagicMock()
+
+                        mock_create_task.side_effect = capture_coro
+                        await client.start()
+
+                        # Run each captured coroutine to completion.
+                        for coro in coros:
+                            try:
+                                await coro
+                            except StopIteration:
+                                pass
+                            except Exception:
+                                pass
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run())
+        finally:
+            loop.close()
+
+        # Verify origin_index was passed correctly.
+        assert len(conn_loop_calls) == 2, f"Expected 2 _conn_loop calls, got {conn_loop_calls}"
+        indices = {c["origin_index"] for c in conn_loop_calls}
+        assert indices == {0, 1}, f"Expected origin_index 0 and 1, got {indices}"

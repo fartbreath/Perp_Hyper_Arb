@@ -377,6 +377,62 @@ class TestWSMessageHandling:
         })))
         assert "tok_007" in fired
 
+    def test_best_bid_ask_updates_book_and_fires_callback(self):
+        """best_bid_ask event must update book.best_bid and fire price callbacks.
+
+        This event is emitted when custom_feature_enabled=True and ensures we
+        receive price updates for thin near-expiry books that have no active
+        order placements/cancellations (which would fire price_change instead).
+        """
+        import json
+        fired = []
+
+        async def cb(token_id, mid):
+            fired.append((token_id, mid))
+
+        self.client._price_callbacks = [cb]
+        # Prime with a stale book snapshot (bid at 0.45, ask at 0.55)
+        from pm_client import OrderBookSnapshot
+        snap = OrderBookSnapshot(token_id="tok_expiry")
+        snap.bids = [(0.45, 100.0), (0.40, 50.0)]
+        snap.asks = [(0.55, 100.0)]
+        self.client._books["tok_expiry"] = snap
+
+        # best_bid_ask fires: best_bid dropped to 0.37 (levels above cancelled)
+        self._run(self.client._handle_ws_message(json.dumps({
+            "event_type": "best_bid_ask",
+            "asset_id": "tok_expiry",
+            "best_bid": "0.37",
+            "best_ask": "0.55",
+        })))
+
+        updated = self.client._books["tok_expiry"]
+        assert updated.best_bid == pytest.approx(0.37), (
+            f"book.best_bid must reflect authoritative best_bid_ask event, got {updated.best_bid}"
+        )
+        # Stale bid levels above 0.37 must be pruned
+        assert all(p <= 0.37 for p, _ in updated.bids), (
+            f"Stale bid levels above best_bid must be pruned: {updated.bids}"
+        )
+        assert len(fired) == 1, "Callback must fire once for best_bid_ask event"
+        assert fired[0][0] == "tok_expiry"
+
+    def test_best_bid_ask_creates_book_if_absent(self):
+        """best_bid_ask for a token with no cached book must create one."""
+        import json
+
+        self._run(self.client._handle_ws_message(json.dumps({
+            "event_type": "best_bid_ask",
+            "asset_id": "tok_new",
+            "best_bid": "0.35",
+            "best_ask": "0.65",
+        })))
+
+        snap = self.client._books.get("tok_new")
+        assert snap is not None
+        assert snap.best_bid == pytest.approx(0.35)
+        assert snap.best_ask == pytest.approx(0.65)
+
 
 # ── Fill-future / recent-fills mechanics ─────────────────────────────────────
 # Covers M-3 items: WS-path resolution, early-fill race, stale-cache pruning.
@@ -1473,3 +1529,257 @@ class TestFetchMarketResolution:
         # Down won → YES/Up lost → 0.0
         assert result == 0.0
 
+
+
+# -- _WSShard INVALID OPERATION reconnect -------------------------------------
+
+class TestWSShard:
+    """_WSShard must reconnect when the PM WS server rejects a subscription.
+
+    Root cause of real production loss: "INVALID OPERATION" on shard 16 caused
+    100 tokens to go dark for the entire session.  No price-change events fired,
+    so the ON loser exit never triggered, and the position resolved at $0.
+
+    The fix: break out of the receive loop on INVALID OPERATION so the shard
+    reconnect path fires immediately and re-subscribes all tokens on a fresh WS
+    connection.
+    """
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_invalid_operation_triggers_reconnect(self):
+        """On INVALID OPERATION the shard must break (not continue) so the
+        reconnect path fires.  The valid message that follows must NOT be
+        processed in the same receive session."""
+        from market_data.pm_client import _WSShard
+
+        shard = _WSShard(shard_id=0, on_message=AsyncMock())
+        shard._running = True
+
+        on_message_calls: list[str] = []
+
+        async def recording_on_message(raw: str) -> None:
+            on_message_calls.append(raw)
+
+        shard._on_message = recording_on_message
+
+        messages = iter(["INVALID OPERATION", '{"event":"book"}'])
+
+        class FakeWS:
+            async def send(self, _msg: str) -> None:
+                pass
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(messages)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        connect_cm = MagicMock()
+        connect_cm.__aenter__ = AsyncMock(return_value=FakeWS())
+        connect_cm.__aexit__ = AsyncMock(return_value=False)
+
+        async def fake_sleep(_secs):
+            shard._running = False
+
+        with (
+            patch("pm_client.websockets.connect", return_value=connect_cm),
+            patch("pm_client.asyncio.sleep", side_effect=fake_sleep),
+        ):
+            self._run(shard._loop())
+
+        # on_message must not have been called -- the break exited before the
+        # valid JSON message could be processed.
+        assert on_message_calls == [], (
+            "Shard should have broken on INVALID OPERATION but processed: "
+            f"{on_message_calls}"
+        )
+        assert shard._rejected == 1, "rejected counter must be incremented"
+
+    def test_incremental_subscribe_uses_operation_format(self):
+        """_subscribe_incremental must send the SubscriptionRequestUpdate format.
+
+        The PM AsyncAPI spec defines two distinct subscription message types:
+          - SubscriptionRequest:       {"assets_ids": [...], "type": "market"}
+            → sent once on initial connect only
+          - SubscriptionRequestUpdate: {"operation": "subscribe", "assets_ids": [...]}
+            → sent for dynamically added tokens on an existing connection
+
+        Sending the initial-subscription format on an existing connection causes
+        the PM server to silently ignore the new token IDs, which is why all 5m
+        pair tokens registered via register_for_book_updates after a shard
+        reconnect received zero WS events.
+        """
+        from market_data.pm_client import _WSShard
+        import json
+
+        shard = _WSShard(shard_id=0, on_message=AsyncMock())
+        shard.connected = True
+
+        sent_messages: list[str] = []
+
+        class FakeWS:
+            async def send(self, msg: str) -> None:
+                sent_messages.append(msg)
+
+        shard._ws = FakeWS()
+
+        asyncio.get_event_loop().run_until_complete(
+            shard._subscribe_incremental({"token_abc", "token_def"})
+        )
+
+        assert len(sent_messages) == 1
+        payload = json.loads(sent_messages[0])
+        assert payload["operation"] == "subscribe", (
+            f"Expected operation=subscribe but got: {payload}"
+        )
+        assert set(payload["assets_ids"]) == {"token_abc", "token_def"}, (
+            f"assets_ids mismatch: {payload['assets_ids']}"
+        )
+        # Must NOT contain 'type': 'market' — that is the initial-connect format only
+        assert "type" not in payload, (
+            f"'type' key must not be present in incremental subscribe: {payload}"
+        )
+
+    def test_initial_subscribe_uses_type_market(self):
+        """Initial subscription on connect must use {\"type\": \"market\"}."""
+        from market_data.pm_client import _WSShard
+        import json
+
+        shard = _WSShard(shard_id=0, on_message=AsyncMock())
+        shard._running = True
+        shard._tokens = {"tok1", "tok2"}
+
+        sent_messages: list[str] = []
+
+        class FakeWS:
+            async def send(self, msg: str) -> None:
+                sent_messages.append(msg)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        connect_cm = MagicMock()
+        connect_cm.__aenter__ = AsyncMock(return_value=FakeWS())
+        connect_cm.__aexit__ = AsyncMock(return_value=False)
+
+        async def fake_sleep(_secs):
+            shard._running = False
+
+        with (
+            patch("pm_client.websockets.connect", return_value=connect_cm),
+            patch("pm_client.asyncio.sleep", side_effect=fake_sleep),
+        ):
+            asyncio.get_event_loop().run_until_complete(shard._loop())
+
+        assert len(sent_messages) >= 1
+        initial = json.loads(sent_messages[0])
+        assert initial["type"] == "market", (
+            f"Initial subscription must have type=market: {initial}"
+        )
+        assert set(initial["assets_ids"]) == {"tok1", "tok2"}
+        assert initial.get("custom_feature_enabled") is True, (
+            f"custom_feature_enabled must be True for best_bid_ask events: {initial}"
+        )
+
+    def test_ping_loop_sends_ping_text_frames(self):
+        """_ping_loop must send text 'PING' frames at PM_WS_PING_INTERVAL intervals.
+
+        Per the official PM AsyncAPI spec (id: ping, contentType: text/plain,
+        const: PING) the client must send a text 'PING' every 10 seconds.
+        The server responds with 'PONG'.  Without this keepalive the PM server
+        closes idle connections after ~10 minutes via TCP RST.
+        """
+        from market_data.pm_client import _WSShard
+        import config as cfg
+
+        shard = _WSShard(shard_id=0, on_message=AsyncMock())
+
+        sent: list[str] = []
+
+        class FakeWS:
+            async def send(self, msg: str) -> None:
+                sent.append(msg)
+
+        call_count = 0
+
+        async def fake_sleep(secs):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 3:
+                raise asyncio.CancelledError
+
+        async def run():
+            with patch("pm_client.asyncio.sleep", side_effect=fake_sleep):
+                try:
+                    await shard._ping_loop(FakeWS())
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.get_event_loop().run_until_complete(run())
+
+        # _ping_loop sleeps first, then sends — so 2 sleeps → 2 PINGs before cancel
+        assert len(sent) == 2, f"Expected 2 PING frames before cancel, got: {sent}"
+        assert all(m == "PING" for m in sent), (
+            f"All frames must be text 'PING', got: {sent}"
+        )
+
+    def test_pong_response_is_silently_ignored(self):
+        """PONG frames from the server must not be passed to on_message.
+
+        The PM server sends text 'PONG' in response to our 'PING' keepalive.
+        This is not a market-data message and must be silently discarded, not
+        dispatched to on_message or logged as an error.
+        """
+        from market_data.pm_client import _WSShard
+
+        shard = _WSShard(shard_id=0, on_message=AsyncMock())
+        shard._running = True
+
+        on_message_calls: list[str] = []
+
+        async def recording_on_message(raw: str) -> None:
+            on_message_calls.append(raw)
+
+        shard._on_message = recording_on_message
+
+        # Interleave PONG (should be ignored) with a real JSON message (should be processed).
+        messages = iter(["PONG", '{"event_type":"book","asset_id":"abc"}'])
+
+        class FakeWS:
+            async def send(self, _msg: str) -> None:
+                pass
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(messages)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        connect_cm = MagicMock()
+        connect_cm.__aenter__ = AsyncMock(return_value=FakeWS())
+        connect_cm.__aexit__ = AsyncMock(return_value=False)
+
+        async def fake_sleep(_secs):
+            shard._running = False
+
+        with (
+            patch("pm_client.websockets.connect", return_value=connect_cm),
+            patch("pm_client.asyncio.sleep", side_effect=fake_sleep),
+        ):
+            self._run(shard._loop())
+
+        assert on_message_calls == ['{"event_type":"book","asset_id":"abc"}'], (
+            "PONG must be silently discarded; only JSON message should reach on_message. "
+            f"Got: {on_message_calls}"
+        )

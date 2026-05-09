@@ -10,7 +10,7 @@ import math
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import config
 from logger import get_bot_logger
@@ -294,6 +294,19 @@ class RiskEngine:
         # First-class HedgeOrder entities keyed by order_id.
         # Persisted to HEDGE_ORDERS_JSON on every state change.
         self._hedge_orders: dict[str, HedgeOrder] = self._load_hedge_orders()
+        # Callbacks fired synchronously from open_position() the moment any
+        # strategy records a new trade.  Allows the PM WS layer and position
+        # monitor to immediately arm their subscription / fallback machinery
+        # without waiting for the main.py state-sync loop (~1 s delay).
+        self._position_open_callbacks: list[Callable[["Position"], None]] = []
+
+    def on_position_open(self, callback: "Callable[[Position], None]") -> None:
+        """Register a synchronous callback fired by open_position() the instant
+        a new trade is recorded.  The callback receives the Position object and
+        must be fast and non-blocking (no I/O, no coroutines).  Called under the
+        risk lock, so callbacks must not re-enter RiskEngine methods.
+        """
+        self._position_open_callbacks.append(callback)
 
     def patch_trade_outcome(self, market_id: str, resolved_yes_price: float, *, force: bool = False) -> int:
         """Deprecated — accounting.py / acct_ledger.csv is the source of truth. Always returns 0."""
@@ -572,6 +585,15 @@ class RiskEngine:
                 )
             except Exception as _acct_err:
                 log.warning("acct: open_position hook failed", exc=str(_acct_err))
+
+        # Fire position-open callbacks outside the lock so callbacks can freely
+        # read public RiskEngine state.  Errors are caught so a misbehaving
+        # callback never suppresses the accounting hook or blocks the scanner.
+        for _cb in self._position_open_callbacks:
+            try:
+                _cb(position)
+            except Exception as _cb_err:
+                log.warning("risk: position_open callback failed", exc=str(_cb_err))
 
     def update_gtd_hedge(
         self,

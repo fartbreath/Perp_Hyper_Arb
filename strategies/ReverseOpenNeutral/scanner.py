@@ -136,11 +136,11 @@ class ReverseOpenNeutralScanner(OpeningNeutralScanner):
             return
         self._running = True
         _ensure_ron_fills_csv()
-        # Register WS bid-monitor callback on the shared PM instance.
-        self._pm.on_price_change(self._on_price_event)
         # Hook into ON's entry so every ON pair is mirrored by RON.
         if self._on_scanner is not None:
             self._on_scanner.register_pair_callback(self._on_on_entry_received)
+            # Fire RON's exit in lock-step with ON's loser exit — not independently.
+            self._on_scanner.register_loser_exit_callback(self._notify_loser_exit)
         log.info("ReverseOpenNeutralScanner started (paper-only, coupled to ON)")
 
     async def stop(self) -> None:
@@ -223,10 +223,8 @@ class ReverseOpenNeutralScanner(OpeningNeutralScanner):
             "yes_pos":           ron_yes,
             "no_pos":            ron_no,
             "yes_exit_order_id": "",
-            "no_exit_order_id":  "",
+            "no_exit_order_id": "",
             "entry_ts":          time.time(),
-            "yes_trigger":       config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER,
-            "no_trigger":        config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER,
         }
         self._pair_csv_data[pair_id] = {
             "timestamp":    datetime.now(timezone.utc).isoformat(),
@@ -255,47 +253,48 @@ class ReverseOpenNeutralScanner(OpeningNeutralScanner):
             no_entry=ron_no.entry_price,
         )
 
-    # ── WS bid-monitoring ─────────────────────────────────────────────────────
+    # ── ON loser-exit notification (fires in lock-step with ON) ──────────────
 
-    async def _on_price_event(self, token_id: str, mid: float) -> None:  # noqa: ARG002
+    async def _notify_loser_exit(
+        self,
+        on_pair_id: str,
+        loser_side: str,
+        exit_price: float,
+    ) -> None:
         """
-        Bid-monitor for paper RON pairs.  Entry path is disabled (no pending markets).
-        Only checks active RON pairs for the loser bid threshold.
+        Called by ON's _on_exit_fill via register_loser_exit_callback().
+        Looks up the matching RON pair by on_pair_id and fires the paper exit
+        at exactly the same moment ON's real exit fills.
         """
         if not getattr(config, "REVERSE_OPENING_NEUTRAL_ENABLED", False):
             return
 
-        pair_id = self._token_to_pair.get(token_id)
-        if pair_id is None or token_id in self._exiting_legs:
-            return
+        # Find the RON pair that mirrors this ON pair.
+        ron_pair_id = next(
+            (pid for pid, csv_row in self._pair_csv_data.items()
+             if csv_row.get("on_pair_id") == on_pair_id),
+            None,
+        )
+        if ron_pair_id is None:
+            return  # pair already exited or never registered
 
-        pair = self._active_pairs.get(pair_id)
+        pair = self._active_pairs.get(ron_pair_id)
         if pair is None:
             return
 
-        yes_pos: Optional[Position] = pair.get("yes_pos")
-        no_pos:  Optional[Position] = pair.get("no_pos")
-
-        if yes_pos and getattr(yes_pos, "token_id", "") == token_id:
-            mon_pos, mon_side, trigger_key = yes_pos, "YES", "yes_trigger"
-        elif no_pos and getattr(no_pos, "token_id", "") == token_id:
-            mon_pos, mon_side, trigger_key = no_pos, "NO", "no_trigger"
-        else:
+        loser_pos: Optional[Position] = pair.get(f"{loser_side.lower()}_pos")
+        if loser_pos is None:
             return
 
-        book = self._pm.get_book(token_id)
-        best_bid = book.best_bid if book is not None else None
-        _bid_threshold = pair.get(trigger_key, config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER)
+        loser_token_id = getattr(loser_pos, "token_id", "")
+        if loser_token_id in self._exiting_legs:
+            return  # already firing
 
-        if best_bid is not None and best_bid <= _bid_threshold:
-            _min_hold = config.OPENING_NEUTRAL_MIN_HOLD_SECS
-            if _min_hold > 0 and time.time() - pair.get("entry_ts", 0.0) < _min_hold:
-                return  # still in hold window — recheck on next tick
-            self._exiting_legs.add(token_id)
-            asyncio.create_task(
-                self._execute_loser_exit(pair_id, mon_side, token_id, mon_pos, best_bid),
-                name=f"ron_exit_{pair_id[:12]}",
-            )
+        self._exiting_legs.add(loser_token_id)
+        asyncio.create_task(
+            self._execute_loser_exit(ron_pair_id, loser_side, loser_token_id, loser_pos, exit_price),
+            name=f"ron_exit_{ron_pair_id[:12]}",
+        )
 
     # ── Exit logic (paper simulation) ─────────────────────────────────────────
 

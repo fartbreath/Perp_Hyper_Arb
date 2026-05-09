@@ -569,15 +569,24 @@ class _Ledger:
                 if spot_exit > 0.0:
                     pos.spot_exit = spot_exit
 
-                # For RESOLVED exits where no exit fill was recorded yet
-                # (position went straight to redemption), fill in exit at settlement
-                if pos.exit_contracts == 0.0:
-                    settlement = 1.0 if token_won else 0.0
-                    pos.exit_vwap      = settlement
+                # Settle any contracts not yet accounted for by pre-resolution fills.
+                # Case 1 (pure resolution, no prior exit): exit_contracts == 0
+                #   → set all exit fields at settlement price.
+                # Case 2 (partial pre-resolution exit): 0 < exit_contracts < entry_contracts
+                #   → blend remaining contracts into exit_vwap at settlement price;
+                #     advance exit_contracts to entry_contracts.
+                # (If exit_contracts already equals entry_contracts, nothing to do.)
+                settlement = 1.0 if token_won else 0.0
+                remaining  = round(pos.entry_contracts - pos.exit_contracts, 8)
+                if remaining > 1e-9:
+                    pos.exit_vwap      = _vwap(pos.exit_vwap, pos.exit_contracts,
+                                               settlement, remaining)
                     pos.exit_contracts = pos.entry_contracts
                     pos.exit_time      = _now_iso()
-                    pos.exit_type      = "RESOLVED"
-                    pos.exit_reason    = "resolved"
+                    if not pos.exit_type:
+                        pos.exit_type  = "RESOLVED"
+                    if not pos.exit_reason:
+                        pos.exit_reason = "resolved"
 
                 # Terminal status
                 if pos.exit_type in ("SL",):

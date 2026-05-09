@@ -362,6 +362,22 @@ class HLClient:
 
     # ── Accessors ──────────────────────────────────────────────────────────────
 
+    def is_connected(self) -> bool:
+        """S3.4: True if the HL WebSocket is currently open and running."""
+        return self._ws_connected
+
+    def get_mark_price_age(self, coin: str) -> Optional[float]:
+        """S3.4: Seconds since the last webData2 update for `coin`.
+
+        Returns None if no webData2 message has ever been received for this coin.
+        webData2 provides both funding rates and mark prices — its timestamp is
+        used here as a proxy for mark-price feed freshness.
+        """
+        snap = self._fundings.get(coin)
+        if snap is None:
+            return None
+        return time.time() - snap.timestamp
+
     def get_mid(self, coin: str) -> Optional[float]:
         """Best available mid price for coin."""
         bbo = self._bbo.get(coin)

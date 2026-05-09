@@ -36,6 +36,8 @@ import math
 import time
 from typing import Callable, Coroutine, Optional
 
+import config
+from core.types import FeedHealth
 from market_data.chainlink_streams_client import ChainlinkStreamsClient
 from market_data.chainlink_ws_client import ChainlinkWSClient
 from market_data.oracle_tick_log import (
@@ -74,6 +76,9 @@ class SpotOracle:
         self._rtds = rtds
         self._cl = chainlink
         self._streams = streams
+        # S3.1: Per-coin feed status cache for health-state transition logging.
+        # Key: "{coin}:{market_type}" → last reported status string.
+        self._feed_status_cache: dict[str, str] = {}
 
     # ── Oracle-routing accessors ──────────────────────────────────────────────
 
@@ -200,6 +205,112 @@ class SpotOracle:
         if self._streams is not None:
             self._streams.on_price_update(make_logging_callback(SOURCE_CHAINLINK_STREAMS))
         self._rtds.on_price_update(make_logging_callback(SOURCE_RTDS))
+
+    # ── Feed health (S3.1) ────────────────────────────────────────────────────
+
+    def get_feed_health(self, coin: str, market_type: str) -> FeedHealth:
+        """Return a FeedHealth snapshot for the oracle feed currently serving `coin`.
+
+        Follows the same priority order as _get_chainlink_spot() / get_mid():
+          Chainlink markets: Streams → RTDS relay → on-chain WS
+          All other markets: RTDS exchange-aggregated
+
+        Logs a structured WARNING the first time a feed transitions to STALE or DOWN,
+        and an INFO when it recovers to HEALTHY.
+
+        The staleness threshold is MOMENTUM_SPOT_MAX_AGE_SECS (default 30s).
+        """
+        from logger import get_bot_logger as _get_log
+        _log = _get_log(__name__)
+
+        now = time.time()
+        stale_thresh = float(getattr(config, "MOMENTUM_SPOT_MAX_AGE_SECS", 30.0))
+        source: str = "none"
+        price: Optional[float] = None
+        age: Optional[float] = None
+
+        if market_type in CHAINLINK_MARKET_TYPES:
+            # Priority 1: ChainlinkStreamsClient
+            if self._streams is not None:
+                snap = self._streams.get_spot(coin)
+                if snap is not None:
+                    source = SOURCE_CHAINLINK_STREAMS
+                    price = snap.price
+                    age = now - snap.timestamp
+
+            # Priority 2: RTDS relay (fallback when streams has no data)
+            if price is None:
+                rtds_snap = self._rtds.get_chainlink_spot(coin)
+                if rtds_snap is not None:
+                    source = SOURCE_RTDS_CHAINLINK
+                    price = rtds_snap.price
+                    age = now - rtds_snap.timestamp
+
+            # Priority 3: on-chain ChainlinkWSClient (last resort, non-HYPE)
+            if price is None and coin != "HYPE":
+                cl_snap = self._cl.get_spot(coin)
+                if cl_snap is not None:
+                    source = SOURCE_CHAINLINK_WS
+                    price = cl_snap.price
+                    age = now - cl_snap.timestamp
+        else:
+            # RTDS exchange-aggregated for 1h / daily / weekly markets
+            rtds_snap = self._rtds.get_spot(coin)
+            if rtds_snap is not None:
+                source = SOURCE_RTDS
+                price = rtds_snap.price
+                age = now - rtds_snap.timestamp
+
+        # Determine status
+        if price is None or age is None:
+            status: str = "DOWN"
+        elif age < stale_thresh:
+            status = "HEALTHY"
+        else:
+            status = "STALE"
+
+        # Chainlink reconnect rate metadata (S3.3)
+        last_reconnect_at = 0.0
+        reconnect_count_1h = 0
+        if self._streams is not None and market_type in CHAINLINK_MARKET_TYPES:
+            last_reconnect_at = self._streams.last_reconnect_at
+            reconnect_count_1h = self._streams.reconnects_1h
+
+        # Log state transitions exactly once per direction (HEALTHY→STALE, STALE→DOWN, etc.)
+        cache_key = f"{coin}:{market_type}"
+        prev_status = self._feed_status_cache.get(cache_key)
+        if prev_status != status:
+            self._feed_status_cache[cache_key] = status
+            if status in ("STALE", "DOWN"):
+                _log.warning(
+                    "oracle_feed_degraded",
+                    coin=coin,
+                    market_type=market_type,
+                    source=source,
+                    status=status,
+                    age_secs=round(age, 1) if age is not None else None,
+                    threshold=stale_thresh,
+                )
+            elif prev_status is not None:
+                # Recovery from STALE/DOWN → HEALTHY
+                _log.info(
+                    "oracle_feed_recovered",
+                    coin=coin,
+                    market_type=market_type,
+                    source=source,
+                    status=status,
+                    age_secs=round(age, 1) if age is not None else None,
+                )
+
+        return FeedHealth(
+            coin=coin,
+            primary_source=source,
+            price=price,
+            age_secs=round(age, 2) if age is not None else None,
+            status=status,
+            last_reconnect_at=last_reconnect_at,
+            reconnect_count_1h=reconnect_count_1h,
+        )
 
     # ── RTDS dashboard conveniences (used by state_sync_loop and data quality) ─
 

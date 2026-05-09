@@ -1091,3 +1091,105 @@ class TestTokenSpaceIndependence:
         pid = _entry(ledger, tok, cid, fill_price=0.70, contracts=100.0, side="YES")
         pos = ledger.get_position(pid)
         assert pos.entry_cost_usd == pytest.approx(70.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# M  Partial pre-resolution exit — remaining contracts credited at settlement
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPartialExitBeforeResolution:
+    """
+    Regression for ON→Momentum promotion accounting bug.
+
+    Scenario: a NO position is accumulated over two entry fills (ON open +
+    momentum add-on).  Before expiry, the momentum tranche is sold via a
+    taker exit.  The market then resolves with NO winning.  on_resolved()
+    must credit ALL entry_contracts at the settlement price, not just the
+    taker-sold tranche.
+
+    Without the fix, on_resolved() only ran the settlement branch when
+    exit_contracts == 0.  With a non-zero partial exit already recorded,
+    the remaining contracts were silently unaccounted for.
+    """
+
+    def test_remaining_contracts_credited_at_settlement(self, ledger):
+        """
+        ON entry: 10 NO @ 0.50  (+10 contracts, VWAP → 0.50)
+        Momentum add-on: 5 NO @ 0.80  (+5 contracts, VWAP → 0.60, total 15)
+        Taker exit: sell 5 @ 1.00  (exit_contracts = 5, exit_vwap = 1.0)
+        Market resolves: NO wins (resolved_yes_price=0.0)
+
+        After on_resolved():
+          exit_contracts must equal entry_contracts (15)
+          exit_vwap      must equal 1.0 (settlement = 1.0 for NO win)
+          gross_pnl      = (1.0 - 0.60) × 15 = $6.00
+        """
+        tok = _new_token()
+        cid = _new_condition()
+
+        # ON entry
+        _entry(ledger, tok, cid, fill_price=0.50, contracts=10.0, side="NO")
+        # Momentum add-on — second entry fill on same position
+        _entry(ledger, tok, cid, fill_price=0.80, contracts=5.0, side="NO")
+        # Momentum taker exit: only the add-on tranche is sold pre-resolution
+        _exit(ledger, tok, fill_price=1.0, contracts=5.0, exit_type="TAKER")
+        # Market resolves: YES failed → NO wins
+        ledger.on_resolved(cid, resolved_yes_price=0.0)
+
+        pos = ledger.get_position_by_token(tok)
+
+        assert pos.exit_contracts == pytest.approx(15.0), (
+            "All 15 contracts must be settled; remaining 10 from the ON tranche "
+            "must be credited by on_resolved() at the settlement price"
+        )
+        assert pos.exit_vwap == pytest.approx(1.0)
+        assert _gross_pnl(pos) == pytest.approx(6.0), (
+            "gross_pnl = (1.0 - 0.60) × 15 = $6.00; "
+            "without the fix only the 5-contract taker exit was credited ($2.00)"
+        )
+
+    def test_pre_resolution_loss_exit_blends_correctly(self, ledger):
+        """
+        Position partially exits at a LOSS price before resolution, then
+        resolves as a WIN.  The exit_vwap must be the weighted average of
+        the pre-resolution sell and the settlement price.
+
+        YES entry: 100 @ 0.40
+        SL exit: 40 @ 0.20  (stop-loss partial exit, exit_vwap=0.20)
+        Market resolves: YES wins (resolved_yes_price=1.0)
+
+        Remaining 60 settle at 1.0.
+        Expected exit_vwap = (0.20×40 + 1.0×60) / 100 = (8 + 60) / 100 = 0.68
+        Expected gross_pnl = (0.68 - 0.40) × 100 = $28.00
+        """
+        tok = _new_token()
+        cid = _new_condition()
+
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        _exit(ledger, tok, fill_price=0.20, contracts=40.0, exit_type="SL")
+        ledger.on_resolved(cid, resolved_yes_price=1.0)
+
+        pos = ledger.get_position_by_token(tok)
+
+        assert pos.exit_contracts == pytest.approx(100.0)
+        assert pos.exit_vwap      == pytest.approx(0.68)
+        assert _gross_pnl(pos)    == pytest.approx(28.0)
+
+    def test_fully_exited_before_resolution_is_unchanged(self, ledger):
+        """
+        When exit_contracts already equals entry_contracts (fully exited before
+        resolution), on_resolved() must NOT alter exit_vwap or exit_contracts.
+        """
+        tok = _new_token()
+        cid = _new_condition()
+
+        _entry(ledger, tok, cid, fill_price=0.40, contracts=100.0, side="YES")
+        _exit(ledger, tok, fill_price=0.90, contracts=100.0, exit_type="TAKER")
+        ledger.on_resolved(cid, resolved_yes_price=1.0)
+
+        pos = ledger.get_position_by_token(tok)
+
+        # exit fields must be exactly what on_exit_fill set — on_resolved must not mutate them
+        assert pos.exit_contracts == pytest.approx(100.0)
+        assert pos.exit_vwap      == pytest.approx(0.90)
+        assert _gross_pnl(pos)    == pytest.approx(50.0)   # (0.90 - 0.40) × 100

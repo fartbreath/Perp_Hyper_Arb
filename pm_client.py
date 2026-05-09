@@ -343,10 +343,11 @@ class _WSShard:
     never forwarded.
 
     Token assignment is stable: once a token is assigned to a shard it stays
-    there until explicitly removed via update_tokens(). update_tokens() only
-    triggers a WS reconnect when NEW tokens are added to the subscription
-    (removals are handled silently — the server keeps sending updates that
-    are ignored since expired tokens' books are cleared in _update_shards).
+    there until explicitly removed via update_tokens(). update_tokens() sends
+    an incremental subscription message to the PM WS server for new tokens
+    (additive; no reconnect needed). Removals are handled silently — the
+    server keeps sending updates that are ignored since expired tokens' books
+    are cleared in _update_shards.
     """
 
     def __init__(
@@ -362,6 +363,10 @@ class _WSShard:
         self._ws: Optional[Any] = None
         self._task: Optional[asyncio.Task] = None
         self._running: bool = False
+        self._connected_at: float = 0.0   # time.time() when current WS session connected
+        # S3.2 — Feed health tracking
+        self._last_message_at: float = 0.0   # time.time() of last received WS message
+        self._message_count: int = 0          # total messages received since start
 
     async def start(self, tokens: set[str]) -> None:
         self._tokens = set(tokens)
@@ -381,17 +386,46 @@ class _WSShard:
     def update_tokens(self, tokens: set[str]) -> None:
         """Replace the token set.
 
-        Never forces a WS reconnect — just updates the in-memory token list.
-        New tokens are subscribed on the shard's next natural reconnect
-        (GroupSocket pattern).  Forcing immediate reconnects was the root
-        cause of mass-shard drops: the subscription refresh called this every
-        ~30 s, triggering 17 simultaneous close+reconnect cycles that
-        overloaded the Polymarket server and caused it to drop connections
-        with code 1006.
+        Tokens ADDED while the shard is connected are subscribed immediately
+        via an incremental subscription message (PM WS accepts multiple
+        subscription messages on the same connection; each is additive).
+        Tokens REMOVED are silently dropped — the server keeps sending updates
+        that are ignored since expired tokens' books are cleared in
+        _update_shards.  Neither case requires a WS reconnect.
+
+        This avoids the original forced-reconnect bug (17 simultaneous
+        close+reconnect cycles causing code-1006 drops) while ensuring that
+        tokens registered mid-session (e.g. new momentum markets, presub
+        lookahead) actually receive book snapshots from the PM WS server.
         """
         if tokens == self._tokens:
             return
+        new_tokens = tokens - self._tokens
         self._tokens = set(tokens)
+        if new_tokens and self._ws is not None and self.connected:
+            asyncio.ensure_future(self._subscribe_incremental(new_tokens))
+
+    async def _subscribe_incremental(self, tokens: set[str]) -> None:
+        """Send an additive subscription message for newly added tokens.
+
+        Uses the SubscriptionRequestUpdate format (operation=subscribe) as
+        defined in the Polymarket AsyncAPI spec.  The initial-subscription
+        format ({"assets_ids": ..., "type": "market"}) must only be sent once
+        per connection; sending it again on an existing connection causes the
+        PM server to silently ignore the new token IDs.
+        """
+        if self._ws is None or not self.connected:
+            return
+        try:
+            # Correct incremental format: SubscriptionRequestUpdate
+            # See https://docs.polymarket.com/asyncapi.json
+            msg = {"operation": "subscribe", "assets_ids": list(tokens), "custom_feature_enabled": True}
+            await self._ws.send(json.dumps(msg))
+            log.debug("PM WS shard incremental subscribe",
+                      shard_id=self.shard_id, added=len(tokens))
+        except Exception as exc:
+            log.debug("PM WS shard incremental subscribe failed",
+                      shard_id=self.shard_id, exc=str(exc))
 
     async def _loop(self) -> None:
         # Stagger the initial connection attempt by shard_id seconds so that
@@ -408,11 +442,12 @@ class _WSShard:
             try:
                 async with websockets.connect(
                     config.PM_WS_URL,
-                    ping_interval=None,   # PM server does not respond to client PINGs;
-                    ping_timeout=None,    # server-side keepalive is handled by the server.
+                    ping_interval=config.PM_WS_PING_INTERVAL,
+                    ping_timeout=20,
                 ) as ws:
                     self._ws = ws
                     self.connected = True
+                    self._connected_at = time.time()
                     backoff = 1.0
                     log.info("PM WS shard connected",
                              shard_id=self.shard_id, token_count=len(self._tokens))
@@ -425,47 +460,64 @@ class _WSShard:
                         # No auth field; lowercase type key.  All tokens sent in
                         # a single message — each shard holds ≤ PM_WS_MAX_MARKETS_PER_WS
                         # tokens so this never exceeds the server per-session limit.
-                        msg = {"assets_ids": tokens_snapshot, "type": "market"}
+                        # custom_feature_enabled enables best_bid_ask events (price
+                        # updates even in thin books with no active orders).
+                        msg = {"assets_ids": tokens_snapshot, "type": "market", "custom_feature_enabled": True}
                         await ws.send(json.dumps(msg))
 
                     async for raw in ws:
-                        if not raw.startswith("{") and not raw.startswith("["):
-                            if "INVALID" in raw.upper():
-                                self._rejected += 1
-                                log.warning(
-                                    "PM WS shard subscription rejected (INVALID OPERATION)",
-                                    shard_id=self.shard_id,
-                                    shard_rejected=self._rejected,
-                                    shard_tokens=len(self._tokens),
-                                )
-                            else:
-                                log.debug("PM WS shard non-JSON",
-                                          shard_id=self.shard_id, preview=raw[:80])
-                            continue
-                        # Process this message SEQUENTIALLY (not create_task) so the
-                        # total number of ready tasks in the event loop stays low.
-                        #
-                        # With create_task: 18 shards × 100 book events = 1800 tasks at
-                        # startup; each fires 6 price-callback tasks → 10800 tasks.
-                        # RTDS and PM server-pong handling are buried at the end of
-                        # that queue and starve for 8+ minutes.
-                        #
-                        # With sequential await: max ~18 receive-loop tasks + ~108
-                        # price-callback tasks at any moment.  _fire_price_change still
-                        # uses create_task for its callbacks so a slow callback (e.g.
-                        # monitor REST exit) never blocks this receive loop.
-                        # The sleep(0) after each message yields to let those tasks and
-                        # I/O (server pong, RTDS data) run before the next message.
-                        try:
-                            await self._on_message(raw)
-                        except Exception as exc:
-                            log.error("PM WS msg processing error",
-                                      shard_id=self.shard_id, exc=str(exc))
-                        await asyncio.sleep(0)
+                            if not raw.startswith("{") and not raw.startswith("["):
+                                if "INVALID" in raw.upper():
+                                    self._rejected += 1
+                                    log.warning(
+                                        "PM WS shard subscription rejected — reconnecting",
+                                        shard_id=self.shard_id,
+                                        shard_rejected=self._rejected,
+                                        shard_tokens=len(self._tokens),
+                                    )
+                                    # A subscription rejection means the server will not
+                                    # deliver book events for any token in this session.
+                                    # Break out of the receive loop so the reconnect path
+                                    # fires immediately and re-subscribes all tokens on a
+                                    # fresh WS connection.
+                                    break
+                                else:
+                                    log.debug("PM WS shard non-JSON",
+                                              shard_id=self.shard_id, preview=raw[:80])
+                                continue
+                            # Process this message SEQUENTIALLY (not create_task) so the
+                            # total number of ready tasks in the event loop stays low.
+                            #
+                            # With create_task: 18 shards × 100 book events = 1800 tasks at
+                            # startup; each fires 6 price-callback tasks → 10800 tasks.
+                            # RTDS and PM server-pong handling are buried at the end of
+                            # that queue and starve for 8+ minutes.
+                            #
+                            # With sequential await: max ~18 receive-loop tasks + ~108
+                            # price-callback tasks at any moment.  _fire_price_change still
+                            # uses create_task for its callbacks so a slow callback (e.g.
+                            # monitor REST exit) never blocks this receive loop.
+                            # The sleep(0) after each message yields to let those tasks and
+                            # I/O (server pong, RTDS data) run before the next message.
+                            try:
+                                # S3.2: Track last message time for shard health.
+                                self._last_message_at = time.time()
+                                self._message_count += 1
+                                await self._on_message(raw)
+                            except Exception as exc:
+                                log.error("PM WS msg processing error",
+                                          shard_id=self.shard_id, exc=str(exc))
+                            await asyncio.sleep(0)
 
             except ConnectionClosed as exc:
                 log.warning("PM WS shard disconnected",
                             shard_id=self.shard_id, code=exc.code, reason=exc.reason)
+            except ConnectionResetError:
+                # Windows ProactorEventLoop raises ConnectionResetError (WinError 10054)
+                # when the server closes the TCP connection with RST.  This is normal
+                # server-side idle-timeout behaviour, not a bug in our code.
+                log.warning("PM WS shard TCP reset by remote",
+                            shard_id=self.shard_id)
             except Exception as exc:
                 log.error("PM WS shard error", shard_id=self.shard_id, exc=str(exc))
             finally:
@@ -490,6 +542,26 @@ class _WSShard:
     @property
     def rejected_count(self) -> int:
         return self._rejected
+
+    @property
+    def health(self) -> str:
+        """S3.2: Derived health state for this shard.
+
+        CONNECTING    — running but TCP not yet established.
+        CONNECTED     — WS open, messages arriving within HL_WS_STALE_SECS.
+        DEGRADED      — WS open but silent for > HL_WS_STALE_SECS seconds.
+        DISCONNECTED  — WS closed (stopped or between reconnects).
+        """
+        if not self._running:
+            return "DISCONNECTED"
+        if not self.connected:
+            return "CONNECTING"
+        if self._last_message_at > 0:
+            age = time.time() - self._last_message_at
+            stale_secs = float(getattr(config, "HL_WS_STALE_SECS", 30))
+            if age > stale_secs:
+                return "DEGRADED"
+        return "CONNECTED"
 
 
 class PMClient:
@@ -536,6 +608,72 @@ class PMClient:
         self._shards: dict[int, _WSShard] = {}    # shard_id → shard
         self._token_shard_map: dict[str, int] = {}  # token_id → shard_id
         self._next_shard_id: int = 0
+        # S2.3 — priority token set: tokens for open positions that should trigger
+        # a REST book refresh when their PM WS book becomes stale.  Registered by
+        # PositionMonitor via register_priority_token() when a position is monitored
+        # with a stale book; cleared via deregister_priority_token() on position close.
+        self._priority_tokens: set[str] = set()
+        # Callbacks fired after each _refresh_markets() pass (inside
+        # _market_refresh_loop).  Allows strategies to update their token maps /
+        # subscription sets immediately when new markets are discovered rather than
+        # waiting for their own independent polling loops.
+        self._market_refresh_callbacks: list[Callable] = []
+
+    # ── Market-refresh callback registration ─────────────────────────────────
+
+    def on_markets_refreshed(self, callback: Callable[[], None]) -> None:
+        """Register a synchronous callback fired after each _refresh_markets() call.
+
+        The callback is called in the asyncio event loop immediately after
+        _market_refresh_loop completes a Gamma API refresh, regardless of whether
+        new markets were found.  Callbacks are scheduled as independent asyncio
+        tasks so they never block the PM client's refresh cycle.
+
+        Strategy scanners use this to rebuild their token maps and subscription
+        sets the moment PM discovers new markets — eliminating the up-to-30 s
+        latency that would otherwise occur if each scanner relied on its own
+        independent polling loop to detect new markets.
+        """
+        self._market_refresh_callbacks.append(callback)
+
+    # ── Priority token management (S2.3) ─────────────────────────────────────
+
+    def register_priority_token(self, token_id: str) -> None:
+        """Mark token_id as priority for REST book refresh when WS book is stale.
+
+        Called by PositionMonitor when a position's PM book age exceeds
+        POSITION_BOOK_FALLBACK_AGE_SECS.  The _book_timestamp_refresh_loop
+        will fetch a fresh REST book snapshot for priority tokens to ensure
+        exit decisions are never made on stale data.
+        """
+        self._priority_tokens.add(token_id)
+
+    def deregister_priority_token(self, token_id: str) -> None:
+        """Remove token_id from the priority refresh set (position closed)."""
+        self._priority_tokens.discard(token_id)
+
+    def get_shard_health(self) -> list:
+        """S3.2: Return a ShardHealth snapshot for every active WS shard.
+
+        Returns list[ShardHealth] (imported lazily to avoid circular imports).
+        Callers should import ShardHealth from core.types for type annotations.
+        """
+        from core.types import ShardHealth
+        now = time.time()
+        result = []
+        for shard in self._shards.values():
+            last_msg_age: Optional[float] = (
+                round(now - shard._last_message_at, 1)
+                if shard._last_message_at > 0 else None
+            )
+            result.append(ShardHealth(
+                shard_id=shard.shard_id,
+                health=shard.health,
+                token_count=shard.subscribed_count,
+                last_message_age_secs=last_msg_age,
+                message_count=shard._message_count,
+            ))
+        return result
 
     # ── Callbacks ──────────────────────────────────────────────────────────────
 
@@ -741,6 +879,7 @@ class PMClient:
         await self._refresh_markets()
 
         asyncio.create_task(self._market_refresh_loop())
+        asyncio.create_task(self._book_timestamp_refresh_loop())
         await self._update_shards()
 
         if not self._paper_mode and self._clob is not None:
@@ -988,6 +1127,65 @@ class PMClient:
             self._prune_expired_markets()
             await self._refresh_markets()
             await self._update_shards()
+            # Notify registered strategies so they can immediately rebuild their
+            # token maps / subscription sets rather than waiting for their own
+            # independent polling timers (which could lag by up to 30 s).
+            for _cb in self._market_refresh_callbacks:
+                asyncio.ensure_future(_cb())
+
+    async def _book_timestamp_refresh_loop(self) -> None:
+        """Periodically mark book timestamps as current for all connected shards.
+
+        PM WS only sends price_change diffs when orders change.  For quiet markets
+        (no new orders in the last N seconds) the book snapshot's timestamp freezes
+        at the time of the last update, which can be the initial subscription snapshot
+        received when the shard first connected — potentially hours ago.
+
+        This is semantically correct: a connected shard guarantees delivery of every
+        change (PM WS protocol).  If no price_change arrived, the book IS current —
+        it just hasn't changed.  We update the timestamp here so the momentum scanner's
+        stale-book gate doesn't reject markets that have a live, correct book.
+
+        Skips shards that are currently disconnected (connected=False) so genuinely
+        stale data from a broken/zombie shard is NOT masked.
+        """
+        _REFRESH_INTERVAL_S = 60.0
+        while self._running:
+            await asyncio.sleep(_REFRESH_INTERVAL_S)
+            now = time.time()
+            refreshed = 0
+            for shard in list(self._shards.values()):
+                if not shard.connected:
+                    continue
+                for token_id in shard._tokens:
+                    snap = self._books.get(token_id)
+                    if snap is not None:
+                        snap.timestamp = now
+                        refreshed += 1
+            if refreshed:
+                log.debug("PM WS book timestamps refreshed",
+                          refreshed=refreshed, shards=len(self._shards))
+
+            # S2.3 — REST fallback for priority tokens (open positions) with
+            # books that are still stale after the WS-timestamp refresh.
+            # A book is still stale when its shard is disconnected or when
+            # the token was newly subscribed and the snapshot hasn't arrived.
+            _book_fallback_secs = getattr(config, "POSITION_BOOK_FALLBACK_AGE_SECS", 0)
+            if _book_fallback_secs > 0 and self._priority_tokens:
+                for _pt in list(self._priority_tokens):
+                    _snap = self._books.get(_pt)
+                    _age = now - _snap.timestamp if _snap is not None else float("inf")
+                    if _age >= _book_fallback_secs:
+                        log.warning(
+                            "PM book stale for priority token — triggering REST refresh",
+                            token_id=_pt[:16],
+                            book_age_secs=round(_age, 1),
+                            fallback_threshold=_book_fallback_secs,
+                        )
+                        asyncio.create_task(
+                            self.fetch_book_rest(_pt),
+                            name=f"pm_rest_book_{_pt[:12]}",
+                        )
 
     # ── WebSocket shards ───────────────────────────────────────────────────────
 
@@ -1243,6 +1441,15 @@ class PMClient:
                     await self._fire_price_change(token_id, snap.mid)
         elif event_type == "last_trade_price":
             pass  # full book resent on trade via book event
+        elif event_type == "best_bid_ask":
+            # Fired when best bid or ask changes (requires custom_feature_enabled).
+            # More reliable than price_change for thin near-expiry books where
+            # there is no active order placement but the best level shifts.
+            self._update_book_from_best_bid_ask(msg)
+            token_id = msg.get("asset_id", "")
+            snap = self._books.get(token_id)
+            if snap and snap.mid is not None:
+                await self._fire_price_change(token_id, snap.mid)
         # other/unknown messages ignored
 
 
@@ -1282,6 +1489,41 @@ class PMClient:
             snap.timestamp = time.time()
             affected.add(token_id)
         return affected
+
+    def _update_book_from_best_bid_ask(self, msg: dict) -> None:
+        """Update book snapshot from a best_bid_ask WS event.
+
+        The best_bid_ask event is authoritative: any cached bid level above
+        best_bid or ask level below best_ask has been removed from the live
+        book (cancelled or filled).  This method prunes those stale levels so
+        that book.best_bid always matches the WS-authoritative value.
+
+        This ensures exit checks see the correct best_bid even when a thin
+        near-expiry book shifts without a price_change (order placed/cancelled)
+        or book (trade) event.
+        """
+        token_id = msg.get("asset_id", "")
+        if not token_id:
+            return
+        best_bid_str = msg.get("best_bid", "")
+        best_ask_str = msg.get("best_ask", "")
+        if not best_bid_str:
+            return
+        best_bid = float(best_bid_str)
+        snap = self._books.setdefault(token_id, OrderBookSnapshot(token_id=token_id))
+        # Prune any stale bid levels above the authoritative best_bid
+        snap.bids = [(p, s) for p, s in snap.bids if p <= best_bid]
+        if not snap.bids or snap.bids[0][0] < best_bid:
+            snap.bids.insert(0, (best_bid, 1.0))
+            snap.bids.sort(key=lambda x: -x[0])
+        if best_ask_str:
+            best_ask = float(best_ask_str)
+            # Prune any stale ask levels below the authoritative best_ask
+            snap.asks = [(p, s) for p, s in snap.asks if p >= best_ask]
+            if not snap.asks or snap.asks[0][0] > best_ask:
+                snap.asks.insert(0, (best_ask, 1.0))
+                snap.asks.sort(key=lambda x: x[0])
+        snap.timestamp = time.time()
 
     # ── Order helpers ──────────────────────────────────────────────────────────
 
@@ -2213,6 +2455,20 @@ class PMClient:
         """Ensure these token IDs remain WS-subscribed regardless of market refresh.
         Call with the YES token IDs of all open positions."""
         self._pinned_tokens = token_ids
+
+    def pin_token(self, token_id: str) -> None:
+        """Immediately add a single token to the pinned set and trigger a shard update.
+
+        Unlike pin_tokens() which atomically replaces the whole set, this adds a
+        token without affecting other pinned tokens.  Called from the risk engine's
+        on_position_open callback so the newly opened position's token is guaranteed
+        subscribed within one event-loop tick — before main.py's state sync loop
+        calls pin_tokens() (~1 s later).  Safe to call concurrently: set.add() is
+        thread-safe in CPython.
+        """
+        self._pinned_tokens.add(token_id)
+        if self._running:
+            asyncio.ensure_future(self._update_shards())
 
     def register_for_book_updates(self, token_ids: set[str], owner: str = "default") -> None:
         """Register additional tokens for WS book subscriptions, bypassing the maker

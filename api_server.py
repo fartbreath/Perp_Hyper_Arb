@@ -30,7 +30,7 @@ from typing import Any, Optional
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Header, Query, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -96,6 +96,8 @@ class BotState:
     funding_cache_ref: Any = None   # FundingRateCache — set once at startup by main.py
     oracle_tracker_ref: Any = None  # OracleTickTracker — set once at startup by main.py
     model_agent_ref: Any = None     # ModelAgent — set once at startup by main.py (ML-04)
+    spot_oracle_ref: Any = None     # SpotOracle — S4 /health/feeds feed status
+    hl_ref: Any = None              # HLClient — S4 /health/feeds HL WS status
 
 
 # Module-level singleton — main.py populates this
@@ -1621,6 +1623,237 @@ def health_pipelines() -> dict:
         })
 
     return {"pipelines": pipelines, "timestamp": now}
+
+
+# ── S4: Feed Health & Observability ──────────────────────────────────────────
+
+_ORACLE_MARKET_TYPE = "bucket_5m"  # Use Chainlink bucket to exercise the primary feed path.
+_ORACLE_COINS: list[str] = []      # Populated lazily from config on first request.
+
+
+def _get_oracle_coins() -> list[str]:
+    global _ORACLE_COINS
+    if not _ORACLE_COINS:
+        _ORACLE_COINS = list(getattr(config, "HL_PERP_COINS", [
+            "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE",
+        ]))
+    return _ORACLE_COINS
+
+
+@app.get("/health/feeds")
+def health_feeds():
+    """S4.1 — Overall feed health: oracle per-coin, PM WS shards, HL WS.
+
+    Returns HTTP 503 when any feed serving open positions is DOWN, so this
+    endpoint is suitable for use with an uptime monitor.
+    """
+    now = time.time()
+    coins = _get_oracle_coins()
+
+    # ── Oracle feeds ──────────────────────────────────────────────────────────
+    oracle_section: dict[str, dict] = {}
+    oracle_statuses: list[str] = []
+    spot = state.spot_oracle_ref
+    if spot is not None:
+        for coin in coins:
+            try:
+                fh = spot.get_feed_health(coin, _ORACLE_MARKET_TYPE)
+                oracle_section[coin] = {
+                    "status": fh.status,
+                    "source": fh.primary_source,
+                    "age_secs": fh.age_secs,
+                    "reconnect_count_1h": fh.reconnect_count_1h,
+                }
+                oracle_statuses.append(fh.status)
+            except Exception:
+                oracle_section[coin] = {"status": "DOWN", "source": None, "age_secs": None, "reconnect_count_1h": 0}
+                oracle_statuses.append("DOWN")
+    else:
+        for coin in coins:
+            oracle_section[coin] = {"status": "UNKNOWN", "source": None, "age_secs": None, "reconnect_count_1h": 0}
+
+    # ── PM WS shards ──────────────────────────────────────────────────────────
+    pm = state.pm_ref
+    shard_health_list = []
+    if pm is not None and hasattr(pm, "get_shard_health"):
+        try:
+            shard_health_list = pm.get_shard_health()
+        except Exception:
+            pass
+
+    shards_connected   = sum(1 for s in shard_health_list if s.health == "CONNECTED")
+    shards_degraded    = sum(1 for s in shard_health_list if s.health == "DEGRADED")
+    shards_connecting  = sum(1 for s in shard_health_list if s.health == "CONNECTING")
+    shards_disconnected = sum(1 for s in shard_health_list if s.health == "DISCONNECTED")
+
+    # ── HL WS ─────────────────────────────────────────────────────────────────
+    hl = state.hl_ref
+    hl_connected = hl.is_connected() if hl is not None and hasattr(hl, "is_connected") else False
+    oldest_mark_age: Optional[float] = None
+    if hl is not None and hasattr(hl, "get_mark_price_age"):
+        for coin in coins:
+            try:
+                age = hl.get_mark_price_age(coin)
+                if age is not None:
+                    oldest_mark_age = max(oldest_mark_age, age) if oldest_mark_age is not None else age
+            except Exception:
+                pass
+
+    # ── Open-position feed risk ───────────────────────────────────────────────
+    risk = state.risk_ref
+    positions_at_risk: int = 0
+    open_position_count: int = 0
+    has_down_on_open_position = False
+    if risk is not None:
+        try:
+            open_positions = risk.get_open_positions()
+            open_position_count = len(open_positions)
+            if spot is not None:
+                for pos in open_positions:
+                    if not getattr(pos, "underlying", ""):
+                        continue
+                    try:
+                        fh = spot.get_feed_health(
+                            pos.underlying,
+                            getattr(pos, "market_type", _ORACLE_MARKET_TYPE),
+                        )
+                        if fh.status == "DOWN":
+                            has_down_on_open_position = True
+                        if fh.status != "HEALTHY":
+                            positions_at_risk += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # ── Overall status ────────────────────────────────────────────────────────
+    if has_down_on_open_position or (not hl_connected and open_position_count > 0):
+        overall_status = "DOWN"
+    elif "STALE" in oracle_statuses or shards_degraded > 0 or shards_disconnected > 0:
+        overall_status = "DEGRADED"
+    elif "DOWN" in oracle_statuses:
+        overall_status = "DEGRADED"  # DOWN feed but no open position at risk
+    else:
+        overall_status = "HEALTHY"
+
+    uptime_s = round(now - state.started_at, 1)
+
+    payload = {
+        "status": overall_status,
+        "timestamp": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+        "uptime_secs": uptime_s,
+        "feeds": {
+            "pm_ws": {
+                "shards_total": len(shard_health_list),
+                "shards_connected": shards_connected,
+                "shards_degraded": shards_degraded,
+                "shards_connecting": shards_connecting,
+                "shards_disconnected": shards_disconnected,
+            },
+            "oracle": oracle_section,
+            "hl_ws": {
+                "connected": hl_connected,
+                "oldest_mark_price_age_secs": round(oldest_mark_age, 1) if oldest_mark_age is not None else None,
+            },
+        },
+        "hard_stop_active": not config.BOT_ACTIVE,
+        "positions_at_risk": positions_at_risk,
+    }
+
+    status_code = 503 if overall_status == "DOWN" else 200
+    return JSONResponse(content=payload, status_code=status_code)
+
+
+@app.get("/health/positions")
+def health_positions() -> list:
+    """S4.2 — Per-position data freshness: oracle age, book age, TTE, suppressed gates."""
+    now_dt = datetime.now(timezone.utc)
+    risk = state.risk_ref
+    pm = state.pm_ref
+    spot = state.spot_oracle_ref
+    monitor = state.monitor_ref
+
+    if risk is None:
+        return []
+
+    stale_thresh_oracle = float(getattr(config, "MOMENTUM_SPOT_MAX_AGE_SECS", 30))
+    stale_thresh_book   = float(getattr(config, "MOMENTUM_BOOK_MAX_AGE_SECS", 30))
+    gate_log_threshold  = int(getattr(config, "GATE_LOG_CONSECUTIVE_THRESHOLD", 3))
+
+    # Gate suppression counters keyed "{token_id}:{gate}" → consecutive count.
+    suppress_counts: dict[str, int] = {}
+    if monitor is not None and hasattr(monitor, "_exit_suppress_counts"):
+        suppress_counts = dict(monitor._exit_suppress_counts)
+
+    result = []
+    try:
+        open_positions = risk.get_open_positions()
+    except Exception:
+        return []
+
+    for pos in open_positions:
+        token_id    = getattr(pos, "token_id", "") or ""
+        coin        = getattr(pos, "underlying", "") or ""
+        strategy    = getattr(pos, "strategy", "") or ""
+        market_type = getattr(pos, "market_type", _ORACLE_MARKET_TYPE)
+
+        # Oracle age
+        oracle_age_secs: Optional[float] = None
+        oracle_status = "DOWN"
+        oracle_source: Optional[str] = None
+        if spot is not None and coin:
+            try:
+                fh = spot.get_feed_health(coin, market_type)
+                oracle_age_secs = fh.age_secs
+                oracle_status   = fh.status
+                oracle_source   = fh.primary_source
+            except Exception:
+                pass
+
+        # Book age
+        book_age_secs: Optional[float] = None
+        book_status = "DOWN"
+        if pm is not None and token_id:
+            try:
+                book = pm.get_book(token_id)
+                if book is not None:
+                    book_age_secs = round(time.time() - book.timestamp, 1)
+                    book_status = "HEALTHY" if book_age_secs <= stale_thresh_book else "STALE"
+            except Exception:
+                pass
+
+        # Time to expiry
+        tte_secs: Optional[float] = None
+        try:
+            market_obj = None
+            if pm is not None and hasattr(pm, "_markets"):
+                market_obj = pm._markets.get(getattr(pos, "market_id", ""))
+            if market_obj is not None and getattr(market_obj, "end_date", None) is not None:
+                tte_secs = round((market_obj.end_date - now_dt).total_seconds(), 0)
+        except Exception:
+            pass
+
+        # Gates suppressed on this token for > gate_log_threshold consecutive cycles
+        gates_suppressed = [
+            gate_key.split(":", 1)[1]
+            for gate_key, count in suppress_counts.items()
+            if gate_key.startswith(f"{token_id}:") and count >= gate_log_threshold
+        ]
+
+        result.append({
+            "token_id": token_id,
+            "strategy": strategy,
+            "coin": coin,
+            "oracle_age_secs": oracle_age_secs,
+            "book_age_secs": book_age_secs,
+            "oracle_status": oracle_status,
+            "book_status": book_status,
+            "oracle_source": oracle_source,
+            "tte_secs": tte_secs,
+            "gates_suppressed": gates_suppressed,
+        })
+
+    return result
 
 
 # ── Model Agent (ML-04) ───────────────────────────────────────────────────────

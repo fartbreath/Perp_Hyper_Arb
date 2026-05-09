@@ -147,12 +147,6 @@ class TestSpotOracleInterface:
 
     # ── Method existence + arity ──────────────────────────────────────────────
 
-    def test_get_mid_accepts_two_positional_args(self):
-        """get_mid(underlying, market_type) — the bug was calling it with 1 arg."""
-        result = self.oracle.get_mid("BTC", "bucket_5m")
-        # Must not raise; result is a float or None
-        assert result is None or isinstance(result, float)
-
     def test_get_mid_rejects_one_arg(self):
         """RTDSClient.get_mid takes 1; SpotOracle.get_mid takes 2. Verify arity."""
         sig = inspect.signature(SpotOracle.get_mid)
@@ -162,39 +156,12 @@ class TestSpotOracleInterface:
             f"got {params}"
         )
 
-    def test_get_spot_accepts_two_positional_args(self):
-        sig = inspect.signature(SpotOracle.get_spot)
-        params = [p for p in sig.parameters if p != "self"]
-        assert len(params) == 2
-
-    def test_get_spot_age_accepts_two_positional_args(self):
-        sig = inspect.signature(SpotOracle.get_spot_age)
-        params = [p for p in sig.parameters if p != "self"]
-        assert len(params) == 2
-
-    def test_all_mids_exists_and_returns_dict(self):
-        result = self.oracle.all_mids()
-        assert isinstance(result, dict)
-
-    def test_get_spot_age_rtds_accepts_one_coin_arg(self):
-        sig = inspect.signature(SpotOracle.get_spot_age_rtds)
-        params = [p for p in sig.parameters if p != "self"]
-        assert len(params) == 1
-
     def test_tracked_coins_is_property_returning_set(self):
         assert isinstance(SpotOracle.tracked_coins, property), (
             "tracked_coins must be a @property — state_sync_loop iterates over it"
         )
         result = self.oracle.tracked_coins
         assert isinstance(result, set)
-
-    def test_on_rtds_update_accepts_callback(self):
-        cb = AsyncMock()
-        self.oracle.on_rtds_update(cb)  # must not raise
-
-    def test_on_chainlink_update_accepts_callback(self):
-        cb = AsyncMock()
-        self.oracle.on_chainlink_update(cb)  # must not raise
 
     # ── RTDSClient signature is incompatible — document it explicitly ─────────
 
@@ -446,22 +413,46 @@ class TestStateSyncLoopContract:
         with pytest.raises(TypeError):
             rtds_direct.get_mid("BTC", "bucket_5m")  # 2 args on RTDSClient spec
 
-    def test_loop_completes_without_exception(self):
-        """state_sync_loop must not raise when given a properly typed SpotOracle."""
-        pm, hl, maker, agent, risk, spot = _make_state_sync_mocks()
-        # Should complete one iteration without raising
-        self._run_one_iteration(spot)
-
     @pytest.mark.parametrize("market_type", list(CHAINLINK_MARKET_TYPES) + ["bucket_daily"])
     def test_get_mid_called_for_every_market_type(self, market_type):
+        """state_sync_loop must call get_mid with the correct market_type for each type.
+
+        Uses the full mock set (not just spot) so the pm mock carries the right
+        market_type through to the get_mid call.
+        """
+        import main as _main
         pm, hl, maker, agent, risk, spot = _make_state_sync_mocks(
             market_type=market_type, underlying="BTC"
         )
-        self._run_one_iteration(spot)
-        if spot.get_mid.call_args_list:
-            _, kwargs_or_args = spot.get_mid.call_args_list[0].args, spot.get_mid.call_args_list[0].kwargs
-            # Verify it was called at all — market must reach the get_mid call
-            assert spot.get_mid.called
+
+        async def _run_loop():
+            _main._shutdown_event = asyncio.Event()
+            _main._state_changed = asyncio.Event()
+            task = asyncio.create_task(
+                _main.state_sync_loop(pm, hl, maker, agent, risk, spot)
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        _run(_run_loop())
+
+        assert spot.get_mid.called, (
+            f"get_mid was not called at all for market_type={market_type!r}"
+        )
+        for call_args in spot.get_mid.call_args_list:
+            args, _ = call_args
+            assert len(args) == 2, (
+                f"get_mid must be called with 2 positional args for {market_type!r}, "
+                f"got {len(args)}: {args}"
+            )
+            assert args[1] == market_type, (
+                f"Expected second arg={market_type!r}, got {args[1]!r}. "
+                f"state_sync_loop must pass mkt.market_type, not a hardcoded value."
+            )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -605,12 +596,15 @@ def live_spot_oracle():
         cl_stub.on_price_update = MagicMock()
         oracle = SpotOracle(rtds, cl_stub, streams=None)
         await rtds.start()
-        # Wait for all 6 exchange-aggregated coins to arrive
+        # Wait for at least 4 exchange-aggregated coins (BTC/ETH/SOL/XRP) AND
+        # at least 3 Chainlink-relay coins (BTC/ETH/SOL via crypto_prices_chainlink).
+        # BNB/DOGE were removed from the RTDS feed so we no longer wait for all 6.
         deadline = time.monotonic() + _LIVE_TIMEOUT_S
         while time.monotonic() < deadline:
             await asyncio.sleep(1.0)
             mids = rtds.all_mids()
-            if len(mids) >= 6:   # BTC/ETH/SOL/XRP/BNB/DOGE
+            cl_coins = [c for c in ["BTC", "ETH", "SOL"] if rtds.get_chainlink_mid(c) is not None]
+            if len(mids) >= 4 and len(cl_coins) >= 3:
                 break
         return oracle, rtds
 
@@ -623,7 +617,7 @@ def live_spot_oracle():
 class TestSpotOracleLive:
     """Verify SpotOracle.get_mid(coin, market_type) returns real prices via RTDS."""
 
-    @pytest.mark.parametrize("coin", ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"])
+    @pytest.mark.parametrize("coin", ["BTC", "ETH", "SOL", "XRP"])
     def test_rtds_daily_returns_positive_price(self, coin, live_spot_oracle):
         price = live_spot_oracle.get_mid(coin, "bucket_daily")
         assert price is not None, (

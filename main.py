@@ -502,16 +502,27 @@ async def state_sync_loop(
             # also added below — a single atomic dict reference swap avoids
             # readers ever seeing a half-built state (A3 fix).
 
-            # Pin only tokens for currently open positions so the WS subscription
-            # filters (TTE horizon, bucket-started, volume) continue to apply to
-            # all other markets (A2 fix — was: pin all tracked tokens).
-            position_tokens = {
-                mkt.token_id_yes
-                for pos in positions_snap.values()
-                if not pos.is_closed
-                for mkt in [markets_snap.get(pos.market_id)]
-                if mkt is not None
-            }
+            # Pin the actual token ID for each open position so the WS
+            # subscription filters (TTE horizon, bucket-started, volume) continue
+            # to apply to all other markets (A2 fix — was: pin all tracked tokens).
+            #
+            # IMPORTANT: pin pos.token_id (the specific leg: YES or NO), NOT just
+            # mkt.token_id_yes.  Opening Neutral pairs hold BOTH legs; pinning only
+            # the YES token left NO tokens on lower-priority shards with no REST
+            # book fallback, causing synchronized data gaps on both legs during
+            # shard reconnects.
+            position_tokens: set[str] = set()
+            for pos in positions_snap.values():
+                if pos.is_closed:
+                    continue
+                _tid = getattr(pos, "token_id", "")
+                if _tid:
+                    position_tokens.add(_tid)
+                else:
+                    # Fallback for positions that pre-date token_id storage.
+                    _mkt = markets_snap.get(pos.market_id)
+                    if _mkt is not None:
+                        position_tokens.add(_mkt.token_id_yes)
             if position_tokens:
                 pm.pin_tokens(position_tokens)
 
@@ -642,6 +653,118 @@ async def state_sync_loop(
             _state_changed.clear()
         except asyncio.TimeoutError:
             pass
+
+
+# ── S4.4: Feed Summary periodic logger ───────────────────────────────────────
+
+async def _feed_summary_loop(
+    spot_oracle,
+    hl_client,
+    risk_engine,
+    interval_secs: float = 60.0,
+) -> None:
+    """Emit a single [FEED_SUMMARY] log line every ``interval_secs`` seconds.
+
+    Only logs when at least one feed is not HEALTHY, keeping normal operation
+    noise-free.  Format::
+
+        [FEED_SUMMARY] pm_shards=17/17 oracle=HEALTHY(BTC,ETH,SOL,XRP,BNB,HYPE)
+            STALE(DOGE:42s) hl=CONNECTED positions_at_risk=2
+    """
+    import time as _time
+    import config as _cfg
+
+    _log = get_bot_logger("feed_summary")
+    coins: list[str] = list(getattr(_cfg, "HL_PERP_COINS", [
+        "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE",
+    ]))
+    market_type = "bucket_5m"
+
+    while True:
+        await asyncio.sleep(interval_secs)
+        try:
+            # ── Oracle status ─────────────────────────────────────────────
+            healthy_coins: list[str] = []
+            stale_entries: list[str] = []  # "COIN:42s"
+            down_coins: list[str] = []
+
+            if spot_oracle is not None:
+                for coin in coins:
+                    try:
+                        fh = spot_oracle.get_feed_health(coin, market_type)
+                        if fh.status == "HEALTHY":
+                            healthy_coins.append(coin)
+                        elif fh.status == "STALE":
+                            age_str = f"{int(fh.age_secs)}s" if fh.age_secs is not None else "?"
+                            stale_entries.append(f"{coin}:{age_str}")
+                        else:
+                            down_coins.append(coin)
+                    except Exception:
+                        down_coins.append(coin)
+
+            # ── PM shard summary ──────────────────────────────────────────
+            pm_shards_part = "pm_shards=?/?"
+            pm_ref = getattr(api_state, "pm_ref", None)
+            if pm_ref is not None and hasattr(pm_ref, "get_shard_health"):
+                try:
+                    shards = pm_ref.get_shard_health()
+                    connected = sum(1 for s in shards if s.health == "CONNECTED")
+                    pm_shards_part = f"pm_shards={connected}/{len(shards)}"
+                except Exception:
+                    pass
+
+            # ── HL WS status ──────────────────────────────────────────────
+            hl_part = "hl=UNKNOWN"
+            if hl_client is not None and hasattr(hl_client, "is_connected"):
+                try:
+                    hl_part = "hl=CONNECTED" if hl_client.is_connected() else "hl=DISCONNECTED"
+                except Exception:
+                    pass
+
+            # ── Positions at risk ─────────────────────────────────────────
+            positions_at_risk = 0
+            if risk_engine is not None and spot_oracle is not None:
+                try:
+                    for pos in risk_engine.get_open_positions():
+                        underlying = getattr(pos, "underlying", "")
+                        if not underlying:
+                            continue
+                        fh = spot_oracle.get_feed_health(
+                            underlying,
+                            getattr(pos, "market_type", market_type),
+                        )
+                        if fh.status != "HEALTHY":
+                            positions_at_risk += 1
+                except Exception:
+                    pass
+
+            # ── Skip if everything is fine ────────────────────────────────
+            all_healthy = (
+                not stale_entries
+                and not down_coins
+                and hl_part == "hl=CONNECTED"
+            )
+            if all_healthy:
+                continue
+
+            # ── Build oracle part ─────────────────────────────────────────
+            oracle_parts: list[str] = []
+            if healthy_coins:
+                oracle_parts.append(f"HEALTHY({','.join(healthy_coins)})")
+            if stale_entries:
+                oracle_parts.append(f"STALE({','.join(stale_entries)})")
+            if down_coins:
+                oracle_parts.append(f"DOWN({','.join(down_coins)})")
+            oracle_part = "oracle=" + " ".join(oracle_parts) if oracle_parts else "oracle=UNKNOWN"
+
+            _log.warning(
+                f"[FEED_SUMMARY] {pm_shards_part} {oracle_part} "
+                f"{hl_part} positions_at_risk={positions_at_risk}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.debug("[FEED_SUMMARY] error during feed scan", error=str(exc))
 
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
@@ -820,6 +943,7 @@ async def main() -> None:
     monitor = PositionMonitor(
         pm, risk_engine,
         spot_client=spot_oracle,
+        hl_client=hl,
         on_close_callback=_on_position_close,
         on_stop_loss_callback=_on_momentum_stop_loss,
         on_closed_full_callback=_on_closed_full,
@@ -835,6 +959,8 @@ async def main() -> None:
     api_state.momentum_ref = momentum_scanner
     api_state.opening_neutral_ref = opening_neutral_scanner
     api_state.reverse_opening_neutral_ref = reverse_opening_neutral_scanner
+    api_state.spot_oracle_ref = spot_oracle  # S4: /health/feeds oracle status
+    api_state.hl_ref = hl                    # S4: /health/feeds HL WS status
 
     # ── Connect clients ──────────────────────────────────────────────────────
     log.info("Connecting PM client…")
@@ -915,6 +1041,10 @@ async def main() -> None:
             name="acct_reconcile",
         ),
         asyncio.create_task(model_agent.run(), name="model_agent"),
+        asyncio.create_task(
+            _feed_summary_loop(spot_oracle, hl, risk_engine),
+            name="feed_summary",
+        ),
     ]
     if config.PAPER_TRADING:
         tasks.append(asyncio.create_task(fill_sim.start(), name="fill_simulator"))

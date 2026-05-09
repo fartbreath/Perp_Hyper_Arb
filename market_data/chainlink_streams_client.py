@@ -86,6 +86,36 @@ _HA_RECONNECT_MIN_S    = 1.0
 _HA_RECONNECT_MAX_S    = 10.0
 _HA_MAX_RECONNECT_ATTEMPTS = 5
 
+# Phase-offset stagger applied to origin_index > 0 connections so the two
+# HA origins do not expire and reconnect at the same moment.  Must be much
+# shorter than the observed server session TTL (~30-60 s) to prevent both
+# origins being simultaneously down during the wait.  5 s is enough separation
+# while keeping the reconnect gap small.
+_HA_RECONNECT_STAGGER_S = 5.0
+
+# Partial-reconnect wait: how long a single dropped origin waits before
+# reconnecting when the other origin is still alive.  Keeping this short (3 s)
+# ensures the down origin rejoins before the live origin's session also expires,
+# preventing the cascade into a full outage.  Do NOT use _WS_SILENCE_TIMEOUT_S
+# / 2 (15 s) here — that was the original bug: 15 s > half the server TTL,
+# so one partial drop reliably cascaded into a full outage.
+_HA_PARTIAL_RECONNECT_WAIT_S = 3.0
+
+# Library built-in WebSocket PING interval and PONG timeout (seconds).
+# The websockets library handles PING/PONG at the protocol level, integrated
+# with the frame-receive loop, so PONG resolution is not subject to asyncio
+# task-scheduling delay.  A 30-second PONG timeout gives plenty of margin for
+# WAN latency spikes while still detecting genuinely dead connections before
+# the 30-second silence timeout fires.
+# NOTE: our earlier manual keepalive loop (RFC 6455 ws.ping() + asyncio
+# wait_for with a 10-second pong_waiter timeout) was the root cause of
+# frequent disconnections: asyncio task-scheduling jitter on Windows
+# ProactorEventLoop caused the 10-second wait_for to fire spuriously even
+# when the server did respond in time, producing session lengths as short as
+# 15-20 seconds.  The library built-in avoids this race entirely.
+_WS_PING_INTERVAL_S = 5.0
+_WS_PING_TIMEOUT_S  = 30.0
+
 # Header names used by the Chainlink data-streams infrastructure.
 _CLL_ORIGIN_HEADER          = "CLL-ORIGIN"
 _CLL_AVAILABLE_ORIGINS_HDR  = "x-cll-available-origins"
@@ -160,6 +190,11 @@ class ChainlinkStreamsClient:
         self._watermark: dict[str, int] = {}
         # Stats
         self.stats = StreamStats()
+        # S3.3 — Rolling reconnect rate tracking (full reconnects only).
+        # _reconnect_timestamps holds wall-clock timestamps of every full_reconnect
+        # event.  Entries older than 3600s are pruned each time a new event fires.
+        self._reconnect_timestamps: list[float] = []
+        self._last_reconnect_at: float = 0.0
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -189,6 +224,17 @@ class ChainlinkStreamsClient:
     def is_connected(self) -> bool:
         """True if at least one HA WebSocket connection is currently open."""
         return self._running and self.stats.active_connections > 0
+
+    @property
+    def reconnects_1h(self) -> int:
+        """Number of full reconnects in the rolling 60-minute window (S3.3)."""
+        cutoff = time.time() - 3600.0
+        return sum(1 for t in self._reconnect_timestamps if t >= cutoff)
+
+    @property
+    def last_reconnect_at(self) -> float:
+        """Epoch timestamp of the most recent full reconnect. 0.0 = never (S3.3)."""
+        return self._last_reconnect_at
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -242,12 +288,10 @@ class ChainlinkStreamsClient:
                 origins=origins,
                 coins=list(self._active_feeds.keys()),
             )
-            # Stagger origins by half the server TTL so their reconnect cycles
-            # are always offset — guaranteeing one connection stays alive.
-            # _WS_SILENCE_TIMEOUT_S ≈ server TTL, so half ≈ 15 s.
-            _ORIGIN_STAGGER_S = _WS_SILENCE_TIMEOUT_S / 2
             for i, origin in enumerate(origins):
-                asyncio.create_task(self._conn_loop(origin, initial_delay=i * _ORIGIN_STAGGER_S))
+                asyncio.create_task(
+                    self._conn_loop(origin, initial_delay=i * _HA_RECONNECT_STAGGER_S, origin_index=i)
+                )
         else:
             origin = origins[0] if origins else ""
             log.info(
@@ -346,15 +390,23 @@ class ChainlinkStreamsClient:
 
     # ── Per-origin connection loop ────────────────────────────────────────────
 
-    async def _conn_loop(self, origin: str, initial_delay: float = 0.0) -> None:
+    async def _conn_loop(
+        self,
+        origin: str,
+        initial_delay: float = 0.0,
+        origin_index: int = 0,
+    ) -> None:
         """Persistent reconnect loop for one server origin.
 
         Mirrors the newWSconnWithRetry / monitorConn pattern from the Go SDK.
         Gives up only when attempts exceed _HA_MAX_RECONNECT_ATTEMPTS AND
         no other connection is currently active (same condition as the SDK).
 
-        initial_delay: seconds to wait before the very first connection attempt,
-        used to stagger HA origins so their server-TTL reconnect cycles are offset.
+        initial_delay:  seconds to wait before the very first connection attempt,
+                       used to stagger HA origins so their reconnect cycles are
+                       always offset — guaranteeing one connection survives.
+        origin_index:  0-based index of this origin; used to restore the phase
+                       offset after a full reconnect (both connections down).
         """
         if initial_delay > 0:
             log.debug(
@@ -392,8 +444,8 @@ class ChainlinkStreamsClient:
                 async with websockets.connect(
                     url,
                     additional_headers=auth_headers,
-                    ping_interval=None,  # Let the server own keepalive; our pings
-                    ping_timeout=None,   # every 2 s caused the server to RST at ~35 s.
+                    ping_interval=_WS_PING_INTERVAL_S,
+                    ping_timeout=_WS_PING_TIMEOUT_S,
                     open_timeout=15,
                 ) as ws:
                     self._ws_handles.append(ws)
@@ -408,39 +460,28 @@ class ChainlinkStreamsClient:
                     )
 
                     try:
-                        while True:
-                            try:
-                                raw = await asyncio.wait_for(
-                                    ws.recv(), timeout=_WS_SILENCE_TIMEOUT_S
-                                )
-                            except asyncio.TimeoutError:
-                                # No data for _WS_SILENCE_TIMEOUT_S — zombie connection.
-                                log.warning(
-                                    "ChainlinkStreamsClient: silence timeout — reconnecting",
-                                    origin=origin_label,
-                                    silence_s=_WS_SILENCE_TIMEOUT_S,
-                                )
-                                break
-                            except ConnectionClosed as exc:
-                                # Server closed the WebSocket cleanly (server-side session TTL).
-                                log.debug(
-                                    "ChainlinkStreamsClient: server closed connection",
-                                    origin=origin_label,
-                                    code=getattr(exc, "code", str(exc)),
-                                )
-                                break
-                            except (AttributeError, OSError) as exc:
-                                # Windows ProactorEventLoop: TCP RST during
-                                # asyncio.wait_for cleanup raises AttributeError
-                                # ('NoneType' has no attribute 'resume_reading')
-                                # or OSError/ConnectionResetError — server-side RST.
-                                log.debug(
-                                    "ChainlinkStreamsClient: connection reset",
-                                    origin=origin_label,
-                                    exc=type(exc).__name__,
-                                )
-                                break
-                            await self._handle_message(json.loads(raw))
+                        # Use `async for` instead of `asyncio.wait_for(ws.recv(), ...)`
+                        # to avoid the Windows ProactorEventLoop cancellation race.
+                        # `asyncio.wait_for` creates an inner Task and cancels it on
+                        # timeout; that cancellation triggers the transport-cleanup
+                        # race ('NoneType' has no attribute 'resume_reading') every
+                        # 10-25 s when combined with the library's 5-s ping interval.
+                        # `async for raw in ws:` calls recv() directly without a
+                        # Task/wait_for wrapper, eliminating the cancellation path.
+                        # Silence detection is handled by ping_interval + ping_timeout
+                        # (5 s ping, 30 s pong timeout) set on the connection above.
+                        try:
+                            async for raw in ws:
+                                await self._handle_message(json.loads(raw))
+                        except (AttributeError, OSError) as exc:
+                            # Windows ProactorEventLoop transport-cleanup race — same
+                            # root cause as pm_client WS shard 'resume_reading' error.
+                            log.info(
+                                "ChainlinkStreamsClient: connection reset",
+                                origin=origin_label,
+                                exc=type(exc).__name__,
+                                session_s=round(time.time() - conn_started_at, 1),
+                            )
                     finally:
                         try:
                             self._ws_handles.remove(ws)
@@ -448,7 +489,7 @@ class ChainlinkStreamsClient:
                             pass
                         session_s = round(time.time() - conn_started_at, 1)
                         self.stats.active_connections -= 1
-                        log.debug(
+                        log.info(
                             "ChainlinkStreamsClient: disconnected",
                             origin=origin_label,
                             session_s=session_s,
@@ -470,24 +511,57 @@ class ChainlinkStreamsClient:
             # Mirror SDK stats: partial if another connection is still alive.
             if self.stats.active_connections > 0:
                 self.stats.partial_reconnects += 1
-                # Another connection is live — deliberately wait half the server
-                # TTL before reconnecting so the two origins stay phase-shifted.
-                # If we reconnect immediately, both origins converge on the same
-                # cycle and go down together every ~30 s.
-                wait = _WS_SILENCE_TIMEOUT_S / 2
-                wait += random.uniform(0.0, 2.0)
+                # Another connection is live — reconnect quickly (3 s) to restore
+                # HA coverage before the live connection's session also expires.
+                # The previous value (_WS_SILENCE_TIMEOUT_S / 2 = 15 s) was the
+                # root of the cascade: 15 s > half the ~30 s server session TTL,
+                # so a partial drop reliably caused both origins to be down
+                # simultaneously on the very next server-close event.
+                wait = _HA_PARTIAL_RECONNECT_WAIT_S
+                wait += random.uniform(0.0, 1.0)
+                log.info(
+                    "ChainlinkStreamsClient: partial reconnect",
+                    origin=origin_label,
+                    partial_reconnects=self.stats.partial_reconnects,
+                    wait_s=round(wait, 1),
+                    active_connections=self.stats.active_connections,
+                )
             else:
                 # All connections simultaneously down — log at WARNING so it's visible.
                 # Reconnect quickly to minimise data gap.
                 self.stats.full_reconnects += 1
+                # S3.3 — Track rolling reconnect rate and alert when excessive.
+                _now = time.time()
+                self._last_reconnect_at = _now
+                self._reconnect_timestamps.append(_now)
+                # Prune entries older than 1 hour.
+                self._reconnect_timestamps = [
+                    t for t in self._reconnect_timestamps if t >= _now - 3600.0
+                ]
+                _reconnects_1h = len(self._reconnect_timestamps)
+                if _reconnects_1h > config.CHAINLINK_MAX_RECONNECTS_1H:
+                    log.warning(
+                        "[CHAINLINK_DEGRADED]",
+                        reconnects_1h=_reconnects_1h,
+                        threshold=config.CHAINLINK_MAX_RECONNECTS_1H,
+                        oracle_quality="impacted",
+                    )
                 log.warning(
                     "ChainlinkStreamsClient: all connections down — reconnecting",
                     origin=origin_label,
                     full_reconnects=self.stats.full_reconnects,
+                    reconnects_1h=_reconnects_1h,
                     stats=str(self.stats),
                 )
-                jitter = random.uniform(0.0, backoff * 0.3)
-                wait   = backoff + jitter
+                # Restore the phase offset so this origin reconnects at a
+                # different time from origin 0, preventing both connections
+                # from cycling in phase after a simultaneous full drop.
+                # Use _HA_RECONNECT_STAGGER_S (5 s) not _WS_SILENCE_TIMEOUT_S/2
+                # (15 s) — 5 s is enough offset while keeping the reconnect gap
+                # well below the server's ~30-60 s session TTL.
+                jitter  = random.uniform(0.0, backoff * 0.3)
+                stagger = origin_index * _HA_RECONNECT_STAGGER_S
+                wait    = backoff + jitter + stagger
 
             log.debug(
                 "ChainlinkStreamsClient: reconnecting",

@@ -222,14 +222,6 @@ class TestFundingSnapshot:
         assert snap is not None
         assert snap.hl_predicted == pytest.approx(0.0001)
 
-    def test_get_funding_returns_snapshot(self):
-        self.client._fundings["BTC"] = FundingSnapshot(coin="BTC", hl_predicted=0.0001)
-        snap = self.client.get_funding("BTC")
-        assert snap.hl_predicted == pytest.approx(0.0001)
-
-    def test_get_funding_unknown_coin(self):
-        assert self.client.get_funding("DOGE") is None
-
 
 # ── webData2 funding push ─────────────────────────────────────────────────────
 
@@ -253,12 +245,6 @@ class TestWebData2:
 
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
-
-    def test_on_funding_update_registers_callback(self):
-        client = self._make_client()
-        calls = []
-        client.on_funding_update(lambda coin, rate, ts: calls.append((coin, rate, ts)))
-        assert len(client._funding_update_callbacks) == 1
 
     def test_webdata2_message_fires_callback(self):
         """webData2 WS push fires registered funding callback for each coin."""

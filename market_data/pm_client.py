@@ -13,6 +13,7 @@ from pm_client import (  # noqa: F401
     PMClient,
     PMMarket,
     OrderBookSnapshot,
+    _WSShard,
     _classify_market,
     _detect_underlying,
     _MARKET_TYPE_KEYWORDS,

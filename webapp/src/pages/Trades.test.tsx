@@ -20,6 +20,7 @@ import type { AcctLedgerRow } from "../api/client";
 import {
   fmtUsd,
   fmtPrice,
+  fmtExitPrice,
   fmtContracts,
   netPnl,
   grossPnl,
@@ -166,6 +167,38 @@ describe("fmtPrice", () => {
 
   it("accepts string input", () => {
     expect(fmtPrice("0.65")).toBe("65.0¢");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 2b fmtExitPrice
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe("fmtExitPrice", () => {
+  it("shows 0.0¢ for exit_vwap=0 when contracts > 0 (settled to zero / loss)", () => {
+    // Key regression: a NO token that loses settles at exit_vwap=0.0.
+    // fmtPrice(0) incorrectly returns '—'; fmtExitPrice must show '0.0¢'.
+    expect(fmtExitPrice(0.0, 9.803922)).toBe("0.0¢");
+  });
+
+  it("shows — when no exit contracts (position not yet exited)", () => {
+    expect(fmtExitPrice(0.0, 0)).toBe("—");
+  });
+
+  it("shows — when contracts undefined", () => {
+    expect(fmtExitPrice(0.0, undefined)).toBe("—");
+  });
+
+  it("formats 1.0 as 100.0¢ (winning settlement)", () => {
+    expect(fmtExitPrice(1.0, 10)).toBe("100.0¢");
+  });
+
+  it("formats mid-range exit price correctly", () => {
+    expect(fmtExitPrice(0.65, 50)).toBe("65.0¢");
+  });
+
+  it("accepts string inputs", () => {
+    expect(fmtExitPrice("0", "9.803922")).toBe("0.0¢");
   });
 });
 

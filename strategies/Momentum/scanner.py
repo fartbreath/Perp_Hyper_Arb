@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import config
+from core.types import GateResult, log_gate_suppression, _should_log_suppression as _should_log_count
 from logger import get_bot_logger
 from market_data.pm_client import PMClient, PMMarket, _MARKET_TYPE_DURATION_SECS
 from market_data.hl_client import HLClient
@@ -216,6 +217,10 @@ class MomentumScanner(BaseStrategy):
         # Deduplication set: market_ids that have already been warned about missing
         # window-open spot.  Prevents log flooding at 1 Hz for expired markets.
         self._warned_no_open_spot: set[str] = set()
+        # S1 Gate audit: consecutive-suppression counters for data-feed gates.
+        # Key: "{condition_id}:{gate_name}",  value: consecutive-scan count.
+        # Escalates log level to WARNING after GATE_LOG_CONSECUTIVE_THRESHOLD hits.
+        self._gate_suppress_counts: dict[str, int] = {}
         # Diagnostics: per-market snapshot from the last completed _scan_once pass.
         # Read by /momentum/diagnostics — no lock needed (GIL + single asyncio writer).
         self._last_scan_diags: list[dict] = []
@@ -276,6 +281,10 @@ class MomentumScanner(BaseStrategy):
         # RTDS (1h / daily / weekly markets) and Chainlink (5m / 15m / 4h markets).
         self._spot.on_rtds_update(self._on_spot_update_entry)
         self._spot.on_chainlink_update(self._on_spot_update_entry)
+        # Rebuild _token_to_market immediately when PM discovers new markets so
+        # _on_price_update_entry can fire early scan wakeups for new buckets
+        # without waiting for _SUBSCRIPTION_REFRESH_INTERVAL (up to 30 s).
+        self._pm.on_markets_refreshed(self._on_pm_markets_refreshed)
         asyncio.create_task(self._scan_loop())
 
     async def stop(self) -> None:
@@ -372,6 +381,24 @@ class MomentumScanner(BaseStrategy):
             max_tte_days=config.MOMENTUM_MAX_TTE_DAYS,
             presub_lookahead=_lookahead,
         )
+
+    async def _on_pm_markets_refreshed(self) -> None:
+        """Called by PMClient immediately after each Gamma API market refresh.
+
+        Rebuilds _token_to_market and re-registers WS subscriptions so that
+        newly discovered markets receive early scan wakeups via
+        _on_price_update_entry without waiting for _SUBSCRIPTION_REFRESH_INTERVAL
+        (up to 30 s).  Errors are caught so a transient failure here never
+        silences the PM client's refresh cycle.
+        """
+        if not self._running:
+            return
+        try:
+            await self._refresh_subscriptions()
+        except Exception as exc:
+            log.warning(
+                "MomentumScanner: _on_pm_markets_refreshed error", exc=str(exc)
+            )
 
     # ── Scan loop ─────────────────────────────────────────────────────────────
 
@@ -593,8 +620,22 @@ class MomentumScanner(BaseStrategy):
                 if _tte_pre is not None:
                     _d["tte_seconds"] = round(_tte_pre)
                 _d["skip_reason"] = "no_book"
+                _gk = f"{market.condition_id}:no_book"
+                _cnt = self._gate_suppress_counts.get(_gk, 0) + 1
+                self._gate_suppress_counts[_gk] = _cnt
+                if _cnt >= config.GATE_LOG_CONSECUTIVE_THRESHOLD and _should_log_count(_cnt, config.GATE_LOG_CONSECUTIVE_THRESHOLD):
+                    log.warning(
+                        "gate_suppressed",
+                        strategy="momentum",
+                        gate="no_book",
+                        entity_id=market.condition_id[:16],
+                        consecutive=_cnt,
+                        reason="PM book absent or mid=None",
+                    )
                 scan_diags.append(_d)
                 continue
+            else:
+                self._gate_suppress_counts.pop(f"{market.condition_id}:no_book", None)
 
             _book_age = round(now_ts - book_yes.timestamp, 1)
             _d["book_age_s"] = _book_age
@@ -608,8 +649,24 @@ class MomentumScanner(BaseStrategy):
             if _book_age > config.MOMENTUM_BOOK_MAX_AGE_SECS:
                 skipped_stale_book += 1
                 _d["skip_reason"] = "stale_book"
+                _gk = f"{market.condition_id}:stale_book"
+                _cnt = self._gate_suppress_counts.get(_gk, 0) + 1
+                self._gate_suppress_counts[_gk] = _cnt
+                if _cnt >= config.GATE_LOG_CONSECUTIVE_THRESHOLD and _should_log_count(_cnt, config.GATE_LOG_CONSECUTIVE_THRESHOLD):
+                    log.warning(
+                        "gate_suppressed",
+                        strategy="momentum",
+                        gate="stale_book",
+                        entity_id=market.condition_id[:16],
+                        consecutive=_cnt,
+                        reason=f"book_age={_book_age}s threshold={config.MOMENTUM_BOOK_MAX_AGE_SECS}s",
+                        value=_book_age,
+                        threshold=config.MOMENTUM_BOOK_MAX_AGE_SECS,
+                    )
                 scan_diags.append(_d)
                 continue
+            else:
+                self._gate_suppress_counts.pop(f"{market.condition_id}:stale_book", None)
 
             # ── Empty book guard ─────────────────────────────────────────────
             # Check for a book that has no levels at all (distinct from stale:
@@ -767,8 +824,24 @@ class MomentumScanner(BaseStrategy):
             if snap is None or snap.mid is None:
                 skipped_stale_spot += 1
                 _d["skip_reason"] = "no_spot"
+                _gk = f"{market.condition_id}:no_spot"
+                _cnt = self._gate_suppress_counts.get(_gk, 0) + 1
+                self._gate_suppress_counts[_gk] = _cnt
+                if _cnt >= config.GATE_LOG_CONSECUTIVE_THRESHOLD and _should_log_count(_cnt, config.GATE_LOG_CONSECUTIVE_THRESHOLD):
+                    log.warning(
+                        "gate_suppressed",
+                        strategy="momentum",
+                        gate="no_spot",
+                        entity_id=market.condition_id[:16],
+                        consecutive=_cnt,
+                        reason=f"oracle returned None for {market.underlying}/{market.market_type}",
+                        underlying=market.underlying,
+                        market_type=market.market_type,
+                    )
                 scan_diags.append(_d)
                 continue
+            else:
+                self._gate_suppress_counts.pop(f"{market.condition_id}:no_spot", None)
 
             _spot_age = round(now_ts - snap.timestamp, 1)
             _d["spot_age_s"] = _spot_age
@@ -777,8 +850,26 @@ class MomentumScanner(BaseStrategy):
             if _spot_age > config.MOMENTUM_SPOT_MAX_AGE_SECS:
                 skipped_stale_spot += 1
                 _d["skip_reason"] = "stale_spot"
+                _gk = f"{market.condition_id}:stale_spot"
+                _cnt = self._gate_suppress_counts.get(_gk, 0) + 1
+                self._gate_suppress_counts[_gk] = _cnt
+                if _cnt >= config.GATE_LOG_CONSECUTIVE_THRESHOLD and _should_log_count(_cnt, config.GATE_LOG_CONSECUTIVE_THRESHOLD):
+                    log.warning(
+                        "gate_suppressed",
+                        strategy="momentum",
+                        gate="stale_spot",
+                        entity_id=market.condition_id[:16],
+                        consecutive=_cnt,
+                        reason=f"spot_age={_spot_age}s threshold={config.MOMENTUM_SPOT_MAX_AGE_SECS}s",
+                        value=_spot_age,
+                        threshold=config.MOMENTUM_SPOT_MAX_AGE_SECS,
+                        underlying=market.underlying,
+                        market_type=market.market_type,
+                    )
                 scan_diags.append(_d)
                 continue
+            else:
+                self._gate_suppress_counts.pop(f"{market.condition_id}:stale_spot", None)
 
             spot = snap.mid
             _d["spot"] = round(spot, 4)

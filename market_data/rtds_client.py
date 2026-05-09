@@ -113,6 +113,8 @@ class RTDSClient:
         self._ws: Any = None
         self._running = False
         self._reconnect_requested: bool = False  # set by health loop; cleared by _ws_loop
+        self._last_data_ts: float = 0.0  # wall-clock time of last actual price/chainlink frame
+        self._last_reconnect_at: float = 0.0  # wall-clock time of last WS connect (for health cooldown)
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -197,16 +199,17 @@ class RTDSClient:
     # ── WebSocket loop ────────────────────────────────────────────────────────
 
     async def _health_log_loop(self) -> None:
-        """Every 60 s log RTDS feed health; reconnect if prices are stale too long."""
+        """Every 20 s log RTDS feed health; reconnect if prices are stale too long."""
         RTDS_STALE_THRESH      = 30.0    # seconds — exchange-aggregated should be active
-        RTDS_STALE_RECONNECT_S = 120.0   # force reconnect if all tracked coins stale this long
-        await asyncio.sleep(60)
+        RTDS_STALE_RECONNECT_S = 45.0    # force reconnect if all tracked coins stale this long
+        await asyncio.sleep(20)
         while self._running:
             rtds_ages = {
                 coin: round(self.get_spot_age(coin), 1)
                 for coin in sorted(self._tracked_coins)
             }
-            rtds_stale = {c: a for c, a in rtds_ages.items() if a > RTDS_STALE_THRESH}
+            rtds_stale = {c: a for c, a in rtds_ages.items()
+                          if a > RTDS_STALE_THRESH and a != float("inf")}
             if rtds_stale:
                 log.warning(
                     "RTDSClient: RTDS exchange prices stale",
@@ -217,10 +220,20 @@ class RTDSClient:
                 # RTDS server has stopped pushing data while responding to our PINGs
                 # (keeping the 15 s recv-timeout alive).  Force a reconnect by closing
                 # the WS so _ws_loop re-subscribes and gets a fresh price batch.
+                #
+                # Guard: skip reconnect if no coin has ever sent a price on this
+                # connection (all ages == inf after _prices.clear() on fresh connect).
+                # all([]) == True in Python, so without this guard a brand-new
+                # connection would immediately trigger another reconnect storm.
+                # Also guard with a 60 s cooldown after the last connect to give the
+                # server time to start delivering prices.
+                non_inf_ages = [a for a in rtds_ages.values() if a != float("inf")]
                 if (
                     rtds_ages
-                    and all(a >= RTDS_STALE_RECONNECT_S for a in rtds_ages.values() if a != float("inf"))
+                    and non_inf_ages
+                    and all(a >= RTDS_STALE_RECONNECT_S for a in non_inf_ages)
                     and self._ws is not None
+                    and time.time() - self._last_reconnect_at > 60.0
                 ):
                     log.warning(
                         "RTDSClient: all prices stale — forcing reconnect",
@@ -232,7 +245,7 @@ class RTDSClient:
                     "RTDSClient: spot prices OK",
                     rtds_ages_s=rtds_ages,
                 )
-            await asyncio.sleep(60)
+            await asyncio.sleep(20)
 
     async def _ws_loop(self) -> None:
         backoff = 1.0
@@ -246,6 +259,13 @@ class RTDSClient:
                 ) as ws:
                     self._ws = ws
                     backoff = 1.0
+                    self._last_reconnect_at = time.time()
+                    # Clear stale cached prices so get_spot_age() returns inf
+                    # (never received) rather than ages from the previous session.
+                    # This prevents the health loop from immediately seeing
+                    # 45 s-stale prices and triggering another reconnect storm.
+                    self._prices.clear()
+                    self._cl_prices.clear()
                     log.info("RTDSClient: RTDS WS connected")
 
                     await self._subscribe(ws)
@@ -253,12 +273,13 @@ class RTDSClient:
                     # Start heartbeat — RTDS requires a PING message every 5 s
                     heartbeat_task = asyncio.create_task(self._heartbeat(ws))
                     try:
-                        # Use an explicit timeout on each recv() so that a zombie
-                        # connection (dead TCP, no close frame) is detected and
-                        # causes a reconnect.  We PING every 5 s so we expect at
-                        # least a PONG back within 10 s in steady state.
-                        # _reconnect_requested is set by _health_log_loop when prices
-                        # are stale; checked every recv cycle (~5 s) for fast response.
+                        # Zombie detection: PONG responses to our PING text frames keep
+                        # recv() alive even when the server stops pushing price data.
+                        # We track _last_data_ts (updated only on real price frames) and
+                        # break if no data in DATA_SILENCE_SECS.  The recv timeout is a
+                        # backstop for a fully dead TCP connection.
+                        DATA_SILENCE_SECS = 30.0
+                        self._last_data_ts = time.time()  # reset on fresh connect
                         while True:
                             if self._reconnect_requested:
                                 self._reconnect_requested = False
@@ -273,6 +294,13 @@ class RTDSClient:
                                 )
                                 break
                             await self._handle_message(frame)
+                            silence = time.time() - self._last_data_ts
+                            if silence > DATA_SILENCE_SECS:
+                                log.warning(
+                                    "RTDSClient: price data silent — forcing reconnect",
+                                    silence_secs=round(silence, 1),
+                                )
+                                break
                     finally:
                         heartbeat_task.cancel()
 
@@ -294,7 +322,7 @@ class RTDSClient:
             "action": "subscribe",
             "subscriptions": [
                 {"topic": "crypto_prices", "type": "update"},
-                {"topic": "crypto_prices_chainlink", "type": "update"},
+                {"topic": "crypto_prices_chainlink", "type": "*"},
             ],
         }
         await ws.send(json.dumps(msg))
@@ -351,6 +379,7 @@ class RTDSClient:
 
         snap = SpotPrice(coin=coin, price=price, timestamp=ts_ms / 1000.0)
         self._prices[coin] = snap
+        self._last_data_ts = time.time()
         log.debug("RTDSClient: price update", coin=coin, price=round(price, 6))
         for cb in self._callbacks:
             try:
@@ -386,6 +415,7 @@ class RTDSClient:
 
         snap = SpotPrice(coin=coin, price=price, timestamp=ts)
         self._cl_prices[coin] = snap
+        self._last_data_ts = time.time()
         log.debug("RTDSClient: chainlink update", coin=coin, price=round(price, 6))
         for cb in self._cl_callbacks:
             try:

@@ -13,6 +13,8 @@ import asyncio
 import csv
 import time
 import uuid
+
+from core.types import GateResult, log_gate_suppression, reset_gate_suppress_counts
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -35,6 +37,14 @@ log = get_bot_logger(__name__)
 # ── ON-02: Opening Neutral fills CSV ─────────────────────────────────────────
 _DATA_DIR = Path(__file__).parent.parent.parent / "data"
 _ON_FILLS_CSV = _DATA_DIR / "on_fills.csv"
+
+# ── Phase 8: ON bid-monitor tick CSV (one row per WS tick for active pairs) ──
+_ON_MONITOR_TICKS_CSV = _DATA_DIR / "on_monitor_ticks.csv"
+_ON_MONITOR_TICKS_HEADER = [
+    "ts", "pair_id", "market_id", "side", "token_prefix",
+    "best_bid", "best_ask", "trigger", "below_trigger",
+    "book_available", "pair_tick_total",
+]
 # on_fills.csv schema — v1 (Phase 0: cold-book guard + entry context logging).
 # Increment this comment and add migration in _ensure_on_fills_csv() whenever
 # columns are added or removed.  Schema version: 4 (added model_a_score, model_a_scale)
@@ -130,6 +140,26 @@ def _update_on_fills_winner_exit(pair_id: str, exit_price: float) -> None:
         logging.getLogger(__name__).error("on_fills.csv winner backfill failed", exc_info=exc)
 
 
+# ── Phase 8: ON bid-monitor tick CSV helpers ──────────────────────────────────
+
+def _ensure_on_monitor_ticks_csv() -> None:
+    _DATA_DIR.mkdir(exist_ok=True)
+    if not _ON_MONITOR_TICKS_CSV.exists():
+        with _ON_MONITOR_TICKS_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=_ON_MONITOR_TICKS_HEADER).writeheader()
+
+
+def _write_on_monitor_tick(row: dict) -> None:
+    """Append one row to on_monitor_ticks.csv.  Never raises."""
+    try:
+        _ensure_on_monitor_ticks_csv()
+        with _ON_MONITOR_TICKS_CSV.open("a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=_ON_MONITOR_TICKS_HEADER).writerow(row)
+    except Exception as _ex:
+        import logging
+        logging.getLogger(__name__).debug("_write_on_monitor_tick failed", exc_info=_ex)
+
+
 class OpeningNeutralScanner(BaseStrategy):
     """
     Scans bucket markets for simultaneous YES+NO opening entries.
@@ -210,6 +240,11 @@ class OpeningNeutralScanner(BaseStrategy):
         # Bid-monitoring exit state for active pairs.
         # Maps token_id → pair_id for all tokens being watched for bid-threshold exit.
         self._token_to_pair: dict[str, str] = {}
+        # Phase 8 diagnostics: per-token tick tracking for active pair monitoring.
+        # Used by stale-tick watchdog and on_monitor_ticks.csv writes.
+        self._pair_token_tick_count: dict[str, int] = {}    # token_id → total ticks
+        self._pair_token_last_tick_ts: dict[str, float] = {}  # token_id → last tick time
+        self._pair_token_registered_at: dict[str, float] = {}  # token_id → armed time
         # Token IDs for which a loser market sell is currently in-flight.
         # Guards against duplicate exit tasks when multiple WS ticks fire before
         # the first _execute_loser_exit task completes.
@@ -235,6 +270,10 @@ class OpeningNeutralScanner(BaseStrategy):
         # _pair_csv_data: pair_id → row dict, populated at _register_pair,
         # updated and written to CSV when the loser fills.
         self._pair_csv_data: dict[str, dict] = {}
+        # Gate audit logging (S1): consecutive-suppression counters per (pair_id, gate).
+        # Key: f"{pair_id}:{gate_name}", value: consecutive suppression count.
+        # Reset when the gate passes (exit fires) or when the pair is closed.
+        self._gate_suppress_counts: dict[str, int] = {}
         # ON-01: cumulative gate skip counters (per bot session, reset on restart).
         self._skipped_cold_book: int = 0
         self._skipped_no_spread: int = 0
@@ -246,17 +285,27 @@ class OpeningNeutralScanner(BaseStrategy):
         # RON mirror hook: coroutines registered via register_pair_callback() are
         # fired (as asyncio tasks) after every successful _register_pair call.
         self._on_pair_registered_callbacks: list = []
+        # RON loser-exit hook: coroutines registered via register_loser_exit_callback()
+        # are fired (as asyncio tasks) immediately when _on_exit_fill runs.
+        self._on_loser_exit_callbacks: list = []
 
     def register_pair_callback(self, cb) -> None:
         """Register a coroutine cb(market, on_pair_id, yes_pos, no_pos) fired after
         each successful pair registration.  Used by ReverseOpenNeutralScanner."""
         self._on_pair_registered_callbacks.append(cb)
 
+    def register_loser_exit_callback(self, cb) -> None:
+        """Register a coroutine cb(on_pair_id, loser_side, exit_price) fired
+        immediately when ON's loser exit fills.  Used by ReverseOpenNeutralScanner
+        so RON fires in lock-step with ON — not independently on bid thresholds."""
+        self._on_loser_exit_callbacks.append(cb)
+
     # ── BaseStrategy interface ────────────────────────────────────────────────
 
     async def start(self) -> None:
         self._running = True
         _ensure_on_fills_csv()
+        _ensure_on_monitor_ticks_csv()
         log.info(
             "OpeningNeutralScanner started",
             market_types=config.OPENING_NEUTRAL_MARKET_TYPES,
@@ -267,6 +316,10 @@ class OpeningNeutralScanner(BaseStrategy):
         # Register event-driven WS price callback.
         # Fires on every book/price_change update for any subscribed token.
         self._pm.on_price_change(self._on_price_event)
+        # Immediately re-sync pending markets whenever PM discovers new markets so
+        # a fresh bucket is registered within one PM refresh cycle (≤15 s) rather
+        # than waiting for the independent 5 s subscription loop to fire next.
+        self._pm.on_markets_refreshed(self._on_pm_markets_refreshed)
         # Pre-populate the pending-market map so we catch markets that are already
         # in their opening window when the scanner starts.
         await self._refresh_pending_markets()
@@ -400,7 +453,48 @@ class OpeningNeutralScanner(BaseStrategy):
                 await self._refresh_pending_markets()
             except Exception as exc:  # pylint: disable=broad-except
                 log.error("OpeningNeutralScanner: subscription refresh error", exc=str(exc))
+            # Phase 8: stale-tick watchdog — warn if active pair tokens stop receiving
+            # WS events (subscription lost or PM WS shard disconnected).
+            _now_w = time.time()
+            _stale_limit = 60.0
+            for _tok, _pair_id in list(self._token_to_pair.items()):
+                if _tok in self._pair_token_last_tick_ts:
+                    _age = _now_w - self._pair_token_last_tick_ts[_tok]
+                    if _age > _stale_limit:
+                        log.warning(
+                            "OpeningNeutral: pair token WS ticks stale",
+                            token_prefix=_tok[:20],
+                            pair_id=_pair_id[:12],
+                            secs_since_last_tick=round(_age, 1),
+                        )
+                else:
+                    # Token registered but never received a tick — warn after 15s
+                    _arm_age = _now_w - self._pair_token_registered_at.get(_tok, _now_w)
+                    if _arm_age > 15.0:
+                        log.warning(
+                            "OpeningNeutral: pair token has never received a WS tick",
+                            token_prefix=_tok[:20],
+                            pair_id=_pair_id[:12],
+                            secs_since_armed=round(_arm_age, 1),
+                        )
             await asyncio.sleep(5)
+
+    async def _on_pm_markets_refreshed(self) -> None:
+        """Called by PMClient immediately after each Gamma API market refresh.
+
+        Syncs _pending_markets the moment PM discovers new markets so a fresh
+        bucket is registered and its entry timer scheduled without waiting for
+        the next _subscription_loop iteration (up to 5 s).  Errors are caught
+        so a transient failure never silences the PM client's refresh cycle.
+        """
+        if not self._running:
+            return
+        try:
+            await self._refresh_pending_markets()
+        except Exception as exc:
+            log.warning(
+                "OpeningNeutralScanner: _on_pm_markets_refreshed error", exc=str(exc)
+            )
 
     async def _refresh_pending_markets(self) -> None:
         """
@@ -567,23 +661,46 @@ class OpeningNeutralScanner(BaseStrategy):
                     "OpeningNeutral: on_fills row flushed at resolution (no loser exit)",
                     pair_id=pid[:12],
                 )
+            # S1: clear gate suppress counts for this pair
+            _stale_keys = [k for k in self._gate_suppress_counts if k.startswith(f"{pid}:")]
+            for _k in _stale_keys:
+                del self._gate_suppress_counts[_k]
+            # Phase 8: clean up per-token tracking dicts so the stale-tick
+            # watchdog doesn't keep firing for tokens that are no longer
+            # subscribed (market expired, pair pruned).
+            for _pos in (yes_p, no_p):
+                _tid = getattr(_pos, "token_id", None) if _pos else None
+                if _tid:
+                    self._token_to_pair.pop(_tid, None)
+                    self._pair_token_last_tick_ts.pop(_tid, None)
+                    self._pair_token_tick_count.pop(_tid, None)
+                    self._pair_token_registered_at.pop(_tid, None)
             log.info(
                 "OpeningNeutral: pair pruned (both legs closed)",
                 pair_id=pid[:12],
                 market_id=pair.get("market_id", "")[:22],
             )
 
-        # Subscribe all pending markets (both YES and NO tokens) to the PM WS so
-        # that pm.get_book() returns live prices.  Uses a named owner so the
-        # momentum scanner's own registrations are not overwritten.
-        # Also include tokens from active (not-yet-resolved) pairs so WS book
-        # events keep firing after entry — required for loser-exit evaluation.
-        extra = {
+        # Subscribe all pending and active-pair tokens via the shared helper so
+        # the same logic is available for immediate calls from _register_pair.
+        self._update_subscriptions()
+
+    def _update_subscriptions(self) -> None:
+        """Build the PM WS subscription set for all pending markets and active
+        (not-yet-resolved) pairs, then register it under the 'opening_neutral'
+        owner key so the momentum scanner's registrations are not overwritten.
+
+        Called from _refresh_pending_markets (5-second cycle) AND immediately
+        from _register_pair so pair tokens are subscribed the moment bid
+        monitoring is armed — not up to 5 seconds later.
+        """
+        extra: set[str] = {
             t
             for mkt in self._pending_markets.values()
             for t in (mkt.token_id_yes, mkt.token_id_no)
             if t
         }
+        _pair_tokens: set[str] = set()
         for pair in self._active_pairs.values():
             if self._pair_is_resolved(pair):
                 continue
@@ -593,11 +710,20 @@ class OpeningNeutralScanner(BaseStrategy):
                 t = getattr(yes_p, "token_id", "")
                 if t:
                     extra.add(t)
+                    _pair_tokens.add(t)
             if no_p and not no_p.is_closed:
                 t = getattr(no_p, "token_id", "")
                 if t:
                     extra.add(t)
+                    _pair_tokens.add(t)
         self._pm.register_for_book_updates(extra, owner="opening_neutral")
+        if _pair_tokens:
+            log.info(
+                "OpeningNeutral: bid-monitor subscriptions registered",
+                pair_token_count=len(_pair_tokens),
+                pair_tokens=[t[:20] for t in sorted(_pair_tokens)],
+                pending_token_count=len(extra) - len(_pair_tokens),
+            )
 
     # ── Scheduled-timer entry (ideas 1, 2, 5) ────────────────────────────────
 
@@ -739,8 +865,15 @@ class OpeningNeutralScanner(BaseStrategy):
                     mon_pos = None
                     mon_side = None
                 if mon_pos is not None and mon_side is not None:
+                    # Phase 8: update per-token tick counters for stale-tick watchdog.
+                    self._pair_token_tick_count[token_id] = (
+                        self._pair_token_tick_count.get(token_id, 0) + 1
+                    )
+                    self._pair_token_last_tick_ts[token_id] = time.time()
+
                     book = self._pm.get_book(token_id)
                     best_bid = book.best_bid if book is not None else None
+                    best_ask = book.best_ask if book is not None else None
                     # ON-04/05: use per-pair trigger for this leg.
                     # Falls back to the global LOSER_EXIT_TRIGGER if the trigger
                     # key is absent (e.g. pairs registered before the feature was
@@ -749,49 +882,79 @@ class OpeningNeutralScanner(BaseStrategy):
                     _bid_threshold = pair.get(
                         _trigger_key, config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER
                     )
-                    if best_bid is not None and best_bid <= _bid_threshold:
-                        # ── Min-hold gate ────────────────────────────────────
-                        # Do not declare a loser until enough time has elapsed
-                        # since entry.  At T+1s YES/NO bids are statistically
-                        # indistinguishable; T+30s is where true losers diverge.
+                    _below = best_bid is not None and best_bid <= _bid_threshold
+                    # Phase 8: write every tick to on_monitor_ticks.csv for analysis.
+                    _write_on_monitor_tick({
+                        "ts":             datetime.now(timezone.utc).isoformat(),
+                        "pair_id":        pair_id[:12],
+                        "market_id":      pair.get("market_id", "")[:22],
+                        "side":           mon_side,
+                        "token_prefix":   token_id[:20],
+                        "best_bid":       round(best_bid, 4) if best_bid is not None else "",
+                        "best_ask":       round(best_ask, 4) if best_ask is not None else "",
+                        "trigger":        round(_bid_threshold, 4),
+                        "below_trigger":  _below,
+                        "book_available": book is not None,
+                        "pair_tick_total": self._pair_token_tick_count.get(token_id, 0),
+                    })
+                    if book is None:
+                        log.warning(
+                            "OpeningNeutral: loser monitor — book unavailable",
+                            pair_id=pair_id[:12],
+                            side=mon_side,
+                            token_prefix=token_id[:20],
+                        )
+                    if _below:
+                        # ── Gate pipeline (S1) ───────────────────────────────
+                        # Every gate appends a GateResult. No early returns.
+                        # Failed gates are logged with consecutive count so
+                        # silent suppression is always visible in the log.
+                        _gates: list[GateResult] = []
+                        _now_ts = time.time()
+                        _entry_ts = pair.get("entry_ts", 0.0)
+                        _age = _now_ts - _entry_ts
+
+                        # ── Min-hold gate ─────────────────────────────────────
                         _min_hold = config.OPENING_NEUTRAL_MIN_HOLD_SECS
-                        if _min_hold > 0:
-                            _entry_ts = pair.get("entry_ts", 0.0)
-                            if time.time() - _entry_ts < _min_hold:
-                                return  # still in hold window — re-check on next tick
-                        # ── Winner confirmation gate (ON-07) ─────────────────
-                        # Require the OTHER token's best bid to be at or above
-                        # OPENING_NEUTRAL_WINNER_CONFIRM_FLOOR before declaring a
-                        # loser.  When both bids are still ~$0.50 the market hasn't
-                        # resolved direction — the dip is transient noise.
+                        _hold_ok = _min_hold <= 0 or _age >= _min_hold
+                        _gates.append(GateResult(
+                            gate="min_hold",
+                            passed=_hold_ok,
+                            reason=f"age={_age:.1f}s threshold={_min_hold}s",
+                            value=_age,
+                            threshold=_min_hold,
+                        ))
+
+                        # ── Winner confirmation gate (ON-07) ──────────────────
                         _confirm_floor = getattr(
                             config, "OPENING_NEUTRAL_WINNER_CONFIRM_FLOOR", 0.0
                         )
+                        _other_pos = no_pos if mon_side == "YES" else yes_pos
+                        _other_token_id = getattr(_other_pos, "token_id", "") if _other_pos else ""
+                        _other_book = self._pm.get_book(_other_token_id) if _other_token_id else None
+                        _other_bid = _other_book.best_bid if _other_book is not None else None
                         if _confirm_floor > 0.0:
-                            _other_pos = no_pos if mon_side == "YES" else yes_pos
-                            _other_token_id = getattr(_other_pos, "token_id", "") if _other_pos else ""
-                            _other_book = self._pm.get_book(_other_token_id) if _other_token_id else None
-                            _other_bid = _other_book.best_bid if _other_book is not None else None
-                            if _other_bid is None or _other_bid < _confirm_floor:
-                                log.debug(
-                                    "OpeningNeutral: loser exit suppressed — winner bid below confirm floor",
-                                    pair_id=pair_id[:12],
-                                    loser_side=mon_side,
-                                    loser_bid=best_bid,
-                                    winner_bid=_other_bid,
-                                    confirm_floor=_confirm_floor,
-                                )
-                                return  # suppress — winner hasn't diverged yet
+                            # None = book unavailable = cannot confirm winner but
+                            # also cannot suppress indefinitely — allow exit.
+                            _winner_ok = (
+                                _other_bid is None  # book unavailable: allow exit
+                                or _other_bid >= _confirm_floor
+                            )
+                            _gates.append(GateResult(
+                                gate="ON-07_winner_confirm",
+                                passed=_winner_ok,
+                                reason=(
+                                    f"winner_bid={_other_bid} floor={_confirm_floor}"
+                                    if _other_bid is not None
+                                    else "winner_book_unavailable=allow_exit"
+                                ),
+                                value=_other_bid,
+                                threshold=_confirm_floor,
+                            ))
+
                         # ── Oracle delta gate (ON-06) ─────────────────────────
-                        # Suppress loser exit when the oracle confirms this leg is
-                        # still winning.  CLOB bids collapse at settlement as market
-                        # makers withdraw — this makes a winning leg look like a loser.
-                        # The oracle is unaffected by CLOB liquidity and is the correct
-                        # signal at expiry.
-                        # Fallback: if oracle is unavailable, apply the configured
-                        # fallback policy (default: allow_exit — safe against stale oracle).
+                        _oracle_delta: Optional[float] = None
                         if getattr(config, "OPENING_NEUTRAL_ORACLE_DELTA_GATE_ENABLED", False):
-                            _oracle_delta: Optional[float] = None
                             _underlying = getattr(mon_pos, "underlying", "") or ""
                             _market_type = getattr(mon_pos, "market_type", "") or ""
                             _strike = getattr(mon_pos, "strike", 0.0) or 0.0
@@ -802,43 +965,31 @@ class OpeningNeutralScanner(BaseStrategy):
                                         _oracle_delta = (_spot_mid - _strike) / _strike * 100
                                     else:
                                         _oracle_delta = (_strike - _spot_mid) / _strike * 100
+
                             if _oracle_delta is not None:
-                                if _oracle_delta > 0:
-                                    # Oracle says this leg is winning — CLOB collapse is noise.
-                                    log.debug(
-                                        "OpeningNeutral: loser exit suppressed — oracle delta positive",
-                                        pair_id=pair_id[:12],
-                                        side=mon_side,
-                                        best_bid=best_bid,
-                                        oracle_delta_pct=round(_oracle_delta, 3),
-                                    )
-                                    return  # suppress — recheck on next tick
-                                # delta <= 0: oracle confirms loser — allow exit below
+                                # delta > 0 means oracle says this leg is winning — suppress
+                                _oracle_gate_ok = _oracle_delta <= 0
+                                _gates.append(GateResult(
+                                    gate="ON-06_oracle_delta",
+                                    passed=_oracle_gate_ok,
+                                    reason=f"oracle_delta={_oracle_delta:.3f}% (>0=winning, suppress)",
+                                    value=round(_oracle_delta, 4),
+                                    threshold=0.0,
+                                ))
                             else:
-                                # Oracle unavailable — apply fallback policy
                                 _fallback = getattr(
                                     config, "OPENING_NEUTRAL_ORACLE_DELTA_GATE_FALLBACK", "allow_exit"
                                 )
-                                if _fallback == "suppress":
-                                    log.debug(
-                                        "OpeningNeutral: loser exit suppressed — oracle unavailable (fallback=suppress)",
-                                        pair_id=pair_id[:12],
-                                        side=mon_side,
-                                        best_bid=best_bid,
-                                    )
-                                    return  # suppress — recheck on next tick
-                                # fallback=allow_exit: fall through and fire
-                                log.debug(
-                                    "OpeningNeutral: oracle unavailable — allowing loser exit (fallback=allow_exit)",
-                                    pair_id=pair_id[:12],
-                                    side=mon_side,
-                                    best_bid=best_bid,
-                                )
+                                _oracle_gate_ok = _fallback != "suppress"
+                                _gates.append(GateResult(
+                                    gate="ON-06_oracle_delta",
+                                    passed=_oracle_gate_ok,
+                                    reason=f"oracle_unavailable fallback={_fallback}",
+                                    value=None,
+                                    threshold=None,
+                                ))
+
                         # ── Model B exit gate (ML-06) ────────────────────────
-                        # Suppress the loser exit when Model B determines the
-                        # CLOB bid collapse is settlement drain, not informed
-                        # selling.  Model B can only suppress — it cannot force
-                        # an exit the rules threshold has not triggered.
                         if getattr(config, "MODEL_B_ENABLED", False) and self._model_agent is not None:
                             try:
                                 _entry_csv = self._pair_csv_data.get(pair_id, {})
@@ -846,7 +997,7 @@ class OpeningNeutralScanner(BaseStrategy):
                                 _mb_context = {
                                     "oracle_delta_pct":          _oracle_delta,
                                     "deribit_iv":                _entry_csv.get("deribit_iv"),
-                                    "implied_prob":              best_bid,  # current CLOB bid — what triggered the exit check
+                                    "implied_prob":              best_bid,
                                     "on_yes_depth_share":        _entry_csv.get("yes_depth_share"),
                                     "on_loser_confidence_score": _entry_csv.get("loser_confidence_score"),
                                     "on_loser_fill_price":       _entry_csv.get("loser_fill_price") or mon_pos.entry_price,
@@ -857,22 +1008,20 @@ class OpeningNeutralScanner(BaseStrategy):
                                     "on_combined_cost":          _entry_csv.get("combined_cost"),
                                     "clob_yes_best_bid":         best_bid,
                                     "clob_yes_bid_depth_5":      _entry_csv.get("clob_yes_bid_depth_5"),
-                                    # ON-only v3 features
                                     "on_price_to_beat":          _entry_csv.get("price_to_beat"),
                                     "on_clob_no_bid_depth_5":    _entry_csv.get("clob_no_bid_depth_5"),
                                     "on_hl_mark_price":          _entry_csv.get("hl_mark_price"),
                                 }
                                 _mb_score = self._model_agent.score_exit(pair_id, _mb_context)
-                                if _mb_score < config.MODEL_B_SUPPRESS_THRESHOLD:
-                                    log.info(
-                                        "OpeningNeutral: Model B suppressed exit",
-                                        market_id=pair.get("market_id", "")[:16],
-                                        pair_id=pair_id[:12],
-                                        side=mon_side,
-                                        model_b_score=round(_mb_score, 3),
-                                        threshold=config.MODEL_B_SUPPRESS_THRESHOLD,
-                                    )
-                                    # ML-06: write suppression to shadow_log for audit trail
+                                _mb_ok = _mb_score >= config.MODEL_B_SUPPRESS_THRESHOLD
+                                _gates.append(GateResult(
+                                    gate="ML-06_model_b",
+                                    passed=_mb_ok,
+                                    reason=f"score={_mb_score:.3f} threshold={config.MODEL_B_SUPPRESS_THRESHOLD}",
+                                    value=round(_mb_score, 4),
+                                    threshold=config.MODEL_B_SUPPRESS_THRESHOLD,
+                                ))
+                                if not _mb_ok:
                                     asyncio.create_task(
                                         self._model_agent.log_model_b_suppression(
                                             market_id=pair.get("market_id", ""),
@@ -882,17 +1031,42 @@ class OpeningNeutralScanner(BaseStrategy):
                                         ),
                                         name=f"mb_shadow_{pair_id[:12]}",
                                     )
-                                    return  # suppress — recheck on next tick
                             except Exception as _mb_exc:
                                 log.warning(
                                     "OpeningNeutral: Model B inference error — allowing exit",
                                     pair_id=pair_id[:12],
                                     exc=str(_mb_exc),
                                 )
-                        # ── Fire loser exit ──────────────────────────────────
-                        # ON-05 audit: log which leg the tightened trigger fired on
-                        # when score=±2, so we can verify the tighten hits the loser
-                        # not the winner.
+                                # Gate not added — error is treated as pass (allow exit)
+
+                        # ── Evaluate all gates ────────────────────────────────
+                        _failed = [g for g in _gates if not g.passed]
+                        _suppress_key_prefix = pair_id
+                        if _failed:
+                            # Build per-gate keys for consecutive count tracking
+                            _gate_keys = {
+                                f"{_suppress_key_prefix}:{g.gate}": g
+                                for g in _failed
+                            }
+                            log_gate_suppression(
+                                log=log,
+                                entity_id=pair_id[:12],
+                                failed_gates=_failed,
+                                suppress_counts=self._gate_suppress_counts,
+                                threshold=config.GATE_LOG_CONSECUTIVE_THRESHOLD,
+                                extra_fields={
+                                    "strategy": "opening_neutral",
+                                    "loser_side": mon_side,
+                                    "best_bid": round(best_bid, 4),
+                                    "trigger": round(_bid_threshold, 4),
+                                },
+                            )
+                            return  # gates suppressing — re-check on next tick
+                        # All gates passed — reset suppress counts for this pair's gates
+                        for _g in _gates:
+                            self._gate_suppress_counts.pop(f"{_suppress_key_prefix}:{_g.gate}", None)
+
+                        # ── Fire loser exit ───────────────────────────────────
                         _base_trigger = config.OPENING_NEUTRAL_LOSER_EXIT_TRIGGER
                         _conf_score = self._pair_csv_data.get(pair_id, {}).get("loser_confidence_score")
                         _tightened = (
@@ -1883,6 +2057,14 @@ class OpeningNeutralScanner(BaseStrategy):
         # than holding the position to $0.00 at resolution.
         self._token_to_pair[yes_token_id] = pair_id
         self._token_to_pair[no_token_id]  = pair_id
+        # Phase 8: record arm time for stale-tick watchdog and diagnostics.
+        _arm_ts = time.time()
+        self._pair_token_registered_at[yes_token_id] = _arm_ts
+        self._pair_token_registered_at[no_token_id]  = _arm_ts
+        # Immediately subscribe the new pair tokens to the PM WS so that
+        # _on_price_event fires on the very next book tick — not up to 5s
+        # later when the _refresh_pending_markets cycle next runs.
+        self._update_subscriptions()
         log.info(
             "OpeningNeutral: bid-monitoring armed on both legs",
             pair_id=pair_id[:12],
@@ -2209,6 +2391,14 @@ class OpeningNeutralScanner(BaseStrategy):
 
         market_id = loser_pos.market_id
 
+        # Notify RON (and any other registered listeners) that the loser exit
+        # has fired so they can record their simulated exit in lock-step with ON.
+        for _cb in self._on_loser_exit_callbacks:
+            asyncio.create_task(
+                _cb(pair_id, filled_side, exit_price),
+                name=f"on_loser_exit_cb_{pair_id[:12]}",
+            )
+
         log.info(
             "OpeningNeutral: loser exit filled — closing loser, promoting winner",
             pair_id=pair_id[:12],
@@ -2403,6 +2593,10 @@ class OpeningNeutralScanner(BaseStrategy):
             if _tok:
                 self._token_to_pair.pop(_tok, None)
                 self._exiting_legs.discard(_tok)
+                # Phase 8: clean up diagnostic tracking dicts
+                self._pair_token_tick_count.pop(_tok, None)
+                self._pair_token_last_tick_ts.pop(_tok, None)
+                self._pair_token_registered_at.pop(_tok, None)
         self._active_pairs.pop(pair_id, None)
 
         # Fire close callback so main.py can update cooldowns and emit

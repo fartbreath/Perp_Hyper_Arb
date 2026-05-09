@@ -66,9 +66,10 @@ import json
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import config
+from core.types import GateResult, log_gate_suppression, PositionDataHealth, _should_log_suppression as _should_log_count
 from logger import get_bot_logger
 from risk import RiskEngine, Position
 from market_data.pm_client import PMClient, _MARKET_TYPE_DURATION_SECS
@@ -321,6 +322,7 @@ def should_exit(
     current_spot: Optional[float] = None,
     delta_sl_pct: Optional[float] = None,
     oracle_age_seconds: Optional[float] = None,
+    suppress_counts: Optional[dict] = None,
 ) -> tuple[bool, str, float]:
     """
     Decide whether a position should be exited.
@@ -427,6 +429,23 @@ def should_exit(
             _suppress_above > 0.0
             and _token_price_for_suppress >= _suppress_above
         )
+        if _suppress_taker_exits and suppress_counts is not None:
+            _gk = f"{pos.token_id}:suppress_taker_exits"
+            _cnt = suppress_counts.get(_gk, 0) + 1
+            suppress_counts[_gk] = _cnt
+            if _cnt >= config.GATE_LOG_CONSECUTIVE_THRESHOLD and _should_log_count(_cnt, config.GATE_LOG_CONSECUTIVE_THRESHOLD):
+                log.warning(
+                    "gate_suppressed",
+                    strategy="momentum",
+                    gate="suppress_taker_exits",
+                    entity_id=pos.market_id[:16],
+                    consecutive=_cnt,
+                    reason=f"token_price={_token_price_for_suppress:.4f} >= suppress_above={_suppress_above}",
+                    value=round(_token_price_for_suppress, 4),
+                    threshold=_suppress_above,
+                )
+        elif not _suppress_taker_exits and suppress_counts is not None:
+            suppress_counts.pop(f"{pos.token_id}:suppress_taker_exits", None)
 
         # Delta SL runs FIRST — requires only spot+strike, NOT token_price.
         # This must evaluate even when the NO CLOB book is drained near expiry
@@ -506,6 +525,30 @@ def should_exit(
                 and current_token_price > _token_veto_floor
             ):
                 _suppress_delta_sl = True
+            # S1: gate audit logging for delta_sl suppress
+            if _suppress_delta_sl and suppress_counts is not None:
+                _gk_dsl = f"{pos.token_id}:suppress_delta_sl"
+                _cnt_dsl = suppress_counts.get(_gk_dsl, 0) + 1
+                suppress_counts[_gk_dsl] = _cnt_dsl
+                if _cnt_dsl >= config.GATE_LOG_CONSECUTIVE_THRESHOLD and _should_log_count(_cnt_dsl, config.GATE_LOG_CONSECUTIVE_THRESHOLD):
+                    _reason_dsl = (
+                        f"token_veto: token_price={current_token_price:.4f} > floor={_token_veto_floor}"
+                        if (_token_veto_floor > 0.0 and current_token_price is not None
+                            and current_token_price > _token_veto_floor and not (_in_grace and _above_min_tte))
+                        else f"grace: age={(now - pos.opened_at).total_seconds():.0f}s < {_delta_sl_grace_secs}s, tte_ok={_above_min_tte}"
+                    )
+                    log.warning(
+                        "gate_suppressed",
+                        strategy="momentum",
+                        gate="suppress_delta_sl",
+                        entity_id=pos.market_id[:16],
+                        consecutive=_cnt_dsl,
+                        reason=_reason_dsl,
+                        delta_pct=round(current_delta_pct, 4) if current_delta_pct is not None else None,
+                        sl_threshold=round(_sl, 4),
+                    )
+            elif not _suppress_delta_sl and suppress_counts is not None:
+                suppress_counts.pop(f"{pos.token_id}:suppress_delta_sl", None)
             if not _suppress_taker_exits and not _suppress_delta_sl and current_delta_pct < _sl:
                 return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
             # Near-expiry: only exit if spot has already crossed the strike
@@ -516,6 +559,30 @@ def should_exit(
                 and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
                 and current_delta_pct < 0
             ):
+                return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
+
+            # S2.4 — Near-expiry hard exit on stale oracle: if we are near expiry
+            # AND the oracle has been silent for longer than the configured threshold
+            # AND the token is NOT clearly winning, exit rather than holding blind
+            # to resolution.  This prevents a frozen oracle from hiding an adverse
+            # spot move during the final seconds of a bucket.
+            _hard_exit_stale_secs = getattr(config, "ORACLE_STALE_NEAR_EXPIRY_HARD_EXIT_SECS", 0)
+            if (
+                not _suppress_taker_exits
+                and _hard_exit_stale_secs > 0
+                and tte_seconds is not None
+                and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
+                and oracle_age_seconds is not None
+                and oracle_age_seconds >= _hard_exit_stale_secs
+                and current_spot is None  # delta unavailable (oracle offline)
+            ):
+                log.warning(
+                    "Monitor: near-expiry hard exit — oracle stale with no spot",
+                    market_id=pos.market_id,
+                    tte_seconds=round(tte_seconds, 1),
+                    oracle_stale_secs=round(oracle_age_seconds, 1),
+                    threshold=_hard_exit_stale_secs,
+                )
                 return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
 
         # Token-price exits (take-profit + prob-based SL) require the held token's CLOB mid.
@@ -563,6 +630,33 @@ def should_exit(
             config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS <= 0  # guard disabled → always allow
             or _oracle_confirmed_stale                       # confirmed oracle lag
         )
+        # S1: log when prob_sl_oracle_ok is suppressing a would-be prob SL
+        _would_fire_prob_sl = (
+            not _suppress_taker_exits
+            and _prob_sl_tte_ok
+            and config.MOMENTUM_PROB_SL_ENABLED
+            and pos.prob_sl_threshold > 0.0
+            and token_price < pos.prob_sl_threshold
+        )
+        if _would_fire_prob_sl and not _prob_sl_oracle_ok and suppress_counts is not None:
+            _gk_psl = f"{pos.token_id}:suppress_prob_sl_oracle"
+            _cnt_psl = suppress_counts.get(_gk_psl, 0) + 1
+            suppress_counts[_gk_psl] = _cnt_psl
+            if _cnt_psl >= config.GATE_LOG_CONSECUTIVE_THRESHOLD:
+                log.warning(
+                    "gate_suppressed",
+                    strategy="momentum",
+                    gate="suppress_prob_sl_oracle",
+                    entity_id=pos.market_id[:16],
+                    consecutive=_cnt_psl,
+                    reason=f"oracle not confirmed stale: age={oracle_age_seconds}s threshold={config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS}s",
+                    oracle_age_secs=oracle_age_seconds,
+                    threshold=config.MOMENTUM_PROB_SL_ORACLE_STALE_SECS,
+                    token_price=round(token_price, 4),
+                    prob_sl_threshold=round(pos.prob_sl_threshold, 4),
+                )
+        elif not _would_fire_prob_sl and suppress_counts is not None:
+            suppress_counts.pop(f"{pos.token_id}:suppress_prob_sl_oracle", None)
         if (
             not _suppress_taker_exits
             and _prob_sl_oracle_ok
@@ -663,6 +757,7 @@ class PositionMonitor:
         risk: RiskEngine,
         interval: int = config.MONITOR_INTERVAL,
         spot_client: Optional[SpotOracle] = None,
+        hl_client: Optional[Any] = None,
         on_close_callback: Optional[Callable[[str], None]] = None,
         on_stop_loss_callback: Optional[Callable[[str, float], None]] = None,
         oracle_tracker: Optional[OracleTickTracker] = None,
@@ -671,6 +766,7 @@ class PositionMonitor:
         self._pm = pm
         self._risk = risk
         self._spot = spot_client  # SpotOracle facade; routes to correct oracle per market type
+        self._hl = hl_client      # HLClient — S3.4 HL mark-price staleness logging
         self._interval = interval
         # Called with market_id whenever a position is successfully closed.
         # Used by MispricingScanner to reset the per-market cooldown clock.
@@ -716,6 +812,10 @@ class PositionMonitor:
         # edge-case where one oracle source fires just before the cache is updated,
         # producing a slightly stale spot value that bypasses the old spot-only check.
         self._last_tick_state: dict[str, tuple] = {}  # market_id → (spot, token_price)
+        # S1 Gate audit: consecutive-suppression counters for should_exit() gate blocks.
+        # Key: "{token_id}:{gate_name}",  value: consecutive evaluation count.
+        # Passed into should_exit() by reference so the function can update them.
+        self._exit_suppress_counts: dict[str, int] = {}
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -730,6 +830,119 @@ class PositionMonitor:
     def get_entry_deviation(self, market_id: str, default: float = 0.0) -> float:
         """Return the recorded entry deviation for a market ID."""
         return self._initial_deviations.get(market_id, default)
+
+    def _check_position_data_freshness(self, pos: Position) -> PositionDataHealth:
+        """Return a freshness snapshot for a single open position (S2).
+
+        Called at the top of every per-position evaluation before any gate
+        runs.  Checks oracle age and PM book age for the held token.
+        Statuses: ``"OK"`` | ``"STALE"`` | ``"MISSING"``.
+
+        Side-effects:
+        - Logs a WARNING when either feed is ``"STALE"`` or ``"MISSING"``.
+        - When oracle is ``"STALE"`` and ORACLE_STALE_POSITION_FALLBACK_SECS > 0,
+          schedules a background task to trigger a REST price refresh via
+          ``SpotOracle.fetch_rest_spot()``.
+        - When book is ``"STALE"`` and POSITION_BOOK_FALLBACK_AGE_SECS > 0,
+          asks ``PMClient.register_priority_token()`` so the book refresh loop
+          will fetch a fresh REST snapshot.
+        """
+        now_ts = time.time()
+
+        # ── Oracle freshness ─────────────────────────────────────────────────
+        oracle_age: Optional[float] = None
+        oracle_source: str = "unknown"
+        oracle_status: str = "MISSING"
+        if self._spot is not None and pos.underlying:
+            spot_mid = self._spot.get_mid(pos.underlying, pos.market_type)
+            if spot_mid is not None:
+                # Use the same monotonic tick tracker that should_exit uses for
+                # oracle_age_seconds — consistent measurement, no dependency on
+                # SpotSnapshot.timestamp (which varies by oracle source).
+                _last_tick = self._last_oracle_tick_ts.get(pos.underlying)
+                if _last_tick is not None:
+                    oracle_age = round(time.monotonic() - _last_tick, 1)
+                    stale_thresh = getattr(config, "MOMENTUM_SPOT_MAX_AGE_SECS", 30)
+                    oracle_status = "OK" if oracle_age <= stale_thresh else "STALE"
+                else:
+                    # Price available but no tick timestamp yet (e.g. first few seconds
+                    # after startup or a cold REST-seeded cache).  Treat as OK — the
+                    # price is fresh enough to have reached the cache.
+                    oracle_status = "OK"
+            # else: snap missing → stays "MISSING"
+
+        # ── Book freshness ────────────────────────────────────────────────────
+        book_age: Optional[float] = None
+        book_status: str = "MISSING"
+        if pos.token_id:
+            book = self._pm.get_book(pos.token_id)
+            if book is not None:
+                book_age = round(now_ts - book.timestamp, 1)
+                stale_thresh_book = getattr(config, "MOMENTUM_BOOK_MAX_AGE_SECS", 30)
+                book_status = "OK" if book_age <= stale_thresh_book else "STALE"
+
+        health = PositionDataHealth(
+            token_id=pos.token_id,
+            coin=pos.underlying or "",
+            oracle_age_secs=oracle_age,
+            book_age_secs=book_age,
+            oracle_status=oracle_status,
+            book_status=book_status,
+            oracle_source=oracle_source,
+        )
+
+        # ── Alerts ───────────────────────────────────────────────────────────
+        if oracle_status != "OK":
+            log.warning(
+                "position_data_stale",
+                token_id=pos.token_id[:16] if pos.token_id else "?",
+                market_id=pos.market_id[:16],
+                coin=pos.underlying,
+                feed="oracle",
+                status=oracle_status,
+                oracle_age_secs=oracle_age,
+                oracle_source=oracle_source,
+                strategy=pos.strategy,
+            )
+        if book_status != "OK":
+            log.warning(
+                "position_data_stale",
+                token_id=pos.token_id[:16] if pos.token_id else "?",
+                market_id=pos.market_id[:16],
+                coin=pos.underlying,
+                feed="pm_book",
+                status=book_status,
+                book_age_secs=book_age,
+                strategy=pos.strategy,
+            )
+
+        # ── Trigger REST fallbacks ────────────────────────────────────────────
+        _oracle_fallback_secs = getattr(config, "ORACLE_STALE_POSITION_FALLBACK_SECS", 0)
+        if (
+            oracle_status == "STALE"
+            and _oracle_fallback_secs > 0
+            and oracle_age is not None
+            and oracle_age >= _oracle_fallback_secs
+            and self._spot is not None
+            and hasattr(self._spot, "fetch_rest_spot")
+        ):
+            asyncio.create_task(
+                self._spot.fetch_rest_spot(pos.underlying, pos.market_type),
+                name=f"oracle_rest_{pos.underlying}_{pos.market_type}",
+            )
+
+        _book_fallback_secs = getattr(config, "POSITION_BOOK_FALLBACK_AGE_SECS", 0)
+        if (
+            book_status == "STALE"
+            and _book_fallback_secs > 0
+            and book_age is not None
+            and book_age >= _book_fallback_secs
+            and pos.token_id
+            and hasattr(self._pm, "register_priority_token")
+        ):
+            self._pm.register_priority_token(pos.token_id)
+
+        return health
 
     async def start(self) -> None:
         self._running = True
@@ -747,6 +960,13 @@ class PositionMonitor:
             # Also fire on Chainlink ticks so 5m/15m/4h position SLs are
             # evaluated the moment a Chainlink oracle price update arrives.
             self._spot.on_chainlink_update(self._on_spot_update)
+        # Immediately pin and register each new position's token in the PM WS
+        # the moment risk.open_position() fires — before the main.py state-sync
+        # loop (~1 s delay) calls pm.pin_tokens().  This closes the window where
+        # a concurrent _update_shards() call could drop the token if the market
+        # slips out of _extra_tokens_by_owner["default"].  Also arms REST book
+        # fallback proactively so stale-book detection is ready from T+0.
+        self._risk.on_position_open(self._on_position_open_sync)
         log.info("PositionMonitor started (event-driven)")
         asyncio.create_task(self._auto_redeem_loop())
         # Rare backstop sweep: catches resolved markets that PM WS never echoes
@@ -769,6 +989,27 @@ class PositionMonitor:
         self._running = False
 
     # ── Event-driven price callback ───────────────────────────────────────────
+
+    def _on_position_open_sync(self, pos: "Position") -> None:
+        """Synchronous callback fired by risk.open_position() — must be fast.
+
+        Called with the risk lock released (see RiskEngine.open_position) so it
+        is safe to call back into the PM client.
+
+        1. Immediately adds the position's token to pm._pinned_tokens so that
+           any concurrent _update_shards() call treats it as pinned — no waiting
+           for the main.py state-sync loop (~1 s) to call pm.pin_tokens().
+        2. Registers the token as a priority token so the _book_timestamp_refresh_loop
+           can trigger REST book refreshes if the WS snapshot goes stale — arming
+           the fallback from T+0 rather than waiting for the first stale-book
+           detection cycle.
+        """
+        if not pos.token_id:
+            return
+        if hasattr(self._pm, "pin_token"):
+            self._pm.pin_token(pos.token_id)
+        if hasattr(self._pm, "register_priority_token"):
+            self._pm.register_priority_token(pos.token_id)
 
     async def _on_price_update(self, token_id: str, mid: float) -> None:
         """Triggered on every PM WS book/price_change tick.
@@ -1575,6 +1816,26 @@ class PositionMonitor:
         expiry_cancel_secs = getattr(config, "MOMENTUM_HEDGE_EXPIRY_CANCEL_SECS", 0)
         min_retain_usd    = getattr(config, "MOMENTUM_HEDGE_MIN_RETAIN_USD", 0.50)
 
+        # S3.4: Log HL mark-price staleness for coins with open hedges.
+        # Dedup by coin so we log at most once per coin per sweep.
+        if self._hl is not None and hasattr(self._hl, "get_mark_price_age"):
+            _hl_stale_secs = float(getattr(config, "HL_WS_STALE_SECS", 30))
+            _logged_hl_coins: set[str] = set()
+            for _ho in self._risk.get_open_hedge_orders():
+                _coin = getattr(_ho, "underlying", "")
+                if not _coin or _coin in _logged_hl_coins:
+                    continue
+                _age = self._hl.get_mark_price_age(_coin)
+                if _age is not None and _age > _hl_stale_secs:
+                    log.warning(
+                        "[HL_DEGRADED]",
+                        coin=_coin,
+                        hedge_order=_ho.order_id[:12],
+                        mark_price_age_secs=round(_age, 1),
+                        threshold=_hl_stale_secs,
+                    )
+                _logged_hl_coins.add(_coin)
+
         for ho in self._risk.get_open_hedge_orders():
             try:
                 # ── 1. Near-expiry cancel ─────────────────────────────────────
@@ -1780,6 +2041,11 @@ class PositionMonitor:
             return
 
         # ── Standard check ─────────────────────────────────────────────────────
+        # S2: Check data feed freshness for momentum positions before any exit gate.
+        # Logs warnings on stale/missing feeds and triggers REST fallbacks when configured.
+        if pos.strategy == "momentum":
+            self._check_position_data_freshness(pos)
+
         # current_price is always the YES-token mid — used for the P&L formula
         # and non-momentum exit conditions (both store entry_price in YES-space).
         # For momentum exits on NO positions we additionally fetch the actual
@@ -1883,6 +2149,7 @@ class PositionMonitor:
             current_spot=current_spot,
             delta_sl_pct=coin_sl,
             oracle_age_seconds=oracle_age_secs,
+            suppress_counts=self._exit_suppress_counts,
         )
 
         # Hysteresis: suppress delta SL until it holds for MOMENTUM_DELTA_SL_MIN_TICKS
@@ -2430,6 +2697,9 @@ class PositionMonitor:
             exit_spot_price=_exit_spot,
             exit_reason=reason,
         )
+        # S2.3: remove token from priority refresh set now that position is closed
+        if pos.token_id and hasattr(self._pm, "deregister_priority_token"):
+            self._pm.deregister_priority_token(pos.token_id)
 
         # For RESOLVED exits: if the position had a hedge order that was never
         # filled (token never appeared in the wallet), write an "unfilled" record.

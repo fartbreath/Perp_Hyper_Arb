@@ -2,6 +2,125 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-09] — PM WS ping race fix; RON lock-step sync; ON loser-exit callbacks; institutional-grade gate audit logging; feed health monitoring; position data safety guards; analysis tooling
+
+### Fix — PM WS shard ping race causing stale books (`pm_client.py`)
+
+**Root cause:** The manual `_ping_loop` task called `ws.send("PING")` concurrently with the
+websockets library's own transport teardown on Windows ProactorEventLoop.  This triggered an
+`AttributeError: 'NoneType'.resume_reading` crash in the shard's receive loop, disconnecting
+the shard silently and freezing all book state for its tokens.  The ON strategy's winner-confirm
+gate (ON-07) then saw a stale winner bid of ~0.57 instead of the real ~0.65+, permanently
+blocking loser exits.
+
+**Changes:**
+- `_ping_loop` method and its `create_task` / `finally: ping_task.cancel()` scaffolding removed.
+- `ping_interval=config.PM_WS_PING_INTERVAL, ping_timeout=20` restored on `websockets.connect()`.
+  The library now owns the RFC-6455 binary ping lifecycle, synchronized with its own transport.
+- `AttributeError` workaround except-block removed (root cause is fixed; workaround was masking it).
+- `_connected_at`, `_last_message_at`, `_message_count` tracking fields added for feed health.
+
+**Result:** No shard crashes observed in 75-minute live session post-fix.  ON-07 winner bid reads
+correctly; loser exits fire as expected.
+
+---
+
+### Fix — PM WS shard incremental subscription (`pm_client.py`)
+
+**Root cause:** `update_tokens()` only updated the in-memory token set.  Tokens registered
+mid-session (new momentum markets, presub lookahead) never received a PM WS book snapshot until
+the shard's next natural reconnect.
+
+**Change:** When new tokens are added while a shard is connected, `_subscribe_incremental()` sends
+an additive `{"operation": "subscribe", "assets_ids": [...]}` message on the live connection.
+Neither path requires a reconnect.
+
+---
+
+### Fix — RON fires in lock-step with ON loser exit (`strategies/ReverseOpenNeutral/scanner.py`, `strategies/OpeningNeutral/scanner.py`)
+
+**Root cause:** RON independently monitored PM bid events and fired when *any* leg crossed the bid
+threshold.  For the DOGE pair, NO hit 0.29 first; RON "sold YES (winner) at 0.50 and held NO" —
+then YES collapsed to 0.27 (the actual loser), so RON had bet on the wrong side ~90 s early.
+
+**Changes:**
+- `strategies/OpeningNeutral/scanner.py`: added `_on_loser_exit_callbacks` list and
+  `register_loser_exit_callback(cb)`.  In `_on_exit_fill`, immediately after the idempotency
+  guard, all registered callbacks are fired as named asyncio tasks
+  (`on_loser_exit_cb_{pair_id[:12]}`).
+- `strategies/ReverseOpenNeutral/scanner.py`: removed `self._pm.on_price_change(...)`.  Replaced
+  `_on_price_event` with `_notify_loser_exit(on_pair_id, loser_side, exit_price)` which fires in
+  the exact same event-loop tick as ON's `_on_exit_fill`.  `yes_trigger`/`no_trigger` keys removed
+  from pair dict (no longer needed).
+
+**Result:** RON always exits the correct leg at the correct moment, fully coupled to ON.
+
+---
+
+### Feature — Institutional-grade gate audit logging (S1) (`monitor.py`, `config.py`, `core/types.py`)
+
+Gates that suppress exits now emit `WARNING`-level `gate_suppressed` log events after
+`GATE_LOG_CONSECUTIVE_THRESHOLD` consecutive suppressions on the same entity, and again at
+power-of-2 multiples thereafter (threshold, 2×, 4×, …).
+
+**Gates covered:** `suppress_taker_exits`, `suppress_delta_sl`.
+
+**New config keys:**
+- `GATE_LOG_CONSECUTIVE_THRESHOLD: int = 10`
+
+---
+
+### Feature — Position data safety guards (S2) (`monitor.py`, `config.py`, `market_data/spot_oracle.py`)
+
+Three runtime guards prevent the bot from holding a position blindly when data feeds degrade:
+
+- **S2.2 — Oracle REST fallback:** when the oracle is stale for
+  `ORACLE_STALE_POSITION_FALLBACK_SECS` (default 60 s) and a position is open for that coin, a
+  one-shot REST price fetch tops up the oracle cache.
+- **S2.3 — PM book REST refresh:** when a priority token's book age exceeds
+  `POSITION_BOOK_FALLBACK_AGE_SECS` (default 45 s), a REST book refresh is triggered via
+  `PMClient.fetch_book_rest()`.
+- **S2.4 — Near-expiry hard exit on stale oracle:** if TTE < near-expiry threshold AND oracle
+  stale ≥ `ORACLE_STALE_NEAR_EXPIRY_HARD_EXIT_SECS` (default 60 s) AND token is not clearly
+  winning, fire a taker exit rather than hold blind to resolution.
+
+**New config keys:** `ORACLE_STALE_POSITION_FALLBACK_SECS`, `POSITION_BOOK_FALLBACK_AGE_SECS`,
+`ORACLE_STALE_NEAR_EXPIRY_HARD_EXIT_SECS`.
+
+---
+
+### Feature — Feed health monitoring (S3) (`monitor.py`, `config.py`)
+
+- **S3.3 — Chainlink reconnect rate alerting:** warn when rolling-1h reconnect count for any
+  Chainlink origin exceeds `CHAINLINK_MAX_RECONNECTS_1H` (default 10).
+- **S3.4 — HL WS mark price staleness:** warn when mark price age for a coin with open hedges
+  exceeds `HL_WS_STALE_SECS` (default 30 s).
+
+---
+
+### Config — `MOMENTUM_BOOK_MAX_AGE_SECS` relaxed (`config.py`)
+
+Raised from 30 s → 120 s.  The 30 s threshold was too aggressive: a single PM WS message
+arriving 31 s after the previous one (normal during low-volume periods) caused the bot to skip
+the entire market for that tick, suppressing valid entries.
+
+---
+
+### Analysis — ON vs RON comparison tooling (`analysis/on_vs_ron.py`, `analysis/backfill_ron_settlement.py`, `analysis/check_acct.py`, `analysis/ron_winners.py`)
+
+Post-session analysis scripts added:
+
+- `on_vs_ron.py`: full ON vs RON comparison table.  ON PnL sourced from `acct_ledger.csv`
+  (correct per-pair contract sizes); RON PnL uses `winner_sold_price + loser_settlement - cost`.
+- `backfill_ron_settlement.py`: reads `acct_ledger.csv` to determine whether each RON pair's
+  held leg settled WIN or LOSS; writes `loser_settlement` column to `ron_fills.csv`.
+- `check_acct.py` / `ron_winners.py`: ad-hoc audit helpers.
+
+**Session result (29 logical pairs):** ON +$20.64, RON −$14.35 (loser=0 assumption).  RON is
+structurally negative EV — winner is capped at ~0.65–0.80 while holding loser to settlement.
+
+---
+
 ## [2026-05-08] — WebSocket stability: PM shard 1006 fix; RTDS staleness reconnect; Chainlink Streams HA phase-shift; event-loop yield
 
 ### Fix — PM WS shard mass-disconnect (code 1006) (`pm_client.py`)

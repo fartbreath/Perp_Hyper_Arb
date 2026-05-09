@@ -1608,3 +1608,55 @@ export interface RonFillsData {
 
 export const useRonFills =
   _makeSingletonHook<RonFillsData>("/ron/fills?limit=50", 10_000);
+
+// ── S4: Feed Health (GET /health/feeds) ───────────────────────────────────────
+
+export interface FeedCoinHealth {
+  status: "HEALTHY" | "STALE" | "DOWN" | "UNKNOWN";
+  source: string | null;
+  age_secs: number | null;
+  reconnect_count_1h: number;
+}
+
+export interface FeedHealthData {
+  status: "HEALTHY" | "DEGRADED" | "DOWN";
+  timestamp: string;
+  uptime_secs: number;
+  hard_stop_active: boolean;
+  positions_at_risk: number;
+  feeds: {
+    pm_ws: {
+      shards_total: number;
+      shards_connected: number;
+      shards_degraded: number;
+      shards_connecting: number;
+      shards_disconnected: number;
+    };
+    oracle: Record<string, FeedCoinHealth>;
+    hl_ws: {
+      connected: boolean;
+      oldest_mark_price_age_secs: number | null;
+    };
+  };
+}
+
+export const useFeedHealth =
+  _makeSingletonHook<FeedHealthData>("/health/feeds", 5_000);
+
+// ── S4: Position Health (GET /health/positions) ───────────────────────────────
+
+export interface PositionHealthEntry {
+  token_id: string;
+  strategy: string;
+  coin: string;
+  oracle_age_secs: number | null;
+  book_age_secs: number | null;
+  oracle_status: "HEALTHY" | "STALE" | "DOWN" | string;
+  book_status: "HEALTHY" | "STALE" | "DOWN" | string;
+  oracle_source: string | null;
+  tte_secs: number | null;
+  gates_suppressed: string[];
+}
+
+export const usePositionHealth =
+  _makeSingletonHook<PositionHealthEntry[]>("/health/positions", 5_000);

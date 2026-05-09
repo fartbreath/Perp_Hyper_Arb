@@ -18,6 +18,17 @@ export function fmtPrice(v: string | number | undefined): string {
   return `${(n * 100).toFixed(1)}¢`;
 }
 
+/**
+ * Like fmtPrice but 0.0 is a valid exit price (means settled to zero / loss).
+ * Shows "—" only when there are no exit contracts (position not yet exited).
+ */
+export function fmtExitPrice(vwap: string | number | undefined, contracts: string | number | undefined): string {
+  if (Number(contracts ?? 0) === 0) return "—";
+  const n = Number(vwap ?? 0);
+  if (!isFinite(n)) return "—";
+  return `${(n * 100).toFixed(1)}¢`;
+}
+
 export function fmtContracts(v: string | number | undefined): string {
   const n = Number(v ?? 0);
   if (!isFinite(n) || n === 0) return "—";

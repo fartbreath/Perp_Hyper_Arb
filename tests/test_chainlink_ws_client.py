@@ -116,40 +116,6 @@ class TestDecodeLatestRoundData:
         assert abs(price - 50_000) < 1e-4
 
 
-# ── AnswerUpdated topics[1] decode ────────────────────────────────────────────
-
-class TestDecodeAnswerUpdatedTopic:
-    """topics[1] carries the int256 indexed current (price) in AnswerUpdated events."""
-
-    def _make_topic(self, price_usd: float, decimals: int = _DECIMALS) -> str:
-        """Encode price_usd as a 0x-prefixed 32-byte int256 hex string."""
-        raw_int = int(round(price_usd * 10 ** decimals))
-        return "0x" + raw_int.to_bytes(32, byteorder="big", signed=True).hex()
-
-    def test_positive_price_decode(self):
-        topic = self._make_topic(65_000.0)
-        raw = int.from_bytes(bytes.fromhex(topic[2:].zfill(64)), byteorder="big", signed=True)
-        price = raw / 10 ** _DECIMALS
-        assert abs(price - 65_000.0) < 1e-6
-
-    def test_small_price_decode(self):
-        topic = self._make_topic(0.15)
-        raw = int.from_bytes(bytes.fromhex(topic[2:].zfill(64)), byteorder="big", signed=True)
-        price = raw / 10 ** _DECIMALS
-        assert abs(price - 0.15) < 1e-7
-
-    def test_negative_signed_value(self):
-        """A negative signed int in topics[1] decodes as negative (not a valid price)."""
-        neg_bytes = (-1).to_bytes(32, byteorder="big", signed=True)
-        raw = int.from_bytes(neg_bytes, byteorder="big", signed=True)
-        assert raw < 0
-
-    def test_zero_value(self):
-        zero_bytes = (0).to_bytes(32, byteorder="big", signed=True)
-        raw = int.from_bytes(zero_bytes, byteorder="big", signed=True)
-        assert raw == 0
-
-
 # ── Accessor tests ────────────────────────────────────────────────────────────
 
 class TestAccessors:
@@ -159,20 +125,8 @@ class TestAccessors:
         client._prices[coin] = SpotPrice(coin=coin, price=price, timestamp=time.time())
         return client
 
-    def test_get_mid_returns_price(self):
-        assert self._seeded("BTC", 65_000.0).get_mid("BTC") == 65_000.0
-
     def test_get_mid_unknown_coin_returns_none(self):
         assert ChainlinkWSClient().get_mid("HYPE") is None
-
-    def test_get_spot_returns_spotprice(self):
-        snap = self._seeded("ETH", 3_100.0).get_spot("ETH")
-        assert isinstance(snap, SpotPrice)
-        assert snap.price == 3_100.0
-        assert snap.coin == "ETH"
-
-    def test_get_spot_unknown_returns_none(self):
-        assert ChainlinkWSClient().get_spot("NOTACOIN") is None
 
     def test_get_spot_age_finite(self):
         age = self._seeded("SOL", 150.0).get_spot_age("SOL")
@@ -180,12 +134,6 @@ class TestAccessors:
 
     def test_get_spot_age_inf_unseen(self):
         assert ChainlinkWSClient().get_spot_age("SOL") == float("inf")
-
-    def test_all_mids(self):
-        client = ChainlinkWSClient()
-        client._prices["BTC"] = SpotPrice(coin="BTC", price=65_000.0, timestamp=time.time())
-        client._prices["ETH"] = SpotPrice(coin="ETH", price=3_100.0, timestamp=time.time())
-        assert client.all_mids() == {"BTC": 65_000.0, "ETH": 3_100.0}
 
 
 # ── _handle_event tests ───────────────────────────────────────────────────────

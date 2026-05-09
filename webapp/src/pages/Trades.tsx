@@ -12,7 +12,7 @@ import { useState, useMemo } from "react";
 import { useAcctLedger } from "../api/client";
 import type { AcctLedgerRow } from "../api/client";
 import {
-  fmtUsd, fmtPrice, fmtContracts,
+  fmtUsd, fmtPrice, fmtExitPrice, fmtContracts,
   netPnl, grossPnl, pnlColor,
   buildGroups,
 } from "./tradesUtils";
@@ -233,7 +233,7 @@ function LedgerRow({ row, indent = false }: { row: AcctLedgerRow; indent?: boole
         {fmtPrice(row.entry_vwap)}
       </td>
       <td style={{ padding: "8px 8px", fontSize: 12, color: "#fbbf24", textAlign: "right", fontFamily: "monospace" }}>
-        {fmtPrice(row.exit_vwap)}
+        {fmtExitPrice(row.exit_vwap, row.exit_contracts)}
       </td>
       <td style={{ padding: "8px 8px", fontSize: 12, color: "#cbd5e1", textAlign: "right", fontFamily: "monospace" }}>
         {fmtContracts(row.entry_contracts)}
@@ -311,7 +311,7 @@ function GroupRows({ group }: { group: LedgerGroup }) {
           </div>
         </td>
         <td colSpan={4} style={{ padding: "8px 8px", fontSize: 11, color: "#64748b", textAlign: "center" }}>
-          {group.rows.map(r => `${fmtPrice(r.entry_vwap)} → ${fmtPrice(r.exit_vwap)}`).join("  ·  ")}
+          {group.rows.map(r => `${fmtPrice(r.entry_vwap)} → ${fmtExitPrice(r.exit_vwap, r.exit_contracts)}`).join("  ·  ")}
         </td>
         <td style={{ padding: "8px 8px", fontSize: 12, textAlign: "right", fontFamily: "monospace",
           color: group.totalGross > 0 ? "#86efac" : "#fca5a5" }}>
@@ -330,7 +330,7 @@ function GroupRows({ group }: { group: LedgerGroup }) {
         <td style={{ padding: "8px 8px" }}>
           <OutcomeBadge outcome={
             group.rows.length > 1
-              ? (net > 0 ? "WIN" : net < 0 ? "LOSS" : "")
+              ? (net > 0.005 ? "WIN" : net < -0.005 ? "LOSS" : "")
               : (group.rows.find(r => r.resolved_outcome)?.resolved_outcome ?? "")
           } />
         </td>
@@ -378,7 +378,7 @@ export default function Trades() {
       const want = outcome.toUpperCase();
       g = g.filter(group => {
         const groupOutcome = group.rows.length > 1
-          ? (group.totalNetPnl > 0 ? "WIN" : group.totalNetPnl < 0 ? "LOSS" : "")
+          ? (group.totalNetPnl > 0.005 ? "WIN" : group.totalNetPnl < -0.005 ? "LOSS" : "")
           : (group.rows.find(r => r.resolved_outcome)?.resolved_outcome ?? "").toUpperCase();
         return groupOutcome === want;
       });

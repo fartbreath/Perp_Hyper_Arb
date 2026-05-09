@@ -6,7 +6,7 @@ import {
   useHealth, usePnl, usePositions, useLauncherStatus,
   startBotProcess, stopBotProcess, usePerformance, useInventory, useConfig, updateConfig,
   useMomentumSignals, useMomentumScanSummary, useOpeningNeutralStatus, useReverseOpeningNeutralStatus, useRonFills, usePipelineHealth,
-  useModelTrainStatus, triggerModelTrain,
+  useModelTrainStatus, triggerModelTrain, useFeedHealth,
 } from "../api/client";
 import type { Position, PipelineStatus } from "../api/client";
 
@@ -1150,11 +1150,138 @@ function ModelTrainingCard() {
   );
 }
 
+// ── S4.3: Feed Health Panel ───────────────────────────────────────────────────
+
+const STATUS_COLORS: Record<string, string> = {
+  HEALTHY: "#22c55e",
+  STALE:   "#f59e0b",
+  DOWN:    "#ef4444",
+  UNKNOWN: "#64748b",
+};
+
+const STATUS_BG: Record<string, string> = {
+  HEALTHY: "#14532d",
+  STALE:   "#451a03",
+  DOWN:    "#450a0a",
+  UNKNOWN: "#1e293b",
+};
+
+function FeedHealthPanel() {
+  const { data, loading, error } = useFeedHealth();
+
+  if (loading && !data) return null;  // silent until first response
+  if (error || !data) return null;    // hide rather than flash an error strip
+
+  const { feeds, status, positions_at_risk } = data;
+  const oracle = feeds.oracle ?? {};
+  const pmWs   = feeds.pm_ws;
+  const hlWs   = feeds.hl_ws;
+
+  const overallColor = STATUS_COLORS[status] ?? STATUS_COLORS.UNKNOWN;
+
+  return (
+    <div
+      className="card"
+      style={{ padding: "0.6rem 0.9rem", borderLeft: `3px solid ${overallColor}` }}
+      aria-label="Feed health status"
+    >
+      {/* Header row */}
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
+        <span style={{ fontWeight: 700, fontSize: "0.82rem", color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          Feed Health
+        </span>
+        <span
+          style={{
+            padding: "1px 8px",
+            borderRadius: 999,
+            fontSize: "0.7rem",
+            fontWeight: 700,
+            background: STATUS_BG[status] ?? STATUS_BG.UNKNOWN,
+            color: overallColor,
+          }}
+        >
+          {status}
+        </span>
+        {positions_at_risk > 0 && (
+          <span style={{ marginLeft: "auto", fontSize: "0.75rem", color: "#f59e0b" }}>
+            ⚠ {positions_at_risk} position{positions_at_risk !== 1 ? "s" : ""} at risk
+          </span>
+        )}
+      </div>
+
+      {/* Body row: coins + PM + HL */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "0.6rem", alignItems: "center" }}>
+
+        {/* Oracle coins */}
+        {Object.entries(oracle).map(([coin, fh]) => {
+          const st  = fh.status ?? "UNKNOWN";
+          const col = STATUS_COLORS[st] ?? STATUS_COLORS.UNKNOWN;
+          const bg  = STATUS_BG[st]    ?? STATUS_BG.UNKNOWN;
+          const ageLabel = fh.age_secs != null ? `${fh.age_secs.toFixed(1)}s` : "–";
+          return (
+            <div
+              key={coin}
+              title={`${coin}: ${st}${fh.age_secs != null ? ` (age ${ageLabel})` : ""}${fh.source ? ` via ${fh.source}` : ""}`}
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                background: bg,
+                borderRadius: 6,
+                padding: "3px 8px",
+                minWidth: 46,
+              }}
+            >
+              <span style={{ fontWeight: 700, fontSize: "0.75rem", color: col }}>{coin}</span>
+              <span style={{ fontSize: "0.65rem", color: col, opacity: 0.85 }}>{ageLabel}</span>
+            </div>
+          );
+        })}
+
+        {/* Separator */}
+        <div style={{ width: 1, height: 32, background: "#334155", flexShrink: 0 }} />
+
+        {/* PM WS shards */}
+        <div
+          title={`PM WebSocket: ${pmWs.shards_connected}/${pmWs.shards_total} connected, ${pmWs.shards_degraded} degraded, ${pmWs.shards_disconnected} disconnected`}
+          style={{ fontSize: "0.78rem", color: pmWs.shards_disconnected > 0 ? "#ef4444" : pmWs.shards_degraded > 0 ? "#f59e0b" : "#22c55e" }}
+        >
+          PM&nbsp;
+          <span style={{ fontWeight: 700 }}>
+            {pmWs.shards_connected}/{pmWs.shards_total}
+          </span>
+          {pmWs.shards_degraded > 0 && <span style={{ color: "#f59e0b" }}> ({pmWs.shards_degraded} deg)</span>}
+        </div>
+
+        {/* Separator */}
+        <div style={{ width: 1, height: 32, background: "#334155", flexShrink: 0 }} />
+
+        {/* HL WS */}
+        <div
+          title={`HL WebSocket: ${hlWs.connected ? "connected" : "disconnected"}${hlWs.oldest_mark_price_age_secs != null ? `, oldest mark age ${hlWs.oldest_mark_price_age_secs}s` : ""}`}
+          style={{ fontSize: "0.78rem", color: hlWs.connected ? "#22c55e" : "#ef4444" }}
+        >
+          HL&nbsp;
+          <span style={{ fontWeight: 700 }}>
+            {hlWs.connected ? "●" : "○"}&nbsp;WS
+          </span>
+          {hlWs.oldest_mark_price_age_secs != null && (
+            <span style={{ color: "#94a3b8", fontSize: "0.7rem" }}>
+              &nbsp;{hlWs.oldest_mark_price_age_secs.toFixed(1)}s
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   return (
     <div className="page">
       <h2>Dashboard</h2>
       <BotControlCard />
+      <FeedHealthPanel />
       <div className="grid-2">
         <PnlCard />
         <BucketPerformanceStrip />
