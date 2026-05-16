@@ -827,7 +827,11 @@ class MomentumScanner(BaseStrategy):
                 _gk = f"{market.condition_id}:no_spot"
                 _cnt = self._gate_suppress_counts.get(_gk, 0) + 1
                 self._gate_suppress_counts[_gk] = _cnt
-                if _cnt >= config.GATE_LOG_CONSECUTIVE_THRESHOLD and _should_log_count(_cnt, config.GATE_LOG_CONSECUTIVE_THRESHOLD):
+                if (
+                    market.market_type != "bucket_weekly"
+                    and _cnt >= config.GATE_LOG_CONSECUTIVE_THRESHOLD
+                    and _should_log_count(_cnt, config.GATE_LOG_CONSECUTIVE_THRESHOLD)
+                ):
                     log.warning(
                         "gate_suppressed",
                         strategy="momentum",
@@ -853,7 +857,11 @@ class MomentumScanner(BaseStrategy):
                 _gk = f"{market.condition_id}:stale_spot"
                 _cnt = self._gate_suppress_counts.get(_gk, 0) + 1
                 self._gate_suppress_counts[_gk] = _cnt
-                if _cnt >= config.GATE_LOG_CONSECUTIVE_THRESHOLD and _should_log_count(_cnt, config.GATE_LOG_CONSECUTIVE_THRESHOLD):
+                if (
+                    market.market_type != "bucket_weekly"
+                    and _cnt >= config.GATE_LOG_CONSECUTIVE_THRESHOLD
+                    and _should_log_count(_cnt, config.GATE_LOG_CONSECUTIVE_THRESHOLD)
+                ):
                     log.warning(
                         "gate_suppressed",
                         strategy="momentum",
@@ -2217,7 +2225,10 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     # entry gate claims no alpha over the market price; a strong signal earns the
     # full premium.  This corrects the flat-premium overconfidence observed in
     # the 0.90–0.95 kelly_win_prob band (47.6% actual vs 92.5% expected).
-    _edge_scale = max(0.0, min(1.0, _strength - 1.0))
+    _edge_scale_base = config.MOMENTUM_KELLY_EDGE_SCALE_BASE_BY_TYPE.get(
+        signal.market_type, 0.0
+    )
+    _edge_scale = max(_edge_scale_base, min(1.0, _strength - 1.0))
     win_prob_clob = min(token_p + _edge_premium * _edge_scale, _win_prob_cap)
 
     # Component 2: oracle-delta strength. strength=1 → right at threshold (0.50
@@ -2237,6 +2248,18 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
     lose_prob = 1.0 - win_prob
     raw_kelly_f = (win_prob * payout_b - lose_prob) / payout_b
     kelly_f = max(0.0, raw_kelly_f)
+
+    # Z-score piecewise multiplier: scale kelly_f down for weak signals and up
+    # for strong signals.  Configured as [[z_min, multiplier], ...] sorted by
+    # z_min ascending.  The highest z_min that is <= observed_z_raw wins.
+    # Empty list (default) = no scaling.
+    _z_mult = 1.0
+    _z_mult_table = config.MOMENTUM_KELLY_Z_SCORE_MULTIPLIER
+    if _z_mult_table:
+        for _z_min, _z_m in sorted(_z_mult_table, key=lambda x: x[0]):
+            if observed_z_raw >= _z_min:
+                _z_mult = _z_m
+    kelly_f = min(1.0, kelly_f * _z_mult)
 
     # Fractional Kelly: multiply by KELLY_FRACTION safety factor.
     # KELLY_FRACTION=1.0 → deploy kelly_f Ã— MAX_ENTRY (full-Kelly relative to max).
@@ -2278,6 +2301,7 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
         "kelly_payout_b":        round(payout_b, 4),
         "kelly_f_raw":           round(raw_kelly_f, 4),    # pre-clip; negative = no EV
         "kelly_f":               round(kelly_f, 4),
+        "kelly_z_mult":          round(_z_mult, 4),        # z-score piecewise multiplier
         "kelly_fraction_cfg":    _fraction_cfg,
         "kelly_multiplier":      round(kelly_multiplier, 4),
         "kelly_size_usd":        size_usd,

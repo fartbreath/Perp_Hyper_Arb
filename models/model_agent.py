@@ -46,7 +46,7 @@ _ANALYSIS_DIR = _REPO_ROOT / "analysis"
 _SHADOW_LOG_PATH = _ANALYSIS_DIR / "shadow_log.csv"
 _ON_FILLS_PATH = _DATA_DIR / "on_fills.csv"
 _MOMENTUM_FILLS_PATH = _DATA_DIR / "momentum_fills.csv"
-_TRADES_PATH = _DATA_DIR / "trades.csv"
+_ACCT_LEDGER_PATH = _DATA_DIR / "acct_ledger.csv"
 _PAPER_TRADES_PATH = _ANALYSIS_DIR / "model_paper_trades.csv"  # ML-08
 
 # ── Shadow log schema ─────────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ class ModelAgent:
         self._last_decision_ts: Optional[float] = None
         self._total_decisions: int = 0
         self._agreement_history: list[bool] = []  # last 20 agreement values
-        self._pending: dict[str, float] = {}  # market_id → shadow_log row index
+        self._pending: dict[str, str] = {}  # market_id → decision_type
 
         # Tracking processed CSV rows (by (market_id, timestamp) tuples)
         self._processed_entry_keys: set[tuple[str, str]] = set()
@@ -194,6 +194,37 @@ class ModelAgent:
         rate: Optional[float] = None
         if len(self._agreement_history) >= 20:
             rate = round(sum(self._agreement_history[-20:]) / 20, 4)
+
+        # Accuracy: among resolved rows, how often did the model predict correctly?
+        # Model A (entry): predicts WIN if score >= 0.5 → correct when outcome=WIN
+        # Model B (exit):  predicts "bad exit" if score < 0.5 → correct when outcome=LOSS
+        accuracy_a: Optional[float] = None
+        accuracy_b: Optional[float] = None
+        resolved_a = [
+            r for r in self._shadow_rows
+            if r.get("decision_type") == "entry"
+            and r.get("actual_outcome") in ("WIN", "LOSS")
+            and r.get("model_a_score") not in (None, "")
+        ]
+        resolved_b = [
+            r for r in self._shadow_rows
+            if r.get("decision_type") in ("exit", "model_b_suppressed")
+            and r.get("actual_outcome") in ("WIN", "LOSS")
+            and r.get("model_b_score") not in (None, "")
+        ]
+        if resolved_a:
+            correct_a = sum(
+                1 for r in resolved_a
+                if (float(r["model_a_score"]) >= 0.5) == (r["actual_outcome"] == "WIN")
+            )
+            accuracy_a = round(correct_a / len(resolved_a), 4)
+        if resolved_b:
+            correct_b = sum(
+                1 for r in resolved_b
+                if (float(r["model_b_score"]) < 0.5) == (r["actual_outcome"] == "LOSS")
+            )
+            accuracy_b = round(correct_b / len(resolved_b), 4)
+
         return {
             "enabled": config.MODEL_AGENT_ENABLED,
             "status": self._status,
@@ -201,6 +232,10 @@ class ModelAgent:
             "agreement_rate_last_20": rate,
             "total_decisions": self._total_decisions,
             "pending_outcomes": len(self._pending),
+            "model_a_accuracy": accuracy_a,
+            "model_b_accuracy": accuracy_b,
+            "model_a_resolved": len(resolved_a),
+            "model_b_resolved": len(resolved_b),
         }
 
     def get_shadow_log(self, limit: int = 50, decision_type: str = "all") -> dict:
@@ -248,7 +283,7 @@ class ModelAgent:
             }
             await self._write_shadow_row(shadow_row)
             if market_id:
-                self._pending[market_id] = len(self._shadow_rows) - 1
+                self._pending[market_id] = "model_b_suppressed"
         except Exception as exc:
             log.warning("ModelAgent.log_model_b_suppression error", market_id=market_id, exc=str(exc))
 
@@ -398,8 +433,8 @@ class ModelAgent:
                     self._shadow_rows.append(row)
                     outcome = row.get("actual_outcome", "PENDING")
                     if outcome == "PENDING" and mid:
-                        # Track row index for potential resolution
-                        self._pending[mid] = len(self._shadow_rows) - 1
+                        # Track decision_type for outcome resolution
+                        self._pending[mid] = dtype
                 # Trim to cap
                 if len(self._shadow_rows) > 1000:
                     self._shadow_rows = self._shadow_rows[-1000:]
@@ -497,7 +532,7 @@ class ModelAgent:
 
             # Track pending outcomes for later resolution
             if mid:
-                self._pending[mid] = len(self._shadow_rows) - 1
+                self._pending[mid] = decision_type
 
             # Update runtime counters
             self._last_decision_ts = float(ts_now)
@@ -511,24 +546,73 @@ class ModelAgent:
 
     async def _resolve_pending_outcomes(self) -> None:
         """
-        Read trades.csv for rows with resolved_outcome=WIN/LOSS and update any
+        Read acct_ledger.csv for rows with resolved_outcome=WIN/LOSS and update any
         PENDING shadow log rows for the same market_id.
+
+        Outcome assignment:
+        - entry (Momentum): resolved_outcome from the single acct_ledger row for
+          that market_id is assigned directly (WIN = trade won, LOSS = trade lost).
+        - exit / model_b_suppressed (OpeningNeutral): the loser_leg is looked up in
+          on_fills.csv, then the loser token's resolved_outcome is read from
+          acct_ledger. If the loser resolved to LOSS (correct identification) the
+          model outcome is WIN; if the loser resolved to WIN (wrong leg exited)
+          the model outcome is LOSS.
         """
-        if not self._pending or not _TRADES_PATH.exists():
+        if not self._pending or not _ACCT_LEDGER_PATH.exists():
             return
         try:
-            resolved: dict[str, str] = {}  # market_id → "WIN" | "LOSS"
-            with open(_TRADES_PATH, newline="", encoding="utf-8") as fh:
+            # Build per-market, per-side outcome map from acct_ledger
+            # al_outcomes[market_id][SIDE] = "WIN" | "LOSS"
+            al_outcomes: dict[str, dict[str, str]] = {}
+            with open(_ACCT_LEDGER_PATH, newline="", encoding="utf-8") as fh:
                 for row in csv.DictReader(fh):
-                    outcome = row.get("resolved_outcome", "").upper()
                     mid = row.get("market_id", "")
-                    if outcome in ("WIN", "LOSS") and mid:
-                        resolved[mid] = outcome
+                    side = row.get("side", "").upper()
+                    outcome = row.get("resolved_outcome", "").upper()
+                    if mid and side and outcome in ("WIN", "LOSS"):
+                        al_outcomes.setdefault(mid, {})[side] = outcome
+
+            # Build loser_leg map from on_fills.csv for ON exit labelling
+            loser_leg_by_mid: dict[str, str] = {}
+            if _ON_FILLS_PATH.exists():
+                with open(_ON_FILLS_PATH, newline="", encoding="utf-8") as fh:
+                    for row in csv.DictReader(fh):
+                        mid = row.get("market_id", "")
+                        loser_leg = row.get("loser_leg", "").upper()
+                        if mid and loser_leg:
+                            loser_leg_by_mid[mid] = loser_leg
 
             to_remove: list[str] = []
-            for mid, _ in list(self._pending.items()):
-                if mid in resolved:
-                    await self._update_outcome(mid, resolved[mid])
+            for mid, decision_type in list(self._pending.items()):
+                if mid not in al_outcomes:
+                    continue
+
+                model_outcome: Optional[str] = None
+                sides = al_outcomes[mid]
+
+                if decision_type == "entry":
+                    # Momentum: one leg per market — use the single resolved outcome
+                    if len(sides) == 1:
+                        model_outcome = next(iter(sides.values()))
+                    else:
+                        # Multiple legs (ON pair matched against a momentum shadow row)
+                        # Prefer the first non-empty; this is an unusual edge case
+                        model_outcome = next(iter(sides.values()))
+
+                else:
+                    # exit / model_b_suppressed: ON loser exit labelling
+                    loser_leg = loser_leg_by_mid.get(mid, "")
+                    if not loser_leg:
+                        # loser_leg not recorded yet — wait for on_fills to be written
+                        continue
+                    loser_resolved = sides.get(loser_leg, "")
+                    if not loser_resolved:
+                        continue
+                    # Correct exit (loser resolved to 0 = LOSS) → model made good call
+                    model_outcome = "WIN" if loser_resolved == "LOSS" else "LOSS"
+
+                if model_outcome:
+                    await self._update_outcome(mid, model_outcome)
                     to_remove.append(mid)
 
             for mid in to_remove:

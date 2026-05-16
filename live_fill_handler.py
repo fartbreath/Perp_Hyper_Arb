@@ -560,6 +560,11 @@ class LiveFillHandler:
         # reflects the correct state rather than showing a stale ghost position.
         # This catches fills missed while the WS was disconnected (e.g. naked-leg
         # close taker orders that resolved before the WS reconnected).
+        #
+        # EXCEPTION: DRY_RUN opening_neutral positions are intentionally absent
+        # from PM wallet because OPENING_NEUTRAL_DRY_RUN=True simulates entries
+        # without placing real orders.  Ghost-dismissing them at 0¢ would corrupt
+        # P_WINNER positions that should be held to market resolution.
         pm_token_ids = {
             pos_data.get("asset") or pos_data.get("asset_id") or ""
             for pos_data in raw_positions
@@ -567,9 +572,65 @@ class LiveFillHandler:
         ghost_count = 0
         for tid, pos in bot_by_token.items():
             if tid not in pm_token_ids:
+                # Skip DRY_RUN opening_neutral positions — never in PM wallet by design.
+                if config.OPENING_NEUTRAL_DRY_RUN and getattr(pos, "strategy", "") == "opening_neutral":
+                    log.debug(
+                        "Reconciliation: skipping DRY_RUN opening_neutral position (not a true ghost)",
+                        token_id=tid[:24],
+                        market_id=pos.market_id[:24],
+                        side=pos.side,
+                    )
+                    continue
                 ghost_count += 1
+                # Ghost positions absent from PM wallet can mean either:
+                #   A) Market resolved while WS was down — tokens redeemed/
+                #      settled and no longer in wallet.  Must close at the
+                #      real settlement price so PnL is correct.
+                #   B) Order never materialised, or position was manually
+                #      closed at an unknown price.  Close at $0 conservatively.
+                # fetch_market_resolution is the authoritative check:
+                #   1.0 = YES/UP won, 0.0 = NO/DOWN won, None = not resolved.
+                _ghost_exit_price = 0.0
+                _ghost_resolved_outcome = ""
+                try:
+                    _resolved_yes = await self._pm.fetch_market_resolution(pos.market_id)
+                    if _resolved_yes is not None:
+                        _yes_sides = {"YES", "UP"}
+                        _token_won = (
+                            _resolved_yes >= 0.99 if pos.side in _yes_sides
+                            else _resolved_yes <= 0.01
+                        )
+                        _ghost_exit_price = 1.0 if _token_won else 0.0
+                        _ghost_resolved_outcome = "WIN" if _token_won else "LOSS"
+                        log.warning(
+                            "Reconciliation: ghost position — market resolved while"
+                            " WS was down; closing at settlement price",
+                            token_id=tid[:24],
+                            market_id=pos.market_id[:24],
+                            side=pos.side,
+                            resolved_yes=_resolved_yes,
+                            settlement_price=_ghost_exit_price,
+                            outcome=_ghost_resolved_outcome,
+                        )
+                    else:
+                        log.warning(
+                            "Reconciliation: ghost position — market not yet resolved;"
+                            " closing at $0 (absent from PM wallet, cause unknown)",
+                            token_id=tid[:24],
+                            market_id=pos.market_id[:24],
+                            side=pos.side,
+                        )
+                except Exception as _e:
+                    log.warning(
+                        "Reconciliation: could not check resolution for ghost position;"
+                        " defaulting to $0 close",
+                        token_id=tid[:24],
+                        exc=str(_e),
+                    )
                 closed = self._risk.close_position(
-                    pos.market_id, exit_price=0.0, side=pos.side
+                    pos.market_id, exit_price=_ghost_exit_price, side=pos.side,
+                    exit_reason="ghost_dismissed",
+                    resolved_outcome=_ghost_resolved_outcome,
                 )
                 if closed is not None:
                     log.warning(

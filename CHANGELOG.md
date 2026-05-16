@@ -2,6 +2,188 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-16] — Accounting CLOB enrichment + reconcile sweep; Model B feature fix; RTDS stability; ON FAK slippage; asyncio watchdog; analysis OPE suite
+
+### Fix — Model B `score_exit` feature mismatch (`models/feature_snapshot.py`)
+
+**Root cause:** `MODEL_B_FEATURES` in `feature_snapshot.py` had drifted to 15 features while
+`model_b.pkl` was trained on 10.  XGBoost raised `feature_names mismatch` on every `score_exit`
+call, causing the model to return 0.5 (neutral) for every open ON position — Model B was
+effectively disabled since the last retrain.
+
+**Fix:** Synced `MODEL_B_FEATURES` back to the 10-feature list in `analysis/train_model.py`.
+The 5 extra features (`oracle_delta_pct`, `implied_prob`, `on_yes_depth_share`, `on_funding_rate`,
+`on_combined_cost`) were added to `feature_snapshot.py` during an earlier refactor but were never
+included in the training run.  Comment block added to both files warning against future drift.
+
+**Requires bot restart** to clear the stale import.
+
+---
+
+### Fix — RTDS stale-reconnect churn (`market_data/rtds_client.py`)
+
+**Root cause:** `RTDS_STALE_RECONNECT_S = 45` was too aggressive.  The `crypto_prices_chainlink`
+RTDS topic is event-driven — during stable markets it legitimately goes 40-60 s between pushes.
+The reconnect fired prematurely, cleared `_prices` / `_cl_prices`, briefly made `get_spot()`
+return `None`, and caused FeedHealth to report DOWN (HTTP 503) for open positions.
+
+**Changes:**
+- `RTDS_STALE_RECONNECT_S` raised from 45 s to 120 s.  Reconnect now only fires after 2 minutes
+  of genuine exchange-price silence.
+- `_prices.clear()` / `_cl_prices.clear()` on reconnect removed.  Prices stay STALE (not DOWN)
+  during the reconnect window — STALE never triggers 503.
+
+---
+
+### Fix — Ghost position close uses settlement price (`live_fill_handler.py`)
+
+**Root cause:** Ghost positions (absent from PM wallet during reconcile) were unconditionally
+closed at `exit_price=0.0`.  If the market had resolved while the WS was down, this recorded a
+$0 loss instead of the real WIN/LOSS settlement price.
+
+**Changes:**
+- Before closing a ghost, `fetch_market_resolution(market_id)` is called.  If resolved, the
+  position is closed at the correct settlement price (1.0 WIN or 0.0 LOSS).
+- `exit_reason="ghost_dismissed"` and `resolved_outcome` passed to `close_position`.
+- `OPENING_NEUTRAL_DRY_RUN` positions explicitly skipped — they are never in the PM wallet by
+  design, so attempting to ghost-dismiss them corrupted P_WINNER ledger rows.
+
+---
+
+### Fix — PM WS shard max markets per shard (`config.py`, `pm_client.py`)
+
+**Root cause:** `PM_WS_MAX_MARKETS_PER_WS=100` was too high; shards were rejected with
+"INVALID OPERATION" at ~94+ tokens.  `custom_feature_enabled` (best_bid_ask events) was
+unconditionally included, generating events for all subscribed tokens and saturating the event
+loop.
+
+**Changes:**
+- `PM_WS_MAX_MARKETS_PER_WS` lowered from 100 to 50.
+- `PM_WS_BEST_BID_ASK: bool = True` flag added.  `custom_feature_enabled` is now gated on this
+  flag so it can be disabled when shard 1006 cascades occur at scale.
+
+---
+
+### Feature — Accounting CLOB enrichment from PM `/data/trades` (`accounting.py`)
+
+Ledger rows are now enriched with authoritative fill prices, sizes, and fees from PM's
+`/data/trades` endpoint at close time.
+
+**New functions:**
+- `set_pm_client(pm)` — registers the live `PMClient` singleton so ledger writes can call CLOB.
+  No-op in PAPER mode or tests.
+- `_enrich_position_from_clob(pos)` — pulls actual taker execution records per order ID; overwrites
+  `entry_contracts`, `entry_vwap`, `exit_contracts`, `exit_vwap`, `fees_usd` when PM differs from
+  in-memory WS-fill values.  Settlement exits keep their vwap but refresh fees.  Returns a
+  `reconciliation_notes` string describing any non-trivial deltas.
+- `_check_clob_balance_divergence(pos)` — compares expected residual contracts against on-chain
+  CLOB balance for RESOLVED/REDEMPTION exits.  If divergence > 5% (`_DIVERGENCE_THRESHOLD = 0.05`),
+  caps `exit_contracts` at the actual redeemable balance and appends `RECONCILE_REQUIRED` to notes.
+
+---
+
+### Feature — Manual ledger vs PM `/activity` reconcile sweep (`api_server.py`)
+
+New authenticated endpoint `POST /reconcile/run?days=N` (default 14 days, max 90).
+
+Computes:
+- `ledger_pnl` — sum of `net_pnl` in `acct_ledger.csv` over the window
+- `pm_realized` — `sum(SELL + REDEEM - BUY)` from PM data-api `/activity`
+- `drift_usd` — ledger vs PM difference
+- `per_market` — same breakdown grouped by market title, sorted worst-first
+- `reconciliation_flagged` — ledger rows tagged `RECONCILE_REQUIRED` by the balance divergence guard
+
+Read-only.  Never mutates the ledger.  Triggered from the Performance page.
+
+---
+
+### Feature — ON entry FAK slippage cap and depth margin (`config.py`, `strategies/OpeningNeutral/scanner.py`)
+
+**Root cause:** One-leg-fill failures occurred when the top-of-book ask was swept in the
+millisecond between book-cache snapshot and FAK matcher arrival.  The YES leg was killed with
+"no orders found to match" while the NO leg filled simultaneously.
+
+**New config keys:**
+- `OPENING_NEUTRAL_FAK_SLIPPAGE_CAP: float = 0.01` — price cap added above observed best ask.
+  Lets the FAK sweep to the next price level rather than dying at the swept level.
+- `OPENING_NEUTRAL_DEPTH_MARGIN_MULT: float = 2.0` — both legs must show resting ask size >= 2x
+  required contracts in the book cache before the FAK is sent.
+
+---
+
+### Feature — asyncio slow-callback watchdog (`main.py`)
+
+`loop.slow_callback_duration` set to `ASYNCIO_SLOW_CALLBACK_SECS` (default 0.5 s) at startup.
+When any coroutine blocks the loop beyond this threshold, asyncio logs a WARNING naming the exact
+callable and source location.  Root diagnostic for PM WS shard 1006 cascades — shards die because
+their 20 s `ping_timeout` fires when the loop cannot process pongs in time.
+
+---
+
+### Feature — Model accuracy tracking (`models/model_agent.py`)
+
+`get_status()` now returns `model_a_accuracy`, `model_b_accuracy`, `model_a_resolved`,
+`model_b_resolved` computed across resolved shadow log rows since startup.
+
+- Model A (entry): correct when `score >= 0.5` and `outcome == WIN`.
+- Model B (exit): correct when `score < 0.5` and `outcome == LOSS`.
+
+Also: `_pending` dict corrected from `dict[str, float]` (row index) to `dict[str, str]`
+(decision_type).  `_resolve_pending_outcomes` now reads `acct_ledger.csv` instead of the
+removed `trades.csv`.
+
+---
+
+### Fix — ON market scope narrowed to `bucket_5m` (`config.py`)
+
+`OPENING_NEUTRAL_MARKET_TYPES` restricted to `["bucket_5m"]`.  The 15m bucket had a 60% win
+rate and negative mean PnL per pair while 5m was at 95.7%+.
+
+---
+
+### Fix — Loser confidence gate disabled (`config.py`)
+
+`OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED` set to `False`.  With ~390 pairs the feature was
+tightening the wrong leg trigger based on sparse funding/depth signals.
+
+---
+
+### Fix — Monitor gate suppression log throttling (`monitor.py`)
+
+The `gate_suppressed` warning for `suppress_prob_sl_oracle` was missing the `_should_log_count`
+power-of-2 throttle guard, causing a log storm on every consecutive suppression.  Added to match
+the existing `suppress_delta_sl` pattern.
+
+---
+
+### Fix — Priority token deregistration after resolution (`monitor.py`)
+
+After `close_position()` on a resolved market, `pm.deregister_priority_token(token_id)` is now
+called.  Previously, resolved tokens stayed in the priority set indefinitely, consuming polling
+budget for tokens with no open position.
+
+---
+
+### Analysis — OPE suite and Model D infrastructure (`analysis/`)
+
+Five new scripts for offline policy evaluation and Model D signal collection:
+
+- **`scan_diags_collector.py`** — polls `/momentum/diagnostics` every 2 s; deduplicates by
+  `scan_ts`; filters pre-signal structural skips; appends to `data/scan_diags.jsonl`.
+- **`stop_loss_ope.py`** — sweeps `MOMENTUM_DELTA_STOP_LOSS_PCT` thresholds 0.5-10% against
+  `momentum_ticks.csv` + `market_outcomes.json`; computes TP/FP/precision/recall/FP-rate per
+  threshold; faceted by coin and bucket.  Current 4% threshold: 87% FP rate.
+- **`z_score_ope.py`** — sweeps z-threshold on `training_data.parquet` momentum rows; computes
+  mean_pnl/win_rate/kelly_weighted_pnl per threshold; faceted by bucket/coin.  Best z=1.86
+  (mean_pnl=+0.68) vs live z=0.80 (mean_pnl=-0.12); `bucket_5m` shows 95.7% win rate.
+- **`config_snapshot_logger.py`** — polls `config_overrides.json` every 3600 s; SHA-256
+  deduplication; appends `{ts, config_hash, config}` to `data/config_snapshots.jsonl`.
+- **`feature_builder.py`** (updated) — v5 exit-time fields added to schema, float cast list, and
+  derivation block: `on_winner_bid_at_exit`, `on_loser_bid_at_exit`, `on_oracle_delta_at_exit`,
+  `on_tte_at_exit_secs`, `on_loser_bid_delta`, `on_winner_bid_delta`.
+
+---
+
 ## [2026-05-09] — PM WS ping race fix; RON lock-step sync; ON loser-exit callbacks; institutional-grade gate audit logging; feed health monitoring; position data safety guards; analysis tooling
 
 ### Fix — PM WS shard ping race causing stale books (`pm_client.py`)

@@ -790,6 +790,28 @@ async def main() -> None:
     """
     Bootstrap all components and run until shutdown.
     """
+    # ── Event-loop slow-callback watchdog ────────────────────────────────────
+    # When any coroutine/handle on the event loop runs synchronously for longer
+    # than `slow_callback_duration`, asyncio logs a WARNING that names the exact
+    # callable and source location.  Routes to bot.log because the asyncio
+    # logger inherits from root.  This is the proper diagnostic for the
+    # recurring PM WS shard 1006 / RTDS-stale cascades: shards die because their
+    # 20s ping_timeout fires when the loop can't process pongs in time.  When
+    # the watchdog warns, the offending callback is the root cause.
+    try:
+        import logging as _logging
+        _loop = asyncio.get_running_loop()
+        _loop.slow_callback_duration = float(
+            getattr(config, "ASYNCIO_SLOW_CALLBACK_SECS", 0.5)
+        )
+        _logging.getLogger("asyncio").setLevel(_logging.WARNING)
+        log.info(
+            "asyncio slow-callback watchdog armed",
+            threshold_s=_loop.slow_callback_duration,
+        )
+    except Exception as _exc:
+        log.warning("asyncio slow-callback watchdog setup failed", exc=str(_exc))
+
     log.info(
         "Bot starting",
         paper_trading=config.PAPER_TRADING,

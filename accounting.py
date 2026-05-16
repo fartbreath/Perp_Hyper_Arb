@@ -89,6 +89,29 @@ LEDGER_HEADER = [
 # How many seconds to wait after the first exit fill before declaring ERROR.
 _CONFIRM_TIMEOUT_S: int = 600  # 10 minutes
 
+# ── PM client singleton (set at startup; used by ledger writer to enrich rows) ─
+# Wired by reconcile_loop() the first time it runs so we don't have to plumb
+# pm_client through every on_*_fill call site.
+_PM_CLIENT_REF = None  # type: ignore[var-annotated]
+
+
+def set_pm_client(pm) -> None:
+    """Register the live PMClient so ledger writes can pull authoritative
+    fill prices, sizes and fees from PM /data/trades.
+
+    Optional. If never called (e.g. PAPER mode, tests) the ledger writer
+    silently degrades to using the in-memory pos values.
+    """
+    global _PM_CLIENT_REF
+    _PM_CLIENT_REF = pm
+
+
+# Divergence threshold: if pos.entry_contracts - exit_contracts diverges from
+# actual on-chain CLOB balance by more than this fraction, the ledger row is
+# tagged RECONCILE_REQUIRED and exit_contracts is capped at the on-chain
+# balance to prevent over-counting redemption payouts.
+_DIVERGENCE_THRESHOLD: float = 0.05  # 5%
+
 
 # ── Status constants ───────────────────────────────────────────────────────────
 class PositionStatus:
@@ -129,7 +152,7 @@ class AccountingPosition:
     # Identity
     pos_id:          str
     strategy:        str   # momentum | opening_neutral | momentum_hedge | maker | mispricing
-    fill_type:       str   # MAIN | LOSER_EXIT | WINNER | HEDGE
+    fill_type:       str   # MAIN | LOSER_EXIT | P_WINNER | WINNER | HEDGE
 
     # Relationship — both optional
     pair_id:         str = ""   # groups YES+NO legs of same ON trade
@@ -215,8 +238,191 @@ def _append_ledger(row: dict) -> None:
         w.writerow(row)
 
 
+def _enrich_position_from_clob(pos: AccountingPosition) -> str:
+    """Pull authoritative fill prices/sizes/fees from PM /data/trades.
+
+    Polymarket /data/trades returns the actual taker execution records for an
+    order, including a ``fee_rate_bps`` field per trade.  We sum size, value
+    and fees per side and overwrite the in-memory pos values so the ledger row
+    reflects what really happened on-chain rather than whatever the local WS
+    fill event reported (which can be stale or wrong on partial fills).
+
+    For RESOLVED / REDEMPTION exits we keep the settlement-derived exit_vwap
+    (1.0 for win, 0.0 for loss, or payout/size for redeem) and only refresh
+    fees \u2014 the SELL side never executed for a held-to-resolution position.
+
+    Returns a human-readable note describing any non-trivial deltas, suitable
+    for the reconciliation_notes ledger column.  Empty string when no enrichment
+    happened or values matched within tolerance.
+    """
+    pm = _PM_CLIENT_REF
+    if pm is None or getattr(pm, "_clob", None) is None:
+        return ""
+    try:
+        from py_clob_client_v2.clob_types import TradeParams
+    except Exception:
+        return ""
+
+    fills = _load_fills_by_token(pos.token_id)
+    entry_oids = sorted({f.order_id for f in fills if f.side == "BUY"  and f.order_id})
+    exit_oids  = sorted({f.order_id for f in fills if f.side == "SELL" and f.order_id})
+
+    def _aggregate(order_ids: list[str]) -> tuple[float, float, float, float]:
+        total_sz, total_val, total_fees = 0.0, 0.0, 0.0
+        for oid in order_ids:
+            try:
+                trades = pm._clob.get_trades(TradeParams(id=oid))  # blocking REST
+            except Exception as exc:
+                log.debug("acct enrich: get_trades failed", order_id=oid[:20], exc=str(exc))
+                continue
+            for t in (trades or []):
+                try:
+                    sz = float(t.get("size", 0))
+                    px = float(t.get("price", 0))
+                    fee_bps = float(t.get("fee_rate_bps", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if sz <= 0 or px <= 0:
+                    continue
+                total_sz   += sz
+                total_val  += sz * px
+                total_fees += sz * px * (fee_bps / 10_000.0)
+        vwap = (total_val / total_sz) if total_sz > 0 else 0.0
+        return total_sz, vwap, total_val, total_fees
+
+    notes: list[str] = []
+    fees_total = 0.0
+
+    if entry_oids:
+        sz, vw, val, fees = _aggregate(entry_oids)
+        if sz > 0:
+            tol_sz = max(0.01 * pos.entry_contracts, 0.001)
+            if abs(sz - pos.entry_contracts) > tol_sz or abs(vw - pos.entry_vwap) > 0.001:
+                notes.append(
+                    f"entry_clob: contracts {pos.entry_contracts:.4f}->{sz:.4f}, "
+                    f"vwap {pos.entry_vwap:.4f}->{vw:.4f}"
+                )
+            pos.entry_contracts = round(sz, 8)
+            pos.entry_vwap      = round(vw, 8)
+            pos.entry_cost_usd  = round(val, 8)
+            fees_total += fees
+
+    if exit_oids:
+        sz, vw, val, fees = _aggregate(exit_oids)
+        if sz > 0:
+            tol_sz = max(0.01 * pos.exit_contracts, 0.001)
+            if pos.exit_type not in ("RESOLVED", "REDEMPTION"):
+                if abs(sz - pos.exit_contracts) > tol_sz or abs(vw - pos.exit_vwap) > 0.001:
+                    notes.append(
+                        f"exit_clob: contracts {pos.exit_contracts:.4f}->{sz:.4f}, "
+                        f"vwap {pos.exit_vwap:.4f}->{vw:.4f}"
+                    )
+                pos.exit_contracts = round(sz, 8)
+                pos.exit_vwap      = round(vw, 8)
+            else:
+                # Settlement-driven exit: keep exit_vwap, but sell-side fees still apply
+                if abs(sz - pos.exit_contracts) > tol_sz:
+                    notes.append(
+                        f"exit_clob_partial: pre_resolve_sells={sz:.4f} (kept settlement vwap)"
+                    )
+            fees_total += fees
+
+    if fees_total > 0:
+        if abs(fees_total - pos.fees_usd) > 1e-6:
+            notes.append(f"fees_clob: {pos.fees_usd:.4f}->{fees_total:.4f}")
+        pos.fees_usd = round(fees_total, 8)
+
+    return "; ".join(notes)
+
+
+def _check_clob_balance_divergence(pos: AccountingPosition) -> str:
+    """Compare expected on-chain balance vs actual CLOB balance.
+
+    For positions that didn't fully exit on-CLOB before resolution
+    (RESOLVED / REDEMPTION), the residual contracts must still be sitting in
+    the wallet to be redeemed.  If the actual CLOB balance is materially
+    lower than (entry_contracts - exit_contracts), tokens were drained
+    elsewhere (manual UI sale, separate bot, etc.) and the redemption payout
+    in the ledger row would be overstated.
+
+    Caps pos.exit_contracts at the actual residual + on-chain balance and
+    returns a RECONCILE_REQUIRED note when divergence exceeds the threshold.
+    Returns empty string when no divergence (or no pm_client wired).
+    """
+    pm = _PM_CLIENT_REF
+    if pm is None or getattr(pm, "_clob", None) is None:
+        return ""
+    if pos.exit_type not in ("RESOLVED", "REDEMPTION"):
+        return ""
+    if not pos.token_id:
+        return ""
+    try:
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+    except Exception:
+        return ""
+    try:
+        resp = pm._clob.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=pos.token_id),
+        )
+    except Exception as exc:
+        log.debug("acct divergence: balance fetch failed", token=pos.token_id[:16], exc=str(exc))
+        return ""
+    raw = resp.get("balance") if isinstance(resp, dict) else None
+    if raw is None:
+        return ""
+    try:
+        clob_balance = float(raw) / 1_000_000.0
+    except (TypeError, ValueError):
+        return ""
+
+    # Already-sold contracts (true CLOB SELL fills) reduce the expected residual.
+    sold_already = sum(
+        f.contracts for f in _load_fills_by_token(pos.token_id) if f.side == "SELL"
+    )
+    expected_residual = max(0.0, pos.entry_contracts - sold_already)
+    if expected_residual <= 1e-6:
+        return ""
+
+    diff_frac = abs(expected_residual - clob_balance) / expected_residual
+    if diff_frac < _DIVERGENCE_THRESHOLD:
+        return ""
+
+    # Cap settlement payout at what is actually redeemable on-chain.
+    capped_exit = round(sold_already + clob_balance, 8)
+    note = (
+        f"RECONCILE_REQUIRED: token_id={pos.token_id[:16]} "
+        f"expected_residual={expected_residual:.4f} clob_balance={clob_balance:.4f} "
+        f"diff_frac={diff_frac:.3f} exit_contracts {pos.exit_contracts:.4f}->{capped_exit:.4f}"
+    )
+    log.warning(
+        "acct: CLOB balance diverges from expected residual \u2014 capping payout",
+        pos_id=pos.pos_id[:12],
+        token_id=pos.token_id[:16],
+        expected_residual=round(expected_residual, 6),
+        clob_balance=round(clob_balance, 6),
+        capped_exit=capped_exit,
+    )
+    pos.exit_contracts = capped_exit
+    return note
+
+
 def _write_ledger_record(pos: AccountingPosition) -> None:
-    """Flatten AccountingPosition into a single LedgerRecord and append."""
+    """Flatten AccountingPosition into a single LedgerRecord and append.
+
+    NOTE: CLOB enrichment (`_enrich_position_from_clob`) and on-chain
+    balance divergence checks (`_check_clob_balance_divergence`) are NOT
+    called inline here.  They issue blocking REST requests against the PM
+    CLOB and `_write_ledger_record` runs from sync `on_resolved`, which is
+    called from the async `_reconcile_once` loop — running blocking I/O on
+    the event-loop thread starves PM WS shard pings, causing CloseCode 1006
+    cascades.
+
+    Enrichment / divergence are now run on-demand via the webapp's
+    `/reconcile/run` endpoint, which can call those helpers from a thread
+    via `asyncio.to_thread` without blocking the trading loop.
+    """
+    reconciliation_notes = ""
+
     gross = _gross_pnl(pos)
     net   = round(gross - pos.fees_usd + pos.rebates_usd, 8)
     row = {
@@ -256,7 +462,7 @@ def _write_ledger_record(pos: AccountingPosition) -> None:
         "pm_exit_confirmed":  pos.pm_exit_confirmed,
         "signal_source":      pos.signal_source,
         "signal_score":       pos.signal_score,
-        "reconciliation_notes": "",
+        "reconciliation_notes": reconciliation_notes,
     }
     _append_ledger(row)
     log.info(
@@ -356,7 +562,7 @@ class _Ledger:
         source:       str = "ws",
         # Position context (passed once at first fill; ignored on subsequent fills)
         strategy:     str = "",
-        fill_type:    str = "MAIN",    # MAIN | LOSER_EXIT | WINNER | HEDGE
+        fill_type:    str = "MAIN",    # MAIN | LOSER_EXIT | P_WINNER | WINNER | HEDGE
         pair_id:      str = "",
         parent_pos_id: str = "",
         market_title: str = "",
@@ -377,6 +583,16 @@ class _Ledger:
 
         Returns the pos_id of the position that was updated/created.
         """
+        # Manual positions (restored from PM wallet without a matching bot entry)
+        # have strategy="unknown".  Do not record them in the ledger — only
+        # bot-created positions belong in accounting.
+        if strategy == "unknown":
+            log.debug(
+                "acct: skipping entry fill — manual/unknown position",
+                token_id=token_id[:16],
+            )
+            return ""
+
         now = _now_iso()
         fill = Fill(
             fill_id=str(uuid.uuid4()),
@@ -524,6 +740,12 @@ class _Ledger:
                 pos.status       = PositionStatus.CLOSING
                 pos.closing_since = now
 
+            # If the fill came from the PM order API (ws/rest), we already have
+            # authoritative confirmation — no need to wait for /activity polling.
+            # Paper fills are also immediately confirmed (no real PM transaction).
+            if source in ("ws", "rest", "paper"):
+                pos.pm_exit_confirmed = True
+
             _save_positions(self._positions)
 
         log.debug(
@@ -630,6 +852,26 @@ class _Ledger:
             pos_id=pos_id[:12],
         )
 
+    def on_winner_held(self, token_id: str) -> None:
+        """
+        Called when an ON winner is held as opening_neutral (PROMOTE_TO_MOMENTUM=False).
+        Tags fill_type="P_WINNER" (predicted winner) without changing the strategy.
+        P_WINNER != WINNER — it means this leg is expected to resolve at $1 based on
+        which side lost.  Actual resolution is confirmed later via on_resolved().
+        """
+        with self._lock:
+            pos_id = self._token_index.get(token_id)
+            if pos_id is None:
+                return
+            pos = self._positions[pos_id]
+            pos.fill_type = "P_WINNER"
+            _save_positions(self._positions)
+        log.info(
+            "acct: ON predicted-winner tagged as P_WINNER (held as opening_neutral)",
+            token_id=token_id[:16],
+            pos_id=pos_id[:12],
+        )
+
     def on_ron_exit(self, winner_token_id: str, loser_token_id: str) -> None:
         """
         Called by ReverseOpenNeutralScanner when the exit trigger fires.
@@ -686,6 +928,9 @@ class _Ledger:
         Call this from main.py:
             asyncio.create_task(get_ledger().reconcile_loop(pm_client))
         """
+        # Wire the singleton so _write_ledger_record can enrich rows from PM
+        # /data/trades and detect on-chain balance divergence.
+        set_pm_client(pm_client)
         await asyncio.sleep(30)   # let startup settle
         while True:
             try:
@@ -728,6 +973,14 @@ class _Ledger:
                 PositionStatus.LIVE, PositionStatus.ERROR
             ) and pos.token_id:
                 unconfirmed_tokens.add(pos.token_id)
+            # Also watch LIVE positions for manual sells — if the user sells a
+            # bot-created position in PM without the bot placing the order, there
+            # is no WS fill callback.  The reconcile loop detects the SELL event
+            # here and records the actual exit price so the ledger is correct.
+            if (pos.status == PositionStatus.LIVE
+                    and pos.token_id
+                    and not pos.pm_exit_confirmed):
+                unconfirmed_tokens.add(pos.token_id)
 
         pm_activity_by_token: dict[str, list[dict]] = {}
         if unconfirmed_tokens:
@@ -760,13 +1013,44 @@ class _Ledger:
 
                 # Confirm exit (SELL on CLOB or REDEEM)
                 if not pos.pm_exit_confirmed and pos.status in (
-                    PositionStatus.CLOSING, PositionStatus.PENDING_RESOLVE
+                    PositionStatus.CLOSING, PositionStatus.PENDING_RESOLVE,
+                    PositionStatus.LIVE,
                 ):
                     for row in rows_for_token:
                         row_type = row.get("type", "").upper()
                         row_side = row.get("side", "").upper()
                         if row_type == "TRADE" and row_side == "SELL":
                             pos.pm_exit_confirmed = True
+                            # Extract actual sell price from PM event.
+                            # Covers both bot-placed exits (price already in
+                            # exit_vwap via on_exit_fill) and manual sells
+                            # (no prior on_exit_fill — we derive it here).
+                            _usdc = float(row.get("usdcSize") or 0)
+                            _size = float(row.get("size") or 0)
+                            if _usdc > 0 and _size > 0 and pos.exit_contracts < 1e-9:
+                                _sell_price = round(_usdc / _size, 8)
+                                pos.exit_vwap = _vwap(
+                                    pos.exit_vwap, pos.exit_contracts,
+                                    _sell_price, _size,
+                                )
+                                pos.exit_contracts = round(pos.exit_contracts + _size, 8)
+                                if not pos.exit_time:
+                                    pos.exit_time = _now_iso()
+                                if not pos.exit_type:
+                                    pos.exit_type = "SELL"
+                            # Manual sell on a LIVE bot position — transition to
+                            # CLOSING so the standard resolution path can complete.
+                            if pos.status == PositionStatus.LIVE:
+                                pos.status = PositionStatus.CLOSING
+                                pos.closing_since = pos.exit_time or _now_iso()
+                                log.info(
+                                    "acct: manual sell detected on LIVE bot position"
+                                    " — advancing to CLOSING",
+                                    pos_id=pos.pos_id[:12],
+                                    market=pos.market_title[:50],
+                                    side=pos.side,
+                                    sell_price=pos.exit_vwap,
+                                )
                             changed = True
                             break
                         if row_type == "REDEEM":

@@ -2,7 +2,7 @@
  * Performance — Deep analytics: equity curve, win rate, Sharpe, rebates, heatmap.
  */
 import { useState } from "react";
-import { usePerformance } from "../api/client";
+import { usePerformance, runReconcile, type ReconcileResult } from "../api/client";
 import {
   LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   CartesianGrid, Cell, ReferenceLine,
@@ -32,6 +32,24 @@ export default function Performance() {
   const [period, setPeriod] = useState<Period>("all");
   const { data, loading, error } = usePerformance(period);
 
+  const [reconcileDays, setReconcileDays] = useState<number>(14);
+  const [reconcileLoading, setReconcileLoading] = useState<boolean>(false);
+  const [reconcileError, setReconcileError] = useState<string | null>(null);
+  const [reconcileResult, setReconcileResult] = useState<ReconcileResult | null>(null);
+
+  async function handleReconcile() {
+    setReconcileLoading(true);
+    setReconcileError(null);
+    try {
+      const r = await runReconcile(reconcileDays);
+      setReconcileResult(r);
+    } catch (e) {
+      setReconcileError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setReconcileLoading(false);
+    }
+  }
+
   return (
     <div className="page">
       <h2>Performance</h2>
@@ -42,6 +60,89 @@ export default function Performance() {
             {p === "all" ? "All time" : p}
           </button>
         ))}
+      </div>
+
+      {/* Manual ledger ↔ PM /activity reconciliation sweep */}
+      <div className="card" style={{ marginBottom: 16 }}>
+        <h3 style={{ marginTop: 0 }}>Ledger Reconcile (manual)</h3>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ fontSize: 13 }}>
+            Window (days):{" "}
+            <input
+              type="number"
+              min={1}
+              max={90}
+              value={reconcileDays}
+              onChange={(e) => setReconcileDays(Math.max(1, Math.min(90, Number(e.target.value) || 14)))}
+              style={{ width: 64 }}
+            />
+          </label>
+          <button onClick={handleReconcile} disabled={reconcileLoading}>
+            {reconcileLoading ? "Running…" : "Run reconcile"}
+          </button>
+          {reconcileError && <span style={{ color: "#ef4444" }}>Error: {reconcileError}</span>}
+        </div>
+
+        {reconcileResult && (
+          <div style={{ marginTop: 12, fontSize: 13 }}>
+            <div className="summary-row" style={{ marginBottom: 8 }}>
+              <div className="stat"><div className="stat-label">Ledger Net P&L</div><div className="stat-val">${reconcileResult.ledger.net_pnl.toFixed(2)}</div></div>
+              <div className="stat"><div className="stat-label">PM Realized</div><div className="stat-val">${reconcileResult.pm.net_realized.toFixed(2)}</div></div>
+              <div className="stat">
+                <div className="stat-label">Drift</div>
+                <div className="stat-val" style={{ color: Math.abs(reconcileResult.drift_usd) < 0.5 ? "#22c55e" : "#ef4444" }}>
+                  ${reconcileResult.drift_usd.toFixed(2)}
+                </div>
+              </div>
+              <div className="stat"><div className="stat-label">PM Buy / Sell / Redeem</div><div className="stat-val">${reconcileResult.pm.buy_usd.toFixed(0)} / ${reconcileResult.pm.sell_usd.toFixed(0)} / ${reconcileResult.pm.redeem_usd.toFixed(0)}</div></div>
+              <div className="stat"><div className="stat-label">Ledger Rows</div><div className="stat-val">{reconcileResult.ledger.rows}</div></div>
+            </div>
+
+            {reconcileResult.reconciliation_flagged.length > 0 && (
+              <details open style={{ marginTop: 8 }}>
+                <summary style={{ color: "#f97316", cursor: "pointer" }}>
+                  ⚠ {reconcileResult.reconciliation_flagged.length} ledger row(s) flagged RECONCILE_REQUIRED
+                </summary>
+                <table style={{ width: "100%", marginTop: 6, fontSize: 12 }}>
+                  <thead>
+                    <tr><th align="left">When</th><th align="left">Market</th><th align="left">Side</th><th align="right">Net P&L</th><th align="left">Notes</th></tr>
+                  </thead>
+                  <tbody>
+                    {reconcileResult.reconciliation_flagged.map((r, i) => (
+                      <tr key={i}>
+                        <td>{r.recorded_at.slice(0, 19).replace("T", " ")}</td>
+                        <td>{r.market_title.slice(0, 60)}</td>
+                        <td>{r.side}</td>
+                        <td align="right" style={{ color: r.net_pnl >= 0 ? "#22c55e" : "#ef4444" }}>${r.net_pnl.toFixed(4)}</td>
+                        <td style={{ fontSize: 11, color: "#888" }}>{r.notes}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </details>
+            )}
+
+            <details style={{ marginTop: 8 }}>
+              <summary style={{ cursor: "pointer" }}>Per-market breakdown ({reconcileResult.per_market.length})</summary>
+              <table style={{ width: "100%", marginTop: 6, fontSize: 12 }}>
+                <thead>
+                  <tr><th align="left">Market</th><th align="right">Buy</th><th align="right">Sell</th><th align="right">Redeem</th><th align="right">PM Net</th></tr>
+                </thead>
+                <tbody>
+                  {reconcileResult.per_market.map((m, i) => (
+                    <tr key={i}>
+                      <td>{m.market_title.slice(0, 70)}</td>
+                      <td align="right">${m.buy_usd.toFixed(2)}</td>
+                      <td align="right">${m.sell_usd.toFixed(2)}</td>
+                      <td align="right">${m.redeem_usd.toFixed(2)}</td>
+                      <td align="right" style={{ color: m.pm_net_usd >= 0 ? "#22c55e" : "#ef4444" }}>${m.pm_net_usd.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </details>
+          </div>
+        )}
       </div>
 
       {error && <div className="error">Failed to load: {error}</div>}

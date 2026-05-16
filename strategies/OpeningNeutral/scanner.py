@@ -47,7 +47,7 @@ _ON_MONITOR_TICKS_HEADER = [
 ]
 # on_fills.csv schema — v1 (Phase 0: cold-book guard + entry context logging).
 # Increment this comment and add migration in _ensure_on_fills_csv() whenever
-# columns are added or removed.  Schema version: 4 (added model_a_score, model_a_scale)
+# columns are added or removed.  Schema version: 5 (added exit-time CLOB signals)
 _ON_FILLS_HEADER = [
     "timestamp", "pair_id", "market_id", "market_title", "underlying",
     "market_type", "yes_entry", "no_entry", "combined_cost",
@@ -67,6 +67,11 @@ _ON_FILLS_HEADER = [
     # ML-07: Model A sizing columns (written even when MODEL_A_ENABLED=False; value=None)
     "model_a_score",      # Model A entry quality score (0–1), None when disabled
     "model_a_scale",      # Resulting size multiplier applied to OPENING_NEUTRAL_SIZE_USD
+    # v5: exit-time CLOB signals (populated in _on_exit_fill) — Model B features
+    "winner_bid_at_exit",    # Winner leg best-bid at the moment loser_exit fires
+    "loser_bid_at_exit",     # Loser leg best-bid that triggered the exit (pre-fill)
+    "oracle_delta_at_exit",  # (spot - strike) / strike * 100 at exit time; >0 = oracle says loser is winning (wrong exit)
+    "tte_at_exit_secs",      # Seconds remaining when loser_exit fires
 ]
 
 # Minimum seconds between entry evaluations for the same market on the hot WS path.
@@ -717,6 +722,7 @@ class OpeningNeutralScanner(BaseStrategy):
                     extra.add(t)
                     _pair_tokens.add(t)
         self._pm.register_for_book_updates(extra, owner="opening_neutral")
+        self._pm.register_best_bid_ask_tokens(extra, owner="opening_neutral")
         if _pair_tokens:
             log.info(
                 "OpeningNeutral: bid-monitor subscriptions registered",
@@ -1197,19 +1203,28 @@ class OpeningNeutralScanner(BaseStrategy):
             )
             return
 
-        # FAK depth guard: both sides must have resting ask size ≥ entry size
-        # in the book cache.  A non-None best_ask only means someone has ever
-        # posted at that price — it doesn't mean that resting order still exists.
-        # If the cache shows zero size at the ask, the FAK will be killed instantly.
+        # FAK depth guard: both sides must have resting ask size ≥
+        # DEPTH_MARGIN_MULT × required_contracts in the book cache.  A non-None
+        # best_ask only means someone has ever posted at that price — it doesn't
+        # mean that resting order still exists.  If the cache shows insufficient
+        # size at the ask, the FAK will be partially or fully killed, producing
+        # the one-leg-fill failure mode.  required_contracts converts size_usd
+        # to shares using the per-leg ask price (units fix).
         size_usd = config.OPENING_NEUTRAL_SIZE_USD
+        depth_mult = getattr(config, "OPENING_NEUTRAL_DEPTH_MARGIN_MULT", 2.0)
         yes_ask_size = _yes_book.asks[0][1] if (_yes_book and _yes_book.asks) else 0.0
         no_ask_size  = _no_book.asks[0][1]  if (_no_book  and _no_book.asks)  else 0.0
-        if yes_ask_size < size_usd or no_ask_size < size_usd:
+        yes_required = (size_usd / yes_ask) if yes_ask > 0 else float("inf")
+        no_required  = (size_usd / no_ask)  if no_ask  > 0 else float("inf")
+        if yes_ask_size < depth_mult * yes_required or no_ask_size < depth_mult * no_required:
             log.warning(
                 "OpeningNeutral: entry skipped — book too thin",
                 market=getattr(market, "title", "")[:60],
                 yes_ask=yes_ask, yes_ask_size=round(yes_ask_size, 4),
+                yes_required=round(yes_required, 4),
                 no_ask=no_ask, no_ask_size=round(no_ask_size, 4),
+                no_required=round(no_required, 4),
+                depth_mult=depth_mult,
                 size_usd=size_usd,
             )
             return
@@ -1746,7 +1761,7 @@ class OpeningNeutralScanner(BaseStrategy):
             # Simulate a fill at the observed ask so the pair is registered in
             # _active_pairs.  Without this the market is re-scanned every tick
             # because no pair is ever recorded, producing infinite duplicate signals.
-            # _exit_loser has its own DRY_RUN guard so no real orders are placed
+            # _execute_loser_exit has its own DRY_RUN guard so no real orders are placed
             # during monitoring either.
             sim_size = round(size_usd / ask_price, 6) if ask_price > 0 else 0.0
             log.debug(
@@ -1761,8 +1776,12 @@ class OpeningNeutralScanner(BaseStrategy):
         is_fak = config.OPENING_NEUTRAL_ORDER_TYPE == "market"
 
         if is_fak:
-            # FAK: cross spread by +0.5c to guarantee a fill.
-            place_price = round(min(ask_price + 0.005, 0.99), 3)
+            # FAK: cross spread by FAK_SLIPPAGE_CAP to guarantee a fill even when
+            # the top-of-book ask is swept in the millisecond window between book
+            # snapshot and matcher arrival (otherwise PM returns "no orders found
+            # to match" and the leg is killed → one-leg-fill failure mode).
+            slip_cap = getattr(config, "OPENING_NEUTRAL_FAK_SLIPPAGE_CAP", 0.02)
+            place_price = round(min(ask_price + slip_cap, 0.99), 3)
             contracts = round(size_usd / place_price, 6) if place_price > 0 else 0.0
             order_id = await self._pm.place_market(
                 token_id=token_id, side="BUY", price=place_price, size=size_usd
@@ -2286,6 +2305,21 @@ class OpeningNeutralScanner(BaseStrategy):
             trigger_bid=trigger_bid,
             threshold=config.OPENING_NEUTRAL_LOSER_EXIT_PRICE,
         )
+        # DRY_RUN: skip real order; simulate an exit fill at the trigger bid so
+        # _on_exit_fill records the pair outcome and the pair is closed cleanly.
+        # Without this guard, place_market is called on tokens the bot never bought
+        # (simulated entry), the CLOB rejects the SELL, order_id is None, and the
+        # loser is never exited — pair stays open forever.
+        if config.OPENING_NEUTRAL_DRY_RUN:
+            log.info(
+                "OpeningNeutral DRY_RUN: simulating loser exit",
+                pair_id=pair_id[:12],
+                side=side,
+                simulated_exit_price=trigger_bid,
+            )
+            await self._on_exit_fill(pair_id, side, exit_price=trigger_bid)
+            return
+
         # By this point Polygon token settlement is long complete (seconds have
         # elapsed since entry).  Fetch the actual credited balance to guarantee
         # we sell exactly what the CLOB holds.
@@ -2419,9 +2453,49 @@ class OpeningNeutralScanner(BaseStrategy):
         _csv_row = self._pair_csv_data.pop(pair_id, None)
         if _csv_row is not None:
             _entry_ts = _csv_row.pop("_entry_ts", time.time())
-            _csv_row["loser_leg"]           = filled_side
-            _csv_row["loser_fill_price"]    = round(exit_price, 4)
+            _csv_row["loser_leg"]            = filled_side
+            _csv_row["loser_fill_price"]     = round(exit_price, 4)
             _csv_row["loser_fill_time_secs"] = round(time.time() - _entry_ts, 1)
+
+            # v5: capture exit-time CLOB signals for Model B training
+            # winner_bid_at_exit — the winner book's best bid at the moment loser_exit fires
+            _w_token_id = getattr(winner_pos, "token_id", "") or ""
+            _w_book = self._pm.get_book(_w_token_id) if _w_token_id else None
+            _csv_row["winner_bid_at_exit"] = round(_w_book.best_bid, 4) if _w_book and _w_book.best_bid is not None else None
+
+            # loser_bid_at_exit — the bid that triggered the exit (the fill price IS
+            # the best-available bid at trigger time; no separate lookup needed)
+            _csv_row["loser_bid_at_exit"] = round(exit_price, 4)
+
+            # oracle_delta_at_exit — (spot - strike) / strike * 100 at exit time
+            # >0 means oracle says the exiting leg is winning (wrong exit signal)
+            _exit_oracle_delta: Optional[float] = None
+            _underlying_oe = getattr(loser_pos, "underlying", "") or ""
+            _market_type_oe = getattr(loser_pos, "market_type", "") or ""
+            _strike_oe = getattr(loser_pos, "strike", 0.0) or 0.0
+            if self._spot is not None and _underlying_oe and _market_type_oe and _strike_oe > 0:
+                _spot_mid_oe = self._spot.get_mid(_underlying_oe, _market_type_oe)
+                if _spot_mid_oe is not None:
+                    try:
+                        if filled_side in ("YES", "UP"):
+                            _exit_oracle_delta = round((_spot_mid_oe - _strike_oe) / _strike_oe * 100, 4)
+                        else:
+                            _exit_oracle_delta = round((_strike_oe - _spot_mid_oe) / _strike_oe * 100, 4)
+                    except ZeroDivisionError:
+                        pass
+            _csv_row["oracle_delta_at_exit"] = _exit_oracle_delta
+
+            # tte_at_exit_secs — seconds remaining when loser_exit fires
+            _end_date_oe = getattr(loser_pos, "end_date", None) or pair.get("end_date")
+            _tte_exit: Optional[float] = None
+            if _end_date_oe is not None:
+                try:
+                    _end_ts = _end_date_oe.timestamp() if hasattr(_end_date_oe, "timestamp") else float(_end_date_oe)
+                    _tte_exit = round(_end_ts - time.time(), 1)
+                except (TypeError, ValueError, AttributeError):
+                    pass
+            _csv_row["tte_at_exit_secs"] = _tte_exit
+
             _write_on_fills_row(_csv_row)
         # ON-02: arm winner backfill so notify_winner_closed() or stop() can
         # fill in winner_exit_price via an in-place CSV row update.
@@ -2576,6 +2650,16 @@ class OpeningNeutralScanner(BaseStrategy):
             # no SL / TP until the market resolves.  Clear neutral_pair_id since
             # the pair structure is dissolved (loser already closed).
             winner_pos.neutral_pair_id = ""
+            # Tag the predicted winner in accounting as fill_type="P_WINNER"
+            # (without changing strategy) so the ledger identifies which leg we
+            # expect to resolve at $1.  P_WINNER ≠ WINNER — resolution is not
+            # confirmed here; on_resolved() determines the actual outcome.
+            if winner_pos.token_id:
+                try:
+                    from accounting import get_ledger
+                    get_ledger().on_winner_held(winner_pos.token_id)
+                except Exception as _wh_err:
+                    log.debug("acct: on_winner_held failed", exc=str(_wh_err))
             log.info(
                 "OpeningNeutral: winner held to resolution (PROMOTE_TO_MOMENTUM=False)",
                 pair_id=pair_id[:12],

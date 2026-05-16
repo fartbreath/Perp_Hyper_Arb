@@ -71,7 +71,12 @@ PM_WS_PING_INTERVAL: float = 10.0    # seconds
 # INVALID OPERATION ("shard_tokens=100 shard_rejected=6" observed in prod).
 # Set to 50 to stay well within the limit and allow headroom for incremental
 # subscriptions added mid-session without crossing the rejection threshold.
-PM_WS_MAX_MARKETS_PER_WS: int = 100
+PM_WS_MAX_MARKETS_PER_WS: int = 50
+# Enable best_bid_ask WS events (requires custom_feature_enabled on subscription).
+# These events give authoritative best-bid pruning on thin near-expiry books but
+# generate events for every subscribed token — can saturate the event loop at
+# scale (35 shards × 50 tokens). Disable if shards are 1006-cascading.
+PM_WS_BEST_BID_ASK: bool = True
 
 # ── Hyperliquid ─────────────────────────────────────────────────────────────
 HL_ADDRESS: str = os.getenv("HL_ADDRESS", "")
@@ -302,14 +307,14 @@ STRATEGY_MOMENTUM_ENABLED: bool = False     # Strategy 3: Momentum / price-confi
 STRATEGY_SPREAD_ENABLED: bool = False       # Strategy 4: Calendar spread / relative-value
 OPENING_NEUTRAL_ENABLED: bool = False       # Strategy 5: Opening neutral (simultaneous YES+NO entry)
 REVERSE_OPENING_NEUTRAL_ENABLED: bool = False  # Strategy 5b: Reverse ON — paper experiment; mirrors ON entry, sells winner for TP, holds loser
-RON_DOUBLE_DOWN_USD: float = 0.0  # Strategy 5b: additional USDC to simulate buying more of the LOSER at winner TP time; 0=disabled
+RON_DOUBLE_DOWN_USD: float = 1.0  # Strategy 5b: additional USDC to simulate buying more of the LOSER at winner TP time; 0=disabled
 
 # ── Strategy 5 — Opening Neutral ──────────────────────────────────────────
 # Market types the scanner watches for simultaneous YES+NO entry opportunities.
 # All bucket types are included — the _is_updown_market() filter ensures only
 # Up/Down direction markets are entered regardless of bucket size.
 OPENING_NEUTRAL_MARKET_TYPES: list = [
-    "bucket_5m", "bucket_15m" #, "bucket_1h", "bucket_4h"
+    "bucket_5m"#, "bucket_15m" , "bucket_1h", "bucket_4h"
 ]
 # How long after open to keep a market in pending state / LIMIT-mode fill timeout.
 # Not an entry gate — entries are pre-market only (timer path). This controls
@@ -331,6 +336,19 @@ OPENING_NEUTRAL_ENTRY_TIMEOUT_SECS: int = 30
 # within this window the order was killed (no match) and the leg is treated as
 # unfilled.  Kept short so the one-leg decision is made in seconds, not 30s.
 OPENING_NEUTRAL_FAK_FILL_TIMEOUT_SECS: int = 10
+# FAK slippage cap (in price units, i.e. dollars-per-share) added to the observed
+# best ask when sending the FAK BUY.  A wider cap lets the order sweep through to
+# the next price level when the top-of-book ask gets swept in the millisecond
+# window between book-cache snapshot and matcher arrival — the dominant cause of
+# one-leg-fill (see bot.log 11:09:58: YES leg killed with "no orders found to
+# match" while NO leg filled at the same instant).  Pays a few extra ticks on
+# entry but completes the pair.
+OPENING_NEUTRAL_FAK_SLIPPAGE_CAP: float = 0.01
+# Per-leg book-depth safety multiplier for the thin-book entry gate.  Both YES
+# and NO must show resting ask size >= MULT * required_contracts in the WS book
+# cache before the FAK is sent.  >1.0 protects against a partial sweep between
+# snapshot and matcher arrival killing one leg.
+OPENING_NEUTRAL_DEPTH_MARGIN_MULT: float = 2.0
 # What to do when only one leg fills within the timeout.
 # "keep_as_momentum" — leave the filled leg running as a momentum position.
 # "exit_immediately" — taker-exit the filled leg at best bid.
@@ -409,7 +427,7 @@ OPENING_NEUTRAL_WINNER_SELL_BUFFER: float = 0.03
 #     funding < -threshold      → NO loser (YES wins 76.2%)
 #     depth_share > 0.75        → NO loser (YES wins 60.0%)
 #   |score| >= 2 → both signals agree → apply TIGHTEN to predicted loser trigger.
-OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED: bool = True
+OPENING_NEUTRAL_LOSER_CONFIDENCE_ENABLED: bool = False
 OPENING_NEUTRAL_LOSER_CONFIDENCE_TIGHTEN: float = 0.02
 
 # ── Oracle delta gate (ON-06) ─────────────────────────────────────────────────
@@ -561,6 +579,22 @@ MOMENTUM_KELLY_EDGE_PREMIUM: float = 0.07        # alpha above CLOB ask price
 MOMENTUM_KELLY_WIN_PROB_CAP: float = 0.95        # hard cap on win_prob_eff
 MOMENTUM_KELLY_CLOB_RELIABLE_TTE: int = 60       # seconds; above this CLOB fully weighted
 MOMENTUM_KELLY_ORACLE_SENSITIVITY: float = 0.15  # slope: delta multiples → win_prob
+# Per-bucket floor on _edge_scale.  0.0 = no change (default for all types).
+# Set e.g. {"bucket_5m": 0.3} to ensure 5m threshold signals claim 30% of the
+# edge premium instead of 0% — preventing kelly_f from collapsing to zero on
+# signals that just clear the entry gate.
+MOMENTUM_KELLY_EDGE_SCALE_BASE_BY_TYPE: dict[str, float] = {}
+
+# Z-score piecewise multiplier on kelly_f.  Empty list = no scaling (default).
+# Each element is [z_min, multiplier].  The multiplier for a signal is taken
+# from the entry with the highest z_min that is still <= signal_obs_z.
+# Example: [[0.0, 0.5], [1.5, 1.0], [2.0, 1.25]]
+#   z < 1.5        → 0.5×  (reduce sizing on weak signals)
+#   1.5 ≤ z < 2.0  → 1.0×  (no change)
+#   z ≥ 2.0        → 1.25× (boost sizing on strong signals)
+# The final kelly_f is still clamped to [0, 1] and subject to
+# MOMENTUM_MAX_ENTRY_USD and MOMENTUM_MIN_ENTRY_USD floors.
+MOMENTUM_KELLY_Z_SCORE_MULTIPLIER: list[list] = []
 
 # Kelly Phase-A extension — persistence z-boost.
 

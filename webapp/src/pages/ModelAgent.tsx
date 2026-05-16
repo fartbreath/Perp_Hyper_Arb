@@ -79,6 +79,32 @@ function AgreementCard({ rate }: { rate: number | null }) {
   );
 }
 
+// ── Accuracy card ─────────────────────────────────────────────────────────────
+
+function AccuracyCard({ label, accuracy, resolved }: { label: string; accuracy: number | null; resolved: number }) {
+  if (accuracy === null || resolved === 0) {
+    return (
+      <div className="card" style={{ minWidth: 180 }}>
+        <div className="card-label">{label} Accuracy</div>
+        <div className="card-value" style={{ color: "#9ca3af" }}>—</div>
+        <div style={{ fontSize: 12, color: "#6b7280" }}>no resolved outcomes</div>
+      </div>
+    );
+  }
+  const colour = accuracy >= 0.6 ? "#22c55e" : accuracy >= 0.5 ? "#f59e0b" : "#ef4444";
+  return (
+    <div className="card" style={{ minWidth: 180 }}>
+      <div className="card-label">{label} Accuracy</div>
+      <div className="card-value" style={{ color: colour, fontSize: 32, fontWeight: 700 }}>
+        {pct(accuracy)}
+      </div>
+      <div style={{ fontSize: 12, color: "#6b7280" }}>
+        {resolved} resolved · {accuracy >= 0.6 ? "✓ Better than random" : accuracy >= 0.5 ? "⚠ Near random" : "✗ Below random"}
+      </div>
+    </div>
+  );
+}
+
 // ── Decision type tabs ────────────────────────────────────────────────────────
 
 const TABS = ["all", "entry", "exit"] as const;
@@ -227,6 +253,10 @@ export default function ModelAgentPage() {
     agreement_rate_last_20: null,
     total_decisions: 0,
     pending_outcomes: 0,
+    model_a_accuracy: null,
+    model_b_accuracy: null,
+    model_a_resolved: 0,
+    model_b_resolved: 0,
   };
 
   return (
@@ -268,6 +298,22 @@ export default function ModelAgentPage() {
         </div>
 
         {status.enabled && <AgreementCard rate={status.agreement_rate_last_20} />}
+
+        {status.enabled && (
+          <AccuracyCard
+            label="Model A (Entry)"
+            accuracy={status.model_a_accuracy}
+            resolved={status.model_a_resolved}
+          />
+        )}
+
+        {status.enabled && (
+          <AccuracyCard
+            label="Model B (Exit)"
+            accuracy={status.model_b_accuracy}
+            resolved={status.model_b_resolved}
+          />
+        )}
 
         {status.enabled && (
           <div className="card" style={{ minWidth: 160 }}>

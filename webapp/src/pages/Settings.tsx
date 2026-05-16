@@ -645,6 +645,15 @@ export default function Settings() {
           ]}
           onSubmit={(v) => apply({ opening_neutral_one_leg_fallback: v })}
         />
+
+        {GAP}
+
+        <Toggle
+          label="Promote Winner to Momentum"
+          description="When ON, the winner leg is handed to PositionMonitor as a momentum position (subject to delta SL, upfrac exit, etc.). When OFF, the winner is held to resolution as an opening_neutral position — no stop-loss, collects full payout if the loser prediction is correct. Recommended: OFF. Data shows holding to resolution is +$5.91 better over 29 pairs."
+          value={data.opening_neutral_promote_to_momentum ?? true}
+          onChange={(v) => apply({ opening_neutral_promote_to_momentum: v })}
+        />
       </div>
 
       {/* ── 2c. Opening Neutral — Asymmetric Sells (Phase 1) ─────────── */}

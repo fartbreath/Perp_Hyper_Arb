@@ -657,6 +657,8 @@ export interface ConfigData {
   opening_neutral_loser_confidence_tighten?: number;
   // ON-07 — Winner confirmation gate
   opening_neutral_winner_confirm_floor?: number;
+  // ON winner exit mode
+  opening_neutral_promote_to_momentum?: boolean;
   // ML / Model Agent (Phase 3–4)
   model_agent_enabled?: boolean;
   model_b_enabled?: boolean;
@@ -945,6 +947,10 @@ export interface ModelStatusData {
   agreement_rate_last_20: number | null;
   total_decisions: number;
   pending_outcomes: number;
+  model_a_accuracy: number | null;
+  model_b_accuracy: number | null;
+  model_a_resolved: number;
+  model_b_resolved: number;
 }
 
 export interface ShadowLogRow {
@@ -1424,6 +1430,48 @@ export async function dismissGhostPosition(tokenId: string, exitPrice: number = 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error((body as { detail?: string }).detail ?? `Dismiss failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+// ── Manual reconcile sweep (Performance page) ─────────────────────────────────
+
+export interface ReconcileResult {
+  window_days: number;
+  since_utc: string;
+  ledger: { rows: number; net_pnl: number; fees: number; rebates: number };
+  pm: {
+    rows: number;
+    buy_usd: number;
+    sell_usd: number;
+    redeem_usd: number;
+    net_realized: number;
+  };
+  drift_usd: number;
+  per_market: Array<{
+    market_title: string;
+    buy_usd: number;
+    sell_usd: number;
+    redeem_usd: number;
+    pm_net_usd: number;
+  }>;
+  reconciliation_flagged: Array<{
+    recorded_at: string;
+    market_title: string;
+    side: string;
+    net_pnl: number;
+    notes: string;
+  }>;
+  timestamp: number;
+}
+
+export async function runReconcile(days: number = 14): Promise<ReconcileResult> {
+  const res = await fetch(`${BASE_URL}/reconcile/run?days=${days}`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Reconcile failed: ${res.status}`);
   }
   return res.json();
 }

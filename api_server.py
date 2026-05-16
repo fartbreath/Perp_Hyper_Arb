@@ -2707,6 +2707,173 @@ async def pm_history_endpoint(
         raise HTTPException(status_code=502, detail="Failed to fetch PM history")
 
 
+# ── Manual ledger ↔ PM /activity reconcile sweep ──────────────────────────────
+
+async def _fetch_pm_activity_window(funder: str, since_ts: int) -> list[dict]:
+    """Page through PM data-api /activity from `since_ts` (unix seconds) forward.
+
+    Polymarket caps offset at 3000.  We bypass that limit by using the
+    `start=<unix_ts>` query parameter (data-api accepts it) so windowed
+    fetches don't trip the cap.  Returns rows in API-native shape.
+    """
+    rows: list[dict] = []
+    page_size = 500
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        offset = 0
+        while True:
+            url = (
+                f"https://data-api.polymarket.com/activity"
+                f"?user={funder}&limit={page_size}&offset={offset}&start={since_ts}"
+            )
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                log.warning("reconcile sweep: PM activity fetch failed", offset=offset, exc=str(exc))
+                break
+            page = data if isinstance(data, list) else data.get("value", [])
+            if not page:
+                break
+            rows.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+            if offset >= 3000:
+                # Cap-protect: shift the window forward if user is hyper-active
+                break
+    return rows
+
+
+@app.post("/reconcile/run", dependencies=[Depends(require_auth)])
+async def reconcile_run_endpoint(
+    days: int = Query(default=14, ge=1, le=90),
+) -> dict:
+    """Manual sweep: compare net ledger USD against PM /activity ground truth.
+
+    Computes:
+      ledger_pnl       = sum of net_pnl in acct_ledger.csv over window
+      pm_realized      = sum of (SELL usdcSize) + (REDEEM usdcSize) - (BUY usdcSize)
+      drift            = ledger_pnl - pm_realized
+      per_market       = same breakdown grouped by market title
+      reconciliation_required = ledger rows whose reconciliation_notes contain
+                                the RECONCILE_REQUIRED flag
+
+    Pure read-only.  Never mutates the ledger.  Triggered manually from the
+    Performance page.
+    """
+    funder = config.POLY_FUNDER
+    if not funder:
+        raise HTTPException(status_code=503, detail="POLY_FUNDER not configured")
+
+    now = datetime.now(timezone.utc)
+    since_dt = now - timedelta(days=days)
+    since_ts = int(since_dt.timestamp())
+
+    # ── Ledger side ───────────────────────────────────────────────────────────
+    ledger_rows: list[dict] = []
+    if ACCT_LEDGER_CSV.exists():
+        try:
+            with ACCT_LEDGER_CSV.open(newline="", encoding="utf-8") as f:
+                ledger_rows = list(csv.DictReader(f))
+        except Exception as exc:
+            log.error("reconcile: failed to read ledger", exc=str(exc))
+            raise HTTPException(status_code=500, detail="Failed to read ledger")
+
+    def _row_in_window(row: dict) -> bool:
+        ts = row.get("recorded_at") or row.get("entry_time") or ""
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt >= since_dt
+        except Exception:
+            return False
+
+    ledger_in_window = [r for r in ledger_rows if _row_in_window(r)]
+    ledger_pnl = sum(float(r.get("net_pnl", 0) or 0) for r in ledger_in_window)
+    ledger_fees = sum(float(r.get("fees_usd", 0) or 0) for r in ledger_in_window)
+    ledger_rebates = sum(float(r.get("rebates_usd", 0) or 0) for r in ledger_in_window)
+
+    # Surface any rows already flagged by the new accounting divergence guard
+    reconcile_flagged: list[dict] = []
+    for r in ledger_in_window:
+        notes = (r.get("reconciliation_notes") or "").strip()
+        if "RECONCILE_REQUIRED" in notes:
+            reconcile_flagged.append({
+                "recorded_at": r.get("recorded_at", ""),
+                "market_title": r.get("market_title", ""),
+                "side": r.get("side", ""),
+                "net_pnl": float(r.get("net_pnl", 0) or 0),
+                "notes": notes,
+            })
+
+    # ── PM /activity side ─────────────────────────────────────────────────────
+    pm_rows = await _fetch_pm_activity_window(funder, since_ts)
+
+    pm_buy_total = 0.0
+    pm_sell_total = 0.0
+    pm_redeem_total = 0.0
+    by_market: dict[str, dict] = {}
+
+    for row in pm_rows:
+        rtype = (row.get("type") or "").upper()
+        side = (row.get("side") or "").upper()
+        try:
+            usdc = float(row.get("usdcSize") or 0)
+        except (TypeError, ValueError):
+            usdc = 0.0
+        title = row.get("title") or row.get("slug") or "?"
+        bucket = by_market.setdefault(title, {"market_title": title, "buy": 0.0, "sell": 0.0, "redeem": 0.0})
+        if rtype == "TRADE" and side == "BUY":
+            pm_buy_total += usdc
+            bucket["buy"] += usdc
+        elif rtype == "TRADE" and side == "SELL":
+            pm_sell_total += usdc
+            bucket["sell"] += usdc
+        elif rtype == "REDEEM":
+            pm_redeem_total += usdc
+            bucket["redeem"] += usdc
+
+    pm_realized = round(pm_sell_total + pm_redeem_total - pm_buy_total, 6)
+    drift = round(ledger_pnl - pm_realized, 6)
+
+    # Per-market net realized
+    per_market = []
+    for title, b in by_market.items():
+        net = round(b["sell"] + b["redeem"] - b["buy"], 6)
+        per_market.append({
+            "market_title": title,
+            "buy_usd":    round(b["buy"], 6),
+            "sell_usd":   round(b["sell"], 6),
+            "redeem_usd": round(b["redeem"], 6),
+            "pm_net_usd": net,
+        })
+    per_market.sort(key=lambda x: x["pm_net_usd"])  # worst first
+
+    return {
+        "window_days": days,
+        "since_utc":   since_dt.isoformat(),
+        "ledger": {
+            "rows":     len(ledger_in_window),
+            "net_pnl":  round(ledger_pnl, 6),
+            "fees":     round(ledger_fees, 6),
+            "rebates":  round(ledger_rebates, 6),
+        },
+        "pm": {
+            "rows":     len(pm_rows),
+            "buy_usd":     round(pm_buy_total, 6),
+            "sell_usd":    round(pm_sell_total, 6),
+            "redeem_usd":  round(pm_redeem_total, 6),
+            "net_realized": pm_realized,
+        },
+        "drift_usd":             drift,
+        "per_market":            per_market,
+        "reconciliation_flagged": reconcile_flagged,
+        "timestamp":             time.time(),
+    }
+
+
 # ── Order event log ───────────────────────────────────────────────────────────
 
 @app.get("/orders")

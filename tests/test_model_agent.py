@@ -59,10 +59,15 @@ _ON_FILL_COLS = [
     "loser_fill_price", "loser_fill_time_secs", "winner_exit_price",
 ]
 
-_TRADES_COLS = [
-    "timestamp", "entry_timestamp", "market_id", "market_title",
-    "market_type", "underlying", "side", "size", "price", "fees_paid",
-    "rebates_earned", "resolved_outcome", "exit_reason",
+_ACCT_LEDGER_COLS = [
+    "record_id", "recorded_at", "pos_id", "pair_id", "parent_pos_id",
+    "strategy", "fill_type", "market_id", "market_title", "market_type",
+    "underlying", "side", "token_id", "entry_vwap", "entry_contracts",
+    "entry_cost_usd", "entry_time", "exit_vwap", "exit_contracts", "exit_time",
+    "exit_type", "exit_reason", "spot_entry", "spot_exit", "strike",
+    "tte_seconds", "resolve_price", "resolved_outcome", "gross_pnl",
+    "fees_usd", "rebates_usd", "net_pnl", "pm_entry_confirmed",
+    "pm_exit_confirmed", "signal_source", "signal_score", "reconciliation_notes",
 ]
 
 
@@ -117,7 +122,7 @@ def tmp_paths(tmp_path):
         "analysis": analysis_dir,
         "momentum_fills": data_dir / "momentum_fills.csv",
         "on_fills": data_dir / "on_fills.csv",
-        "trades": data_dir / "trades.csv",
+        "acct_ledger": data_dir / "acct_ledger.csv",
         "shadow_log": analysis_dir / "shadow_log.csv",
     }
 
@@ -129,7 +134,7 @@ def _make_agent(paths: dict):
     with (
         patch("models.model_agent._ON_FILLS_PATH", paths["on_fills"]),
         patch("models.model_agent._MOMENTUM_FILLS_PATH", paths["momentum_fills"]),
-        patch("models.model_agent._TRADES_PATH", paths["trades"]),
+        patch("models.model_agent._ACCT_LEDGER_PATH", paths["acct_ledger"]),
         patch("models.model_agent._SHADOW_LOG_PATH", paths["shadow_log"]),
         patch.object(config, "MODEL_AGENT_ENABLED", True),
     ):
@@ -145,7 +150,7 @@ def _run_agent_async(paths: dict, coro_factory):
         with (
             patch("models.model_agent._ON_FILLS_PATH", paths["on_fills"]),
             patch("models.model_agent._MOMENTUM_FILLS_PATH", paths["momentum_fills"]),
-            patch("models.model_agent._TRADES_PATH", paths["trades"]),
+            patch("models.model_agent._ACCT_LEDGER_PATH", paths["acct_ledger"]),
             patch("models.model_agent._SHADOW_LOG_PATH", paths["shadow_log"]),
             patch.object(config, "MODEL_AGENT_ENABLED", True),
         ):
@@ -193,15 +198,15 @@ def test_no_duplicate_rows_on_reprocess(tmp_paths):
 # â”€â”€ AC-2: outcome-resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def test_pending_resolved_to_win_when_trade_csv_shows_win(tmp_paths):
-    """PENDING shadow row is updated to WIN when trades.csv shows resolved_outcome=WIN."""
+    """PENDING shadow row is updated to WIN when acct_ledger shows resolved_outcome=WIN."""
     ts = str(time.time() - 10)
     _write_csv(tmp_paths["momentum_fills"], [_make_momentum_fill("mkt-003", ts=ts)], _MOM_FILL_COLS)
 
-    trade = {k: "" for k in _TRADES_COLS}
-    trade["market_id"] = "mkt-003"
-    trade["resolved_outcome"] = "WIN"
-    trade["timestamp"] = str(time.time())
-    _write_csv(tmp_paths["trades"], [trade], _TRADES_COLS)
+    ledger = {k: "" for k in _ACCT_LEDGER_COLS}
+    ledger["market_id"] = "mkt-003"
+    ledger["side"] = "YES"
+    ledger["resolved_outcome"] = "WIN"
+    _write_csv(tmp_paths["acct_ledger"], [ledger], _ACCT_LEDGER_COLS)
 
     async def run(ma):
         await ma._ensure_header()
@@ -216,15 +221,15 @@ def test_pending_resolved_to_win_when_trade_csv_shows_win(tmp_paths):
 
 
 def test_pending_resolved_to_loss(tmp_paths):
-    """PENDING â†’ LOSS when trades.csv shows LOSS."""
+    """PENDING → LOSS when acct_ledger shows LOSS."""
     ts = str(time.time() - 10)
     _write_csv(tmp_paths["momentum_fills"], [_make_momentum_fill("mkt-004", ts=ts)], _MOM_FILL_COLS)
 
-    trade = {k: "" for k in _TRADES_COLS}
-    trade["market_id"] = "mkt-004"
-    trade["resolved_outcome"] = "LOSS"
-    trade["timestamp"] = str(time.time())
-    _write_csv(tmp_paths["trades"], [trade], _TRADES_COLS)
+    ledger = {k: "" for k in _ACCT_LEDGER_COLS}
+    ledger["market_id"] = "mkt-004"
+    ledger["side"] = "YES"
+    ledger["resolved_outcome"] = "LOSS"
+    _write_csv(tmp_paths["acct_ledger"], [ledger], _ACCT_LEDGER_COLS)
 
     async def run(ma):
         await ma._ensure_header()
@@ -312,7 +317,7 @@ def test_get_status_returns_correct_schema(tmp_paths):
         with (
             patch("models.model_agent._ON_FILLS_PATH", tmp_paths["on_fills"]),
             patch("models.model_agent._MOMENTUM_FILLS_PATH", tmp_paths["momentum_fills"]),
-            patch("models.model_agent._TRADES_PATH", tmp_paths["trades"]),
+            patch("models.model_agent._ACCT_LEDGER_PATH", tmp_paths["acct_ledger"]),
             patch("models.model_agent._SHADOW_LOG_PATH", tmp_paths["shadow_log"]),
             patch.object(config, "MODEL_AGENT_ENABLED", True),
         ):
@@ -358,7 +363,7 @@ def test_get_shadow_log_filter_by_decision_type(tmp_paths):
         with (
             patch("models.model_agent._ON_FILLS_PATH", tmp_paths["on_fills"]),
             patch("models.model_agent._MOMENTUM_FILLS_PATH", tmp_paths["momentum_fills"]),
-            patch("models.model_agent._TRADES_PATH", tmp_paths["trades"]),
+            patch("models.model_agent._ACCT_LEDGER_PATH", tmp_paths["acct_ledger"]),
             patch("models.model_agent._SHADOW_LOG_PATH", tmp_paths["shadow_log"]),
             patch.object(config, "MODEL_AGENT_ENABLED", True),
         ):

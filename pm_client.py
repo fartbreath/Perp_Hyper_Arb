@@ -419,13 +419,42 @@ class _WSShard:
         try:
             # Correct incremental format: SubscriptionRequestUpdate
             # See https://docs.polymarket.com/asyncapi.json
-            msg = {"operation": "subscribe", "assets_ids": list(tokens), "custom_feature_enabled": True}
+            msg = {"operation": "subscribe", "assets_ids": list(tokens)}
+            if getattr(config, "PM_WS_BEST_BID_ASK", False):
+                msg["custom_feature_enabled"] = True
             await self._ws.send(json.dumps(msg))
             log.debug("PM WS shard incremental subscribe",
                       shard_id=self.shard_id, added=len(tokens))
         except Exception as exc:
             log.debug("PM WS shard incremental subscribe failed",
                       shard_id=self.shard_id, exc=str(exc))
+
+    async def _ping_loop(self, ws) -> None:
+        """Send application-level 'PING' text messages per PM AsyncAPI spec.
+
+        PM's market WS server requires clients to send the literal text 'PING'
+        every PM_WS_PING_INTERVAL seconds (default 10 s) to keep the session
+        alive.  The server responds with the text 'PONG'.  This is separate
+        from WebSocket protocol-level ping frames (binary frame 0x9/0xA) which
+        PM's application layer does not count as keepalives.
+
+        Without this, PM drops connections that have no recent market events
+        (quiet markets on higher-numbered shards) with CloseCode 1006 after
+        ~60 s.  Lower shards (active markets) survived previously only because
+        frequent price_change events reset PM's idle timer.
+        """
+        try:
+            while True:
+                await asyncio.sleep(config.PM_WS_PING_INTERVAL)
+                if self._ws is ws and self.connected:
+                    await ws.send("PING")
+                    log.debug("PM WS shard PING sent", shard_id=self.shard_id)
+                else:
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass  # Connection dropped — outer _loop handles reconnect
 
     async def _loop(self) -> None:
         # Stagger the initial connection attempt by shard_id seconds so that
@@ -442,6 +471,17 @@ class _WSShard:
             try:
                 async with websockets.connect(
                     config.PM_WS_URL,
+                    # Protocol-level binary ping frames (ping_interval) serve two
+                    # purposes independent of PM's application-level keepalive:
+                    # 1. They let the websockets library detect dead TCP connections
+                    #    and close them cleanly before the OS fires a TCP RST.  Without
+                    #    this, abrupt server-side drops hit Windows ProactorEventLoop's
+                    #    IOCP queue while transport is already None, causing:
+                    #    AttributeError: 'NoneType' object has no attribute 'resume_reading'
+                    # 2. They maintain the TCP connection through NAT/firewalls.
+                    # _ping_loop() separately sends application-level text 'PING' per
+                    # PM's AsyncAPI spec to reset PM's own idle timer (1006 prevention).
+                    # Both are required and serve different layers.
                     ping_interval=config.PM_WS_PING_INTERVAL,
                     ping_timeout=20,
                 ) as ws:
@@ -460,12 +500,16 @@ class _WSShard:
                         # No auth field; lowercase type key.  All tokens sent in
                         # a single message — each shard holds ≤ PM_WS_MAX_MARKETS_PER_WS
                         # tokens so this never exceeds the server per-session limit.
-                        # custom_feature_enabled enables best_bid_ask events (price
-                        # updates even in thin books with no active orders).
-                        msg = {"assets_ids": tokens_snapshot, "type": "market", "custom_feature_enabled": True}
+                        msg = {"assets_ids": tokens_snapshot, "type": "market"}
+                        if getattr(config, "PM_WS_BEST_BID_ASK", False):
+                            msg["custom_feature_enabled"] = True
                         await ws.send(json.dumps(msg))
 
-                    async for raw in ws:
+                    # Application-level keepalive per PM AsyncAPI spec.
+                    # Runs concurrently with the receive loop; cancelled on disconnect.
+                    _ping_task = asyncio.ensure_future(self._ping_loop(ws))
+                    try:
+                        async for raw in ws:
                             if not raw.startswith("{") and not raw.startswith("["):
                                 if "INVALID" in raw.upper():
                                     self._rejected += 1
@@ -487,18 +531,6 @@ class _WSShard:
                                 continue
                             # Process this message SEQUENTIALLY (not create_task) so the
                             # total number of ready tasks in the event loop stays low.
-                            #
-                            # With create_task: 18 shards × 100 book events = 1800 tasks at
-                            # startup; each fires 6 price-callback tasks → 10800 tasks.
-                            # RTDS and PM server-pong handling are buried at the end of
-                            # that queue and starve for 8+ minutes.
-                            #
-                            # With sequential await: max ~18 receive-loop tasks + ~108
-                            # price-callback tasks at any moment.  _fire_price_change still
-                            # uses create_task for its callbacks so a slow callback (e.g.
-                            # monitor REST exit) never blocks this receive loop.
-                            # The sleep(0) after each message yields to let those tasks and
-                            # I/O (server pong, RTDS data) run before the next message.
                             try:
                                 # S3.2: Track last message time for shard health.
                                 self._last_message_at = time.time()
@@ -507,7 +539,8 @@ class _WSShard:
                             except Exception as exc:
                                 log.error("PM WS msg processing error",
                                           shard_id=self.shard_id, exc=str(exc))
-                            await asyncio.sleep(0)
+                    finally:
+                        _ping_task.cancel()
 
             except ConnectionClosed as exc:
                 log.warning("PM WS shard disconnected",
@@ -582,6 +615,10 @@ class PMClient:
         # strategies (e.g. momentum + opening_neutral) can register independently
         # without overwriting each other.  All sets are unioned in _update_shards.
         self._extra_tokens_by_owner: dict[str, set[str]] = {}
+        # Tokens that should receive best_bid_ask processing when PM_WS_BEST_BID_ASK
+        # is enabled.  Keyed by owner (same pattern as _extra_tokens_by_owner).
+        # If all sets are empty, all tokens are processed (no filter).
+        self._best_bid_ask_owners: dict[str, set[str]] = {}
         self._price_callbacks: list[Callable] = []
         self._order_fill_callbacks: list[Callable] = []
         self._user_ws_reconnect_callbacks: list[Callable] = []  # A1: fired after user WS reconnects
@@ -1183,7 +1220,7 @@ class PMClient:
                             fallback_threshold=_book_fallback_secs,
                         )
                         asyncio.create_task(
-                            self.fetch_book_rest(_pt),
+                            self._refresh_priority_book_rest(_pt),
                             name=f"pm_rest_book_{_pt[:12]}",
                         )
 
@@ -1443,10 +1480,16 @@ class PMClient:
             pass  # full book resent on trade via book event
         elif event_type == "best_bid_ask":
             # Fired when best bid or ask changes (requires custom_feature_enabled).
-            # More reliable than price_change for thin near-expiry books where
-            # there is no active order placement but the best level shifts.
-            self._update_book_from_best_bid_ask(msg)
+            # Only process for tokens registered via register_best_bid_ask_tokens.
+            # If no tokens are registered, process all (unfiltered fallback).
             token_id = msg.get("asset_id", "")
+            _watched: set[str] = (
+                set().union(*self._best_bid_ask_owners.values())
+                if self._best_bid_ask_owners else set()
+            )
+            if _watched and token_id not in _watched:
+                return  # not a watched token — skip to avoid event loop saturation
+            self._update_book_from_best_bid_ask(msg)
             snap = self._books.get(token_id)
             if snap and snap.mid is not None:
                 await self._fire_price_change(token_id, snap.mid)
@@ -1916,8 +1959,8 @@ class PMClient:
             try:
                 async with websockets.connect(
                     config.PM_USER_WS_URL,
-                    ping_interval=config.PM_WS_PING_INTERVAL,
-                    ping_timeout=20,
+                    ping_interval=config.PM_WS_PING_INTERVAL,  # client keepalive: detects dead
+                    ping_timeout=20,                            # peers + keeps NAT entries warm.
                 ) as ws:
                     await ws.send(sub_msg)
                     log.info("PM user WS connected — fill events active")
@@ -2392,6 +2435,53 @@ class PMClient:
             return None
         return yes_depth / total
 
+    async def _refresh_priority_book_rest(self, token_id: str) -> None:
+        """Fetch a priority token's book via REST; auto-deregister on 404 (market expired).
+
+        Makes a single HTTP call. On 200: updates the book cache. On 404: auto-deregisters
+        the token (market is expired — no open position can exist for it). On other errors:
+        logs at debug level and leaves the token registered for the next cycle.
+        """
+        url = f"{config.POLY_HOST}/book"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    params={"token_id": token_id},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status == 404:
+                        # Market expired — safe to auto-deregister.
+                        self._priority_tokens.discard(token_id)
+                        log.warning(
+                            "PM priority book 404 — market expired, auto-deregistering",
+                            token_id=token_id[:16],
+                        )
+                        return
+                    if resp.status != 200:
+                        log.debug(
+                            "PM priority book REST non-200 — will retry next cycle",
+                            token_id=token_id[:16],
+                            status=resp.status,
+                        )
+                        return
+                    data = await resp.json()
+            bids = sorted(
+                [(float(e["price"]), float(e["size"])) for e in data.get("bids", [])],
+                key=lambda x: x[0], reverse=True,
+            )
+            asks = sorted(
+                [(float(e["price"]), float(e["size"])) for e in data.get("asks", [])],
+                key=lambda x: x[0],
+            )
+            snap = OrderBookSnapshot(token_id=token_id, bids=bids, asks=asks)
+            self._books[token_id] = snap
+        except Exception as exc:  # pylint: disable=broad-except
+            log.debug(
+                "PM priority book REST error — will retry next cycle",
+                token_id=token_id[:16], exc=str(exc),
+            )
+
     async def fetch_book_rest(self, token_id: str) -> Optional["OrderBookSnapshot"]:
         """Fetch a fresh orderbook snapshot from the CLOB REST API.
 
@@ -2479,6 +2569,18 @@ class PMClient:
         self._extra_tokens_by_owner[owner] = token_ids
         if self._running:
             asyncio.ensure_future(self._update_shards())
+
+    def register_best_bid_ask_tokens(self, token_ids: set[str], owner: str = "default") -> None:
+        """Register tokens that should receive best_bid_ask event processing.
+
+        Only relevant when PM_WS_BEST_BID_ASK=True.  Events for tokens NOT in
+        any registered set are dropped before book update or callback, preventing
+        event-loop saturation from 1750-token floods.
+
+        If no owner has registered (all sets empty), all tokens are processed
+        as a safe fallback.  Call with an empty set to clear an owner's watch.
+        """
+        self._best_bid_ask_owners[owner] = token_ids
 
     def fee_free_markets(self) -> list[PMMarket]:
         return [m for m in self._markets.values() if m.is_fee_free]

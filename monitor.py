@@ -642,7 +642,7 @@ def should_exit(
             _gk_psl = f"{pos.token_id}:suppress_prob_sl_oracle"
             _cnt_psl = suppress_counts.get(_gk_psl, 0) + 1
             suppress_counts[_gk_psl] = _cnt_psl
-            if _cnt_psl >= config.GATE_LOG_CONSECUTIVE_THRESHOLD:
+            if _cnt_psl >= config.GATE_LOG_CONSECUTIVE_THRESHOLD and _should_log_count(_cnt_psl, config.GATE_LOG_CONSECUTIVE_THRESHOLD):
                 log.warning(
                     "gate_suppressed",
                     strategy="momentum",
@@ -1328,6 +1328,8 @@ class PositionMonitor:
                                     mkt.condition_id, exit_price=_exit_p,
                                     side=rp.side, resolved_outcome=_outcome_str,
                                 )
+                                if rp.token_id and hasattr(self._pm, "deregister_priority_token"):
+                                    self._pm.deregister_priority_token(rp.token_id)
                         # Force-correct any already-closed record with wrong outcome
                         try:
                             patched = self._risk.patch_trade_outcome(
@@ -1649,6 +1651,8 @@ class PositionMonitor:
                                     mkt.condition_id, exit_price=settled_price, side=rp.side,
                                     resolved_outcome=_win_str,
                                 )
+                                if rp.token_id and hasattr(self._pm, "deregister_priority_token"):
+                                    self._pm.deregister_priority_token(rp.token_id)
                         # Correct any already-closed record with wrong outcome
                         try:
                             patched = self._risk.patch_trade_outcome(

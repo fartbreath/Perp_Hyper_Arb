@@ -20,27 +20,36 @@ from typing import Any
 # ── Feature lists (must match train_model.py) ────────────────────────────────
 
 # Model B — exit quality gate
+# NOTE: tte_seconds_at_entry is intentionally excluded — feature_builder.py does
+# not populate it for Opening Neutral rows (all zero, zero variance).
 MODEL_B_FEATURES: list[str] = [
-    "oracle_delta_pct",
-    "deribit_iv",
-    "implied_prob",
-    "on_yes_depth_share",
+    # Entry-time: CLOB depth signal (8x difference between wrong vs correct exits)
+    "clob_yes_bid_depth_5",    # YES-leg top-5 bid depth in USDC at entry — strongest signal
+    "clob_yes_best_bid",       # YES best bid at entry
+    "on_clob_no_bid_depth_5",  # NO-leg bid depth at entry
+    # Entry-time: fill quality
     "on_loser_confidence_score",
     "on_loser_fill_price",
     "on_loser_fill_time_secs",
-    "tte_seconds_at_entry",
-    "hour_utc",
-    "on_funding_rate",
-    "on_combined_cost",
-    "clob_yes_best_bid",
-    "clob_yes_bid_depth_5",
-    # ON-only (v3) — -999 sentinel for Momentum rows
+    # Entry-time: oracle / IV context (sparse but real when available)
+    "deribit_iv",
     "on_price_to_beat",
-    "on_clob_no_bid_depth_5",
     "on_hl_mark_price",
+    # Time context
+    "hour_utc",
+    # v5: exit-time CLOB signals — ADD these once the bot collects data with scanner v5
+    # (100% null in current training data — held back to avoid corrupting the model)
+    # "on_winner_bid_at_exit",
+    # "on_loser_bid_at_exit",
+    # "on_oracle_delta_at_exit",
+    # "on_tte_at_exit_secs",
 ]
 
 # Model A — entry quality / sizing
+# NOTE: Only Momentum-specific features are included here.  ON-specific columns
+# (on_yes_depth_share, on_clob_no_bid_depth_5, on_funding_rate, on_price_to_beat,
+# on_hl_mark_price) were removed because they are always -999 for momentum rows
+# and the trained model does not include them in its feature set.
 MODEL_A_FEATURES: list[str] = [
     "mom_z_score",
     "mom_effective_z",
@@ -51,13 +60,7 @@ MODEL_A_FEATURES: list[str] = [
     "oracle_delta_pct",
     "deribit_iv",
     "mom_yes_depth_share",
-    "on_yes_depth_share",
-    # ON-only (v3) — -999 sentinel for pure Momentum rows
-    "on_clob_no_bid_depth_5",
     "mom_funding_rate",
-    "on_funding_rate",
-    "on_price_to_beat",
-    "on_hl_mark_price",
     "mom_tte_seconds",
     "tte_seconds_at_entry",
     "hour_utc",

@@ -200,8 +200,11 @@ class RTDSClient:
 
     async def _health_log_loop(self) -> None:
         """Every 20 s log RTDS feed health; reconnect if prices are stale too long."""
-        RTDS_STALE_THRESH      = 30.0    # seconds — exchange-aggregated should be active
-        RTDS_STALE_RECONNECT_S = 45.0    # force reconnect if all tracked coins stale this long
+        RTDS_STALE_THRESH      = 30.0    # seconds — log a warning when any coin exceeds this
+        RTDS_STALE_RECONNECT_S = 120.0   # force reconnect only if all tracked coins are this stale
+        # 120 s because crypto_prices is event-driven — during stable markets it can
+        # legitimately go 40-60 s between pushes.  45 s was too aggressive and caused
+        # reconnect churn that briefly cleared _prices, making health-check report DOWN.
         await asyncio.sleep(20)
         while self._running:
             rtds_ages = {
@@ -216,17 +219,15 @@ class RTDSClient:
                     rtds_stale=rtds_stale,
                     rtds_fresh={c: a for c, a in rtds_ages.items() if c not in rtds_stale},
                 )
-                # If all tracked coins are stale beyond the reconnect threshold, the
-                # RTDS server has stopped pushing data while responding to our PINGs
-                # (keeping the 15 s recv-timeout alive).  Force a reconnect by closing
-                # the WS so _ws_loop re-subscribes and gets a fresh price batch.
+                # If all tracked coins are stale beyond the reconnect threshold (120 s),
+                # the RTDS server has genuinely stopped pushing exchange prices.  Force
+                # a reconnect so _ws_loop re-subscribes and gets a fresh price batch.
                 #
-                # Guard: skip reconnect if no coin has ever sent a price on this
-                # connection (all ages == inf after _prices.clear() on fresh connect).
+                # Guard: skip if no coin has ever sent a price (all ages == inf on a
+                # brand-new connection before the first batch arrives).
                 # all([]) == True in Python, so without this guard a brand-new
                 # connection would immediately trigger another reconnect storm.
-                # Also guard with a 60 s cooldown after the last connect to give the
-                # server time to start delivering prices.
+                # Also guard with a 60 s cooldown after the last connect.
                 non_inf_ages = [a for a in rtds_ages.values() if a != float("inf")]
                 if (
                     rtds_ages
@@ -260,12 +261,15 @@ class RTDSClient:
                     self._ws = ws
                     backoff = 1.0
                     self._last_reconnect_at = time.time()
-                    # Clear stale cached prices so get_spot_age() returns inf
-                    # (never received) rather than ages from the previous session.
-                    # This prevents the health loop from immediately seeing
-                    # 45 s-stale prices and triggering another reconnect storm.
-                    self._prices.clear()
-                    self._cl_prices.clear()
+                    # Do NOT clear _prices / _cl_prices on reconnect.
+                    # Clearing caused a 3-5 s window where get_spot() returned None,
+                    # which made FeedHealth report DOWN for any open 1h/daily position
+                    # and drove /health/feeds to return HTTP 503.  Keeping the last
+                    # known prices means the feed stays STALE (not DOWN) during the
+                    # reconnect window — STALE is correct and never causes 503.
+                    # The RTDS_STALE_RECONNECT_S guard (120 s) prevents reconnect
+                    # storms even without the clear, because the cooldown only fires
+                    # after 2 minutes of complete exchange-price silence.
                     log.info("RTDSClient: RTDS WS connected")
 
                     await self._subscribe(ws)
