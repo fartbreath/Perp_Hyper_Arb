@@ -43,6 +43,12 @@ MODEL_B_FEATURES: list[str] = [
     # "on_loser_bid_at_exit",
     # "on_oracle_delta_at_exit",
     # "on_tte_at_exit_secs",
+    # v6: early-warning SL signals — ADD once 200+ exits have been logged with
+    # signal values (currently null in all historical rows — held back to avoid
+    # corrupting the model).  Join on market_id + exit tick ts from momentum_ticks.csv.
+    # "exit_hl_mark_div_pct",       # HL mark divergence at exit tick (Signal A)
+    # "exit_hl_depth_imbalance",    # HL book position-adjusted imbalance at exit (Signal B)
+    # "exit_tte_secs",              # TTE at exit tick (context for signal strength)
 ]
 
 # Model A — entry quality / sizing

@@ -670,6 +670,12 @@ export interface ConfigData {
   model_a_independent_entry_threshold?: number;
   model_a_min_tte_secs?: number;
   model_a_max_open_positions?: number;
+  // ML-C2: Model C divergence calibrator
+  model_c_enabled?: boolean;
+  model_c_suppress_threshold?: number;
+  // ML-D4: Model D config policy optimizer
+  model_d_enabled?: boolean;
+  model_d_max_delta_pct?: number;
 }
 
 export interface InventoryData {
@@ -961,6 +967,7 @@ export interface ShadowLogRow {
   rules_decision: string;
   model_a_score: string;
   model_b_score: string;
+  model_c_score?: string;  // ML-C2: present when MODEL_C_ENABLED=True
   model_decision: string;
   agreed: string;
   actual_outcome: string;
@@ -985,6 +992,8 @@ export interface ModelTrainStatus {
   last_exit_code: number | null;
   model_b_exists: boolean;
   model_a_exists: boolean;
+  model_c_exists: boolean;
+  model_d_exists: boolean;
   log_tail: string[];
 }
 
@@ -999,6 +1008,80 @@ export async function triggerModelTrain(): Promise<{ status: string }> {
   }
   return res.json();
 }
+
+// ── ML-C2: Model C calibration ────────────────────────────────────────────────
+
+export interface ModelCCalibrationBucket {
+  bucket_lo: number;
+  bucket_hi: number;
+  n: number;
+  actual_win_rate: number | null;
+  predicted_midpoint: number;
+}
+
+export interface ModelCScoreHistogramBucket {
+  lo: number;
+  hi: number;
+  count: number;
+}
+
+export interface ModelCCalibrationResponse {
+  exists: boolean;
+  reason?: string;
+  n_rows?: number;
+  n_scored?: number;
+  buckets?: ModelCCalibrationBucket[];
+  score_histogram?: ModelCScoreHistogramBucket[];
+  mean_score?: number;
+  actual_win_rate?: number;
+}
+
+export const useModelCCalibration = () =>
+  usePolling<ModelCCalibrationResponse>("/model/c/calibration", 60_000);
+
+// ── ML-D4: Model D recommendations ───────────────────────────────────────────
+
+export interface ModelDRecommendation {
+  vol_regime: string;
+  underlying: string;
+  n: number;
+  delta_z_score: number | null;
+  delta_kelly: number | null;
+  delta_delta_sl: number | null;
+}
+
+export interface ModelDRecommendationsResponse {
+  exists: boolean;
+  reason?: string;
+  n_signal_events?: number;
+  target_signal_events?: number;
+  n_rows_trained?: number;
+  trained_at?: number | null;
+  dimensions?: string[];
+  recommendations?: ModelDRecommendation[];
+}
+
+export const useModelDRecommendations = () =>
+  usePolling<ModelDRecommendationsResponse>("/model/d/recommendations", 60_000);
+
+export interface ModelDLogRow {
+  timestamp: string;
+  market_id: string;
+  market_type: string;
+  decision_type: string;
+  delta_z_score: string;
+  delta_kelly: string;
+  delta_sl: string;
+  context_snapshot: string;
+}
+
+export interface ModelDLogResponse {
+  rows: ModelDLogRow[];
+  total: number;
+}
+
+export const useModelDLog = (limit = 100) =>
+  usePolling<ModelDLogResponse>(`/model/d/log?limit=${limit}`, 15_000);
 
 // ── ML-08: model paper trades ─────────────────────────────────────────────────
 

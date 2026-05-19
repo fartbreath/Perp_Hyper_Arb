@@ -64,6 +64,7 @@ class FundingSnapshot:
     binance_predicted: Optional[float] = None
     bybit_predicted: Optional[float] = None
     timestamp: float = field(default_factory=time.time)
+    mark_px: Optional[float] = None  # HL perp mark price from webData2
 
 
 class HLClient:
@@ -85,6 +86,7 @@ class HLClient:
         self._bbo: dict[str, BBO] = {}          # coin → BBO
         self._mids: dict[str, float] = {}        # coin → mid price
         self._fundings: dict[str, FundingSnapshot] = {}
+        self._depth_imbalance: dict[str, float] = {}  # coin → (bid_depth - ask_depth) / total_depth
         self._bbo_callbacks: list[Callable] = []
         self._funding_update_callbacks: list[Callable] = []
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -257,6 +259,15 @@ class HLClient:
             bbo = BBO(coin=coin, bid=bid, ask=ask)
             self._bbo[coin] = bbo
             await self._fire_bbo(coin, bbo)
+            # Depth imbalance: sum top-N levels for early-warning SL signal
+            _depth_levels = getattr(config, "MOMENTUM_HL_DEPTH_SL_LEVELS", 5)
+            _sum_bid = sum(float(b["sz"]) for b in bids[:_depth_levels]) if bids else 0.0
+            _sum_ask = sum(float(a["sz"]) for a in asks[:_depth_levels]) if asks else 0.0
+            _total = _sum_bid + _sum_ask
+            if _total > 0 and coin in config.HL_PERP_COINS:
+                if not hasattr(self, "_depth_imbalance"):
+                    self._depth_imbalance = {}
+                self._depth_imbalance[coin] = (_sum_bid - _sum_ask) / _total
 
         elif channel == "webData2":
             # Real-time funding rate + mark price feed.
@@ -279,6 +290,7 @@ class HLClient:
                     coin=coin,
                     hl_predicted=rate,
                     timestamp=ts,
+                    mark_px=mark_px,
                 )
                 # Fire registered callbacks (e.g. FundingRateCache.on_ws_update)
                 self._fire_funding(coin, rate, ts, mark_px=mark_px)
@@ -377,6 +389,25 @@ class HLClient:
         if snap is None:
             return None
         return time.time() - snap.timestamp
+
+    def get_mark_price(self, coin: str) -> Optional[float]:
+        """Current HL perp mark price for coin from webData2 WS push.
+
+        Returns None if no webData2 message has been received yet for this coin.
+        Used by the early-warning SL signal (MOMENTUM_HL_MARK_SL_ENABLED).
+        """
+        snap = self._fundings.get(coin)
+        return snap.mark_px if snap is not None else None
+
+    def get_depth_imbalance(self, coin: str) -> Optional[float]:
+        """HL perp order book depth imbalance from the last l2Book WS message.
+
+        Returns (sum_bid_depth - sum_ask_depth) / total_depth over the top
+        MOMENTUM_HL_DEPTH_SL_LEVELS levels.  Range: [-1.0, +1.0].
+        +1.0 = all bids, -1.0 = all asks.  None if no l2Book message received yet.
+        Used by the early-warning SL signal (MOMENTUM_HL_DEPTH_SL_ENABLED).
+        """
+        return self._depth_imbalance.get(coin)
 
     def get_mid(self, coin: str) -> Optional[float]:
         """Best available mid price for coin."""

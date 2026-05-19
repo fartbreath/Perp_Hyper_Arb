@@ -84,6 +84,9 @@ LEDGER_HEADER = [
     "pm_entry_confirmed", "pm_exit_confirmed",
     "signal_source", "signal_score",
     "reconciliation_notes",
+    # ML-D2: config snapshot at trade close — enables per-trade parameter attribution.
+    "z_score_used", "kelly_multiplier_used", "delta_sl_pct_used",
+    "upfrac_threshold_used", "loser_exit_trigger_used",
 ]
 
 # How many seconds to wait after the first exit fill before declaring ERROR.
@@ -463,6 +466,16 @@ def _write_ledger_record(pos: AccountingPosition) -> None:
         "signal_source":      pos.signal_source,
         "signal_score":       pos.signal_score,
         "reconciliation_notes": reconciliation_notes,
+        # ML-D2: live config values at close time (approximate entry-time values,
+        # stable within a session; config_overrides.json changes apply to all trades
+        # opened after the reload so per-trade attribution is correct at session granularity).
+        "z_score_used":            getattr(config, "MOMENTUM_VOL_Z_SCORE", ""),
+        "kelly_multiplier_used":   getattr(config, "MOMENTUM_KELLY_MULTIPLIER", ""),
+        "delta_sl_pct_used":       config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get(
+            pos.underlying, config.MOMENTUM_DELTA_STOP_LOSS_PCT
+        ) if pos.underlying else getattr(config, "MOMENTUM_DELTA_STOP_LOSS_PCT", ""),
+        "upfrac_threshold_used":   getattr(config, "MOMENTUM_UPFRAC_EXIT_THRESHOLD", ""),
+        "loser_exit_trigger_used": getattr(config, "OPENING_NEUTRAL_LOSER_EXIT_TRIGGER", ""),
     }
     _append_ledger(row)
     log.info(

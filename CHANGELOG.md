@@ -2,6 +2,121 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-19] — Early Warning SL; ML-D4 Model D simulator; Model C simulator; Chainlink zombie-feed fix; near-expiry suppress bypass; config audit trail; OPE page
+
+### Feature — Early Warning SL: HL Mark Price Divergence (Signal A) (`monitor.py`, `hl_client.py`, `config.py`)
+
+Independent stop-loss signal that fires when the HL perp mark price crosses the strike while the Chainlink oracle has not yet updated. The perp mark leads the oracle by 2–5 s on genuine directional moves, giving a narrow but clean early exit window.
+
+**New config vars (all off by default):**
+- `MOMENTUM_HL_MARK_SL_ENABLED: bool = False`
+- `MOMENTUM_HL_MARK_SL_THRESHOLD_PCT: float = 0.0` — fires when mark divergence < this (0.0 = mark crossed strike; negative = allow slack)
+- `MOMENTUM_HL_MARK_SL_MAX_TTE: int = 30` — only active within this many seconds of expiry
+
+**New exit reason:** `ExitReason.MOMENTUM_HL_MARK_SL = "hl_mark_sl"`
+
+**HLClient changes:** `FundingSnapshot.mark_px` field added; `get_mark_price(coin)` method returns current webData2 mark price. New momentum_ticks.csv column: `hl_mark_price`, `hl_mark_div_pct`.
+
+---
+
+### Feature — Early Warning SL: HL Perp Depth Imbalance (Signal B) (`monitor.py`, `hl_client.py`, `config.py`)
+
+Independent stop-loss signal that fires when the HL perp order book is heavily positioned against the trade (asks >> bids for UP trades, bids >> asks for DOWN). Computed from the top N levels of the l2Book WS stream.
+
+**New config vars (all off by default):**
+- `MOMENTUM_HL_DEPTH_SL_ENABLED: bool = False`
+- `MOMENTUM_HL_DEPTH_SL_IMBALANCE_THRESHOLD: float = 0.40` — fires when position-adjusted imbalance < −threshold
+- `MOMENTUM_HL_DEPTH_SL_MAX_TTE: int = 30`
+- `MOMENTUM_HL_DEPTH_SL_LEVELS: int = 5` — order book levels to sum
+
+**New exit reason:** `ExitReason.MOMENTUM_HL_DEPTH_SL = "hl_depth_sl"`
+
+**HLClient changes:** `_depth_imbalance` dict updated on every l2Book WS message; `get_depth_imbalance(coin)` returns position-adjusted imbalance in [−1, +1]. New momentum_ticks.csv column: `hl_depth_imbalance`.
+
+---
+
+### Feature — Near-expiry suppress bypass TTE gate (`monitor.py`, `config.py`)
+
+`MOMENTUM_NEAR_EXPIRY_SUPPRESS_BYPASS_TTE: int = 30` — within this many seconds of expiry the `suppress_taker_exits` gate is bypassed for the near-expiry check. Prevents a 0.92-token from escaping stop-loss in the final 30 s where terminal collapse is observed empirically.
+
+Set to 0 to disable (previous behaviour).
+
+---
+
+### Fix — Chainlink zombie-feed staleness (`market_data/spot_oracle.py`, `config.py`)
+
+`SpotOracle.get_spot()` now treats a Chainlink Streams snapshot as stale if its age exceeds `CHAINLINK_STREAMS_STALE_SECS` (default 3.0 s). A connected-but-frozen feed (upstream repeating the same price) falls through to the RTDS relay rather than blocking it. SpotOracle switches back to Chainlink Streams automatically when a fresh snapshot arrives — no sticky state.
+
+Previously, a zombie Streams feed would suppress the RTDS relay indefinitely, causing oracle data to appear stuck even when RTDS was healthy.
+
+---
+
+### Feature — ML-D1: Signal event log + position snapshots (`strategies/Momentum/event_log.py`, `strategies/Momentum/scanner.py`, `monitor.py`)
+
+Scan diagnostic rows that reach the vol/delta computation stage are appended to `data/signal_events.jsonl` via `emit_signal_events_batch()`. Gate results (z_pass, funding_pass, depth_share_pass, twap_pass, entered) are computed from `skip_reason` and stored alongside all ML features.
+
+`write_position_snapshot()` appends open-position state snapshots to `data/position_snapshots.jsonl` at each monitor tick for ML-D4 context attribution.
+
+PositionMonitor tracks `_last_upfrac` per market for ML-D1 upfrac feature.
+
+---
+
+### Feature — ML-D2: Config audit trail in acct_ledger (`accounting.py`)
+
+Five new columns added to `LEDGER_HEADER` and `_write_ledger_record`:
+`z_score_used`, `kelly_multiplier_used`, `delta_sl_pct_used`, `upfrac_threshold_used`, `loser_exit_trigger_used`.
+
+Captures live config values at close time (session-granularity attribution — stable within a session; config_overrides.json reloads apply to all trades opened after the reload).
+
+---
+
+### Feature — ML-D4: Multi-output Model D v0 — Config Policy Simulator (`analysis/train_model.py`, `models/model_agent.py`, `config.py`, `api_server.py`, webapp)
+
+Model D is a set of 3 independent `XGBRegressor` models (one per dimension: `z_score`, `kelly`, `delta_sl`) that recommend config deltas per market context. Trained accretively from `training_data.parquet` using OPE reward surface labels (optimal − live) as targets. Shadow mode only — deltas are never applied to live config.
+
+**`analysis/train_model.py`:**
+- `_derive_model_d_labels(df)` — calls `build_surface()` per (vol_regime, underlying) group, assigns `target_delta_z_score/kelly/sl` labels
+- `_generate_model_d_shap_report()` — per-dimension SHAP beeswarm HTML report
+- `MODEL_D_MIN_ROWS = 30` — skips training gracefully when insufficient data
+- `--also-v1` flag — retrain always writes `model_b_v1.pkl` + `model_b_v1_shap.html` (previously only written when explicitly targeting v1)
+
+**`models/model_agent.py`:**
+- `score_config_policy(market_id, context)` — returns `{delta_z_score, delta_kelly, delta_sl}` clamped to ±`MODEL_D_MAX_DELTA_PCT`; `None` when disabled
+- `_write_model_d_row()` — async append to `analysis/model_d_log.csv` (separate file; no shadow_log schema churn)
+- `get_model_d_log(limit)` — public method for API
+
+**`config.py`:** `MODEL_D_ENABLED`, `MODEL_D_PATH`, `MODEL_D_MAX_DELTA_PCT` (±50% default), plus `MODEL_C_ENABLED`, `MODEL_C_SUPPRESS_THRESHOLD`, `MODEL_C_PATH`.
+
+**`api_server.py`:**
+- `GET /model/d/recommendations` — per-(vol_regime, underlying) recommendation table or waiting-for-data (n_signal_events / 10,000 target)
+- `GET /model/d/log` — recent shadow decisions from `model_d_log.csv`
+- `GET /model/c/calibration` — Model C calibration curve (predicted P(WIN) vs actual win rate in decile buckets) + score histogram
+- `model_d_exists`, `model_c_exists` in `/model/train_status`
+- `MODEL_D_ENABLED` / `MODEL_D_MAX_DELTA_PCT` in `_MUTABLE_CONFIG`, `ConfigPatch`, `GET /config`
+- Retrain subprocess now passes `--also-v1`
+
+**Webapp:**
+- `webapp/src/pages/ModelD.tsx` (new) — "Waiting for data" progress bar (% toward 10k signal events, ~July 2026) when model not trained; recommendation table with colour-coded Δ values (green=loosen, red=tighten) when trained; recent shadow decisions log
+- `webapp/src/pages/ModelC.tsx` (new) — SVG calibration curve, score distribution histogram, bucket table; "Model C not trained yet" state when pkl absent
+- `webapp/src/App.tsx` — `/model-c` and `/model-d` routes added to Model Sim nav dropdown
+- `webapp/src/pages/Settings.tsx` — Model D toggle + `MODEL_D_MAX_DELTA_PCT` conditional float input
+- `webapp/src/api/client.ts` — `ModelCCalibrationResponse`, `ModelDRecommendationsResponse`, `ModelDLogResponse` interfaces + poll hooks; `model_c_exists` / `model_d_exists` in `ModelTrainStatus`
+
+---
+
+### Feature — ML-D3: OPE Reward Surface webapp page (`webapp/src/pages/OPE.tsx`, `api_server.py`)
+
+New `/ope` route in the Model Sim dropdown. Fetches `GET /ope/surface` with vol_regime / underlying filters and renders reward surface heatmaps + optimal config table.
+
+---
+
+### Feature — Kelly at-cap size limit + LOW-vol TWAP gate (`config.py`, `strategies/Momentum/scanner.py`)
+
+- `MOMENTUM_KELLY_AT_CAP_MAX_USD: float = 5` — hard cap on position size when Kelly win_prob reaches the 0.95 cap. At-cap entries have the same win rate as sub-cap entries but produce larger losses when they fail (avg −$0.88 vs −$0.03).
+- `MOMENTUM_TWAP_REQUIRE_DATA_LOW_VOL: bool = True` — blocks entry in LOW vol regime when `twap_dev_bps` is unavailable. LOW vol + NaN TWAP observed 50% win rate vs 91% when TWAP is present; fail-closed prevents the TWAP multiplier from silently doing nothing.
+
+---
+
 ## [2026-05-16] — Accounting CLOB enrichment + reconcile sweep; Model B feature fix; RTDS stability; ON FAK slippage; asyncio watchdog; analysis OPE suite
 
 ### Fix — Model B `score_exit` feature mismatch (`models/feature_snapshot.py`)

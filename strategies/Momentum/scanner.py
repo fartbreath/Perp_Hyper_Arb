@@ -81,7 +81,7 @@ from strategies.Momentum.market_utils import (
 )
 from strategies.Momentum.signal import MomentumSignal
 from strategies.Momentum.vol_fetcher import VolFetcher
-from strategies.Momentum.event_log import emit as _emit_event
+from strategies.Momentum.event_log import emit as _emit_event, emit_signal_events_batch as _emit_signal_events_batch
 
 log = get_bot_logger(__name__)
 
@@ -1195,6 +1195,20 @@ class MomentumScanner(BaseStrategy):
             _d["twap_dev_bps"] = round(_twap_dev_bps, 2) if _twap_dev_bps is not None else None
             _d["vol_regime"] = _vol_regime
 
+            # ── M-14b: TWAP data required in LOW vol regime ─────────────────
+            # When vol_regime is LOW and TWAP data is unavailable, the M-14
+            # multiplier protection cannot fire.  LOW vol + NaN TWAP observed
+            # 50% win rate vs 91% with TWAP present — fail-closed when missing.
+            if (
+                getattr(config, "MOMENTUM_TWAP_REQUIRE_DATA_LOW_VOL", True)
+                and _vol_regime == "LOW"
+                and _twap_dev_bps is None
+            ):
+                skipped_twap_yes += 1
+                _d["skip_reason"] = "twap_data_missing_low_vol"
+                scan_diags.append(_d)
+                continue
+
             # ── SIGNAL: emit immediately ─────────────────────────────────────
             # vol_src already set above from vol_result (reflects actual source used)
             signal = MomentumSignal(
@@ -1247,6 +1261,7 @@ class MomentumScanner(BaseStrategy):
             self._market_cooldown[f"{market.condition_id}:{high_side}"] = now_ts
             _save_cooldowns(self._cooldown_path, self._market_cooldown)
             executed = await self._execute_signal(signal, market)
+            _d["executed"] = executed
             if executed:
                 signals_fired += 1
                 # NB: open_momentum counter is NOT incremented here.
@@ -1308,6 +1323,8 @@ class MomentumScanner(BaseStrategy):
         )
         # Persist diags for /momentum/diagnostics — no vol re-calls needed.
         self._last_scan_diags = scan_diags
+        # ML-D1: append signal events for all markets that reached vol/delta stage.
+        _emit_signal_events_batch(scan_diags)
         self._last_scan_summary = {
             "bucket_markets":          len(bucket_markets),
             "signals_fired":           signals_fired,
@@ -2286,6 +2303,13 @@ def _compute_kelly_size_usd(signal: "MomentumSignal", max_entry_usd: float | Non
             config.MOMENTUM_MIN_ENTRY_USD,
             round(fraction_of_max * _max_entry, 2),
         )
+        # At-cap size limiter: when win_prob has hit the hard ceiling, the model
+        # has exhausted its confidence — any additional size comes from the cap
+        # compression, not from incremental signal strength.  At-cap entries show
+        # the same win rate as below-cap entries but larger losses when they fail.
+        _at_cap_max = getattr(config, "MOMENTUM_KELLY_AT_CAP_MAX_USD", 0.0)
+        if _at_cap_max > 0.0 and win_prob >= _win_prob_cap:
+            size_usd = min(size_usd, max(config.MOMENTUM_MIN_ENTRY_USD, _at_cap_max))
 
     debug: dict = {
         "kelly_tte_eff_s":       round(tte_eff, 1),

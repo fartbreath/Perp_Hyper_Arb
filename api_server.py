@@ -639,6 +639,12 @@ _MUTABLE_CONFIG = {
     "model_a_independent_entry_threshold":        ("MODEL_A_INDEPENDENT_ENTRY_THRESHOLD",           float),
     "model_a_min_tte_secs":                       ("MODEL_A_MIN_TTE_SECS",                          int),
     "model_a_max_open_positions":                 ("MODEL_A_MAX_OPEN_POSITIONS",                    int),
+    # ML-C2: Model C divergence calibrator
+    "model_c_enabled":                            ("MODEL_C_ENABLED",                               bool),
+    "model_c_suppress_threshold":                 ("MODEL_C_SUPPRESS_THRESHOLD",                    float),
+    # ML-D4: Model D config policy optimizer
+    "model_d_enabled":                            ("MODEL_D_ENABLED",                               bool),
+    "model_d_max_delta_pct":                      ("MODEL_D_MAX_DELTA_PCT",                         float),
 }
 
 
@@ -913,6 +919,12 @@ class ConfigPatch(BaseModel):
     model_a_independent_entry_threshold: float | None = None
     model_a_min_tte_secs: int | None = None
     model_a_max_open_positions: int | None = None
+    # ML-C2: Model C divergence calibrator
+    model_c_enabled: bool | None = None
+    model_c_suppress_threshold: float | None = None
+    # ML-D4: Model D config policy optimizer
+    model_d_enabled: bool | None = None
+    model_d_max_delta_pct: float | None = None
 
 
 @app.get("/config")
@@ -1188,6 +1200,12 @@ async def get_config() -> dict:
         "model_a_independent_entry_threshold":        getattr(config, "MODEL_A_INDEPENDENT_ENTRY_THRESHOLD", 0.7),
         "model_a_min_tte_secs":                       getattr(config, "MODEL_A_MIN_TTE_SECS", 30),
         "model_a_max_open_positions":                 getattr(config, "MODEL_A_MAX_OPEN_POSITIONS", 5),
+        # ML-C2: Model C divergence calibrator
+        "model_c_enabled":                            getattr(config, "MODEL_C_ENABLED", False),
+        "model_c_suppress_threshold":                 getattr(config, "MODEL_C_SUPPRESS_THRESHOLD", 0.5),
+        # ML-D4: Model D config policy optimizer
+        "model_d_enabled":                            getattr(config, "MODEL_D_ENABLED", False),
+        "model_d_max_delta_pct":                      getattr(config, "MODEL_D_MAX_DELTA_PCT", 0.5),
         "timestamp":            time.time(),
     }
 
@@ -1922,6 +1940,8 @@ class _TrainState:
     last_log_lines: list[str] = field(default_factory=list)
     model_b_exists: bool = False
     model_a_exists: bool = False
+    model_c_exists: bool = False
+    model_d_exists: bool = False
 
 _train_state = _TrainState()
 
@@ -1929,6 +1949,8 @@ _train_state = _TrainState()
 def _refresh_model_exists() -> None:
     _train_state.model_b_exists = (_ANALYSIS_DIR / "model_b_v0.pkl").is_file()
     _train_state.model_a_exists = (_ANALYSIS_DIR / "model_a_v0.pkl").is_file()
+    _train_state.model_c_exists = (_ANALYSIS_DIR / "model_c_v0.pkl").is_file()
+    _train_state.model_d_exists = (_ANALYSIS_DIR / "model_d_v0.pkl").is_file()
 
 
 async def _run_training() -> None:
@@ -1939,9 +1961,9 @@ async def _run_training() -> None:
     _train_state.last_log_lines = []
     lines: list[str] = []
 
-    async def _run_script(script: str) -> int:
+    async def _run_script(script: str, extra_args: list[str] | None = None) -> int:
         proc = await asyncio.create_subprocess_exec(
-            _sys.executable, script,
+            _sys.executable, script, *(extra_args or []),
             cwd=str(_ANALYSIS_DIR),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -1961,7 +1983,7 @@ async def _run_training() -> None:
             lines.append(f"[api] feature_builder.py exited with code {rc1}")
             _train_state.last_exit_code = rc1
             return
-        rc2 = await _run_script(str(_ANALYSIS_DIR / "train_model.py"))
+        rc2 = await _run_script(str(_ANALYSIS_DIR / "train_model.py"), ["--also-v1"])
         _train_state.last_exit_code = rc2
     except Exception as exc:
         lines.append(f"[api] Training error: {exc}")
@@ -1984,6 +2006,8 @@ def model_train_status() -> dict:
         "last_exit_code": _train_state.last_exit_code,
         "model_b_exists": _train_state.model_b_exists,
         "model_a_exists": _train_state.model_a_exists,
+        "model_c_exists": _train_state.model_c_exists,
+        "model_d_exists": _train_state.model_d_exists,
         "log_tail": _train_state.last_log_lines[-20:],
     }
 
@@ -3876,6 +3900,236 @@ def get_report(filename: str):
 </html>"""
         return HTMLResponse(content=html, status_code=404)
     return FileResponse(path, media_type="text/html")
+
+
+# ── OPE Reward Surface ────────────────────────────────────────────────────────
+
+@app.get("/ope/surface")
+def get_ope_surface(vol_regime: str = "ALL", underlying: str = "ALL"):
+    """
+    ML-D3: Return OPE reward surface data for the given vol_regime / underlying facet.
+
+    Query params:
+      vol_regime: LOW | NORMAL | HIGH | ALL (default ALL)
+      underlying: BTC | ETH | SOL | ALL (default ALL)
+
+    Returns JSON with z_score, delta_sl, kelly dimension arrays and an optimal table.
+    Blocking call; runs analysis in-process on each request (~0.5–2 s for 1,435 rows).
+    Consider caching if request rate is high.
+    """
+    valid_regimes = {"LOW", "NORMAL", "HIGH", "ALL"}
+    vr = vol_regime.upper()
+    ul = underlying.upper()
+    if vr not in valid_regimes:
+        raise HTTPException(status_code=400, detail=f"vol_regime must be one of {sorted(valid_regimes)}")
+
+    try:
+        from analysis.ope_reward_surface import build_surface
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail=f"ope_reward_surface module unavailable: {exc}")
+
+    try:
+        surface = build_surface(
+            vol_regime=None if vr == "ALL" else vr,
+            underlying=None if ul == "ALL" else ul,
+        )
+    except SystemExit as exc:
+        raise HTTPException(status_code=500, detail=f"OPE surface build failed (missing data): {exc}")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"OPE surface build error: {exc}")
+
+    return surface
+
+
+# ── ML-D4: Model C calibration + Model D simulator endpoints ─────────────────
+
+@app.get("/model/c/calibration")
+def model_c_calibration() -> dict:
+    """
+    ML-C2/D4: Return Model C calibration curve data.
+
+    Loads training_data.parquet + model_c_v0.pkl, scores all ON rows, buckets
+    predicted P(WIN) into deciles, and returns actual win rate per bucket.
+    Returns {"exists": false} when model_c_v0.pkl is not trained yet.
+    """
+    model_c_path = _ANALYSIS_DIR / "model_c_v0.pkl"
+    parquet_path = _ANALYSIS_DIR / "training_data.parquet"
+    if not model_c_path.exists():
+        return {"exists": False, "reason": "model_c_v0.pkl not yet trained"}
+    if not parquet_path.exists():
+        return {"exists": False, "reason": "training_data.parquet missing — run retrain first"}
+    try:
+        import pickle, pandas as _pd, numpy as _np
+        from analysis.train_model import MODEL_C_FEATURES
+
+        with open(model_c_path, "rb") as fh:
+            model_c = pickle.load(fh)
+
+        df = _pd.read_parquet(parquet_path)
+
+        # Filter ON rows with resolved outcome
+        if "strategy" in df.columns:
+            df = df[df["strategy"] == "opening_neutral"].copy()
+        if "resolved_outcome" not in df.columns:
+            return {"exists": False, "reason": "resolved_outcome column missing from parquet"}
+        df = df[df["resolved_outcome"].notna()].copy()
+
+        if len(df) == 0:
+            return {"exists": True, "n_rows": 0, "buckets": [], "note": "No labelled ON rows yet"}
+
+        # Build feature matrix, handle missing cols with -999 sentinel
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            X = _pd.DataFrame([
+                {f: row.get(f, -999.0) for f in MODEL_C_FEATURES}
+                for _, row in df.iterrows()
+            ])
+        scores = model_c.predict_proba(X)[:, 1]
+        outcomes = (df["resolved_outcome"].astype(str).str.upper() == "WIN").astype(int).values
+
+        # Calibration: 10 equal-width buckets 0.0–1.0
+        bins = _np.linspace(0.0, 1.0, 11)
+        buckets = []
+        for i in range(len(bins) - 1):
+            lo, hi = bins[i], bins[i + 1]
+            mask = (scores >= lo) & (scores < hi if hi < 1.0 else scores <= hi)
+            n = int(mask.sum())
+            actual_wr = float(_np.mean(outcomes[mask])) if n > 0 else None
+            buckets.append({
+                "bucket_lo": round(float(lo), 1),
+                "bucket_hi": round(float(hi), 1),
+                "n": n,
+                "actual_win_rate": round(actual_wr, 4) if actual_wr is not None else None,
+                "predicted_midpoint": round(float((lo + hi) / 2), 2),
+            })
+
+        # Score histogram
+        hist, hist_edges = _np.histogram(scores, bins=20, range=(0.0, 1.0))
+        score_histogram = [
+            {"lo": round(float(hist_edges[i]), 2), "hi": round(float(hist_edges[i+1]), 2), "count": int(hist[i])}
+            for i in range(len(hist))
+        ]
+
+        return {
+            "exists": True,
+            "n_rows": int(len(df)),
+            "n_scored": int(len(scores)),
+            "buckets": buckets,
+            "score_histogram": score_histogram,
+            "mean_score": round(float(_np.mean(scores)), 4),
+            "actual_win_rate": round(float(_np.mean(outcomes)), 4),
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Model C calibration error: {exc}")
+
+
+@app.get("/model/d/recommendations")
+def model_d_recommendations() -> dict:
+    """
+    ML-D4: Return Model D config policy recommendations per (vol_regime, underlying).
+
+    For each group, runs Model D inference on a representative context vector
+    (medians from training data for that group) and returns the delta recommendations.
+    Returns {"exists": false} when model_d_v0.pkl has not been trained yet.
+    """
+    model_d_path = _ANALYSIS_DIR / "model_d_v0.pkl"
+    parquet_path = _ANALYSIS_DIR / "training_data.parquet"
+
+    _refresh_model_exists()
+    if not model_d_path.exists():
+        # Count signal events to show progress toward data threshold
+        n_signal_events = 0
+        signal_events_path = Path(__file__).parent / "data" / "signal_events.jsonl"
+        if signal_events_path.exists():
+            try:
+                with open(signal_events_path, "r", encoding="utf-8") as fh:
+                    n_signal_events = sum(1 for _ in fh)
+            except Exception:
+                pass
+        return {
+            "exists": False,
+            "n_signal_events": n_signal_events,
+            "target_signal_events": 10000,
+            "reason": "model_d_v0.pkl not yet trained — retrain when parquet has ≥30 Momentum rows",
+        }
+
+    try:
+        import pickle, pandas as _pd, numpy as _np
+
+        with open(model_d_path, "rb") as fh:
+            bundle = pickle.load(fh)
+
+        models_d = bundle.get("models", {})
+        feature_names = bundle.get("feature_names", [])
+        n_rows = bundle.get("n_rows", 0)
+        trained_at = bundle.get("trained_at")
+        dimensions = bundle.get("dimensions", list(models_d.keys()))
+
+        if not models_d:
+            return {"exists": True, "rows": [], "note": "No sub-models in bundle"}
+
+        # Load parquet to get representative context per group
+        recommendations = []
+        if parquet_path.exists():
+            df = _pd.read_parquet(parquet_path)
+            if "strategy" in df.columns:
+                df = df[df["strategy"] == "momentum"].copy()
+
+            # Build groups
+            has_vr = "mom_vol_regime" in df.columns
+            has_ul = "underlying" in df.columns
+
+            if has_vr and has_ul:
+                groups = [(str(vr), str(ul)) for vr, ul in df[["mom_vol_regime", "underlying"]].drop_duplicates().itertuples(index=False)]
+            elif has_ul:
+                groups = [("ALL", str(ul)) for ul in df["underlying"].unique()]
+            else:
+                groups = [("ALL", "ALL")]
+
+            for vr, ul in groups:
+                mask = _pd.Series(True, index=df.index)
+                if has_vr and vr not in ("ALL", "nan", "None"):
+                    mask &= (df["mom_vol_regime"].astype(str) == vr)
+                if has_ul and ul not in ("ALL", "nan", "None"):
+                    mask &= (df["underlying"].astype(str) == ul)
+
+                df_group = df[mask]
+                if len(df_group) == 0:
+                    continue
+
+                # Median context vector for this group
+                context_row = {f: float(df_group[f].median()) if f in df_group.columns else -999.0 for f in feature_names}
+                X = _pd.DataFrame([context_row])
+
+                rec: dict = {"vol_regime": vr, "underlying": ul, "n": int(len(df_group))}
+                for dim in ("z_score", "kelly", "delta_sl"):
+                    model_dim = models_d.get(dim)
+                    if model_dim is not None:
+                        delta = float(model_dim.predict(X)[0])
+                        rec[f"delta_{dim}"] = round(delta, 4)
+                    else:
+                        rec[f"delta_{dim}"] = None
+                recommendations.append(rec)
+
+        return {
+            "exists": True,
+            "n_rows_trained": n_rows,
+            "trained_at": trained_at,
+            "dimensions": dimensions,
+            "recommendations": recommendations,
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Model D recommendations error: {exc}")
+
+
+@app.get("/model/d/log")
+def model_d_log(limit: int = Query(default=100, ge=1, le=500)) -> dict:
+    """ML-D4: Return last N rows of model_d_log.csv (shadow policy recommendations)."""
+    ma = state.model_agent_ref
+    if ma is None:
+        return {"rows": [], "total": 0}
+    return ma.get_model_d_log(limit=limit)
 
 
 # ── Webapp static assets + SPA catch-all ─────────────────────────────────────

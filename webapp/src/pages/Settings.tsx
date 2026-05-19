@@ -780,6 +780,111 @@ export default function Settings() {
         />
       </div>
 
+      {/* ── 2e. Momentum — Early Warning SL Signals ─────────────────── */}
+      <div className="card">
+        <h3>Momentum — Early Warning SL Signals</h3>
+        <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+          Two extra exit triggers that can get you out faster than the normal stop-loss.
+          The normal delta SL waits for the price oracle to confirm a move, which can take
+          a few seconds too long near expiry. These signals watch faster data sources and
+          can exit first. Enable any combination — each one works on its own. All are off
+          by default. Data is always recorded even when off, so you can review what
+          would have triggered before turning anything on.
+        </p>
+
+        {/* Signal A: HL Mark Price Divergence */}
+        <h4 style={{ marginBottom: "0.5rem", color: "#334155" }}>Signal A — HL Futures Price</h4>
+        <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+          Watches the Hyperliquid futures price for the same asset. Futures traders
+          react to news 2–5 seconds faster than the price oracle used by the bot.
+          If the futures price already crosses your strike, this signal exits before
+          the oracle catches up.
+        </p>
+
+        <Toggle
+          label="Enable HL Futures Price SL"
+          description="Exit early if the HL futures price crosses your strike before the price oracle confirms it."
+          value={data.momentum_hl_mark_sl_enabled ?? false}
+          onChange={(v) => apply({ momentum_hl_mark_sl_enabled: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="How far past the strike before exiting (%)"
+          description="0.0 = exit the moment futures cross the strike. Increase (e.g. 0.1) to require futures to go 0.1% past the strike before triggering — reduces false exits on tiny wiggles."
+          value={data.momentum_hl_mark_sl_threshold_pct ?? 0.0}
+          step={0.1}
+          unit="%"
+          onSubmit={(v) => apply({ momentum_hl_mark_sl_threshold_pct: v })}
+        />
+
+        {GAP}
+
+        <NumberInput
+          label="Only active in last N seconds"
+          description="Signal A only kicks in during the final seconds before expiry. Set to 30 = only active in the last 30 seconds. Has no effect earlier in the trade."
+          value={data.momentum_hl_mark_sl_max_tte ?? 30}
+          step={5}
+          unit="s"
+          onSubmit={(v) => apply({ momentum_hl_mark_sl_max_tte: Math.round(v) })}
+        />
+
+        {GAP}
+
+        {/* Signal B: HL Perp Depth Imbalance */}
+        <h4 style={{ marginBottom: "0.5rem", color: "#334155" }}>Signal B — HL Futures Order Book Pressure</h4>
+        <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+          Watches whether futures sellers are piling up against your position.
+          If you're holding an UP bet and the futures book is flooded with sell
+          orders (and few buyers), that's a sign the market is moving against you.
+          This signal exits before the price drop is confirmed.
+        </p>
+
+        <Toggle
+          label="Enable Order Book Pressure SL"
+          description="Exit early if the futures order book shows heavy selling pressure against your position."
+          value={data.momentum_hl_depth_sl_enabled ?? false}
+          onChange={(v) => apply({ momentum_hl_depth_sl_enabled: v })}
+        />
+
+        {GAP}
+
+        <FloatInput
+          label="Sell pressure sensitivity"
+          description="How one-sided the order book must be before exiting. 0 = exit on any imbalance. 1.0 = only exit when the book is completely one-sided. Default 0.40 is a moderate threshold — raise it if you're getting too many false exits, lower it to exit earlier on smaller imbalances."
+          value={data.momentum_hl_depth_sl_imbalance_threshold ?? 0.40}
+          step={0.05}
+          unit="ratio"
+          onSubmit={(v) => apply({ momentum_hl_depth_sl_imbalance_threshold: v })}
+        />
+
+        {GAP}
+
+        <NumberInput
+          label="Only active in last N seconds"
+          description="Signal B only kicks in during the final seconds before expiry. Set to 30 = only active in the last 30 seconds."
+          value={data.momentum_hl_depth_sl_max_tte ?? 30}
+          step={5}
+          unit="s"
+          onSubmit={(v) => apply({ momentum_hl_depth_sl_max_tte: Math.round(v) })}
+        />
+
+        <Advanced>
+          <NumberInput
+            label="Order book depth to scan"
+            description="How many price levels to look at when measuring order book pressure. 5 = look at the 5 best bid and ask prices. Higher = more complete picture but also noisier."
+            value={data.momentum_hl_depth_sl_levels ?? 5}
+            step={1}
+            unit="levels"
+            onSubmit={(v) => apply({ momentum_hl_depth_sl_levels: Math.round(v) })}
+          />
+        </Advanced>
+
+        {GAP}
+
+      </div>
+
       {/* ── 3. Market Types ──────────────────────────────────────────── */}
       <div className="card">
         <h3>
@@ -3043,6 +3148,52 @@ export default function Settings() {
           unit=""
           onSubmit={(v) => apply({ model_a_max_open_positions: v })}
         />
+
+        {GAP}
+
+        <Toggle
+          label="Model C Divergence Calibrator"
+          description="ML-C2: Shadow-log calibrated P(WIN) from 2-point CLOB delta and oracle context. Model C score is read-only — it does not gate exits in Phase 1. Visible as model_c_score column in Shadow Agent table."
+          value={data.model_c_enabled ?? false}
+          onChange={(v) => apply({ model_c_enabled: v })}
+        />
+
+        {(data.model_c_enabled ?? false) && (
+          <>
+            {GAP}
+            <FloatInput
+              label="Model C Calibrated Exit Threshold"
+              description="Adaptive loser-exit threshold derived from divergence calibrator. Reserved for Phase 2 — currently logged but not enforced."
+              value={data.model_c_suppress_threshold ?? 0.5}
+              step={0.05}
+              unit=""
+              onSubmit={(v) => apply({ model_c_suppress_threshold: v })}
+            />
+          </>
+        )}
+
+        {GAP}
+
+        <ToggleRow
+          label="Model D Config Policy Optimizer"
+          description="ML-D4: Shadow-mode only. Recommends z_score / kelly / stop-loss deltas per vol-regime and underlying based on historical momentum outcomes. Writes recommendations to model_d_log.csv. Does NOT adjust live config automatically."
+          value={data.model_d_enabled ?? false}
+          onChange={(v) => apply({ model_d_enabled: v })}
+        />
+
+        {(data.model_d_enabled ?? false) && (
+          <>
+            {GAP}
+            <FloatInput
+              label="Model D Max Config Delta (%)"
+              description="Maximum allowed recommended adjustment as a fraction of 1.0 (e.g. 0.5 = ±50%). Clamps the raw regressor output to prevent extreme suggestions."
+              value={data.model_d_max_delta_pct ?? 0.5}
+              step={0.05}
+              unit=""
+              onSubmit={(v) => apply({ model_d_max_delta_pct: v })}
+            />
+          </>
+        )}
       </div>
 
       {/* ── Position Monitor ─────────────────────────────────── */}

@@ -577,6 +577,11 @@ MOMENTUM_KELLY_MULTIPLIER_BY_TYPE: dict[str, float] = {
 # ORACLE_SENSITIVITY: maps signal-strength multiples above threshold → win_prob slope.
 MOMENTUM_KELLY_EDGE_PREMIUM: float = 0.07        # alpha above CLOB ask price
 MOMENTUM_KELLY_WIN_PROB_CAP: float = 0.95        # hard cap on win_prob_eff
+# When win_prob reaches the cap (0.95), position size is additionally capped at
+# this USD value.  0.0 = disabled.  At-cap entries have the same win rate as
+# below-cap entries but produce larger losses when they fail (avg -$0.88 vs -$0.03).
+# Applies after all other kelly math; MIN_ENTRY_USD floor is still respected.
+MOMENTUM_KELLY_AT_CAP_MAX_USD: float = 5
 MOMENTUM_KELLY_CLOB_RELIABLE_TTE: int = 60       # seconds; above this CLOB fully weighted
 MOMENTUM_KELLY_ORACLE_SENSITIVITY: float = 0.15  # slope: delta multiples → win_prob
 # Per-bucket floor on _edge_scale.  0.0 = no change (default for all types).
@@ -634,6 +639,10 @@ MOMENTUM_DEPTH_SHARE_NO_MAX: float = 0.60    # skip NO entry when yes_depth_shar
 MOMENTUM_TWAP_GATE_ENABLED: bool = True
 MOMENTUM_TWAP_DEV_THRESHOLD_BPS: float = -5.0        # dev below this (oracle below TWAP) triggers multiplier
 MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER: float = 1.4  # raises YES/UP z-bar in low-vol + neg TWAP dev
+# Hard gate: block entry in LOW vol regime when twap_dev_bps is unavailable.
+# LOW vol + NaN TWAP observed 50% win rate vs 91% when TWAP is present.
+# The TWAP multiplier protection (M-14) cannot fire without data — fail-closed.
+MOMENTUM_TWAP_REQUIRE_DATA_LOW_VOL: bool = True
 
 # ── M-13: cl_upfrac rolling-window exit ──────────────────────────────────────
 # Rolling up-tick fraction over UPFRAC_WINDOW_SECONDS. Sampled once per window.
@@ -679,6 +688,23 @@ MOMENTUM_DELTA_SL_MIN_TICKS: int = 3        # hysteresis: delta SL only fires af
 # (suppression), not a trigger — the SL still fires if the token also reprices down.
 # Set to 0.0 to disable.  Only applied when current_token_price is available.
 MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR: float = 0.0  # disabled by default; set via override
+
+# ── Early Warning SL: HL Mark Price Divergence ───────────────────────────────
+# Independent SL signal: fires when the HL perp mark price crosses the strike
+# while the Chainlink oracle is still above it.  The perp CLOB leads the
+# oracle by 2-5 seconds on real directional moves.  All-off by default.
+MOMENTUM_HL_MARK_SL_ENABLED:       bool  = False
+MOMENTUM_HL_MARK_SL_THRESHOLD_PCT: float = 0.0   # fire when mark divergence < this (0.0 = mark crossed strike; negative = allow slack)
+MOMENTUM_HL_MARK_SL_MAX_TTE:       int   = 30    # only active when tte_seconds < this
+
+# ── Early Warning SL: HL Perp Depth Imbalance ────────────────────────────────
+# Independent SL signal: fires when the HL perp book is heavily positioned
+# against this trade (asks >> bids for UP, bids >> asks for DOWN).
+MOMENTUM_HL_DEPTH_SL_ENABLED:             bool  = False
+MOMENTUM_HL_DEPTH_SL_IMBALANCE_THRESHOLD: float = 0.40  # fire when position-adjusted imbalance < -threshold
+MOMENTUM_HL_DEPTH_SL_MAX_TTE:             int   = 30    # only active when tte_seconds < this
+MOMENTUM_HL_DEPTH_SL_LEVELS:              int   = 5     # order book levels to include in depth sum
+
 MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above this
 # High-probability taker-exit suppression: when the held token's CLOB mid is AT OR
 # ABOVE this price all stop-loss taker exits (delta SL, near-expiry time stop, prob
@@ -686,7 +712,7 @@ MOMENTUM_TAKE_PROFIT: float = 0.999         # Exit if held token rises above thi
 # (MOMENTUM_TAKE_PROFIT ≈ 0.999) is never suppressed.
 # Rationale: at 90c+ the crowd has priced a near-certain win; any taker exit forfeits
 # expected value.  Set to 0.0 to disable.
-MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE: float = 0.87
+MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE: float = 0.92
 # How long to wait for PM API to confirm settlement before falling back to the
 # resolution oracle.  PM can take 1–10 min to flip closed=True on the CLOB API
 # for short-duration (5m/15m) bucket markets.  After this many seconds past
@@ -701,6 +727,11 @@ MOMENTUM_RESOLVED_FORCE_CLOSE_SEC: int = 300  # seconds past end_date before ora
 # Near-expiry time-stop: when TTE is very short and spot has already crossed
 # the strike (delta < 0), exit via taker to avoid a binary snap to zero.
 MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS: int = 90        # TTE threshold (seconds)
+# Within this many seconds of expiry the suppress_taker_exits gate is bypassed
+# for the near-expiry check regardless of token price.  At TTE < 30s even a
+# 0.92 token is at risk of a terminal collapse (as seen in the ETH DOWN case).
+# Set to 0 to disable (suppress always applies up to the time-stop threshold).
+MOMENTUM_NEAR_EXPIRY_SUPPRESS_BYPASS_TTE: int = 30
 
 # Phase B — Two-oracle strategy: near-expiry delta SL uses only the on-chain
 # AggregatorV3 feed (ChainlinkWSClient) instead of freshest-wins (which normally
@@ -915,6 +946,13 @@ MOMENTUM_PROB_SL_ORACLE_STALE_SECS: float = 10.0  # suppress prob-SL when oracle
 # within one 5m-bucket expiry window rather than two.
 CHAINLINK_SILENCE_WATCHDOG_SECS: int = 30
 
+# Maximum age of a ChainlinkStreams snapshot before SpotOracle falls through
+# to the RTDS relay.  ChainlinkStreams pushes ~2–3 updates/sec per coin, so
+# anything older than 3 s indicates a zombie feed (connected but no new data).
+# SpotOracle switches back to ChainlinkStreams automatically the moment a fresh
+# snapshot arrives — no sticky state.
+CHAINLINK_STREAMS_STALE_SECS: float = 3.0
+
 # ── Kalshi signal confirmation layer ──────────────────────────────────────
 # When KALSHI_ENABLED=True, the scanner fetches matching Kalshi market prices
 # and uses |PM − Kalshi| as the primary deviation signal. Markets with no Kalshi
@@ -996,6 +1034,16 @@ MODEL_B_SUPPRESS_THRESHOLD: float = 0.5   # ML-06: suppress loser exit if score 
 MODEL_A_ENABLED: bool = False              # ML-07: Model A entry sizing scale
 MODEL_A_MIN_SCALE: float = 0.5            # ML-07: minimum Kelly scale (50% of base)
 MODEL_A_MAX_SCALE: float = 1.0            # ML-07: maximum Kelly scale (no upscale in Phase 3)
+
+# Model C — CLOB/Oracle divergence calibrator (ML-C2)
+MODEL_C_ENABLED: bool = False             # ML-C2: enable Model C shadow scoring (default off)
+MODEL_C_SUPPRESS_THRESHOLD: float = 0.5  # ML-C2: adaptive exit threshold (0.0–1.0)
+MODEL_C_PATH: str = str(Path(__file__).parent / "analysis" / "model_c_v0.pkl")
+
+# Model D — Config Policy Optimizer (ML-D4)
+MODEL_D_ENABLED: bool = False            # ML-D4: enable Model D shadow scoring (default off)
+MODEL_D_PATH: str = str(Path(__file__).parent / "analysis" / "model_d_v0.pkl")
+MODEL_D_MAX_DELTA_PCT: float = 0.5       # ML-D4: max config adjustment as fraction of live value (±50%)
 
 # Phase 4 — Independent Entry Evaluation (ML-08, ML-09)
 # All default False / conservative until Phase 3 acceptance criteria are met.

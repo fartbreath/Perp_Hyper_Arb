@@ -138,9 +138,12 @@ class SpotOracle:
 
         Priority order:
           1. ChainlinkStreamsClient — direct Data Streams WS, ~190ms ahead of relay
-             for all seven coins.  Used whenever a snapshot is available.
+             for all seven coins.  Used when a snapshot is available AND fresh
+             (age < CHAINLINK_SILENCE_WATCHDOG_SECS).  A connected-but-frozen feed
+             (Chainlink upstream repeating the same price) is treated as stale and
+             falls through to the RTDS relay.
           2. RTDSClient relay     — Polymarket's crypto_prices_chainlink push.
-             Used when direct feed has not yet delivered a price.
+             Used when direct feed is unavailable or stale.
           3. ChainlinkWSClient   — on-chain Polygon AggregatorV3 (non-HYPE).
              Last-resort fallback; seed timestamp ages out quickly without a
              paid Polygon WS endpoint.
@@ -149,9 +152,13 @@ class SpotOracle:
         if self._streams is not None:
             streams_snap = self._streams.get_spot(coin)
             if streams_snap is not None:
-                return streams_snap
+                _max_age_s = getattr(config, "CHAINLINK_STREAMS_STALE_SECS", 5.0)
+                if (time.time() - streams_snap.timestamp) < _max_age_s:
+                    return streams_snap
+                # Snapshot exists but is stale (zombie feed — connected but price
+                # frozen upstream).  Fall through to RTDS relay below.
 
-        # 2. RTDS relay — fallback when direct is unavailable.
+        # 2. RTDS relay — fallback when direct is unavailable or stale.
         rtds_snap = self._rtds.get_chainlink_spot(coin)
         if rtds_snap is not None:
             return rtds_snap

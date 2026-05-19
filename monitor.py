@@ -79,7 +79,7 @@ from market_data.oracle_tick_tracker import OracleTickTracker
 from ctf_utils import _redeem_ctf_via_safe
 from py_clob_client_v2.config import get_contract_config as _get_contract_config
 _POLY_CONTRACTS = _get_contract_config(137)  # Polygon mainnet — CTF + collateral addresses
-from strategies.Momentum.event_log import emit as _emit_event
+from strategies.Momentum.event_log import emit as _emit_event, write_position_snapshot as _write_position_snapshot
 
 log = get_bot_logger(__name__)
 
@@ -97,6 +97,8 @@ class ExitReason:
     MOMENTUM_NEAR_EXPIRY        = "momentum_near_expiry"        # momentum: near expiry and spot has crossed strike
     MOMENTUM_UPFRAC_EXIT        = "upfrac_exit"                 # momentum: oracle tick up-fraction EWMA below threshold for N windows (M-13)
     MOMENTUM_PROB_STOP_LOSS     = "prob_sl"                     # momentum: CLOB token-price dropped below prob-SL threshold
+    MOMENTUM_HL_MARK_SL         = "hl_mark_sl"                  # momentum: HL perp mark crossed strike before Chainlink oracle
+    MOMENTUM_HL_DEPTH_SL        = "hl_depth_sl"                 # momentum: HL perp book heavily positioned against trade
     LOSER_EXIT                  = "loser_exit"                  # opening_neutral: loser bid-monitor trigger fired
 
 
@@ -131,6 +133,9 @@ _PENDING_RESOLUTIONS_PATH = _DATA_DIR / "pending_resolutions.json"
 #   delta_retreat_pct — (entry_delta - current_delta) / entry_delta * 100
 #   exit          — True if this tick triggered an exit
 #   reason        — exit reason label or empty
+#   hl_mark_price       — HL perp mark price at this tick (Signal A)
+#   hl_mark_div_pct     — (hl_mark - strike) / strike * 100; negative = mark below strike for UP
+#   hl_depth_imbalance  — position-adjusted HL book imbalance: negative = market against trade (Signal B)
 
 MOMENTUM_TICKS_CSV   = _DATA_DIR / "momentum_ticks.csv"
 _MOMENTUM_TICKS_HEADER = [
@@ -138,6 +143,7 @@ _MOMENTUM_TICKS_HEADER = [
     "tte_s", "entry_tok", "token", "tok_drop_pct",
     "entry_spot", "spot", "entry_delta", "current_delta", "delta_retreat_pct",
     "exit", "reason",
+    "hl_mark_price", "hl_mark_div_pct", "hl_depth_imbalance",
 ]
 
 def _ensure_momentum_ticks_csv() -> None:
@@ -154,6 +160,8 @@ def _write_momentum_tick(
     current_delta_pct: Optional[float],
     exit_flag: bool,
     reason: str,
+    hl_mark_price: Optional[float] = None,
+    hl_position_imbalance: Optional[float] = None,
 ) -> None:
     """Append one row to momentum_ticks.csv."""
     try:
@@ -176,6 +184,13 @@ def _write_momentum_tick(
             round((entry_delta - current_delta_pct) / entry_delta * 100, 4)
             if entry_delta is not None and entry_delta != 0 and current_delta_pct is not None else None
         )
+        # HL mark divergence pct (Signal A): position-direction-adjusted
+        hl_mark_div: Optional[float] = None
+        if hl_mark_price is not None and pos.strike > 0:
+            if pos.side in ("YES", "BUY_YES", "UP"):
+                hl_mark_div = round((hl_mark_price - pos.strike) / pos.strike * 100, 6)
+            else:
+                hl_mark_div = round((pos.strike - hl_mark_price) / pos.strike * 100, 6)
         row = {
             "ts":               datetime.now(timezone.utc).isoformat(),
             "market_id":        pos.market_id,
@@ -193,6 +208,9 @@ def _write_momentum_tick(
             "delta_retreat_pct": delta_retreat if delta_retreat is not None else "",
             "exit":             exit_flag,
             "reason":           reason,
+            "hl_mark_price":    round(hl_mark_price, 4) if hl_mark_price is not None else "",
+            "hl_mark_div_pct":  round(hl_mark_div, 6) if hl_mark_div is not None else "",
+            "hl_depth_imbalance": round(hl_position_imbalance, 6) if hl_position_imbalance is not None else "",
         }
         with MOMENTUM_TICKS_CSV.open("a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=_MOMENTUM_TICKS_HEADER).writerow(row)
@@ -323,6 +341,8 @@ def should_exit(
     delta_sl_pct: Optional[float] = None,
     oracle_age_seconds: Optional[float] = None,
     suppress_counts: Optional[dict] = None,
+    hl_mark_price: Optional[float] = None,
+    hl_position_imbalance: Optional[float] = None,
 ) -> tuple[bool, str, float]:
     """
     Decide whether a position should be exited.
@@ -553,8 +573,20 @@ def should_exit(
                 return True, ExitReason.MOMENTUM_STOP_LOSS, unrealised
             # Near-expiry: only exit if spot has already crossed the strike
             # (delta < 0).  Avoids premature exits from CLOB price collapse.
+            # Within MOMENTUM_NEAR_EXPIRY_SUPPRESS_BYPASS_TTE seconds of expiry
+            # the suppress gate is overridden — at this range even a high-priced
+            # token can collapse terminally before the suppress can lift.
+            _near_expiry_bypass_tte = getattr(config, "MOMENTUM_NEAR_EXPIRY_SUPPRESS_BYPASS_TTE", 0)
+            _near_expiry_suppress_active = (
+                _suppress_taker_exits
+                and not (
+                    _near_expiry_bypass_tte > 0
+                    and tte_seconds is not None
+                    and tte_seconds < _near_expiry_bypass_tte
+                )
+            )
             if (
-                not _suppress_taker_exits
+                not _near_expiry_suppress_active
                 and tte_seconds is not None
                 and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
                 and current_delta_pct < 0
@@ -677,6 +709,58 @@ def should_exit(
         )
         if token_price >= _tp_threshold:
             return True, ExitReason.MOMENTUM_TAKE_PROFIT, unrealised
+
+        # ── Early Warning SL: HL Mark Price Divergence (Signal A) ──────────
+        # Fires when HL perp mark has crossed the strike while Chainlink has not.
+        # TTE gate 30s (narrower than velocity — perp mark is a faster, cleaner signal).
+        if (
+            not _suppress_taker_exits
+            and getattr(config, "MOMENTUM_HL_MARK_SL_ENABLED", False)
+            and hl_mark_price is not None
+            and pos.strike > 0
+            and tte_seconds is not None
+            and tte_seconds < getattr(config, "MOMENTUM_HL_MARK_SL_MAX_TTE", 30)
+        ):
+            _hl_threshold_pct = getattr(config, "MOMENTUM_HL_MARK_SL_THRESHOLD_PCT", 0.0)
+            if pos.side in ("YES", "BUY_YES", "UP"):
+                _hl_mark_div = (hl_mark_price - pos.strike) / pos.strike * 100
+            else:
+                _hl_mark_div = (pos.strike - hl_mark_price) / pos.strike * 100
+            if _hl_mark_div < _hl_threshold_pct:
+                log.warning(
+                    "early_warning_sl",
+                    signal="hl_mark",
+                    market_id=pos.market_id[:20],
+                    hl_mark=round(hl_mark_price, 4),
+                    strike=pos.strike,
+                    divergence_pct=round(_hl_mark_div, 4),
+                    threshold_pct=_hl_threshold_pct,
+                    tte=round(tte_seconds, 1),
+                )
+                return True, ExitReason.MOMENTUM_HL_MARK_SL, unrealised
+
+        # ── Early Warning SL: HL Perp Depth Imbalance (Signal B) ───────────
+        # Fires when HL perp book is heavily positioned against this trade.
+        # TTE gate 30s — requires hl_position_imbalance already adjusted for side.
+        if (
+            not _suppress_taker_exits
+            and getattr(config, "MOMENTUM_HL_DEPTH_SL_ENABLED", False)
+            and hl_position_imbalance is not None
+            and tte_seconds is not None
+            and tte_seconds < getattr(config, "MOMENTUM_HL_DEPTH_SL_MAX_TTE", 30)
+        ):
+            _depth_threshold = getattr(config, "MOMENTUM_HL_DEPTH_SL_IMBALANCE_THRESHOLD", 0.40)
+            if hl_position_imbalance < -_depth_threshold:
+                log.warning(
+                    "early_warning_sl",
+                    signal="hl_depth",
+                    market_id=pos.market_id[:20],
+                    position_imbalance=round(hl_position_imbalance, 4),
+                    threshold=_depth_threshold,
+                    tte=round(tte_seconds, 1),
+                )
+                return True, ExitReason.MOMENTUM_HL_DEPTH_SL, unrealised
+
         return False, "", unrealised
 
     # ── Mispricing exits ──────────────────────────────────────────────────────
@@ -792,6 +876,7 @@ class PositionMonitor:
         # Exit fires when count reaches config.MOMENTUM_UPFRAC_EXIT_WINDOWS.
         self._upfrac_below_count: dict[str, int] = {}   # pos.market_id → count
         self._upfrac_window_ts: dict[str, float] = {}   # pos.market_id → last window evaluation time
+        self._last_upfrac: dict[str, float] = {}         # ML-D1: last computed upfrac per market_id
         self._oracle_tracker = oracle_tracker  # M-13 OracleTickTracker (Phase 3)
         # Tracks positions currently being exited to prevent double-exit races
         # between the poll loop and the event-driven on_price_update path.
@@ -2142,6 +2227,37 @@ class PositionMonitor:
             time.monotonic() - _last_tick if _last_tick is not None else None
         )
 
+        # ── Early Warning SL signal computation ──────────────────────────────
+        # Signal A: HL perp mark price (already arriving via webData2 WS).
+        # Always collected for tick logging even when ENABLED=False — should_exit()
+        # gates on the ENABLED flag separately.
+        _hl_mark_price: Optional[float] = None
+        if (
+            pos.strategy == "momentum"
+            and self._hl is not None
+            and pos.underlying
+        ):
+            _hl_mark_price = self._hl.get_mark_price(pos.underlying) if hasattr(self._hl, "get_mark_price") else None
+
+        # Signal B: HL perp depth imbalance — adjusted for position side.
+        # raw imbalance: +1=all bids, -1=all asks.  Position-adjusted: negative means
+        # market is positioned against this trade.
+        # Always collected for tick logging even when ENABLED=False.
+        _hl_position_imbalance: Optional[float] = None
+        if (
+            pos.strategy == "momentum"
+            and self._hl is not None
+            and pos.underlying
+        ):
+            _raw_imbalance = self._hl.get_depth_imbalance(pos.underlying) if hasattr(self._hl, "get_depth_imbalance") else None
+            if _raw_imbalance is not None:
+                # UP/YES: heavy asks (negative raw) means market offered against position.
+                # DOWN/NO: heavy bids (positive raw) means market bid against position.
+                if pos.side in ("YES", "BUY_YES", "UP"):
+                    _hl_position_imbalance = _raw_imbalance
+                else:
+                    _hl_position_imbalance = -_raw_imbalance
+
         exit_flag, reason, unrealised = should_exit(
             pos=pos,
             current_price=current_price,
@@ -2154,6 +2270,8 @@ class PositionMonitor:
             delta_sl_pct=coin_sl,
             oracle_age_seconds=oracle_age_secs,
             suppress_counts=self._exit_suppress_counts,
+            hl_mark_price=_hl_mark_price,
+            hl_position_imbalance=_hl_position_imbalance,
         )
 
         # Hysteresis: suppress delta SL until it holds for MOMENTUM_DELTA_SL_MIN_TICKS
@@ -2228,6 +2346,7 @@ class PositionMonitor:
                         pos.underlying or "", window_secs=float(_window_secs)
                     )
                     if _upfrac is not None:
+                        self._last_upfrac[pos.market_id] = _upfrac  # ML-D1: cache for snapshot
                         _threshold = config.MOMENTUM_UPFRAC_EXIT_THRESHOLD
                         _below = (
                             _upfrac < _threshold
@@ -2304,7 +2423,42 @@ class PositionMonitor:
                     current_delta_pct=_tick_delta,
                     exit_flag=exit_flag,
                     reason=reason,
+                    hl_mark_price=_hl_mark_price,
+                    hl_position_imbalance=_hl_position_imbalance,
                 )
+                # ML-D1: write position snapshot for momentum positions (not range).
+                # delta_sl_would_fire = raw check ignoring grace/veto suppression.
+                # upfrac_below = whether the last sampled upfrac is below threshold.
+                if pos.strategy == "momentum":
+                    _dsl_would_fire = (
+                        _tick_delta is not None and _tick_delta < coin_sl
+                    )
+                    _last_upfrac_val = self._last_upfrac.get(pos.market_id)
+                    _upfrac_thr = config.MOMENTUM_UPFRAC_EXIT_THRESHOLD
+                    _upfrac_below_flag = (
+                        _last_upfrac_val is not None and (
+                            _last_upfrac_val < _upfrac_thr
+                            if pos.side in ("YES", "UP", "BUY_YES")
+                            else _last_upfrac_val > (1.0 - _upfrac_thr)
+                        )
+                    )
+                    _write_position_snapshot(
+                        market_id=pos.market_id,
+                        side=pos.side,
+                        token_id=pos.token_id,
+                        underlying=pos.underlying,
+                        tte_seconds=tte_seconds,
+                        current_token_price=current_token_price,
+                        oracle_delta_pct=_tick_delta,
+                        hl_mark_price=_hl_mark_price,
+                        hl_depth_imbalance=_hl_position_imbalance,
+                        delta_sl_would_fire=_dsl_would_fire,
+                        upfrac_below=_upfrac_below_flag,
+                        last_upfrac=_last_upfrac_val,
+                        coin_sl=coin_sl,
+                        exit_flag=exit_flag,
+                        reason=reason,
+                    )
                 # Update dedup tracker so the next identical-state tick is skipped.
                 self._last_tick_state[pos.market_id] = _tick_state
         else:
@@ -2333,6 +2487,7 @@ class PositionMonitor:
             # a re-entry into the same market starts with a fresh clock.
             self._upfrac_below_count.pop(pos.market_id, None)
             self._upfrac_window_ts.pop(pos.market_id, None)
+            self._last_upfrac.pop(pos.market_id, None)
 
             if reason == ExitReason.RESOLVED:
                 # Use mid for both legs on resolution.  best_bid and best_ask straddle

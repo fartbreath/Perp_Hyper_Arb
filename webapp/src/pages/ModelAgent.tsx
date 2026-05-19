@@ -171,6 +171,7 @@ function ShadowTable({ rows }: { rows: ShadowLogRow[] }) {
             <th>Rules</th>
             <th>Model A</th>
             <th>Model B</th>
+            <th>Model C</th>
             <th>Decision</th>
             <th>Agreed</th>
             <th>Outcome</th>
@@ -222,6 +223,9 @@ function ShadowTable({ rows }: { rows: ShadowLogRow[] }) {
                 </td>
                 <td style={{ fontFamily: "monospace", fontSize: 12, color: "#d1d5db" }}>
                   {r.model_b_score ? Number(r.model_b_score).toFixed(2) : "—"}
+                </td>
+                <td style={{ fontFamily: "monospace", fontSize: 12, color: r.model_c_score ? "#a78bfa" : "#6b7280" }}>
+                  {r.model_c_score ? Number(r.model_c_score).toFixed(2) : "—"}
                 </td>
                 <td style={{ fontFamily: "monospace", fontSize: 12 }}>{r.model_decision}</td>
                 <td style={{ color: agreedColour(r.agreed), fontWeight: 700 }}>
@@ -342,6 +346,78 @@ export default function ModelAgentPage() {
           <ShadowTable rows={shadowData?.rows ?? []} />
         </>
       )}
+
+      {/* ML-C2: Model C Calibration Scatter — shown when any shadow row has model_c_score */}
+      {status.enabled && (() => {
+        const exitRows = (shadowData?.rows ?? []).filter(
+          (r) => r.model_c_score && r.model_c_score !== "" && r.decision_type === "exit"
+        );
+        if (exitRows.length === 0) return null;
+
+        // Parse features_snapshot to get CLOB and oracle implied probs
+        type ScatterPoint = { x: number; y: number; score: number; outcome: string };
+        const points: ScatterPoint[] = exitRows.flatMap((r) => {
+          try {
+            const f = JSON.parse(r.features_snapshot || "{}");
+            const loserBid = f.on_loser_bid_at_exit ?? f.loser_bid_at_exit;
+            const oracleProb = f.on_oracle_delta_at_exit ?? f.oracle_delta_at_exit;
+            if (loserBid == null) return [];
+            return [{
+              x: Number(loserBid),
+              y: oracleProb != null ? Number(oracleProb) : 0.5,
+              score: Number(r.model_c_score),
+              outcome: r.actual_outcome,
+            }];
+          } catch {
+            return [];
+          }
+        });
+        if (points.length === 0) return null;
+
+        const W = 380, H = 220, PAD = 36;
+        const xMin = Math.min(...points.map((p) => p.x));
+        const xMax = Math.max(...points.map((p) => p.x));
+        const yMin = Math.min(...points.map((p) => p.y));
+        const yMax = Math.max(...points.map((p) => p.y));
+        const toSvgX = (v: number) => PAD + ((v - xMin) / (xMax - xMin || 1)) * (W - 2 * PAD);
+        const toSvgY = (v: number) => H - PAD - ((v - yMin) / (yMax - yMin || 1)) * (H - 2 * PAD);
+        const scoreColour = (s: number) => {
+          const r2 = Math.round(255 * (1 - s));
+          const g2 = Math.round(180 * s);
+          const b2 = Math.round(255 * s);
+          return `rgb(${r2},${g2},${b2})`;
+        };
+
+        return (
+          <div className="card" style={{ marginTop: 24 }}>
+            <div style={{ fontWeight: 600, color: "#e2e8f0", marginBottom: 4 }}>
+              Model C Calibration — CLOB vs Oracle Implied Prob
+            </div>
+            <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 12 }}>
+              x = loser bid at exit · y = oracle implied prob · colour = Model C score (purple = high)
+            </div>
+            <svg width={W} height={H} style={{ display: "block" }}>
+              <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="#374151" strokeWidth={1} />
+              <line x1={PAD} y1={PAD} x2={PAD} y2={H - PAD} stroke="#374151" strokeWidth={1} />
+              {points.map((p, i) => (
+                <circle
+                  key={i}
+                  cx={toSvgX(p.x)}
+                  cy={toSvgY(p.y)}
+                  r={5}
+                  fill={scoreColour(p.score)}
+                  fillOpacity={0.8}
+                  stroke={p.outcome === "WIN" ? "#22c55e" : p.outcome === "LOSS" ? "#ef4444" : "#6b7280"}
+                  strokeWidth={1.5}
+                />
+              ))}
+            </svg>
+            <div style={{ fontSize: 11, color: "#6b7280", marginTop: 4 }}>
+              {points.length} exit decisions with Model C score · ring colour = resolved outcome
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

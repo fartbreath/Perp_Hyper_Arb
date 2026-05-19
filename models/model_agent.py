@@ -44,6 +44,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 _DATA_DIR = _REPO_ROOT / "data"
 _ANALYSIS_DIR = _REPO_ROOT / "analysis"
 _SHADOW_LOG_PATH = _ANALYSIS_DIR / "shadow_log.csv"
+_MODEL_D_LOG_PATH = _ANALYSIS_DIR / "model_d_log.csv"  # ML-D4: separate log (avoids shadow_log schema churn)
 _ON_FILLS_PATH = _DATA_DIR / "on_fills.csv"
 _MOMENTUM_FILLS_PATH = _DATA_DIR / "momentum_fills.csv"
 _ACCT_LEDGER_PATH = _DATA_DIR / "acct_ledger.csv"
@@ -59,10 +60,23 @@ _SHADOW_COLS = [
     "rules_decision",   # "enter" | "exit" | "skip" | "hold"
     "model_a_score",
     "model_b_score",
+    "model_c_score",    # ML-C2: CLOB/oracle divergence calibrator score (None when disabled)
     "model_decision",   # "agree" | "disagree"
     "agreed",           # "true" | "false"
     "actual_outcome",   # "PENDING" | "WIN" | "LOSS"
     "features_snapshot",  # JSON string
+]
+
+# ML-D4: separate log schema (separate file avoids shadow_log CSV schema churn)
+_MODEL_D_COLS = [
+    "timestamp",
+    "market_id",
+    "market_type",
+    "decision_type",     # "entry" (config policy applies at entry)
+    "delta_z_score",     # recommended z_score adjustment
+    "delta_kelly",       # recommended kelly multiplier adjustment
+    "delta_sl",          # recommended delta_sl_pct adjustment
+    "context_snapshot",  # JSON of input context features
 ]
 
 POLL_INTERVAL_SECS: float = 10.0
@@ -121,8 +135,13 @@ class ModelAgent:
         # Models — loaded lazily on first score call
         self._model_a: Any = None
         self._model_b: Any = None
+        self._model_c: Any = None
+        self._model_d: Any = None  # ML-D4: dict bundle {"models": {dim: regressor}, ...}
         self._model_a_loaded: bool = False
         self._model_b_loaded: bool = False
+        self._model_c_loaded: bool = False
+        self._model_d_loaded: bool = False
+        self._model_d_log_lock: Optional[asyncio.Lock] = None  # lazy init (needs event loop)
 
         # Runtime state
         self._status: str = "DISABLED"
@@ -186,6 +205,68 @@ class ModelAgent:
         except Exception as exc:
             log.warning("ModelAgent.score_exit error", market_id=market_id, exc=str(exc))
             return 0.5
+
+    def score_divergence(self, market_id: str, context: Optional[dict] = None) -> Optional[float]:
+        """
+        ML-C2: Return Model C calibrated P(WIN) for an exit decision.
+
+        Uses CLOB bid deltas and oracle context to output a continuous 0–1 probability.
+        Returns None when MODEL_C_ENABLED=False or model not loaded.
+        Never raises.
+        """
+        if not getattr(config, "MODEL_C_ENABLED", False):
+            return None
+        if not config.MODEL_AGENT_ENABLED:
+            return None
+        try:
+            from analysis.train_model import MODEL_C_FEATURES
+            model = self._load_model_c()
+            if model is None:
+                return None
+            features = build_exit_snapshot(context or {})
+            return self._predict(model, features, MODEL_C_FEATURES)
+        except Exception as exc:
+            log.warning("ModelAgent.score_divergence error", market_id=market_id, exc=str(exc))
+            return None
+
+    def score_config_policy(self, market_id: str, context: Optional[dict] = None) -> Optional[dict]:
+        """
+        ML-D4: Return Model D recommended config deltas for an entry decision.
+
+        Returns dict with keys: delta_z_score, delta_kelly, delta_sl (each float).
+        Returns None when MODEL_D_ENABLED=False, model not loaded, or on error.
+        Deltas are clamped to ±MODEL_D_MAX_DELTA_PCT of 1.0 (relative).
+        Never raises.
+        """
+        if not getattr(config, "MODEL_D_ENABLED", False):
+            return None
+        if not config.MODEL_AGENT_ENABLED:
+            return None
+        try:
+            from analysis.train_model import MODEL_D_FEATURES
+            bundle = self._load_model_d()
+            if bundle is None:
+                return None
+            models = bundle.get("models", {})
+            if not models:
+                return None
+            features = build_entry_snapshot(context or {})
+            max_delta = float(getattr(config, "MODEL_D_MAX_DELTA_PCT", 0.5))
+            result: dict = {}
+            import pandas as pd
+            for dim in ("z_score", "kelly", "delta_sl"):
+                model_dim = models.get(dim)
+                if model_dim is None:
+                    result[f"delta_{dim}"] = 0.0
+                    continue
+                row_df = pd.DataFrame([{f: features.get(f, -999.0) for f in MODEL_D_FEATURES}])
+                raw_delta = float(model_dim.predict(row_df)[0])
+                clamped = max(-max_delta, min(max_delta, raw_delta))
+                result[f"delta_{dim}"] = round(clamped, 4)
+            return result
+        except Exception as exc:
+            log.warning("ModelAgent.score_config_policy error", market_id=market_id, exc=str(exc))
+            return None
 
     # ── API state accessors ───────────────────────────────────────────────────
 
@@ -276,6 +357,7 @@ class ModelAgent:
                 "rules_decision": "exit",
                 "model_a_score": "",
                 "model_b_score": f"{score:.4f}",
+                "model_c_score": "",
                 "model_decision": "suppress",
                 "agreed": "false",
                 "actual_outcome": "PENDING",
@@ -393,6 +475,37 @@ class ModelAgent:
                     log.warning("ModelAgent: failed to load Model B", exc=str(exc))
         return self._model_b
 
+    def _load_model_c(self) -> Any:
+        """Lazy-load Model C pkl (ML-C2). Returns None if disabled or file not found."""
+        if not self._model_c_loaded:
+            self._model_c_loaded = True
+            path = Path(getattr(config, "MODEL_C_PATH", ""))
+            if path and path.exists():
+                try:
+                    import pickle
+                    with open(path, "rb") as fh:
+                        self._model_c = pickle.load(fh)
+                    log.info("ModelAgent: Model C loaded", path=str(path))
+                except Exception as exc:
+                    log.warning("ModelAgent: failed to load Model C", exc=str(exc))
+        return self._model_c
+
+    def _load_model_d(self) -> Any:
+        """Lazy-load Model D bundle pkl (ML-D4). Returns None if disabled or file not found."""
+        if not self._model_d_loaded:
+            self._model_d_loaded = True
+            path = Path(getattr(config, "MODEL_D_PATH", ""))
+            if path and path.exists():
+                try:
+                    import pickle
+                    with open(path, "rb") as fh:
+                        self._model_d = pickle.load(fh)
+                    dims = list((self._model_d or {}).get("models", {}).keys())
+                    log.info("ModelAgent: Model D loaded", path=str(path), dims=dims)
+                except Exception as exc:
+                    log.warning("ModelAgent: failed to load Model D", exc=str(exc))
+        return self._model_d
+
     def _predict(self, model: Any, features: dict, feature_list: list[str]) -> float:
         """Run inference and return P(class=1). Raises on failure (caller catches)."""
         try:
@@ -494,11 +607,13 @@ class ModelAgent:
             mid = row.get("market_id", "")
             ts_now = str(time.time())
 
-            # Score both models
+            # Score all models
             if decision_type == "entry":
                 features = build_entry_snapshot(row)
                 a_score = self.score_entry(mid, row)
                 b_score: Optional[float] = None
+                c_score: Optional[float] = None
+                d_policy: Optional[dict] = self.score_config_policy(mid, row)  # ML-D4
                 rules_decision = "enter"
                 # Model agrees if it also would enter (score > 0.5)
                 model_decision_enter = a_score >= 0.5
@@ -507,6 +622,8 @@ class ModelAgent:
                 features = build_exit_snapshot(row)
                 a_score = None
                 b_score = self.score_exit(mid, row)
+                c_score = self.score_divergence(mid, row)  # ML-C2: may be None
+                d_policy = None  # config policy only applies at entry
                 rules_decision = "exit"
                 # Model agrees if it also would exit (score >= 0.5 means genuine drain)
                 model_decision_exit = b_score >= 0.5
@@ -522,6 +639,7 @@ class ModelAgent:
                 "rules_decision": rules_decision,
                 "model_a_score": f"{a_score:.4f}" if a_score is not None else "",
                 "model_b_score": f"{b_score:.4f}" if b_score is not None else "",
+                "model_c_score": f"{c_score:.4f}" if c_score is not None else "",
                 "model_decision": model_decision,
                 "agreed": "true" if agreed else "false",
                 "actual_outcome": "PENDING",
@@ -529,6 +647,19 @@ class ModelAgent:
             }
 
             await self._write_shadow_row(shadow_row)
+
+            # ML-D4: write Model D policy recommendation to separate log (entry only)
+            if d_policy is not None and decision_type == "entry":
+                await self._write_model_d_row({
+                    "timestamp": ts_now,
+                    "market_id": mid,
+                    "market_type": row.get("market_type", ""),
+                    "decision_type": decision_type,
+                    "delta_z_score": f"{d_policy.get('delta_z_score', 0.0):.4f}",
+                    "delta_kelly": f"{d_policy.get('delta_kelly', 0.0):.4f}",
+                    "delta_sl": f"{d_policy.get('delta_sl', 0.0):.4f}",
+                    "context_snapshot": json.dumps({f: features.get(f) for f in list(features.keys())[:20]}),
+                })
 
             # Track pending outcomes for later resolution
             if mid:
@@ -665,6 +796,32 @@ class ModelAgent:
         self._shadow_rows.append(row)
         if len(self._shadow_rows) > 1000:
             self._shadow_rows = self._shadow_rows[-1000:]
+
+    async def _write_model_d_row(self, row: dict) -> None:
+        """ML-D4: append one row to model_d_log.csv (separate file for schema hygiene)."""
+        if self._model_d_log_lock is None:
+            self._model_d_log_lock = asyncio.Lock()
+        async with self._model_d_log_lock:
+            write_header = not _MODEL_D_LOG_PATH.exists()
+            _MODEL_D_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_MODEL_D_LOG_PATH, "a", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=_MODEL_D_COLS, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+
+    def get_model_d_log(self, limit: int = 100) -> dict:
+        """Return last N rows of model_d_log.csv, newest first."""
+        if not _MODEL_D_LOG_PATH.exists():
+            return {"rows": [], "total": 0}
+        try:
+            with open(_MODEL_D_LOG_PATH, newline="", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+            sliced = rows[-limit:][::-1]
+            return {"rows": sliced, "total": len(rows)}
+        except Exception as exc:
+            log.warning("ModelAgent: error reading model_d_log", exc=str(exc))
+            return {"rows": [], "total": 0, "error": str(exc)}
 
     # ── ML-08: independent entry scan (paper trades) ──────────────────────────
 
