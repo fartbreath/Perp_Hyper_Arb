@@ -191,6 +191,7 @@ class AccountingPosition:
     exit_time:       str = ""
     exit_type:       str = ""      # RESOLVED | TAKER | SL | TP | LOSER_EXIT | REDEMPTION
     exit_reason:     str = ""      # ExitReason string: momentum_stop_loss | prob_sl | upfrac_exit | loser_exit | …
+    pending_exit_reason: str = ""  # pre-recorded exit reason set when exit is attempted; used as fallback if fill never arrives
     closing_since:   str = ""      # timestamp when CLOSING state was first entered
     pm_exit_confirmed: bool = False
 
@@ -771,6 +772,21 @@ class _Ledger:
         )
         return pos_id
 
+    def set_pending_exit_reason(self, token_id: str, reason: str) -> None:
+        """Pre-record an intended exit reason before a fill arrives.
+
+        Called when an exit order is attempted but the fill may not arrive
+        before market resolution (e.g. order rejected near expiry). Prevents
+        handle_resolution() from overwriting the reason with 'resolved'.
+        """
+        with self._lock:
+            pos_id = self._token_index.get(token_id)
+            if pos_id is None:
+                return
+            pos = self._positions.get(pos_id)
+            if pos is not None and pos.status not in PositionStatus.TERMINAL:
+                pos.pending_exit_reason = reason
+
     def on_resolved(
         self,
         condition_id:      str,
@@ -821,7 +837,7 @@ class _Ledger:
                     if not pos.exit_type:
                         pos.exit_type  = "RESOLVED"
                     if not pos.exit_reason:
-                        pos.exit_reason = "resolved"
+                        pos.exit_reason = pos.pending_exit_reason or "resolved"
 
                 # Terminal status
                 if pos.exit_type in ("SL",):

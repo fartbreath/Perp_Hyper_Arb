@@ -52,6 +52,7 @@ _DATA_DIR.mkdir(exist_ok=True)
 MOMENTUM_EVENTS_PATH    = _DATA_DIR / "momentum_events.jsonl"
 SIGNAL_EVENTS_PATH      = _DATA_DIR / "signal_events.jsonl"
 POSITION_SNAPSHOTS_PATH = _DATA_DIR / "position_snapshots.jsonl"
+EXIT_SNAPSHOTS_PATH     = _DATA_DIR / "mom_exit_snapshots.jsonl"
 
 
 def emit(event: str, **kwargs: Any) -> None:
@@ -230,3 +231,69 @@ def write_position_snapshot(
             fh.write(json.dumps(row) + "\n")
     except Exception as exc:
         log.debug("position_snapshots.jsonl write error", exc=str(exc))
+
+
+# ── ML-C1: Momentum exit snapshot log ────────────────────────────────────────
+# Written once per SL exit (momentum_stop_loss, hl_mark_sl, prob_sl,
+# momentum_near_expiry, upfrac_exit).  Never written on RESOLVED or take-profit
+# exits — those outcomes are clean and don't need exit-quality labelling.
+#
+# These records are the training source for a momentum exit model (Model C
+# pivot to momentum data).  feature_builder.py joins them to the fills data
+# by market_id + side to add exit-time features to each training row.
+#
+# Key features logged:
+#   bid_delta_pct       — token price drop from entry VWAP to exit CLOB mid (%)
+#   oracle_delta_pct    — sign-adjusted spot vs strike delta at exit time (%)
+#   hl_mark_delta_pct   — HL perp mark vs strike (sign-adjusted, %)
+#   tte_remaining_secs  — seconds left in bucket when SL fires
+
+
+def write_exit_snapshot(
+    *,
+    market_id: str,
+    side: str,
+    token_id: str,
+    underlying: str,
+    market_type: str,
+    exit_reason: str,
+    entry_price: float,
+    entry_spot: Optional[float],
+    tte_remaining_secs: Optional[float],
+    exit_token_mid: Optional[float],
+    bid_delta_pct: Optional[float],
+    oracle_delta_pct: Optional[float],
+    hl_mark_price: Optional[float],
+    hl_mark_delta_pct: Optional[float],
+    hl_depth_imbalance: Optional[float],
+    opposite_bid_depth_usd: Optional[float] = None,
+) -> None:
+    """Append one exit-snapshot row to mom_exit_snapshots.jsonl.
+
+    Fire-and-forget: never raises; errors are logged at DEBUG level only.
+    """
+    row: dict[str, Any] = {
+        "schema_version":    1,
+        "ts":                datetime.now(timezone.utc).isoformat(),
+        "market_id":         market_id,
+        "side":              side,
+        "token_id":          token_id,
+        "underlying":        underlying,
+        "market_type":       market_type,
+        "exit_reason":       exit_reason,
+        "entry_price":       round(entry_price, 6),
+        "entry_spot":        round(entry_spot, 4) if entry_spot else None,
+        "tte_remaining_secs": round(tte_remaining_secs, 2) if tte_remaining_secs is not None else None,
+        "exit_token_mid":    round(exit_token_mid, 6) if exit_token_mid is not None else None,
+        "bid_delta_pct":     round(bid_delta_pct, 6) if bid_delta_pct is not None else None,
+        "oracle_delta_pct":  round(oracle_delta_pct, 6) if oracle_delta_pct is not None else None,
+        "hl_mark_price":     round(hl_mark_price, 4) if hl_mark_price is not None else None,
+        "hl_mark_delta_pct": round(hl_mark_delta_pct, 6) if hl_mark_delta_pct is not None else None,
+        "hl_depth_imbalance": round(hl_depth_imbalance, 6) if hl_depth_imbalance is not None else None,
+        "opposite_bid_depth_usd": round(opposite_bid_depth_usd, 2) if opposite_bid_depth_usd is not None else None,
+    }
+    try:
+        with EXIT_SNAPSHOTS_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception as exc:
+        log.debug("mom_exit_snapshots.jsonl write error", exc=str(exc))

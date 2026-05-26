@@ -79,7 +79,7 @@ from market_data.oracle_tick_tracker import OracleTickTracker
 from ctf_utils import _redeem_ctf_via_safe
 from py_clob_client_v2.config import get_contract_config as _get_contract_config
 _POLY_CONTRACTS = _get_contract_config(137)  # Polygon mainnet — CTF + collateral addresses
-from strategies.Momentum.event_log import emit as _emit_event, write_position_snapshot as _write_position_snapshot
+from strategies.Momentum.event_log import emit as _emit_event, write_position_snapshot as _write_position_snapshot, write_exit_snapshot as _write_exit_snapshot
 
 log = get_bot_logger(__name__)
 
@@ -99,6 +99,7 @@ class ExitReason:
     MOMENTUM_PROB_STOP_LOSS     = "prob_sl"                     # momentum: CLOB token-price dropped below prob-SL threshold
     MOMENTUM_HL_MARK_SL         = "hl_mark_sl"                  # momentum: HL perp mark crossed strike before Chainlink oracle
     MOMENTUM_HL_DEPTH_SL        = "hl_depth_sl"                 # momentum: HL perp book heavily positioned against trade
+    MOMENTUM_ORACLE_STALE_SL    = "oracle_stale_sl"              # momentum: oracle stale — exiting blind hold
     LOSER_EXIT                  = "loser_exit"                  # opening_neutral: loser bid-monitor trigger fired
 
 
@@ -533,7 +534,15 @@ def should_exit(
             )
             _in_grace = (now - pos.opened_at).total_seconds() < _delta_sl_grace_secs
             _above_min_tte = tte_seconds is not None and tte_seconds >= _min_tte
-            _suppress_delta_sl = _in_grace and _above_min_tte
+            # WINNER (ON-promoted): require BOTH age < grace AND TTE still above entry
+            # threshold — prevents a late-promoted position from holding an infinite
+            # blind spot until TTE drops below min_tte (up to 340s for 15m buckets).
+            # MAIN: age-only grace — _above_min_tte is always False for bucket_5m MAIN
+            # because entry requires TTE ≤ min_tte, so the AND gate made grace a no-op.
+            if _is_winner:
+                _suppress_delta_sl = _in_grace and _above_min_tte
+            else:
+                _suppress_delta_sl = _in_grace
             # Token price veto: if the CLOB token mid is still above the veto floor,
             # the oracle retreat is likely a transient noise tick (crowd not repricing).
             # Only applied when current_token_price is available; floor=0.0 disables.
@@ -594,10 +603,10 @@ def should_exit(
                 return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
 
             # S2.4 — Near-expiry hard exit on stale oracle: if we are near expiry
-            # AND the oracle has been silent for longer than the configured threshold
-            # AND the token is NOT clearly winning, exit rather than holding blind
-            # to resolution.  This prevents a frozen oracle from hiding an adverse
-            # spot move during the final seconds of a bucket.
+            # AND the oracle has been silent for longer than the configured threshold,
+            # exit rather than holding blind to resolution.  Covers both a completely
+            # dead oracle (spot=None) and a frozen-cache oracle (spot is the stale
+            # cached price replayed without a live push).
             _hard_exit_stale_secs = getattr(config, "ORACLE_STALE_NEAR_EXPIRY_HARD_EXIT_SECS", 0)
             if (
                 not _suppress_taker_exits
@@ -606,16 +615,36 @@ def should_exit(
                 and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
                 and oracle_age_seconds is not None
                 and oracle_age_seconds >= _hard_exit_stale_secs
-                and current_spot is None  # delta unavailable (oracle offline)
             ):
                 log.warning(
-                    "Monitor: near-expiry hard exit — oracle stale with no spot",
+                    "Monitor: near-expiry hard exit — oracle stale",
                     market_id=pos.market_id,
                     tte_seconds=round(tte_seconds, 1),
                     oracle_stale_secs=round(oracle_age_seconds, 1),
                     threshold=_hard_exit_stale_secs,
+                    spot_available=current_spot is not None,
                 )
                 return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
+
+            # S2.5 — Mid-hold stale oracle exit: if the oracle has been silent
+            # beyond ORACLE_STALE_MID_HOLD_EXIT_SECS (default 120 s) at any TTE,
+            # exit rather than holding blind.  Bypasses the winner-suppress gate
+            # because a stale oracle cannot confirm the position is still winning.
+            _mid_hold_stale_secs = getattr(config, "ORACLE_STALE_MID_HOLD_EXIT_SECS", 0)
+            if (
+                _mid_hold_stale_secs > 0
+                and oracle_age_seconds is not None
+                and oracle_age_seconds >= _mid_hold_stale_secs
+            ):
+                log.warning(
+                    "Monitor: mid-hold exit — oracle stale",
+                    market_id=pos.market_id,
+                    tte_seconds=round(tte_seconds, 1) if tte_seconds is not None else None,
+                    oracle_stale_secs=round(oracle_age_seconds, 1),
+                    threshold=_mid_hold_stale_secs,
+                    spot_available=current_spot is not None,
+                )
+                return True, ExitReason.MOMENTUM_ORACLE_STALE_SL, unrealised
 
         # Token-price exits (take-profit + prob-based SL) require the held token's CLOB mid.
         if pos.side in ("YES", "BUY_YES", "UP"):
@@ -941,18 +970,18 @@ class PositionMonitor:
         if self._spot is not None and pos.underlying:
             spot_mid = self._spot.get_mid(pos.underlying, pos.market_type)
             if spot_mid is not None:
-                # Use the same monotonic tick tracker that should_exit uses for
-                # oracle_age_seconds — consistent measurement, no dependency on
-                # SpotSnapshot.timestamp (which varies by oracle source).
-                _last_tick = self._last_oracle_tick_ts.get(pos.underlying)
-                if _last_tick is not None:
-                    oracle_age = round(time.monotonic() - _last_tick, 1)
+                # Route oracle age through SpotOracle.get_spot_age so it tracks
+                # the correct feed per market type: RTDS for 1h/daily/weekly
+                # (which settle on Binance OHLC) and Chainlink for 5m/15m/4h.
+                # Using _last_oracle_tick_ts (refreshed by both feeds) would mask
+                # RTDS staleness for 1h positions when Chainlink is still alive.
+                _raw_age = self._spot.get_spot_age(pos.underlying, pos.market_type)
+                if not math.isinf(_raw_age):
+                    oracle_age = round(_raw_age, 1)
                     stale_thresh = getattr(config, "MOMENTUM_SPOT_MAX_AGE_SECS", 30)
                     oracle_status = "OK" if oracle_age <= stale_thresh else "STALE"
                 else:
-                    # Price available but no tick timestamp yet (e.g. first few seconds
-                    # after startup or a cold REST-seeded cache).  Treat as OK — the
-                    # price is fresh enough to have reached the cache.
+                    # No snapshot yet (startup / cold cache) — treat as OK.
                     oracle_status = "OK"
             # else: snap missing → stays "MISSING"
 
@@ -2168,6 +2197,9 @@ class PositionMonitor:
             if pos.side in ("YES", "BUY_YES", "UP"):
                 # YES/UP CLOB mid; None when book is drained (delta SL still active via oracle spot).
                 current_token_price = book.mid if book is not None else None
+                # ML-C1: also fetch the opposite (NO) book for exit snapshot logging.
+                # In-memory lookup only — no network cost.
+                book_no = self._pm._books.get(market.token_id_no)
             else:
                 book_no = self._pm._books.get(market.token_id_no)
                 if book_no is not None and book_no.mid is not None:
@@ -2222,10 +2254,14 @@ class PositionMonitor:
         coin_sl = config.MOMENTUM_DELTA_SL_PCT_BY_COIN.get(
             pos.underlying, config.MOMENTUM_DELTA_STOP_LOSS_PCT
         ) if pos.underlying else config.MOMENTUM_DELTA_STOP_LOSS_PCT
-        _last_tick = self._last_oracle_tick_ts.get(pos.underlying or "")
-        oracle_age_secs = (
-            time.monotonic() - _last_tick if _last_tick is not None else None
-        )
+        # Use SpotOracle.get_spot_age so the age tracks the settlement-correct
+        # feed: RTDS for 1h/daily/weekly, Chainlink for 5m/15m/4h.  This ensures
+        # S2.4/S2.5 fire when the relevant feed is stale, not masked by the other.
+        if self._spot is not None and pos.underlying:
+            _raw_age = self._spot.get_spot_age(pos.underlying, pos.market_type)
+            oracle_age_secs = None if math.isinf(_raw_age) else _raw_age
+        else:
+            oracle_age_secs = None
 
         # ── Early Warning SL signal computation ──────────────────────────────
         # Signal A: HL perp mark price (already arriving via webData2 WS).
@@ -2489,6 +2525,80 @@ class PositionMonitor:
             self._upfrac_window_ts.pop(pos.market_id, None)
             self._last_upfrac.pop(pos.market_id, None)
 
+            # ML-C1: log exit-time snapshot for momentum SL exits (not RESOLVED/TP).
+            # Written to data/mom_exit_snapshots.jsonl for Model C training data.
+            _MOM_SL_EXIT_REASONS = frozenset({
+                ExitReason.MOMENTUM_STOP_LOSS,
+                ExitReason.MOMENTUM_NEAR_EXPIRY,
+                ExitReason.MOMENTUM_PROB_STOP_LOSS,
+                ExitReason.MOMENTUM_HL_MARK_SL,
+                ExitReason.MOMENTUM_UPFRAC_EXIT,
+            })
+            if pos.strategy == "momentum" and reason in _MOM_SL_EXIT_REASONS:
+                _exit_oracle_delta: Optional[float] = None
+                if current_spot is not None and pos.strike > 0:
+                    if pos.side in ("YES", "BUY_YES", "UP"):
+                        _exit_oracle_delta = round(
+                            (current_spot - pos.strike) / pos.strike * 100, 6
+                        )
+                    elif pos.spot_price > pos.strike:
+                        # Dip-market NO/DOWN: winning = spot > strike.
+                        _exit_oracle_delta = round(
+                            (current_spot - pos.strike) / pos.strike * 100, 6
+                        )
+                    else:
+                        # Reach-market / bucket NO/DOWN: winning = spot < strike.
+                        _exit_oracle_delta = round(
+                            (pos.strike - current_spot) / pos.strike * 100, 6
+                        )
+                _exit_bid_delta_pct: Optional[float] = None
+                if current_token_price is not None and pos.entry_price > 0:
+                    _exit_bid_delta_pct = round(
+                        (current_token_price - pos.entry_price) / pos.entry_price * 100, 6
+                    )
+                _hl_mark_delta_pct_exit: Optional[float] = None
+                if _hl_mark_price is not None and pos.strike > 0:
+                    if pos.side in ("YES", "BUY_YES", "UP"):
+                        _hl_mark_delta_pct_exit = round(
+                            (_hl_mark_price - pos.strike) / pos.strike * 100, 6
+                        )
+                    else:
+                        _hl_mark_delta_pct_exit = round(
+                            (pos.strike - _hl_mark_price) / pos.strike * 100, 6
+                        )
+                # Opposite-side CLOB depth at exit: 5-level bid depth of the token
+                # we are NOT holding.  Rising opposite depth while held token drains
+                # indicates the crowd is actively pricing a reversal (not just settlement
+                # liquidity withdrawal).  book_no is now always fetched for momentum
+                # positions regardless of side (YES/UP: book_no=NO book).
+                _opposite_bid_depth_usd: Optional[float] = None
+                if pos.side in ("YES", "BUY_YES", "UP"):
+                    _opp_book = book_no  # NO book already fetched above
+                else:
+                    _opp_book = book    # YES book is the opposite for NO/DOWN positions
+                if _opp_book is not None and _opp_book.bids:
+                    _opposite_bid_depth_usd = round(
+                        sum(p * s for p, s in _opp_book.bids[:5]), 2
+                    )
+                _write_exit_snapshot(
+                    market_id=pos.market_id,
+                    side=pos.side,
+                    token_id=pos.token_id,
+                    underlying=pos.underlying or "",
+                    market_type=pos.market_type or "",
+                    exit_reason=reason,
+                    entry_price=pos.entry_price,
+                    entry_spot=pos.spot_price if pos.spot_price else None,
+                    tte_remaining_secs=tte_seconds,
+                    exit_token_mid=current_token_price,
+                    bid_delta_pct=_exit_bid_delta_pct,
+                    oracle_delta_pct=_exit_oracle_delta,
+                    hl_mark_price=_hl_mark_price,
+                    hl_mark_delta_pct=_hl_mark_delta_pct_exit,
+                    hl_depth_imbalance=_hl_position_imbalance,
+                    opposite_bid_depth_usd=_opposite_bid_depth_usd,
+                )
+
             if reason == ExitReason.RESOLVED:
                 # Use mid for both legs on resolution.  best_bid and best_ask straddle
                 # 0.50 near expiry: bid rounds down to 0 while ask rounds up to 1,
@@ -2664,6 +2774,15 @@ class PositionMonitor:
                     # _exit_position directly with a fresh taker price.
                     self._pending_exit_positions[f"{pos.market_id}:{pos.side}"] = reason
                     self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
+                    # Pre-record the exit reason in accounting so that if the
+                    # market resolves before a retry succeeds, handle_resolution()
+                    # uses the correct reason instead of 'resolved'.
+                    if pos.token_id:
+                        try:
+                            from accounting import get_ledger as _get_ledger
+                            _get_ledger().set_pending_exit_reason(pos.token_id, reason)
+                        except Exception:
+                            pass
                     return
             else:
                 # Limit order with post_only for automatic monitor exits.
@@ -2705,6 +2824,15 @@ class PositionMonitor:
                     # Register for forced retry on next monitor cycle.
                     self._pending_exit_positions[f"{pos.market_id}:{pos.side}"] = reason
                     self._exiting_positions.discard(f"{pos.market_id}:{pos.side}")
+                    # Pre-record the exit reason in accounting so that if the
+                    # market resolves before a retry succeeds, handle_resolution()
+                    # uses the correct reason instead of 'resolved'.
+                    if pos.token_id:
+                        try:
+                            from accounting import get_ledger as _get_ledger
+                            _get_ledger().set_pending_exit_reason(pos.token_id, reason)
+                        except Exception:
+                            pass
                     return
 
         # ── Taker exit: confirm actual fill price via WS / REST ──────────────

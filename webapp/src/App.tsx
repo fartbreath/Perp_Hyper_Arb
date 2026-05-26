@@ -44,12 +44,12 @@ const MODEL_SIM_LINKS: { to: string; label: string }[] = [
 
 // Dropdown group: Models — SHAP reports and explainability, one per model
 const MODEL_REPORT_LINKS: { href: string; label: string; badge?: string }[] = [
-  { href: `${BASE_URL}/reports/model_a_v0_shap.html`, label: "Model A — Entry Quality", badge: "A" },
-  { href: `${BASE_URL}/reports/model_b_v0_shap.html`, label: "Model B — Exit Gate (v0)", badge: "B" },
-  { href: `${BASE_URL}/reports/model_b_v1_shap.html`, label: "Model B v1 — Exit Gate (v5 features)", badge: "B1" },
-  { href: `${BASE_URL}/reports/model_c_v0_shap.html`, label: "Model C — Divergence", badge: "C" },
+  { href: `${BASE_URL}/reports/model_a_v0_shap.html`, label: "Model A — Entry WIN Gate", badge: "A" },
+  { href: `${BASE_URL}/reports/model_b_v0_shap.html`, label: "Model B — ON Loser Exit Gate (v0)", badge: "B" },
+  { href: `${BASE_URL}/reports/model_b_v1_shap.html`, label: "Model B v1 — ON Loser Exit Gate (v5 features)", badge: "B1" },
+  { href: `${BASE_URL}/reports/model_c_v0_shap.html`, label: "Model C — Exit P(WIN) Calibrator", badge: "C" },
   // Model D (Config Policy) — added when model_d_v0.pkl is available
-  { href: `${BASE_URL}/reports/model_d_v0_shap.html`, label: "Model D — Config Policy", badge: "D" },
+  { href: `${BASE_URL}/reports/model_d_v0_shap.html`, label: "Model D — Regime Config Advisor", badge: "D" },
 ];
 
 function NavDropdown({

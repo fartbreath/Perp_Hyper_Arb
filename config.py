@@ -631,6 +631,18 @@ MOMENTUM_DEPTH_SHARE_GATE_ENABLED: bool = True
 MOMENTUM_DEPTH_SHARE_YES_MIN: float = 0.40   # skip YES entry when yes_depth_share < 0.40
 MOMENTUM_DEPTH_SHARE_NO_MAX: float = 0.60    # skip NO entry when yes_depth_share > 0.60
 
+# ── M-15: HL Perp Depth Imbalance Entry Gate ─────────────────────────────────
+# Block entry when the HL perp book is heavily positioned against the trade.
+# Raw imbalance: +1 = all bids, -1 = all asks. Position-adjusted so that
+# negative values always mean "market positioned against this trade".
+# Analysis (77 trades, 2026-05-19): entry imbalance < -0.30 → 50% WR vs 70.7%
+# for the rest (+9.7pp). XRP excluded — imbalance is inverted for that coin.
+# Source: analysis/hl_gate_overlap.py (2026-05-19).
+# Fail-open when HL WS not connected (returns None).
+MOMENTUM_HL_ENTRY_GATE_ENABLED: bool = False
+MOMENTUM_HL_ENTRY_IMBALANCE_MIN: float = -0.30   # block entry when position-adj imbalance < this
+MOMENTUM_HL_ENTRY_GATE_EXCLUDE_COINS: list = ["XRP"]  # coins exempt from this gate (inverted signal)
+
 # ── M-14: TWAP Deviation Entry Gate ──────────────────────────────────────────
 # YES/UP entries only (NO/DOWN not validated — see PRD M-14).
 # In LOW volatility regime: if oracle is below its 10s TWAP by this many bps,
@@ -1138,7 +1150,13 @@ POSITION_BOOK_FALLBACK_AGE_SECS: int = 45
 # AND oracle has been stale for longer than this threshold AND the token is not
 # clearly winning (below MOMENTUM_TAKER_EXIT_SUPPRESS_ABOVE), fire a taker exit
 # rather than holding blind to resolution.  0 = disabled.
-ORACLE_STALE_NEAR_EXPIRY_HARD_EXIT_SECS: int = 60
+ORACLE_STALE_NEAR_EXPIRY_HARD_EXIT_SECS: int = 10
+
+# S2.5 — Mid-hold stale oracle exit: if the oracle has been silent for this
+# many seconds while a momentum position is open (at any TTE), exit rather
+# than holding blind.  Bypasses the winner-suppress gate — a stale oracle
+# cannot confirm the position is winning.  0 = disabled.
+ORACLE_STALE_MID_HOLD_EXIT_SECS: int = 120
 
 # ── Institutional Grade — Feed Health (S3) ────────────────────────────────────
 # S3.3 — Chainlink reconnect rate alerting: warn when the rolling-1h reconnect

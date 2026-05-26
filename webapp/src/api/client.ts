@@ -562,7 +562,7 @@ export interface ConfigData {
   momentum_phase_c_min_tte_daily?: number;
   momentum_phase_c_min_tte_weekly?: number;
   momentum_phase_c_min_tte_milestone?: number;
-  // Signal entry gates (M-10, M-11, M-14)
+  // Signal entry gates (M-10, M-11, M-14, M-15)
   momentum_funding_gate_enabled?: boolean;
   momentum_funding_gate_yes_max?: number;
   momentum_funding_gate_no_min?: number;
@@ -572,6 +572,17 @@ export interface ConfigData {
   momentum_twap_gate_enabled?: boolean;
   momentum_twap_dev_threshold_bps?: number;
   momentum_twap_dev_low_vol_yes_multiplier?: number;
+  // M-11: HL Mark SL (Signal A) & HL Depth SL (Signal B)
+  momentum_hl_mark_sl_enabled?: boolean;
+  momentum_hl_mark_sl_threshold_pct?: number;
+  momentum_hl_mark_sl_max_tte?: number;
+  momentum_hl_depth_sl_enabled?: boolean;
+  momentum_hl_depth_sl_imbalance_threshold?: number;
+  momentum_hl_depth_sl_max_tte?: number;
+  momentum_hl_depth_sl_levels?: number;
+  // M-15: HL perp depth imbalance entry gate
+  momentum_hl_entry_gate_enabled?: boolean;
+  momentum_hl_entry_imbalance_min?: number;
   // M-13: upfrac EWMA early exit
   momentum_upfrac_exit_enabled?: boolean;
   momentum_upfrac_exit_threshold?: number;

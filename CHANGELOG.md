@@ -2,6 +2,106 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-05-26] — M-15 HL entry gate; S2.4/S2.5 stale oracle exits; ML-C1 exit snapshot log; Model A feature refresh; delta SL grace fix; accounting pending-exit reason
+
+### Feature — M-15: HL Perp Depth Imbalance Entry Gate (`strategies/Momentum/scanner.py`, `strategies/Momentum/signal.py`, `config.py`, `api_server.py`)
+
+Blocks entry when the HL perp book is heavily positioned against the trade. Position-adjusted imbalance (negative = market against trade) is fetched from `HLClient.get_depth_imbalance()` at scan time. Analysis (77 trades, 2026-05-19): imbalance < −0.30 → 50% WR vs 70.7% for the rest (+9.7pp). XRP excluded — imbalance signal is inverted for that coin. Fail-open when HL WS is not connected (returns None).
+
+**New config vars:**
+- `MOMENTUM_HL_ENTRY_GATE_ENABLED: bool = False`
+- `MOMENTUM_HL_ENTRY_IMBALANCE_MIN: float = -0.30`
+- `MOMENTUM_HL_ENTRY_GATE_EXCLUDE_COINS: list = ["XRP"]`
+
+`hl_entry_imbalance` column added to `momentum_fills.csv` and logged unconditionally (gate off or on). `MomentumSignal.entry_hl_depth_imbalance` field added. Gate and `skipped_hl_entry` counter exposed in scan diagnostics. API patch/GET endpoints updated.
+
+---
+
+### Feature — S2.5: Mid-hold stale oracle exit (`monitor.py`, `config.py`)
+
+New S2.5 exit block fires when the settlement-correct oracle (RTDS for 1h/daily/weekly; Chainlink for 5m/15m/4h) has been silent for `ORACLE_STALE_MID_HOLD_EXIT_SECS` seconds at **any** TTE. Bypasses the winner-suppress gate — a stale oracle cannot confirm the position is winning.
+
+**New config var:** `ORACLE_STALE_MID_HOLD_EXIT_SECS: int = 120`
+
+**New exit reason:** `ExitReason.MOMENTUM_ORACLE_STALE_SL = "oracle_stale_sl"`
+
+---
+
+### Fix — S2.4: Near-expiry stale oracle exit now catches frozen-cache oracles (`monitor.py`, `config.py`)
+
+S2.4 previously required `current_spot is None` to fire, meaning it only triggered when the oracle was completely offline. A stale RTDS feed that replays a cached price (e.g. RTDS disconnected but internal cache still holds the last-known value) would never satisfy `current_spot is None`, leaving the near-expiry exit blind.
+
+Removed the `current_spot is None` condition — S2.4 now fires based on `oracle_age_seconds >= threshold` alone. `spot_available=True/False` added to the warning log for diagnostics.
+
+`ORACLE_STALE_NEAR_EXPIRY_HARD_EXIT_SECS` lowered from 60 → **10** seconds.
+
+---
+
+### Fix — Oracle age tracks settlement-correct feed per market type (`monitor.py`)
+
+`oracle_age_seconds` (used by S2.4, S2.5, and position health reporting) was computed from `_last_oracle_tick_ts`, which is refreshed by **both** RTDS and Chainlink callbacks. This meant a 1h/daily/weekly position with stale RTDS showed `oracle_age` of only 2–3 s if Chainlink was alive, preventing S2.4/S2.5 from firing.
+
+Both call sites now use `self._spot.get_spot_age(pos.underlying, pos.market_type)`, which routes to RTDS age for 1h/daily/weekly and Chainlink age for 5m/15m/4h. Chainlink staying alive can no longer mask a stale RTDS for 1h positions.
+
+---
+
+### Fix — Delta SL grace applies age-only for MAIN positions (`monitor.py`)
+
+The existing grace gate was `_in_grace AND _above_min_tte`. For `bucket_5m` MAIN entries, `tte_seconds < MOMENTUM_MIN_TTE_SECONDS` is a required entry condition, so `_above_min_tte` was always `False` — making the grace period a no-op for all MAIN 5m positions.
+
+Now split by position type:
+- **MAIN**: grace = `_in_grace` only (age-based)
+- **WINNER (ON-promoted)**: grace = `_in_grace AND _above_min_tte` (both age and TTE)
+
+---
+
+### Feature — ML-C1: Momentum exit snapshot log (`strategies/Momentum/event_log.py`, `monitor.py`)
+
+`write_exit_snapshot()` appends one record to `data/mom_exit_snapshots.jsonl` for every momentum SL exit (`momentum_stop_loss`, `hl_mark_sl`, `prob_sl`, `momentum_near_expiry`, `upfrac_exit`). Not written on RESOLVED or take-profit exits.
+
+**Fields logged:** `bid_delta_pct`, `oracle_delta_pct`, `hl_mark_delta_pct`, `hl_depth_imbalance`, `opposite_bid_depth_usd`, `tte_remaining_secs`, `exit_token_mid`, `entry_price`, `entry_spot`, `exit_reason`.
+
+For YES/UP positions, the NO book is now also fetched in `_check_position` (in-memory lookup, no network cost) to populate `opposite_bid_depth_usd`.
+
+---
+
+### Feature — ML-07: Model A feature set refresh (`models/feature_snapshot.py`, `strategies/Momentum/scanner.py`)
+
+- `deribit_iv` removed from `MODEL_A_FEATURES` — 87.5% null for momentum rows, dropped in model_a_v0 retrain
+- `clob_yes_bid_depth_5` added — top-5 YES bid depth in USDC at entry
+- `mom_hl_depth_imbalance` added — position-adjusted HL book imbalance at entry
+- `is_bucket_5m`, `is_bucket_1h`, `is_bucket_15m`, `is_bucket_4h` added — one-hot flags derived from `market_type`
+- `build_entry_snapshot()` updated to populate all new fields; `_ma_context` in scanner updated to pass `clob_yes_bid_depth_5`, `hl_entry_imbalance`, and `market_type`
+- Model B v5 exit-time features (`on_winner_bid_at_exit`, `on_loser_bid_at_exit`, `on_oracle_delta_at_exit`, `on_tte_at_exit_secs`) un-commented and activated in `MODEL_B_FEATURES` — XGBoost handles NaN natively; inert until populated by scanner v5 data
+
+---
+
+### Fix — Accounting: pending exit reason survives market resolution (`accounting.py`)
+
+`AccountingPosition.pending_exit_reason` field added. `_Ledger.set_pending_exit_reason(token_id, reason)` pre-records the intended exit reason when a taker exit is attempted. `handle_resolution()` now uses `pending_exit_reason` as fallback instead of `"resolved"` — prevents a near-expiry SL attempt from being recorded as `exit_reason="resolved"` when the market settles before the retry fill arrives.
+
+`set_pending_exit_reason()` is called from both taker-exit retry paths in `_exit_position()` (`monitor.py`).
+
+---
+
+### Fix — Risk: `skip_accounting=True` on startup position restore (`risk.py`, `live_fill_handler.py`)
+
+`RiskEngine.open_position()` gains a `skip_accounting: bool = False` kwarg. The startup restore path in `live_fill_handler.py` now passes `skip_accounting=True` to prevent `on_entry_fill()` from double-counting contracts for positions already recorded in `acct_positions.json`.
+
+---
+
+### Fix — API: Model C calibration handles mixed resolved_outcome types (`api_server.py`)
+
+`model_c_calibration()` now coerces all feature columns to float (`pd.to_numeric(errors="coerce").fillna(-999)`) before calling `predict_proba()`, and handles `resolved_outcome` stored as either int (1/0) or string ("WIN"/"LOSS").
+
+---
+
+### Fix — Scanner: eagerly creates `momentum_fills.csv` on start (`strategies/Momentum/scanner.py`)
+
+`_ensure_momentum_fills_csv()` is now called in `MomentumScanner.start()` so `feature_builder.py` can always open the file even if no fills have occurred in the current session.
+
+---
+
 ## [2026-05-19] — Early Warning SL; ML-D4 Model D simulator; Model C simulator; Chainlink zombie-feed fix; near-expiry suppress bypass; config audit trail; OPE page
 
 ### Feature — Early Warning SL: HL Mark Price Divergence (Signal A) (`monitor.py`, `hl_client.py`, `config.py`)

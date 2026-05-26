@@ -132,6 +132,8 @@ MOMENTUM_FILLS_HEADER = [
     # ── Model A sizing (ML-07, Phase 3) ────────────────────────────────────
     "model_a_score",       # ModelAgent score_entry() output (0–1); None if disabled
     "model_a_scale",       # Kelly scale factor applied: MODEL_A_MIN..MAX_SCALE
+    # ── M-15: HL perp depth imbalance at entry ───────────────────────────
+    "hl_entry_imbalance",  # position-adjusted HL book imbalance at scan time (float | None)
 ]
 
 
@@ -243,6 +245,9 @@ class MomentumScanner(BaseStrategy):
 
     async def start(self) -> None:
         self._running = True
+        # Eagerly create momentum_fills.csv so feature_builder.py can always
+        # open it (even if no fills have occurred in the current session).
+        _ensure_momentum_fills_csv()
         log.info(
             "MomentumScanner started",
             interval=config.MOMENTUM_SCAN_INTERVAL,
@@ -477,6 +482,7 @@ class MomentumScanner(BaseStrategy):
         skipped_depth_share_yes = 0
         skipped_depth_share_no = 0
         skipped_twap_yes = 0
+        skipped_hl_entry = 0
 
         band_lo = config.MOMENTUM_PRICE_BAND_LOW
         band_hi = config.MOMENTUM_PRICE_BAND_HIGH
@@ -1209,6 +1215,34 @@ class MomentumScanner(BaseStrategy):
                 scan_diags.append(_d)
                 continue
 
+            # ── M-15: HL Perp Depth Imbalance Entry Gate ────────────────────
+            # Block entry when the HL perp book is heavily positioned against
+            # the trade.  Raw imbalance: +1 = all bids, -1 = all asks.
+            # Position-adjusted so negative = market positioned against trade.
+            # Analysis (77 trades): imbalance < -0.30 → 50% WR vs 70.7% (+9.7pp).
+            # Fail-open when HL WS data is None (transient connectivity gap).
+            # Always fetched for fills CSV logging regardless of gate state.
+            _hl_raw_imbalance: Optional[float] = (
+                self._hl.get_depth_imbalance(coin) if self._hl is not None else None
+            )
+            _hl_entry_imbalance: Optional[float] = None
+            if _hl_raw_imbalance is not None:
+                _hl_entry_imbalance = (
+                    _hl_raw_imbalance if _gate_side == "YES" else -_hl_raw_imbalance
+                )
+            _d["hl_entry_imbalance"] = round(_hl_entry_imbalance, 4) if _hl_entry_imbalance is not None else None
+            _hl_entry_exclude = getattr(config, "MOMENTUM_HL_ENTRY_GATE_EXCLUDE_COINS", ["XRP"])
+            if (
+                getattr(config, "MOMENTUM_HL_ENTRY_GATE_ENABLED", False)
+                and _hl_entry_imbalance is not None
+                and coin not in _hl_entry_exclude
+                and _hl_entry_imbalance < getattr(config, "MOMENTUM_HL_ENTRY_IMBALANCE_MIN", -0.30)
+            ):
+                skipped_hl_entry += 1
+                _d["skip_reason"] = "hl_entry_gate"
+                scan_diags.append(_d)
+                continue
+
             # ── SIGNAL: emit immediately ─────────────────────────────────────
             # vol_src already set above from vol_result (reflects actual source used)
             signal = MomentumSignal(
@@ -1237,6 +1271,7 @@ class MomentumScanner(BaseStrategy):
             signal.entry_yes_depth_share = _yes_depth_share
             signal.entry_twap_dev_bps = _twap_dev_bps
             signal.entry_vol_regime = _vol_regime
+            signal.entry_hl_depth_imbalance = _hl_entry_imbalance
             # ── Kelly sizing preview for diagnostics ─────────────────────
             # Compute Kelly fields now so the webapp diagnostics row for this
             # signal shows the full sizing breakdown, not just whether it fired.
@@ -1320,6 +1355,7 @@ class MomentumScanner(BaseStrategy):
             skipped_depth_share_yes=skipped_depth_share_yes,
             skipped_depth_share_no=skipped_depth_share_no,
             skipped_twap_yes=skipped_twap_yes,
+            skipped_hl_entry=skipped_hl_entry,
         )
         # Persist diags for /momentum/diagnostics — no vol re-calls needed.
         self._last_scan_diags = scan_diags
@@ -1347,6 +1383,7 @@ class MomentumScanner(BaseStrategy):
             "skipped_depth_share_yes": skipped_depth_share_yes,
             "skipped_depth_share_no":  skipped_depth_share_no,
             "skipped_twap_yes":        skipped_twap_yes,
+            "skipped_hl_entry":        skipped_hl_entry,
         }
         self._last_scan_ts = now_ts
 
@@ -1548,21 +1585,29 @@ class MomentumScanner(BaseStrategy):
                     ) * 100 + 1e-9
                 )
                 _ma_context = {
-                    "signal_obs_z":     _obs_z_now,
-                    "effective_z":      _kelly_debug.get("kelly_z_total"),
-                    "signal_sigma_ann": signal.sigma_ann,
-                    "kelly_f":          _kelly_debug.get("kelly_f"),
-                    "kelly_win_prob":   _kelly_debug.get("kelly_win_prob"),
-                    "kelly_multiplier": _kelly_debug.get("kelly_fraction_cfg"),
-                    "oracle_delta_pct": signal.delta_pct,
-                    "deribit_iv":       signal.sigma_ann if signal.vol_source == "deribit_atm" else None,
-                    "yes_depth_share":  signal.entry_yes_depth_share,
-                    "tte_seconds":      signal.tte_seconds,
-                    "timestamp":        signal.timestamp,
-                    "vol_regime":       signal.entry_vol_regime,
-                    "twap_dev_bps":     signal.entry_twap_dev_bps,
-                    "signal_delta_pct": signal.delta_pct,
-                    "funding_rate":     signal.entry_funding_rate,
+                    "signal_obs_z":        _obs_z_now,
+                    "effective_z":         _kelly_debug.get("kelly_z_total"),
+                    "signal_sigma_ann":    signal.sigma_ann,
+                    "kelly_f":             _kelly_debug.get("kelly_f"),
+                    "kelly_win_prob":      _kelly_debug.get("kelly_win_prob"),
+                    "kelly_multiplier":    _kelly_debug.get("kelly_fraction_cfg"),
+                    "oracle_delta_pct":    signal.delta_pct,
+                    "deribit_iv":          signal.sigma_ann if signal.vol_source == "deribit_atm" else None,
+                    "yes_depth_share":     signal.entry_yes_depth_share,
+                    "tte_seconds":         signal.tte_seconds,
+                    "timestamp":           signal.timestamp,
+                    "vol_regime":          signal.entry_vol_regime,
+                    "twap_dev_bps":        signal.entry_twap_dev_bps,
+                    "signal_delta_pct":    signal.delta_pct,
+                    "funding_rate":        signal.entry_funding_rate,
+                    # ML-07: features added to match model_a_v0 22-feature schema
+                    "clob_yes_bid_depth_5": (
+                        round(sum(p * s for p, s in book.bids[:5]), 2)
+                        if book.bids else None
+                    ),
+                    "hl_entry_imbalance":  signal.entry_hl_depth_imbalance,
+                    # build_entry_snapshot derives is_bucket_* flags from market_type
+                    "market_type":         signal.market_type,
                 }
                 _model_a_score = self._model_agent.score_entry(signal.market_id, _ma_context)
                 _min_sc = config.MODEL_A_MIN_SCALE
@@ -2064,6 +2109,8 @@ class MomentumScanner(BaseStrategy):
                 # Model A sizing (ML-07, Phase 3)
                 "model_a_score": round(_model_a_score, 4) if _model_a_score is not None else None,
                 "model_a_scale": round(_model_a_scale, 4),
+                # M-15: HL entry imbalance
+                "hl_entry_imbalance": round(signal.entry_hl_depth_imbalance, 4) if signal.entry_hl_depth_imbalance is not None else None,
             }
             with MOMENTUM_FILLS_CSV.open("a", newline="") as _f:
                 _writer = csv.DictWriter(_f, fieldnames=MOMENTUM_FILLS_HEADER, extrasaction="ignore")

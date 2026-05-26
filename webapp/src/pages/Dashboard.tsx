@@ -1113,13 +1113,23 @@ function ModelTrainingCard() {
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
         <ModelChip
           exists={data?.model_b_exists ?? false}
-          label="Model B — CLOB trust"
+          label="Model B — ON loser exit gate"
           href="http://localhost:8080/reports/model_b_v0_shap.html"
         />
         <ModelChip
           exists={data?.model_a_exists ?? false}
-          label="Model A — entry quality"
+          label="Model A — entry WIN gate"
           href="http://localhost:8080/reports/model_a_v0_shap.html"
+        />
+        <ModelChip
+          exists={data?.model_c_exists ?? false}
+          label="Model C — exit P(WIN) calibrator"
+          href="http://localhost:8080/reports/model_c_v0_shap.html"
+        />
+        <ModelChip
+          exists={data?.model_d_exists ?? false}
+          label="Model D — regime config advisor"
+          href="http://localhost:8080/reports/model_d_v0_shap.html"
         />
       </div>
 

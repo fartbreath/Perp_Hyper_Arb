@@ -417,7 +417,7 @@ class LiveFillHandler:
                 entry_cost_usd=round(entry_cost, 4),
                 token_id=token_id,
             )
-            self._risk.open_position(pos)
+            self._risk.open_position(pos, skip_accounting=True)
             # Pin so WS subscription survives the next market-refresh sweep.
             self._pm._pinned_tokens.add(token_id)
             restored += 1

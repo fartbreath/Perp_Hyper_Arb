@@ -761,7 +761,7 @@ export default function Settings() {
 
         <NumberInput
           label="MAIN Grace Period"
-          description="Delta SL grace window for direct Momentum entries (seconds). Reduced from 120s to close the protection gap before near-expiry. Recommended: 90s."
+          description="Delta SL grace window for direct Momentum entries (MAIN fill_type). The delta SL is suppressed for this many seconds after entry AND while TTE is still above the bucket minimum — so for bucket_5m entries (entry window ≤ 120s TTE) this grace is inactive unless TTE > MOMENTUM_MIN_TTE_SECONDS.bucket_5m. Recommended: 20–30s."
           value={data.momentum_delta_sl_grace_secs ?? 90}
           step={10}
           unit="s"
@@ -2092,17 +2092,6 @@ export default function Settings() {
 
             {GAP}
 
-            <NumberInput
-              label="Delta SL Grace Window (s)"
-              description="Seconds after a position opens during which the delta stop-loss is suppressed. Prevents early SL fires on ON-promoted WINNERs that arrive near-ATM. Grace is also gated by min TTE — the SL re-arms early if TTE drops below the bucket minimum regardless."
-              value={data.momentum_delta_sl_grace_secs ?? 120}
-              step={10}
-              unit="s"
-              onSubmit={(v) => apply({ momentum_delta_sl_grace_secs: v })}
-            />
-
-            {GAP}
-
             <FloatInput
               label="Delta SL Token Price Veto Floor"
               description="If the held token's CLOB mid is still above this price when the oracle delta retreats below the SL threshold, the SL is suppressed. The CLOB crowd not repricing indicates the oracle move is likely noise. Set to 0.0 to disable. Recommended: 0.55."
@@ -2694,6 +2683,36 @@ export default function Settings() {
               </>
             )}
 
+            <SectionHead title="M-15: HL Perp Depth Imbalance Entry Gate" />
+            <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
+              Blocks entry when the HL perp order book is heavily positioned against the trade.
+              Raw imbalance is position-adjusted so that negative values always mean "market is
+              against this trade". Analysis (77 trades, 2026-05-19): imbalance &lt; -0.30 → 50%
+              win rate vs 70.7% for the rest (+9.7 pp). XRP is excluded (inverted signal).
+              Fail-open when HL WebSocket data is unavailable.
+            </p>
+            <Toggle
+              label="HL Entry Imbalance Gate Enabled"
+              description="When ON, block entry when the position-adjusted HL perp depth imbalance falls below the threshold."
+              value={data.momentum_hl_entry_gate_enabled ?? false}
+              onChange={(v) => apply({ momentum_hl_entry_gate_enabled: v })}
+            />
+            {(data.momentum_hl_entry_gate_enabled ?? false) && (
+              <>
+                {GAP}
+                <FloatInput
+                  label="Min HL Entry Imbalance"
+                  description="Block entry when position-adjusted imbalance is below this. e.g. -0.30 = block when book is 30%+ against the trade. Range: -1.0 (all asks) to 0.0."
+                  value={data.momentum_hl_entry_imbalance_min ?? -0.30}
+                  step={0.05}
+                  min={-1.0}
+                  max={0.0}
+                  unit=""
+                  onSubmit={(v) => apply({ momentum_hl_entry_imbalance_min: v })}
+                />
+              </>
+            )}
+
             <SectionHead title="M-13: Up-Fraction EWMA Early Exit" />
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
               Oracle tick up-fraction EWMA. For YES positions: exit when EWMA stays below threshold
@@ -3044,7 +3063,7 @@ export default function Settings() {
         <p className="settings-desc">
           Shadow-mode ML agent that scores every entry and exit.{" "}
           <strong>MODEL_AGENT_ENABLED and Independent Entry Scan require a bot restart.</strong>{" "}
-          Model B gate and Model A scale apply immediately when toggled.
+          Model A: P(WIN) entry gate/sizer (22 momentum features). Model B: ON loser-exit gate (genuine drain vs. noise). Both apply immediately when toggled.
         </p>
 
         {GAP}
@@ -3079,8 +3098,8 @@ export default function Settings() {
         {GAP}
 
         <Toggle
-          label="Model A Sizing Scale"
-          description="Scale entry size on low-confidence entries. Min×=0.5 at score 0; Max×=1.0 at score 1. Upscaling >1× disabled until ≥200 live-validated trades."
+          label="Model A Entry Size Scale"
+          description="Scale entry size by Model A P(WIN) score. Min×=0.5 at score 0; Max×=1.0 at score 1. Model A predicts WIN probability from 22 momentum entry features — analysis shows it is a strong retroactive entry gate. Upscaling >1× disabled until ≥200 live-validated trades."
           value={data.model_a_enabled ?? false}
           onChange={(v) => apply({ model_a_enabled: v })}
         />
@@ -3089,7 +3108,7 @@ export default function Settings() {
 
         <FloatInput
           label="Model A Min Scale"
-          description="Minimum size multiplier when model score ≈ 0. 0.5 = half-size on lowest-confidence entries."
+          description="Minimum size multiplier when Model A entry gate score ≈ 0. 0.5 = half-size on lowest-confidence entries."
           value={data.model_a_min_scale ?? 0.5}
           step={0.05}
           unit="×"
@@ -3100,7 +3119,7 @@ export default function Settings() {
 
         <FloatInput
           label="Model A Max Scale"
-          description="Maximum size multiplier when model score ≈ 1. Keep ≤ 1.0 until ≥ 200 live-validated trades."
+          description="Maximum size multiplier when Model A entry gate score ≈ 1. Keep ≤ 1.0 until ≥ 200 live-validated trades."
           value={data.model_a_max_scale ?? 1.0}
           step={0.05}
           unit="×"
@@ -3111,7 +3130,7 @@ export default function Settings() {
 
         <Toggle
           label="Independent Entry Scan"
-          description="Evaluate ALL PM markets with Model A — no z-score/funding/TWAP pre-filters. Records to analysis/model_paper_trades.csv. Requires Model Agent Enabled + bot restart."
+          description="Use Model A as a standalone entry gate — evaluates ALL PM markets with no z-score/funding/TWAP pre-filters, entering paper trades when score ≥ threshold. Records to analysis/model_paper_trades.csv. Requires Model Agent Enabled + bot restart."
           value={data.model_a_independent_enabled ?? false}
           onChange={(v) => apply({ model_a_independent_enabled: v })}
         />
@@ -3174,7 +3193,7 @@ export default function Settings() {
 
         {GAP}
 
-        <ToggleRow
+        <Toggle
           label="Model D Config Policy Optimizer"
           description="ML-D4: Shadow-mode only. Recommends z_score / kelly / stop-loss deltas per vol-regime and underlying based on historical momentum outcomes. Writes recommendations to model_d_log.csv. Does NOT adjust live config automatically."
           value={data.model_d_enabled ?? false}

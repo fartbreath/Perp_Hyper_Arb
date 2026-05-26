@@ -52,6 +52,7 @@ class MomentumSignal:
     entry_yes_depth_share: Optional[float] = None   # YES bid depth share at scan time
     entry_twap_dev_bps: Optional[float] = None      # oracle TWAP deviation in bps at scan time
     entry_vol_regime: str = "UNKNOWN"               # vol regime at scan time ("HIGH"/"LOW"/"UNKNOWN")
+    entry_hl_depth_imbalance: Optional[float] = None  # M-15: position-adj HL book imbalance at scan time
 
     @property
     def edge_pct(self) -> float:

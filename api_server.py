@@ -562,6 +562,17 @@ _MUTABLE_CONFIG = {
     "momentum_twap_gate_enabled":            ("MOMENTUM_TWAP_GATE_ENABLED",            bool),
     "momentum_twap_dev_threshold_bps":       ("MOMENTUM_TWAP_DEV_THRESHOLD_BPS",       float),
     "momentum_twap_dev_low_vol_yes_multiplier": ("MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER", float),
+    # M-11: HL Mark SL (Signal A) & HL Depth SL (Signal B) — early-warning stop-loss
+    "momentum_hl_mark_sl_enabled":           ("MOMENTUM_HL_MARK_SL_ENABLED",           bool),
+    "momentum_hl_mark_sl_threshold_pct":     ("MOMENTUM_HL_MARK_SL_THRESHOLD_PCT",     float),
+    "momentum_hl_mark_sl_max_tte":           ("MOMENTUM_HL_MARK_SL_MAX_TTE",           int),
+    "momentum_hl_depth_sl_enabled":          ("MOMENTUM_HL_DEPTH_SL_ENABLED",          bool),
+    "momentum_hl_depth_sl_imbalance_threshold": ("MOMENTUM_HL_DEPTH_SL_IMBALANCE_THRESHOLD", float),
+    "momentum_hl_depth_sl_max_tte":          ("MOMENTUM_HL_DEPTH_SL_MAX_TTE",          int),
+    "momentum_hl_depth_sl_levels":           ("MOMENTUM_HL_DEPTH_SL_LEVELS",           int),
+    # M-15: HL perp depth imbalance entry gate
+    "momentum_hl_entry_gate_enabled":        ("MOMENTUM_HL_ENTRY_GATE_ENABLED",        bool),
+    "momentum_hl_entry_imbalance_min":       ("MOMENTUM_HL_ENTRY_IMBALANCE_MIN",       float),
     # M-13: upfrac EWMA early exit
     "momentum_upfrac_exit_enabled":          ("MOMENTUM_UPFRAC_EXIT_ENABLED",          bool),
     "momentum_upfrac_exit_threshold":        ("MOMENTUM_UPFRAC_EXIT_THRESHOLD",        float),
@@ -826,7 +837,7 @@ class ConfigPatch(BaseModel):
     momentum_kelly_win_prob_cap: float | None = None
     momentum_kelly_clob_reliable_tte: int | None = None
     momentum_kelly_oracle_sensitivity: float | None = None
-    # Signal entry gates (M-10, M-11, M-14)
+    # Signal entry gates (M-10, M-11, M-14, M-15)
     momentum_funding_gate_enabled: bool | None = None
     momentum_funding_gate_yes_max: float | None = None
     momentum_funding_gate_no_min: float | None = None
@@ -836,6 +847,17 @@ class ConfigPatch(BaseModel):
     momentum_twap_gate_enabled: bool | None = None
     momentum_twap_dev_threshold_bps: float | None = None
     momentum_twap_dev_low_vol_yes_multiplier: float | None = None
+    # M-11: HL Mark SL (Signal A) & HL Depth SL (Signal B)
+    momentum_hl_mark_sl_enabled: bool | None = None
+    momentum_hl_mark_sl_threshold_pct: float | None = None
+    momentum_hl_mark_sl_max_tte: int | None = None
+    momentum_hl_depth_sl_enabled: bool | None = None
+    momentum_hl_depth_sl_imbalance_threshold: float | None = None
+    momentum_hl_depth_sl_max_tte: int | None = None
+    momentum_hl_depth_sl_levels: int | None = None
+    # M-15: HL perp depth imbalance entry gate
+    momentum_hl_entry_gate_enabled: bool | None = None
+    momentum_hl_entry_imbalance_min: float | None = None
     # M-13: upfrac EWMA early exit
     momentum_upfrac_exit_enabled: bool | None = None
     momentum_upfrac_exit_threshold: float | None = None
@@ -1118,6 +1140,17 @@ async def get_config() -> dict:
         "momentum_twap_gate_enabled":            config.MOMENTUM_TWAP_GATE_ENABLED,
         "momentum_twap_dev_threshold_bps":       config.MOMENTUM_TWAP_DEV_THRESHOLD_BPS,
         "momentum_twap_dev_low_vol_yes_multiplier": config.MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER,
+        # M-11: HL Mark SL (Signal A) & HL Depth SL (Signal B)
+        "momentum_hl_mark_sl_enabled":           config.MOMENTUM_HL_MARK_SL_ENABLED,
+        "momentum_hl_mark_sl_threshold_pct":     config.MOMENTUM_HL_MARK_SL_THRESHOLD_PCT,
+        "momentum_hl_mark_sl_max_tte":           config.MOMENTUM_HL_MARK_SL_MAX_TTE,
+        "momentum_hl_depth_sl_enabled":          config.MOMENTUM_HL_DEPTH_SL_ENABLED,
+        "momentum_hl_depth_sl_imbalance_threshold": config.MOMENTUM_HL_DEPTH_SL_IMBALANCE_THRESHOLD,
+        "momentum_hl_depth_sl_max_tte":          config.MOMENTUM_HL_DEPTH_SL_MAX_TTE,
+        "momentum_hl_depth_sl_levels":           config.MOMENTUM_HL_DEPTH_SL_LEVELS,
+        # M-15: HL perp depth imbalance entry gate
+        "momentum_hl_entry_gate_enabled":        config.MOMENTUM_HL_ENTRY_GATE_ENABLED,
+        "momentum_hl_entry_imbalance_min":       config.MOMENTUM_HL_ENTRY_IMBALANCE_MIN,
         # M-13: upfrac EWMA early exit
         "momentum_upfrac_exit_enabled":          config.MOMENTUM_UPFRAC_EXIT_ENABLED,
         "momentum_upfrac_exit_threshold":        config.MOMENTUM_UPFRAC_EXIT_THRESHOLD,
@@ -3985,8 +4018,14 @@ def model_c_calibration() -> dict:
                 {f: row.get(f, -999.0) for f in MODEL_C_FEATURES}
                 for _, row in df.iterrows()
             ])
+        # Coerce all columns to float; null/object columns (e.g. features not yet
+        # populated in training_data.parquet) are filled with the -999 sentinel so
+        # XGBoost receives a fully numeric DataFrame.
+        X = X.apply(_pd.to_numeric, errors="coerce").fillna(-999.0)
         scores = model_c.predict_proba(X)[:, 1]
-        outcomes = (df["resolved_outcome"].astype(str).str.upper() == "WIN").astype(int).values
+        # resolved_outcome may be stored as int (1/0) or string ("WIN"/"LOSS")
+        ro = df["resolved_outcome"]
+        outcomes = ((ro == 1) | (ro.astype(str).str.upper() == "WIN")).astype(int).values
 
         # Calibration: 10 equal-width buckets 0.0–1.0
         bins = _np.linspace(0.0, 1.0, 11)

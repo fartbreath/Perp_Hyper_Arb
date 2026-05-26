@@ -269,6 +269,12 @@ export default function ModelAgentPage() {
       <p style={{ color: "#9ca3af", marginBottom: 20, fontSize: 14 }}>
         ML-04 — shadow-mode decision log. The model observes every bot decision
         without affecting live trades or positions.
+        {" "}<strong style={{ color: "#d1d5db" }}>Model A</strong>: P(WIN) at entry — trained on
+        momentum entry features; used as an entry gate (independent scan) and optionally a size scaler.
+        {" "}<strong style={{ color: "#d1d5db" }}>Model B</strong>: ON loser-exit gate — predicts
+        genuine drain vs. noise on Opening Neutral loser exits.
+        {" "}<strong style={{ color: "#d1d5db" }}>Model C</strong>: calibrated P(WIN) at exit from
+        CLOB/oracle divergence context — shadow-read-only.
       </p>
 
       {/* Disabled banner */}
@@ -305,7 +311,7 @@ export default function ModelAgentPage() {
 
         {status.enabled && (
           <AccuracyCard
-            label="Model A (Entry)"
+            label="Model A (Entry Gate)"
             accuracy={status.model_a_accuracy}
             resolved={status.model_a_resolved}
           />
@@ -313,7 +319,7 @@ export default function ModelAgentPage() {
 
         {status.enabled && (
           <AccuracyCard
-            label="Model B (Exit)"
+            label="Model B (ON Exit Gate)"
             accuracy={status.model_b_accuracy}
             resolved={status.model_b_resolved}
           />

@@ -518,7 +518,7 @@ class RiskEngine:
         """Composite position key — one slot per (market, side) pair."""
         return f"{market_id}:{side}"
 
-    def open_position(self, position: Position) -> None:
+    def open_position(self, position: Position, *, skip_accounting: bool = False) -> None:
         with self._lock:
             key = self._pos_key(position.market_id, position.side)
             existing = self._positions.get(key)
@@ -559,7 +559,10 @@ class RiskEngine:
                 self._save_token_strategy()
 
         # Accounting hook – fire-and-forget, never blocks strategy execution
-        if position.token_id:
+        # skip_accounting=True is used by startup restore paths that load positions
+        # from acct_positions.json on disk — calling on_entry_fill() there would
+        # double-count contracts since accounting already has the position.
+        if position.token_id and not skip_accounting:
             try:
                 from accounting import get_ledger  # local import avoids circular dep
                 _source = "paper" if config.PAPER_TRADING else "ws"

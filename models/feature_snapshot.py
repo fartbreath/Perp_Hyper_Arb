@@ -37,12 +37,11 @@ MODEL_B_FEATURES: list[str] = [
     "on_hl_mark_price",
     # Time context
     "hour_utc",
-    # v5: exit-time CLOB signals — ADD these once the bot collects data with scanner v5
-    # (100% null in current training data — held back to avoid corrupting the model)
-    # "on_winner_bid_at_exit",
-    # "on_loser_bid_at_exit",
-    # "on_oracle_delta_at_exit",
-    # "on_tte_at_exit_secs",
+    # v5: exit-time CLOB signals (XGBoost handles NaN natively — inert until populated)
+    "on_winner_bid_at_exit",
+    "on_loser_bid_at_exit",
+    "on_oracle_delta_at_exit",
+    "on_tte_at_exit_secs",
     # v6: early-warning SL signals — ADD once 200+ exits have been logged with
     # signal values (currently null in all historical rows — held back to avoid
     # corrupting the model).  Join on market_id + exit tick ts from momentum_ticks.csv.
@@ -56,6 +55,7 @@ MODEL_B_FEATURES: list[str] = [
 # (on_yes_depth_share, on_clob_no_bid_depth_5, on_funding_rate, on_price_to_beat,
 # on_hl_mark_price) were removed because they are always -999 for momentum rows
 # and the trained model does not include them in its feature set.
+# SYNC: must match MODEL_A_FEATURES in analysis/train_model.py.
 MODEL_A_FEATURES: list[str] = [
     "mom_z_score",
     "mom_effective_z",
@@ -64,8 +64,9 @@ MODEL_A_FEATURES: list[str] = [
     "mom_kelly_win_prob",
     "mom_kelly_multiplier",
     "oracle_delta_pct",
-    "deribit_iv",
+    # deribit_iv excluded — 87.5% null for momentum rows, dropped in model_a_v0 retrain
     "mom_yes_depth_share",
+    "clob_yes_bid_depth_5",   # top-5 YES bid depth in USDC at entry
     "mom_funding_rate",
     "mom_tte_seconds",
     "tte_seconds_at_entry",
@@ -74,6 +75,11 @@ MODEL_A_FEATURES: list[str] = [
     "vol_regime_high",
     "mom_twap_dev_bps",
     "mom_signal_delta_pct",
+    "mom_hl_depth_imbalance",  # HL perp book imbalance at entry
+    "is_bucket_5m",
+    "is_bucket_1h",
+    "is_bucket_15m",
+    "is_bucket_4h",
 ]
 
 _SENTINEL = -999.0
@@ -133,6 +139,11 @@ def build_exit_snapshot(row: dict) -> dict[str, float]:
         "on_price_to_beat":         row.get("on_price_to_beat") or row.get("price_to_beat"),
         "on_clob_no_bid_depth_5":   row.get("on_clob_no_bid_depth_5") or row.get("clob_no_bid_depth_5"),
         "on_hl_mark_price":         row.get("on_hl_mark_price") or row.get("hl_mark_price"),
+        # v5: exit-time signals (populated by scanner v5; NaN when absent)
+        "on_winner_bid_at_exit":     row.get("on_winner_bid_at_exit") or row.get("winner_bid_at_exit"),
+        "on_loser_bid_at_exit":      row.get("on_loser_bid_at_exit") or row.get("loser_bid_at_exit"),
+        "on_oracle_delta_at_exit":   row.get("on_oracle_delta_at_exit") or row.get("oracle_delta_at_exit"),
+        "on_tte_at_exit_secs":       row.get("on_tte_at_exit_secs") or row.get("tte_at_exit_secs"),
     }
 
     return {feat: _safe_float(feature_map.get(feat)) for feat in MODEL_B_FEATURES}
@@ -148,7 +159,8 @@ def build_entry_snapshot(row: dict) -> dict[str, float]:
       tte_seconds → mom_tte_seconds, yes_depth_share → mom_yes_depth_share,
       funding_rate → mom_funding_rate, twap_dev_bps, signal_delta_pct,
       vol_regime → vol_regime_high, hour_utc, day_of_week, oracle_delta_pct,
-      deribit_iv, on_yes_depth_share, on_funding_rate
+      clob_yes_bid_depth_5, hl_entry_imbalance → mom_hl_depth_imbalance,
+      market_type → is_bucket_5m/1h/15m/4h
     """
     # Derive hour_utc, day_of_week from timestamp
     hour_utc: float = _SENTINEL
@@ -172,30 +184,38 @@ def build_entry_snapshot(row: dict) -> dict[str, float]:
     else:
         vol_regime_high = _SENTINEL
 
+    # Derive bucket-type boolean flags from market_type
+    market_type_raw = str(row.get("market_type") or "").lower()
+    _bucket_map = {
+        "is_bucket_5m":  "bucket_5m",
+        "is_bucket_1h":  "bucket_1h",
+        "is_bucket_15m": "bucket_15m",
+        "is_bucket_4h":  "bucket_4h",
+    }
+
     feature_map: dict[str, Any] = {
-        "mom_z_score":          row.get("signal_obs_z"),
-        "mom_effective_z":      row.get("effective_z"),
-        "mom_sigma_ann":        row.get("signal_sigma_ann"),
-        "mom_kelly_f":          row.get("kelly_f"),
-        "mom_kelly_win_prob":   row.get("kelly_win_prob"),
-        "mom_kelly_multiplier": row.get("kelly_multiplier"),
-        "oracle_delta_pct":     row.get("oracle_delta_pct"),
-        "deribit_iv":           row.get("deribit_iv"),
-        "mom_yes_depth_share":  row.get("yes_depth_share"),
-        "on_yes_depth_share":   row.get("on_yes_depth_share"),
-        "mom_funding_rate":     row.get("funding_rate"),
-        "on_funding_rate":      row.get("on_funding_rate"),
-        "mom_tte_seconds":      row.get("tte_seconds"),
-        "tte_seconds_at_entry": row.get("tte_seconds_at_entry") or row.get("tte_seconds"),
-        "hour_utc":             hour_utc if hour_utc != _SENTINEL else row.get("hour_utc"),
-        "day_of_week":          day_of_week if day_of_week != _SENTINEL else row.get("day_of_week"),
-        "vol_regime_high":      vol_regime_high,
-        "mom_twap_dev_bps":     row.get("twap_dev_bps"),
-        "mom_signal_delta_pct": row.get("signal_delta_pct"),
-        # ON-only features (v3) — populated when the entry was an ON-promoted trade
-        "on_clob_no_bid_depth_5": row.get("on_clob_no_bid_depth_5") or row.get("clob_no_bid_depth_5"),
-        "on_price_to_beat":       row.get("on_price_to_beat") or row.get("price_to_beat"),
-        "on_hl_mark_price":       row.get("on_hl_mark_price") or row.get("hl_mark_price"),
+        "mom_z_score":            row.get("signal_obs_z"),
+        "mom_effective_z":        row.get("effective_z"),
+        "mom_sigma_ann":          row.get("signal_sigma_ann"),
+        "mom_kelly_f":            row.get("kelly_f"),
+        "mom_kelly_win_prob":     row.get("kelly_win_prob"),
+        "mom_kelly_multiplier":   row.get("kelly_multiplier"),
+        "oracle_delta_pct":       row.get("oracle_delta_pct"),
+        "mom_yes_depth_share":    row.get("yes_depth_share"),
+        "clob_yes_bid_depth_5":   row.get("clob_yes_bid_depth_5"),
+        "mom_funding_rate":       row.get("funding_rate"),
+        "mom_tte_seconds":        row.get("tte_seconds"),
+        "tte_seconds_at_entry":   row.get("tte_seconds_at_entry") or row.get("tte_seconds"),
+        "hour_utc":               hour_utc if hour_utc != _SENTINEL else row.get("hour_utc"),
+        "day_of_week":            day_of_week if day_of_week != _SENTINEL else row.get("day_of_week"),
+        "vol_regime_high":        vol_regime_high,
+        "mom_twap_dev_bps":       row.get("twap_dev_bps"),
+        "mom_signal_delta_pct":   row.get("signal_delta_pct"),
+        "mom_hl_depth_imbalance": row.get("hl_entry_imbalance"),
+        # Bucket-type one-hots (1.0 / 0.0; _SENTINEL when market_type missing)
+        **{flag: (1.0 if market_type_raw == bucket else 0.0)
+           if market_type_raw else None
+           for flag, bucket in _bucket_map.items()},
     }
 
     return {feat: _safe_float(feature_map.get(feat)) for feat in MODEL_A_FEATURES}
