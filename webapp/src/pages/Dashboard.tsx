@@ -1064,6 +1064,7 @@ function ModelTrainingCard() {
   const { data } = useModelTrainStatus();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [showLog, setShowLog] = useState(false);
 
   const running = data?.running ?? false;
 
@@ -1090,6 +1091,17 @@ function ModelTrainingCard() {
   const exitOk = data?.last_exit_code === 0 || data?.last_exit_code === null;
   const lastRun = data?.last_finished_ts ?? null;
 
+  // Extract the most useful failure line from the log tail for display.
+  const failureLine = (() => {
+    if (exitOk || !data?.log_tail?.length) return null;
+    const lines = data.log_tail;
+    // Prefer lines that contain ERROR / AUC / minimum / skipped keywords
+    const priority = lines.slice().reverse().find(l =>
+      /error|auc|minimum|leakage|not installed/i.test(l)
+    );
+    return priority ?? lines[lines.length - 1] ?? null;
+  })();
+
   return (
     <div className="card">
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
@@ -1101,7 +1113,7 @@ function ModelTrainingCard() {
             Last trained {ageLabel(lastRun)}
             {data?.last_exit_code !== null && data?.last_exit_code !== undefined && (
               <span style={{ marginLeft: 6, color: exitOk ? "#22c55e" : "#ef4444" }}>
-                · exit {data.last_exit_code}
+                · {exitOk ? "succeeded" : "failed"}
               </span>
             )}
           </span>
@@ -1109,6 +1121,16 @@ function ModelTrainingCard() {
           <span style={{ fontSize: 12, color: "#6b7280" }}>Not yet trained</span>
         )}
       </div>
+
+      {!exitOk && failureLine && (
+        <div style={{
+          background: "#1f0a0a", border: "1px solid #7f1d1d", borderRadius: 6,
+          padding: "8px 12px", marginBottom: 12, fontSize: 12,
+          color: "#fca5a5", fontFamily: "monospace", whiteSpace: "pre-wrap", wordBreak: "break-all",
+        }}>
+          {failureLine}
+        </div>
+      )}
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
         <ModelChip
@@ -1152,10 +1174,36 @@ function ModelTrainingCard() {
         >
           {running ? "Training…" : "↺ Retrain"}
         </button>
+        {data?.log_tail?.length ? (
+          <button
+            onClick={() => setShowLog(v => !v)}
+            style={{
+              padding: "5px 12px", borderRadius: 6, border: "1px solid #374151",
+              cursor: "pointer", fontSize: "0.8rem", background: "transparent",
+              color: "#9ca3af",
+            }}
+          >
+            {showLog ? "Hide log" : "Show log"}
+          </button>
+        ) : null}
         {err && (
           <span style={{ color: "#ef4444", fontSize: 12 }}>{err}</span>
         )}
       </div>
+      {showLog && data?.log_tail?.length ? (
+        <div style={{
+          marginTop: 10, background: "#0f172a", border: "1px solid #1e293b",
+          borderRadius: 6, padding: "10px 12px", maxHeight: 260, overflowY: "auto",
+          fontSize: 11, fontFamily: "monospace", color: "#94a3b8", whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+        }}>
+          {data.log_tail.map((line, i) => (
+            <div key={i} style={{ color: /error|failed/i.test(line) ? "#fca5a5" : undefined }}>
+              {line}
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

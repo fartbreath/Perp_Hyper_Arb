@@ -13,10 +13,11 @@ Runs unconditionally — not just when positions are open — so you get:
 CSV columns:
   ts            — UTC ISO-8601 timestamp (local event-receipt time, not on-chain)
   coin          — BTC / ETH / SOL / … / HYPE
-  source        — "chainlink_ws"     : ChainlinkWSClient AnswerUpdated event (Polygon AggregatorV3)
-                  "rtds_chainlink"   : RTDS crypto_prices_chainlink relay (Polymarket → CL Data Streams)
-                  "chainlink_streams": ChainlinkStreamsClient direct Data Streams WebSocket
-                  "rtds"             : RTDSClient crypto_prices (exchange-aggregated)
+  source        — "chainlink_ws"       : ChainlinkWSClient AnswerUpdated event (Polygon AggregatorV3)
+                  "rtds_chainlink"     : RTDS crypto_prices_chainlink relay (Polymarket → CL Data Streams)
+                  "chainlink_streams"  : ChainlinkStreamsClient direct Data Streams WebSocket
+                  "rtds"               : RTDSClient crypto_prices (exchange-aggregated)
+                  "binance_bookticker": BinanceBookTickerClient combined bookTicker WS (1h/daily/weekly)
   price         — oracle price in USD
 
 Usage — call enable_oracle_tick_log() on SpotOracle after instantiation in main():
@@ -46,6 +47,7 @@ _SOURCE_CHAINLINK_WS      = "chainlink_ws"
 _SOURCE_RTDS_CHAINLINK    = "rtds_chainlink"
 _SOURCE_CHAINLINK_STREAMS = "chainlink_streams"
 _SOURCE_RTDS              = "rtds"
+_SOURCE_BINANCE           = "binance_bookticker"
 
 
 def _ensure_csv() -> None:
@@ -86,3 +88,4 @@ SOURCE_CHAINLINK_WS      = _SOURCE_CHAINLINK_WS
 SOURCE_RTDS_CHAINLINK    = _SOURCE_RTDS_CHAINLINK
 SOURCE_CHAINLINK_STREAMS = _SOURCE_CHAINLINK_STREAMS
 SOURCE_RTDS              = _SOURCE_RTDS
+SOURCE_BINANCE           = _SOURCE_BINANCE

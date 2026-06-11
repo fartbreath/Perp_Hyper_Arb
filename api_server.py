@@ -334,11 +334,15 @@ def build_live_state() -> dict:
             pass
     pnl_bundle = _pnl_cache if _pnl_cache else None
 
+    # NOTE: "markets" is intentionally excluded from the SSE bundle.
+    # With 4000+ markets the serialised JSON is ~1-4 MB per push — sending it
+    # every second saturates the browser's JSON parser and triggers GC-pressure
+    # OOM crashes in the frontend.  The Markets page polls /markets via REST
+    # every 10 s instead, which is plenty fast for a read-only display.
     bundle: dict = {
         "health": health,
         "positions": positions,
         "risk": risk,
-        "markets": markets,
         "funding": funding_bundle,
         "signals": signals,
         "momentum_signals": momentum_signals,
@@ -563,10 +567,11 @@ _MUTABLE_CONFIG = {
     "momentum_twap_dev_threshold_bps":       ("MOMENTUM_TWAP_DEV_THRESHOLD_BPS",       float),
     "momentum_twap_dev_low_vol_yes_multiplier": ("MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER", float),
     # M-11: HL Mark SL (Signal A) & HL Depth SL (Signal B) — early-warning stop-loss
-    "momentum_hl_mark_sl_enabled":           ("MOMENTUM_HL_MARK_SL_ENABLED",           bool),
-    "momentum_hl_mark_sl_threshold_pct":     ("MOMENTUM_HL_MARK_SL_THRESHOLD_PCT",     float),
-    "momentum_hl_mark_sl_max_tte":           ("MOMENTUM_HL_MARK_SL_MAX_TTE",           int),
-    "momentum_hl_depth_sl_enabled":          ("MOMENTUM_HL_DEPTH_SL_ENABLED",          bool),
+    "momentum_hl_mark_sl_enabled":               ("MOMENTUM_HL_MARK_SL_ENABLED",               bool),
+    "momentum_hl_mark_sl_threshold_pct":         ("MOMENTUM_HL_MARK_SL_THRESHOLD_PCT",         float),
+    "momentum_hl_mark_sl_max_tte":               ("MOMENTUM_HL_MARK_SL_MAX_TTE",               int),
+    "momentum_hl_mark_sl_oracle_itm_floor_pct": ("MOMENTUM_HL_MARK_SL_ORACLE_ITM_FLOOR_PCT",  float),
+    "momentum_hl_depth_sl_enabled":              ("MOMENTUM_HL_DEPTH_SL_ENABLED",              bool),
     "momentum_hl_depth_sl_imbalance_threshold": ("MOMENTUM_HL_DEPTH_SL_IMBALANCE_THRESHOLD", float),
     "momentum_hl_depth_sl_max_tte":          ("MOMENTUM_HL_DEPTH_SL_MAX_TTE",          int),
     "momentum_hl_depth_sl_levels":           ("MOMENTUM_HL_DEPTH_SL_LEVELS",           int),
@@ -655,6 +660,7 @@ _MUTABLE_CONFIG = {
     "model_c_suppress_threshold":                 ("MODEL_C_SUPPRESS_THRESHOLD",                    float),
     # ML-D4: Model D config policy optimizer
     "model_d_enabled":                            ("MODEL_D_ENABLED",                               bool),
+    "model_d_simulate":                           ("MODEL_D_SIMULATE",                              bool),
     "model_d_max_delta_pct":                      ("MODEL_D_MAX_DELTA_PCT",                         float),
 }
 
@@ -851,6 +857,7 @@ class ConfigPatch(BaseModel):
     momentum_hl_mark_sl_enabled: bool | None = None
     momentum_hl_mark_sl_threshold_pct: float | None = None
     momentum_hl_mark_sl_max_tte: int | None = None
+    momentum_hl_mark_sl_oracle_itm_floor_pct: float | None = None
     momentum_hl_depth_sl_enabled: bool | None = None
     momentum_hl_depth_sl_imbalance_threshold: float | None = None
     momentum_hl_depth_sl_max_tte: int | None = None
@@ -946,6 +953,7 @@ class ConfigPatch(BaseModel):
     model_c_suppress_threshold: float | None = None
     # ML-D4: Model D config policy optimizer
     model_d_enabled: bool | None = None
+    model_d_simulate: bool | None = None
     model_d_max_delta_pct: float | None = None
 
 
@@ -1141,10 +1149,11 @@ async def get_config() -> dict:
         "momentum_twap_dev_threshold_bps":       config.MOMENTUM_TWAP_DEV_THRESHOLD_BPS,
         "momentum_twap_dev_low_vol_yes_multiplier": config.MOMENTUM_TWAP_DEV_LOW_VOL_YES_MULTIPLIER,
         # M-11: HL Mark SL (Signal A) & HL Depth SL (Signal B)
-        "momentum_hl_mark_sl_enabled":           config.MOMENTUM_HL_MARK_SL_ENABLED,
-        "momentum_hl_mark_sl_threshold_pct":     config.MOMENTUM_HL_MARK_SL_THRESHOLD_PCT,
-        "momentum_hl_mark_sl_max_tte":           config.MOMENTUM_HL_MARK_SL_MAX_TTE,
-        "momentum_hl_depth_sl_enabled":          config.MOMENTUM_HL_DEPTH_SL_ENABLED,
+        "momentum_hl_mark_sl_enabled":               config.MOMENTUM_HL_MARK_SL_ENABLED,
+        "momentum_hl_mark_sl_threshold_pct":         config.MOMENTUM_HL_MARK_SL_THRESHOLD_PCT,
+        "momentum_hl_mark_sl_max_tte":               config.MOMENTUM_HL_MARK_SL_MAX_TTE,
+        "momentum_hl_mark_sl_oracle_itm_floor_pct": config.MOMENTUM_HL_MARK_SL_ORACLE_ITM_FLOOR_PCT,
+        "momentum_hl_depth_sl_enabled":              config.MOMENTUM_HL_DEPTH_SL_ENABLED,
         "momentum_hl_depth_sl_imbalance_threshold": config.MOMENTUM_HL_DEPTH_SL_IMBALANCE_THRESHOLD,
         "momentum_hl_depth_sl_max_tte":          config.MOMENTUM_HL_DEPTH_SL_MAX_TTE,
         "momentum_hl_depth_sl_levels":           config.MOMENTUM_HL_DEPTH_SL_LEVELS,
@@ -1238,6 +1247,7 @@ async def get_config() -> dict:
         "model_c_suppress_threshold":                 getattr(config, "MODEL_C_SUPPRESS_THRESHOLD", 0.5),
         # ML-D4: Model D config policy optimizer
         "model_d_enabled":                            getattr(config, "MODEL_D_ENABLED", False),
+        "model_d_simulate":                           getattr(config, "MODEL_D_SIMULATE", True),
         "model_d_max_delta_pct":                      getattr(config, "MODEL_D_MAX_DELTA_PCT", 0.5),
         "timestamp":            time.time(),
     }
@@ -1392,6 +1402,10 @@ async def patch_config(patch: ConfigPatch) -> dict:
             attr_changes["MOMENTUM_MIN_DELTA_PCT_BY_COIN"] = dict(config.MOMENTUM_MIN_DELTA_PCT_BY_COIN)
         if any(f in updated for f in _min_delta_type_map):
             attr_changes["MOMENTUM_MIN_DELTA_PCT_BY_TYPE"] = dict(config.MOMENTUM_MIN_DELTA_PCT_BY_TYPE)
+        if any(f in updated for f in _kelly_mult_map):
+            attr_changes["MOMENTUM_KELLY_MULTIPLIER_BY_TYPE"] = dict(config.MOMENTUM_KELLY_MULTIPLIER_BY_TYPE)
+        if any(f in updated for f in _phase_c_map):
+            attr_changes["MOMENTUM_PHASE_C_MIN_TTE_SECONDS"] = dict(config.MOMENTUM_PHASE_C_MIN_TTE_SECONDS)
         _save_overrides(attr_changes)
     return {
         "updated": updated,

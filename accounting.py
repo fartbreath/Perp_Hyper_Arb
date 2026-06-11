@@ -829,6 +829,28 @@ class _Ledger:
                 # (If exit_contracts already equals entry_contracts, nothing to do.)
                 settlement = 1.0 if token_won else 0.0
                 remaining  = round(pos.entry_contracts - pos.exit_contracts, 8)
+
+                # Ghost-dismiss correction (Case 3): if the position was ghost-dismissed
+                # at $0.00 but the market resolves WIN, the $0 exit was a premature
+                # in-memory close — typically the PM wallet didn't show the position
+                # because the market auto-redeemed tokens during a WS gap (tokens paid
+                # out at $1.00 before the reconciler fetched the wallet).
+                # Correct exit_vwap to the settlement price before writing the ledger.
+                if (
+                    remaining <= 1e-9
+                    and pos.exit_reason == "ghost_dismissed"
+                    and token_won
+                    and abs(pos.exit_vwap) < 1e-9
+                ):
+                    pos.exit_vwap = settlement  # 1.0
+                    log.warning(
+                        "acct: ghost_dismissed at $0 corrected to settlement price",
+                        pos_id=pos.pos_id[:12],
+                        market_id=pos.market_id[:16],
+                        side=pos.side,
+                        settlement=settlement,
+                    )
+
                 if remaining > 1e-9:
                     pos.exit_vwap      = _vwap(pos.exit_vwap, pos.exit_contracts,
                                                settlement, remaining)

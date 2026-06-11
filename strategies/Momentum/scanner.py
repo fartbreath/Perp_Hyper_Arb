@@ -341,17 +341,23 @@ class MomentumScanner(BaseStrategy):
         """Register all started bucket markets within MOMENTUM_MAX_TTE_DAYS for PM WS
         book subscriptions, independently of the maker's TTE/volume filters.
 
-        Also subscribes to upcoming (not-yet-started) bucket markets within
-        MOMENTUM_PRESUB_LOOKAHEAD additional periods, giving book data for the
-        pre-start window (useful for price-vs-TTE data collection).
+        Pre-subscription lookahead is controlled per market type via
+        MOMENTUM_PRESUB_LOOKAHEAD_BY_TYPE (falls back to MOMENTUM_PRESUB_LOOKAHEAD for
+        types not listed).  Large-duration types (daily, weekly) default to 0 — only
+        subscribe when the market is already active.  The scanner refresh fires every
+        30 s and on every PM market-discovery event, so these markets are picked up
+        within 30 s of becoming active without needing any pre-subscription buffer.
 
-        Called on startup and every 5 minutes from the scan loop.  This populates
+        Called on startup and every 30 s from the scan loop.  This populates
         self._pm._books for the full momentum candidate set so get_book() returns
         live data rather than None for non-maker markets.
         """
         _now = time.time()
         _max_tte = config.MOMENTUM_MAX_TTE_DAYS * 86_400
-        _lookahead = config.MOMENTUM_PRESUB_LOOKAHEAD
+        _lookahead_global: int = config.MOMENTUM_PRESUB_LOOKAHEAD
+        _lookahead_by_type: dict[str, int] = getattr(
+            config, "MOMENTUM_PRESUB_LOOKAHEAD_BY_TYPE", {}
+        )
         tokens: set[str] = set()
         for mkt in self._pm.get_markets().values():
             if mkt.market_type not in _TARGET_MARKET_TYPES:
@@ -363,12 +369,12 @@ class MomentumScanner(BaseStrategy):
                 continue
             _dur = _MARKET_TYPE_DURATION_SECS.get(mkt.market_type)
             if _dur is not None and tte > _dur:
-                # Market hasn't started yet.  Subscribe if within the lookahead
-                # window (next MOMENTUM_PRESUB_LOOKAHEAD periods) so we capture
-                # price data before the entry window opens.
-                if _lookahead <= 0 or tte > _dur * (1 + _lookahead):
+                # Market hasn't started yet.  Subscribe only if within the
+                # per-type lookahead window; fall back to global lookahead.
+                _la = _lookahead_by_type.get(mkt.market_type, _lookahead_global)
+                if _la <= 0 or tte > _dur * (1 + _la):
                     continue
-            # Subscribe broadly — include all started + near-start markets
+            # Subscribe — started or within per-type lookahead window
             tokens.add(mkt.token_id_yes)
             tokens.add(mkt.token_id_no)
         self._pm.register_for_book_updates(tokens)
@@ -384,7 +390,7 @@ class MomentumScanner(BaseStrategy):
             "MomentumScanner: WS subscriptions refreshed",
             tokens=len(tokens),
             max_tte_days=config.MOMENTUM_MAX_TTE_DAYS,
-            presub_lookahead=_lookahead,
+            presub_lookahead=_lookahead_global,
         )
 
     async def _on_pm_markets_refreshed(self) -> None:
@@ -1125,8 +1131,8 @@ class MomentumScanner(BaseStrategy):
             # logs the actual rate regardless of whether the gate is enabled.
             _funding_rate: float | None = None
             _gate_side = "YES" if high_side in ("YES", "UP") else "NO"
+            coin = market.underlying
             if self._funding_cache is not None:
-                coin = market.underlying
                 if config.MOMENTUM_FUNDING_GATE_ENABLED and self._funding_cache.is_stale(coin):
                     skipped_funding_stale += 1
                     _d["skip_reason"] = "funding_stale"

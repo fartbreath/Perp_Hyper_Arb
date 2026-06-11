@@ -2,6 +2,111 @@
 
 All notable changes to this repository are documented in this file.
 
+## [2026-06-11] — Binance bookTicker oracle; Chainlink stale-secs fix; near-expiry hysteresis; veto-floor reduction; HL mark oracle ITM gate; duplicate-tick guard; ghost-dismiss accounting fix; Model D simulate; signal_events 180-day retention; PM WS subscription optimisation
+
+### Feature — Binance bookTicker as primary spot oracle for 1h/daily/weekly (`market_data/spot_oracle.py`, `market_data/binance_bookticker_client.py`, `config.py`, `main.py`)
+
+`BinanceBookTickerClient` is now wired as the primary spot price source for 1h/daily/weekly markets (which settle against Binance candle close prices).  `SpotOracle._get_spot_1h_daily_weekly()` tries `BinanceBookTickerClient` first (freshness gate: `BINANCE_BOOKTICKER_STALE_SECS`, default 10 s), falling through to RTDS when stale.  `get_spot_age()` for these market types now returns `min(binance_age, rtds_age)` so a live bookTicker snapshot suppresses false `oracle_stale_sl` exits even during brief RTDS outages.  `on_rtds_update()` fires on both RTDS ticks **and** bookTicker ticks.
+
+`oracle_tick_log.py` gains a `SOURCE_BINANCE` constant.
+
+**New config var:** `BINANCE_BOOKTICKER_STALE_SECS: float = 10.0`
+
+---
+
+### Fix — Chainlink Streams stale threshold 3 s → 30 s (`config.py`)
+
+`CHAINLINK_STREAMS_STALE_SECS` was 3.0 s — tighter than the average Data Streams inter-event interval (~1.6 s, with gaps to ~10 s during quiet prices).  This caused frequent false fallthrough to the RTDS relay mid-hold, which triggered monitor callbacks at the relay's 1 Hz heartbeat even when no new Chainlink round had arrived — the root cause of dual-source false stop-losses.
+
+Raised to **30.0 s** (conservative ceiling aligned with the AggregatorV3 deviation heartbeat).  Comment in config updated with measured cadence data (153 k events / 72 h).
+
+---
+
+### Fix — Near-expiry stop: threshold 39 → 20 s + 3-tick hysteresis (`monitor.py`, `config.py`, `config_overrides.json`)
+
+Analysis of 94 near-expiry stop firings revealed a 95.7% false-positive rate: the median TTE at trigger was 28.3 s (above the 39 s threshold), and false-positive positions had only 1–2 consecutive negative-delta ticks (transient oracle noise) vs 112 for the one genuine save.
+
+Two fixes:
+- **Threshold**: `MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS` lowered from 39 → **20 s** via `config_overrides.json` (below the 28.3 s median false-positive TTE).
+- **Hysteresis**: new `MOMENTUM_NEAR_EXPIRY_MIN_CONSECUTIVE_TICKS` (default 3) requires that many consecutive ticks with `delta < 0` AND `TTE < threshold` before firing.  Counter is stored in the existing `suppress_counts` dict keyed `"{token_id}:ne_neg_delta"` and reset the moment the condition is not met.  When `suppress_counts is None` the counter defaults to threshold (fires immediately — safe fallback).
+
+Post-fix validation (Jun 8–11, 93 trades): 8/8 near-expiry exits are WIN, zero false positives, +$3.28 net (vs −$8.62 wasted on false exits pre-fix).
+
+**New config var:** `MOMENTUM_NEAR_EXPIRY_MIN_CONSECUTIVE_TICKS: int = 3`
+
+---
+
+### Fix — Delta SL veto floor 0.65 → 0.50 (`config_overrides.json`)
+
+`MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR` was 0.65.  Momentum entries occur at token prices 0.69–0.75, meaning the veto floor engaged immediately after entry and suppressed the delta stop-loss for the full hold.  Lowered to **0.50**: the veto still blocks exits when the crowd price clearly favours the trade (>50% WIN) but no longer fires automatically at typical entry prices.
+
+---
+
+### Feature — HL mark SL oracle ITM confirmation gate (`monitor.py`, `config.py`, `webapp/src/pages/Settings.tsx`)
+
+New suppression gate for the HL perp mark stop-loss: when the Chainlink settlement oracle confirms the position is solidly ITM by more than `MOMENTUM_HL_MARK_SL_ORACLE_ITM_FLOOR_PCT`, the HL mark stop is suppressed.  Rationale: near expiry the HL perp mark diverges from Chainlink due to funding-rate noise — Chainlink is the settlement source, so a solid Chainlink ITM margin overrides a bearish perp mark.  `suppressed` and `itm_floor` fields added to the `hl_mark_sl` warning log.  Settings UI exposes the new knob ("Oracle ITM Floor %").
+
+**New config var:** `MOMENTUM_HL_MARK_SL_ORACLE_ITM_FLOOR_PCT: float = 0.0`
+
+---
+
+### Fix — Duplicate tick guard in PositionMonitor (`monitor.py`)
+
+Multiple oracle callbacks (RTDS + Binance bookTicker, or two chainlink_streams events) could interleave at asyncio `await` boundaries, causing two concurrent `_check_position` coroutines for the same position.  This produced duplicate momentum_ticks.csv rows and could trigger duplicate taker-exit orders.
+
+New `_checking_positions: set[str]` tracks in-flight checks by `"{market_id}:{side}"`.  Both the PM price-change handler and the spot-update handler skip a position check if one is already in flight.
+
+---
+
+### Fix — Ghost-dismiss WIN correction in accounting (`accounting.py`)
+
+When a PM WS gap causes the reconciler to mark a position as a ghost at $0.00 (`ghost_dismissed`), and the market subsequently resolves WIN, the ledger was recording a $0 exit VWAP — booking a full loss on a winning trade.
+
+The resolver now detects this case (`remaining ≤ 0, exit_reason == "ghost_dismissed", token_won, exit_vwap ≈ 0`) and corrects `pos.exit_vwap` to the settlement price (1.0) before writing the ledger row.
+
+---
+
+### Fix — Ghost reconciler: don't dismiss unresolved positions (`live_fill_handler.py`)
+
+The ghost reconciler was closing positions at $0 when the PM wallet API returned no matching position, even for markets that had not yet resolved.  This booked false losses when the market subsequently settled WIN.
+
+The reconciler now only dismisses when the market is confirmed resolved.  Unresolved-market positions are left in memory (a comment chain in the code explains the three cases A/B/C).
+
+---
+
+### Feature — Model D simulate flag; startup O(1) seed (`models/model_agent.py`, `config.py`, `api_server.py`)
+
+- **`MODEL_D_SIMULATE: bool = True`** — when True, Model D recommendations are logged only and never applied to live config.  Exposed in `api_server.py` `_MUTABLE_CONFIG` and `ConfigPatch` so it can be toggled at runtime.
+- **Fast cold start**: new `_read_csv_tail` reads only the last 2,000 rows of `shadow_log` via a binary seek from EOF, avoiding a full sequential scan on every startup.  `_seed_sync()` runs dedup-key seeding in an executor thread.
+
+---
+
+### Feature — signal_events 180-day rolling retention (`strategies/Momentum/event_log.py`)
+
+`_KEEP_DAYS` raised from 7 → **180** (trigger: file > 200 MB).  OPE reward surface computation for Model D requires 4–8 weeks of accumulated signal events; 7-day rotation was discarding the data before it could be used for training.  Fast-prefix timestamp check avoids full JSON parse during pruning.
+
+---
+
+### Fix — PM WS subscription optimisation: per-type presub lookahead (`strategies/Momentum/scanner.py`, `config.py`)
+
+`MOMENTUM_PRESUB_LOOKAHEAD = 4` was applied uniformly to all market types, causing weekly markets to pre-subscribe `4 × 7 days = 28 days` of future markets — the dominant driver of 1,808 WS-subscribed tokens (≈ 19 shards at 100-token capacity).
+
+New `MOMENTUM_PRESUB_LOOKAHEAD_BY_TYPE` dict sets per-type lookahead: **1** for 5m/15m/1h/4h (one period ahead), **0** for daily/weekly (subscribe only when active).  The subscription refresh already fires every 30 s **and** on every PM market-discovery event (`on_pm_markets_refreshed`), so a 30-second subscription latency for newly-active daily/weekly markets is negligible.
+
+Expected reduction: **1,808 → ~400–600 tokens** (6–10 fewer WS shards, faster post-PM-restart reconnect).
+
+Investigation finding (confirmed via Polymarket status page): the recurring ABNORMAL_CLOSURE 1006 mass-disconnects on Jun 10–11 are **PM-side CLOB restarts and RTDS infrastructure incidents**, not a CPU/data throughput bottleneck on the bot.
+
+**New config var:** `MOMENTUM_PRESUB_LOOKAHEAD_BY_TYPE: dict[str, int]`
+
+---
+
+### Feature — Training page: failure details + log expand (`webapp/src/pages/Dashboard.tsx`)
+
+When a training run fails, the Dashboard now shows the highest-priority error line extracted from the log tail (regex: `error|auc|minimum|leakage|not installed`) inline below the status badge.  A "Show log / Hide log" toggle reveals the full scrollable log tail (max 260 px).
+
+---
+
 ## [2026-05-26] — M-15 HL entry gate; S2.4/S2.5 stale oracle exits; ML-C1 exit snapshot log; Model A feature refresh; delta SL grace fix; accounting pending-exit reason
 
 ### Feature — M-15: HL Perp Depth Imbalance Entry Gate (`strategies/Momentum/scanner.py`, `strategies/Momentum/signal.py`, `config.py`, `api_server.py`)

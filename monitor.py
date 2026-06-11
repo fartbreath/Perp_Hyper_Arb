@@ -63,6 +63,8 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import math
+import math
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -600,7 +602,22 @@ def should_exit(
                 and tte_seconds < config.MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS
                 and current_delta_pct < 0
             ):
-                return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
+                # Hysteresis: require N consecutive ticks to filter transient oracle
+                # noise.  Analysis: false positives had median 2 negative-delta ticks;
+                # the genuine save had 112.  Threshold from config (default 3).
+                _ne_min_ticks = getattr(config, "MOMENTUM_NEAR_EXPIRY_MIN_CONSECUTIVE_TICKS", 3)
+                _ne_key = f"{pos.token_id}:ne_neg_delta"
+                if suppress_counts is not None:
+                    _ne_cnt = suppress_counts.get(_ne_key, 0) + 1
+                    suppress_counts[_ne_key] = _ne_cnt
+                else:
+                    _ne_cnt = _ne_min_ticks  # no state dict → fire immediately (safe default)
+                if _ne_cnt >= _ne_min_ticks:
+                    return True, ExitReason.MOMENTUM_NEAR_EXPIRY, unrealised
+            else:
+                # Reset counter whenever condition is not met (delta recovered or TTE out of window)
+                if suppress_counts is not None:
+                    suppress_counts.pop(f"{pos.token_id}:ne_neg_delta", None)
 
             # S2.4 — Near-expiry hard exit on stale oracle: if we are near expiry
             # AND the oracle has been silent for longer than the configured threshold,
@@ -755,7 +772,17 @@ def should_exit(
                 _hl_mark_div = (hl_mark_price - pos.strike) / pos.strike * 100
             else:
                 _hl_mark_div = (pos.strike - hl_mark_price) / pos.strike * 100
-            if _hl_mark_div < _hl_threshold_pct:
+            # Oracle ITM confirmation gate: if Chainlink oracle confirms the position
+            # is solidly ITM (above the floor), trust Chainlink over HL perp mark
+            # noise.  HL perpetual mark diverges from Chainlink at volatile moments
+            # near expiry — the settlement oracle is Chainlink, not HL.
+            _hl_mark_itm_floor = getattr(config, "MOMENTUM_HL_MARK_SL_ORACLE_ITM_FLOOR_PCT", 0.0)
+            _hl_mark_oracle_suppressed = (
+                _hl_mark_itm_floor > 0.0
+                and _oracle_delta_pct is not None
+                and _oracle_delta_pct > _hl_mark_itm_floor
+            )
+            if not _hl_mark_oracle_suppressed and _hl_mark_div < _hl_threshold_pct:
                 log.warning(
                     "early_warning_sl",
                     signal="hl_mark",
@@ -764,6 +791,9 @@ def should_exit(
                     strike=pos.strike,
                     divergence_pct=round(_hl_mark_div, 4),
                     threshold_pct=_hl_threshold_pct,
+                    oracle_delta_pct=round(_oracle_delta_pct, 6) if _oracle_delta_pct is not None else None,
+                    itm_floor=_hl_mark_itm_floor,
+                    suppressed=_hl_mark_oracle_suppressed,
                     tte=round(tte_seconds, 1),
                 )
                 return True, ExitReason.MOMENTUM_HL_MARK_SL, unrealised
@@ -930,6 +960,11 @@ class PositionMonitor:
         # Key: "{token_id}:{gate_name}",  value: consecutive evaluation count.
         # Passed into should_exit() by reference so the function can update them.
         self._exit_suppress_counts: dict[str, int] = {}
+        # Concurrent-check guard: prevents duplicate tick writes caused by multiple
+        # oracle callbacks (e.g., RTDS + binance bookTicker) running concurrently
+        # for the same position when they interleave at event-loop await boundaries.
+        # Key: "{market_id}:{side}" — same format as _exiting_positions.
+        self._checking_positions: set[str] = set()
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -1143,7 +1178,13 @@ class PositionMonitor:
             key = f"{pos.market_id}:{pos.side}"
             if key in self._exiting_positions:
                 continue  # exit already in progress for this leg
-            await self._check_position(pos, triggering_token_id=token_id, triggering_mid=mid)
+            if key in self._checking_positions:
+                continue  # check already in-flight — skip to avoid duplicate tick burst
+            self._checking_positions.add(key)
+            try:
+                await self._check_position(pos, triggering_token_id=token_id, triggering_mid=mid)
+            finally:
+                self._checking_positions.discard(key)
 
     async def _on_spot_update(self, coin: str, price: float) -> None:
         """Triggered on every spot price tick (RTDS).
@@ -1161,7 +1202,13 @@ class PositionMonitor:
             key = f"{pos.market_id}:{pos.side}"
             if key in self._exiting_positions:
                 continue
-            await self._check_position(pos)
+            if key in self._checking_positions:
+                continue  # check already in-flight — skip to avoid duplicate tick burst
+            self._checking_positions.add(key)
+            try:
+                await self._check_position(pos)
+            finally:
+                self._checking_positions.discard(key)
 
     # ── Pending market-outcome resolution ─────────────────────────────────────
 

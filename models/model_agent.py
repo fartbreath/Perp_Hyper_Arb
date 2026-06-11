@@ -50,6 +50,93 @@ _MOMENTUM_FILLS_PATH = _DATA_DIR / "momentum_fills.csv"
 _ACCT_LEDGER_PATH = _DATA_DIR / "acct_ledger.csv"
 _PAPER_TRADES_PATH = _ANALYSIS_DIR / "model_paper_trades.csv"  # ML-08
 
+# How many tail rows of shadow_log to read on startup (for PENDING tracking + in-memory cache).
+# Old entries can never appear as new fills — we only need recent history.
+_SHADOW_SEED_TAIL_ROWS = 2_000
+
+
+def _read_csv_tail(path: Path, n: int) -> list[dict]:
+    """
+    Read the last *n* rows of a large CSV using a single binary seek from the end,
+    avoiding a full sequential scan.  The features_snapshot JSON field uses no
+    embedded newlines (json.dumps default), so binary line-splitting is safe here.
+    """
+    file_size = path.stat().st_size
+    if file_size == 0:
+        return []
+    # ~600 bytes / row is a conservative overestimate for shadow_log rows
+    read_size = min(file_size, int(n * 650))
+    with open(path, "rb") as fh:
+        header_bytes = fh.readline()
+        header_line = header_bytes.decode("utf-8", errors="replace").strip()
+        seek_pos = max(len(header_bytes), file_size - read_size)
+        fh.seek(seek_pos)
+        if seek_pos > len(header_bytes):
+            fh.readline()  # discard partial row at seek boundary
+        payload = fh.read().decode("utf-8", errors="replace")
+    headers = next(csv.reader([header_line]))
+    rows: list[dict] = []
+    for line in payload.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = next(csv.reader([line]))
+            if len(parsed) == len(headers):
+                rows.append(dict(zip(headers, parsed)))
+        except Exception:
+            pass
+    return rows[-n:]
+
+
+def _seed_sync() -> tuple[set, set, list, dict]:
+    """
+    Synchronous seed work — intended to be called inside an executor.
+    Returns (entry_keys, exit_keys, tail_rows, pending) so no mutable
+    ModelAgent state is touched from a background thread.
+    """
+    entry_keys: set[tuple[str, str]] = set()
+    exit_keys: set[tuple[str, str]] = set()
+
+    # ── 1. Seed dedup keys from fills CSVs (fast — ~1.7 k rows total) ────────
+    # The processed_keys sets are keyed by (market_id, timestamp) taken from
+    # the fills CSV rows.  Shadow-log timestamps are str(time.time()) at
+    # decision time and therefore never match fills-CSV timestamps; reading
+    # shadow_log for dedup was always a no-op.
+    for path, keys_set in [
+        (_MOMENTUM_FILLS_PATH, entry_keys),
+        (_ON_FILLS_PATH, exit_keys),
+    ]:
+        if not path.exists():
+            continue
+        try:
+            with open(path, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    mid = row.get("market_id", "")
+                    ts = row.get("timestamp", "")
+                    if mid:
+                        keys_set.add((mid, ts))
+        except Exception as exc:
+            log.warning("ModelAgent seed: could not read fills CSV", path=str(path), exc=str(exc))
+
+    # ── 2. Read tail of shadow_log for in-memory cache + PENDING tracking ────
+    tail_rows: list[dict] = []
+    pending: dict[str, str] = {}
+    if _SHADOW_LOG_PATH.exists():
+        try:
+            tail_rows = _read_csv_tail(_SHADOW_LOG_PATH, _SHADOW_SEED_TAIL_ROWS)
+            for row in tail_rows:
+                mid = row.get("market_id", "")
+                dtype = row.get("decision_type", "")
+                outcome = row.get("actual_outcome", "PENDING")
+                if outcome == "PENDING" and mid:
+                    pending[mid] = dtype
+        except Exception as exc:
+            log.warning("ModelAgent seed: could not read shadow_log tail", exc=str(exc))
+
+    return entry_keys, exit_keys, tail_rows, pending
+
+
 # ── Shadow log schema ─────────────────────────────────────────────────────────
 
 _SHADOW_COLS = [
@@ -242,6 +329,9 @@ class ModelAgent:
             return None
         if not config.MODEL_AGENT_ENABLED:
             return None
+        if getattr(config, "MODEL_D_SIMULATE", True):
+            # Simulate-only mode: score and log recommendations, but caller must not apply deltas
+            pass  # allow scoring to continue — caller (_score_fill_row) only logs, never applies
         try:
             from analysis.train_model import MODEL_D_FEATURES
             bundle = self._load_model_d()
@@ -527,32 +617,26 @@ class ModelAgent:
 
     async def _seed_processed_keys(self) -> None:
         """
-        Read existing shadow_log.csv and seed _processed_entry_keys /
-        _processed_exit_keys so we don't re-log history on restart.
+        Seed _processed_entry_keys / _processed_exit_keys and the in-memory
+        shadow-log cache on startup.
+
+        Runs the file I/O in an executor so the event loop is never blocked.
+        Dedup keys are sourced from the fills CSVs (~1.7 k rows combined) rather
+        than shadow_log (~21 k rows) — shadow_log timestamps are decision-time
+        epoch floats and never match the fills-CSV ISO timestamps used as keys
+        in _process_csv_for_entries, so reading shadow_log for dedup was always
+        a no-op.  Shadow_log is now only tail-read for the in-memory display
+        cache and PENDING outcome tracking.
         """
-        if not _SHADOW_LOG_PATH.exists():
-            return
-        try:
-            with open(_SHADOW_LOG_PATH, newline="", encoding="utf-8") as fh:
-                for row in csv.DictReader(fh):
-                    mid = row.get("market_id", "")
-                    ts = row.get("timestamp", "")
-                    dtype = row.get("decision_type", "")
-                    if dtype == "entry":
-                        self._processed_entry_keys.add((mid, ts))
-                    elif dtype == "exit":
-                        self._processed_exit_keys.add((mid, ts))
-                    # Populate in-memory log
-                    self._shadow_rows.append(row)
-                    outcome = row.get("actual_outcome", "PENDING")
-                    if outcome == "PENDING" and mid:
-                        # Track decision_type for outcome resolution
-                        self._pending[mid] = dtype
-                # Trim to cap
-                if len(self._shadow_rows) > 1000:
-                    self._shadow_rows = self._shadow_rows[-1000:]
-        except Exception as exc:
-            log.warning("ModelAgent: could not seed processed keys", exc=str(exc))
+        loop = asyncio.get_event_loop()
+        entry_keys, exit_keys, tail_rows, pending = await loop.run_in_executor(
+            None, _seed_sync
+        )
+        self._processed_entry_keys.update(entry_keys)
+        self._processed_exit_keys.update(exit_keys)
+        self._shadow_rows.extend(tail_rows)
+        self._pending.update(pending)
+
 
     async def _process_new_entries(self) -> None:
         """

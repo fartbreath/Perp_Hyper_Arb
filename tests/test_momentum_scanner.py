@@ -2200,6 +2200,7 @@ class TestFundingFeedOutageDetection:
         spot_snap.timestamp = time.time()
         scanner._spot.get_spot = MagicMock(return_value=spot_snap)
         scanner._pm.get_depth_share = MagicMock(return_value=0.60)
+        scanner._hl.get_depth_imbalance = MagicMock(return_value=None)  # fail-open
         scanner._cooldown_path = ""  # prevent writing to real cooldowns file
         return scanner
 

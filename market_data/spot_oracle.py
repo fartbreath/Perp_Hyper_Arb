@@ -22,10 +22,17 @@ Oracle sources by coin × market type:
   - All coins on 1h/daily/weekly: RTDSClient exchange-aggregated prices.
 
 Callers register callbacks via:
-  on_chainlink_update(cb)   — fires on every event from ChainlinkWSClient (non-HYPE
-                              Chainlink coins) AND RTDSClient chainlink relay (all
-                              coins) AND ChainlinkStreamsClient (HYPE direct stream).
-  on_rtds_update(cb)        — fires on every RTDS exchange-aggregated tick.
+  on_chainlink_update(cb)   — fires on Data Streams events (when ChainlinkStreamsClient
+                              is configured) plus ChainlinkWSClient events.  When Data
+                              Streams is NOT configured, falls back to RTDSClient
+                              chainlink relay.  rtds_chainlink callbacks are suppressed
+                              while Data Streams is active — registering both caused
+                              dual-source false stop-losses (RTDS 1 Hz heartbeat fires
+                              stale price when chainlink_streams is briefly quiet).
+  on_rtds_update(cb)        — fires on every RTDS exchange-aggregated tick AND every
+                              Binance bookTicker tick (when BinanceBookTickerClient is available).
+                              Use this to react to oracle price changes for 1h/daily/
+                              weekly markets regardless of which source fires first.
 
 CHAINLINK_MARKET_TYPES is the single canonical definition of which market types
 use the Chainlink oracle.  Import it here; do not import from rtds_client.
@@ -38,10 +45,12 @@ from typing import Callable, Coroutine, Optional
 
 import config
 from core.types import FeedHealth
+from market_data.binance_bookticker_client import BinanceBookTickerClient
 from market_data.chainlink_streams_client import ChainlinkStreamsClient
 from market_data.chainlink_ws_client import ChainlinkWSClient
 from market_data.oracle_tick_log import (
     make_logging_callback,
+    SOURCE_BINANCE,
     SOURCE_CHAINLINK_WS,
     SOURCE_RTDS_CHAINLINK,
     SOURCE_CHAINLINK_STREAMS,
@@ -72,10 +81,12 @@ class SpotOracle:
         rtds: RTDSClient,
         chainlink: ChainlinkWSClient,
         streams: Optional[ChainlinkStreamsClient] = None,
+        binance: Optional[BinanceBookTickerClient] = None,
     ) -> None:
         self._rtds = rtds
         self._cl = chainlink
         self._streams = streams
+        self._binance = binance
         # S3.1: Per-coin feed status cache for health-state transition logging.
         # Key: "{coin}:{market_type}" → last reported status string.
         self._feed_status_cache: dict[str, str] = {}
@@ -92,20 +103,43 @@ class SpotOracle:
         if market_type in CHAINLINK_MARKET_TYPES:
             snap = self._get_chainlink_spot(underlying)
             return snap.price if snap is not None else None
+        # 1h / daily / weekly: Binance kline primary (exact settlement source),
+        # RTDS exchange-aggregated fallback.
+        snap = self._get_binance_spot(underlying)
+        if snap is not None:
+            return snap.price
         return self._rtds.get_mid(underlying)
 
     def get_spot(self, underlying: str, market_type: str) -> Optional[SpotPrice]:
         """Return the oracle-correct SpotPrice snapshot for `underlying`."""
         if market_type in CHAINLINK_MARKET_TYPES:
             return self._get_chainlink_spot(underlying)
-        return self._rtds.get_spot(underlying)
+        snap = self._get_binance_spot(underlying)
+        return snap if snap is not None else self._rtds.get_spot(underlying)
 
     def get_spot_age(self, underlying: str, market_type: str) -> float:
-        """Seconds since the last oracle update for `underlying`; inf if never received."""
+        """Seconds since the last oracle update for `underlying`; inf if never received.
+
+        For 1h/daily/weekly markets the freshness of EITHER Binance bookTicker OR RTDS
+        is used (minimum of both ages).  Ignoring a 50-second-old bookTicker snapshot
+        because it exceeds BINANCE_BOOKTICKER_STALE_SECS would cause oracle_stale_sl exits
+        (S2.5) to fire during brief RTDS outages while bookTicker is still delivering
+        valid Binance prices — this change prevents those false positives.
+        """
         if market_type in CHAINLINK_MARKET_TYPES:
             snap = self._get_chainlink_spot(underlying)
             return time.time() - snap.timestamp if snap is not None else float("inf")
-        return self._rtds.get_spot_age(underlying)
+        # For 1h/daily/weekly: use the freshest signal across bookTicker and RTDS.
+        # Access bookTicker directly (bypassing the BINANCE_BOOKTICKER_STALE_SECS routing
+        # gate) so a gate-stale but recent snapshot still informs staleness detection.
+        now = time.time()
+        binance_age = float("inf")
+        if self._binance is not None:
+            snap = self._binance.get_spot(underlying)
+            if snap is not None:
+                binance_age = now - snap.timestamp
+        rtds_age = self._rtds.get_spot_age(underlying)
+        return min(binance_age, rtds_age)
 
     def get_mid_resolution_oracle(
         self, underlying: str, market_type: str
@@ -130,6 +164,24 @@ class SpotOracle:
             snap = self._cl.get_spot(underlying)
             return snap.price if snap is not None else None
         return self.get_mid(underlying, market_type)
+
+    # ── Binance bookTicker accessor (1h / daily / weekly markets) ──────────────
+
+    def _get_binance_spot(self, coin: str) -> Optional[SpotPrice]:
+        """Return a fresh Binance bookTicker snapshot for ``coin``, or None if unavailable.
+
+        A snapshot is considered stale when its age exceeds BINANCE_BOOKTICKER_STALE_SECS
+        (default 10 s).  Stale → fall through to RTDS.
+        """
+        if self._binance is None:
+            return None
+        snap = self._binance.get_spot(coin)
+        if snap is None:
+            return None
+        max_age = float(getattr(config, "BINANCE_BOOKTICKER_STALE_SECS", 10.0))
+        if time.time() - snap.timestamp < max_age:
+            return snap
+        return None
 
     # ── Chainlink dual-feed arbiter (all coins) ───────────────────────────────
 
@@ -175,21 +227,44 @@ class SpotOracle:
     ) -> None:
         """Register callback(coin, price) fired on every Chainlink oracle event.
 
-        Fires on:
-          - AnswerUpdated events for BTC/ETH/SOL/XRP/BNB/DOGE (ChainlinkWSClient)
-          - crypto_prices_chainlink RTDS relay for all coins including HYPE (RTDSClient)
-          - Direct Data Streams reports for all coins (ChainlinkStreamsClient, if enabled)
+        When ChainlinkStreamsClient is configured (the primary source for all coins),
+        callbacks fire ONLY on Data Streams events — NOT on the RTDS relay.
+        Registering callbacks on both sources caused dual-source false stop-losses:
+        the RTDS relay fires at ~1 Hz regardless of whether a new Chainlink round has
+        arrived.  When chainlink_streams is briefly quiet (>CHAINLINK_STREAMS_STALE_SECS),
+        `_get_chainlink_spot()` falls through to the stale RTDS snapshot, and a
+        monitor evaluation triggered by that RTDS heartbeat sees the wrong price.
+
+        Priority:
+          - ChainlinkStreamsClient configured  → callbacks on streams + chainlink_ws only
+          - ChainlinkStreamsClient not configured → callbacks on rtds relay + chainlink_ws
+
+        NOTE: rtds_chainlink remains available as a silent price fallback inside
+        `_get_chainlink_spot()` — it just must not drive independent callbacks.
         """
         self._cl.on_price_update(callback)
-        self._rtds.on_chainlink_update(callback)
         if self._streams is not None:
+            # Primary source active: only fire on chainlink_streams events.
+            # rtds_chainlink is still a price fallback in _get_chainlink_spot()
+            # but must NOT produce independent monitor callbacks.
             self._streams.on_price_update(callback)
+        else:
+            # No direct Data Streams feed — use RTDS relay as the callback source.
+            self._rtds.on_chainlink_update(callback)
 
     def on_rtds_update(
         self, callback: Callable[[str, float], Coroutine]
     ) -> None:
-        """Register callback(coin, price) fired on every RTDS exchange-aggregated tick."""
+        """Register callback(coin, price) fired on every RTDS or Binance tick.
+
+        Both feeds cover 1h/daily/weekly market types.  The callback fires
+        on whichever source delivers the update first — callers (position monitor,
+        OracleTickTracker) re-evaluate using get_spot() which already applies
+        the Binance-primary / RTDS-fallback priority.
+        """
         self._rtds.on_price_update(callback)
+        if self._binance is not None:
+            self._binance.on_price_update(callback)
 
     # ── Oracle tick logging ─────────────────────────────────────────────
 
@@ -212,6 +287,8 @@ class SpotOracle:
         if self._streams is not None:
             self._streams.on_price_update(make_logging_callback(SOURCE_CHAINLINK_STREAMS))
         self._rtds.on_price_update(make_logging_callback(SOURCE_RTDS))
+        if self._binance is not None:
+            self._binance.on_price_update(make_logging_callback(SOURCE_BINANCE))
 
     # ── Feed health (S3.1) ────────────────────────────────────────────────────
 
@@ -261,12 +338,20 @@ class SpotOracle:
                     price = cl_snap.price
                     age = now - cl_snap.timestamp
         else:
-            # RTDS exchange-aggregated for 1h / daily / weekly markets
-            rtds_snap = self._rtds.get_spot(coin)
-            if rtds_snap is not None:
-                source = SOURCE_RTDS
-                price = rtds_snap.price
-                age = now - rtds_snap.timestamp
+            # 1h / daily / weekly markets: Binance kline primary (exact settlement
+            # source for PM crypto-price markets), RTDS exchange-aggregated fallback.
+            binance_snap = self._get_binance_spot(coin)
+            if binance_snap is not None:
+                source = SOURCE_BINANCE
+                price = binance_snap.price
+                age = now - binance_snap.timestamp
+            else:
+                # Binance stale / unavailable — fall back to RTDS
+                rtds_snap = self._rtds.get_spot(coin)
+                if rtds_snap is not None:
+                    source = SOURCE_RTDS
+                    price = rtds_snap.price
+                    age = now - rtds_snap.timestamp
 
         # Determine status
         if price is None or age is None:

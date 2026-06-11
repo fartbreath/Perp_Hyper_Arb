@@ -175,6 +175,28 @@ def emit_signal_events_batch(scan_diags: list[dict]) -> None:
         }
         lines.append(json.dumps(row))
     try:
+        # Rolling window: drop rows older than 180 days when the file exceeds
+        # 200 MB.  ope_reward_surface.py requires 4-8 weeks of accumulated
+        # signal_events to compute OPE labels for Model D — 180 days gives
+        # plenty of margin while preventing unbounded disk growth.
+        _MAX_BYTES = 200 * 1024 ** 2  # 200 MB trigger
+        _KEEP_DAYS = 180
+        if SIGNAL_EVENTS_PATH.exists() and SIGNAL_EVENTS_PATH.stat().st_size > _MAX_BYTES:
+            _cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                       - __import__("datetime").timedelta(days=_KEEP_DAYS)).isoformat()
+            _kept: list[bytes] = []
+            for _raw in SIGNAL_EVENTS_PATH.read_bytes().splitlines():
+                if not _raw:
+                    continue
+                # Fast prefix check before JSON parse — "ts" is always first key
+                _ts_start = _raw.find(b'"ts":"')
+                if _ts_start != -1:
+                    _ts_val = _raw[_ts_start + 6 : _ts_start + 32].decode("ascii", errors="ignore")
+                    if _ts_val >= _cutoff:
+                        _kept.append(_raw)
+                else:
+                    _kept.append(_raw)  # malformed — keep rather than lose
+            SIGNAL_EVENTS_PATH.write_bytes(b"\n".join(_kept) + b"\n")
         with SIGNAL_EVENTS_PATH.open("a", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
     except Exception as exc:

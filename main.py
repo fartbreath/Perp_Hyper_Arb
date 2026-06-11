@@ -75,6 +75,7 @@ from market_data.hl_client import HLClient
 from market_data.rtds_client import RTDSClient
 from market_data.chainlink_ws_client import ChainlinkWSClient
 from market_data.chainlink_streams_client import ChainlinkStreamsClient
+from market_data.binance_bookticker_client import BinanceBookTickerClient
 from market_data.spot_oracle import SpotOracle
 from market_data.funding_rate_cache import FundingRateCache
 from market_data.oracle_tick_tracker import OracleTickTracker
@@ -850,8 +851,11 @@ async def main() -> None:
     risk_engine = RiskEngine()
     pm = PMClient()
     hl = HLClient()
-    # Spot price source: RTDS (crypto_prices) for 1h/daily/weekly markets;
-    # on-chain Chainlink HTTP polling for 5m/15m/4h markets.
+    # Spot price feeds:
+    #   5m/15m/4h markets  → Chainlink (on-chain AggregatorV3 + Data Streams)
+    #   1h/daily/weekly    → Binance kline WebSocket (primary: exact settlement
+    #                         source for PM crypto-price markets) with RTDS
+    #                         exchange-aggregated feed as fallback.
     # SpotOracle facade routes get_mid/get_spot/get_spot_age to the right client.
     spot_client = RTDSClient()
     # Chainlink oracles — event-driven, zero polling:
@@ -861,7 +865,8 @@ async def main() -> None:
     # SpotOracle picks the freshest snapshot from both HYPE feeds automatically.
     chainlink_ws = ChainlinkWSClient()
     chainlink_streams = ChainlinkStreamsClient()
-    spot_oracle = SpotOracle(spot_client, chainlink_ws, chainlink_streams)
+    binance_bookticker = BinanceBookTickerClient()
+    spot_oracle = SpotOracle(spot_client, chainlink_ws, chainlink_streams, binance_bookticker)
     # Enable raw oracle tick CSV logging (data/oracle_ticks.csv).
     # Records every oracle event from all sources regardless of open positions.
     # Used for post-trade analysis, feed-liveness checks, and inter-feed latency.
@@ -1029,6 +1034,9 @@ async def main() -> None:
 
     log.info("Starting Chainlink Streams client (HYPE/USD direct feed)…")
     await chainlink_streams.start()
+
+    log.info("Starting Binance bookTicker client (1h/daily/weekly oracle)…")
+    await binance_bookticker.start()
 
     # In live mode: cancel any stale open orders and restore existing positions
     # before the maker strategy begins quoting.  No-op in paper mode.

@@ -484,6 +484,12 @@ class _WSShard:
                     # Both are required and serve different layers.
                     ping_interval=config.PM_WS_PING_INTERVAL,
                     ping_timeout=20,
+                    # Remove the default 1 MB frame-size limit.  PM order-book
+                    # frames are typically 5–50 KB, but a large snapshot during
+                    # a heavy market move could theoretically exceed 1 MB.  The
+                    # library would raise ConnectionClosedError code 1009 (not
+                    # 1006), but eliminating the cap entirely is zero-cost here.
+                    max_size=None,
                 ) as ws:
                     self._ws = ws
                     self.connected = True
@@ -1446,9 +1452,10 @@ class PMClient:
 
     async def _handle_ws_message(self, raw: str) -> None:
         try:
-            # Each call runs as an independent asyncio task (see _loop),
-            # so json.loads blocking here does not stall the receive loop
-            # or any other shard's keepalive processing.
+            # Messages are processed sequentially in the receive loop
+            # (await self._on_message(raw) in _WSShard._loop) to keep the
+            # event-loop task queue shallow.  json.loads is C-backed and
+            # runs in <0.2 ms for typical PM payloads — no executor needed.
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             log.debug("PM WS JSON decode error", preview=raw[:80])

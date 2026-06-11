@@ -1449,7 +1449,7 @@ class RiskEngine:
                     order_id=_closed_pos.order_id or "",
                     fill_price=exit_price,
                     contracts=_closed_pos.size,
-                    exit_type=resolved_outcome if resolved_outcome else "TAKER",
+                    exit_type="RESOLVED" if resolved_outcome else "TAKER",
                     exit_reason=exit_reason,
                     source=_source,
                     spot_exit=exit_spot_price,

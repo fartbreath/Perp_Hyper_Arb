@@ -599,6 +599,7 @@ def _make_mock_spot(spot: float, coin: str = "BTC") -> MagicMock:
     """Return a mock SpotOracle whose get_mid(coin, market_type) returns the given spot price."""
     mock_spot = MagicMock()
     mock_spot.get_mid = MagicMock(side_effect=lambda c, mt=None: spot if c == coin else None)
+    mock_spot.get_spot_age = MagicMock(return_value=1.0)
     return mock_spot
 
 
@@ -3041,3 +3042,60 @@ class TestUpfracEwmaExit:
             _run(monitor._check_position(pos))
         assert not risk._positions["mkt_001:YES"].is_closed
         assert monitor._upfrac_below_count.get("mkt_001", 0) == 0
+
+
+# ── Regression: math import in monitor.py ────────────────────────────────────
+
+class TestCheckPositionDataFreshness:
+    """Regression tests for the math.isinf() calls in _check_position_data_freshness.
+
+    These tests will raise NameError if 'import math' is ever removed from
+    monitor.py, because the code path exercises math.isinf() directly.
+    """
+
+    def _make_pos(self, underlying="ETH", market_type="bucket_1h"):
+        return Position(
+            market_id="mkt_math_reg",
+            market_type=market_type,
+            underlying=underlying,
+            side="YES",
+            size=10.0,
+            entry_price=0.70,
+            strategy="momentum",
+            strike=2100.0,
+        )
+
+    def _make_mon(self, spot_age: float, spot_mid: float = 2100.0):
+        spot = MagicMock()
+        spot.get_mid.return_value = spot_mid
+        spot.get_spot_age.return_value = spot_age
+        mon, pm, _ = _make_monitor(spot_client=spot)
+        pm.get_book.return_value = None
+        return mon
+
+    def test_cold_cache_inf_age_returns_ok(self):
+        """math.isinf(float('inf')) branch: cold-cache start-up → oracle_status OK."""
+        mon = self._make_mon(spot_age=float("inf"))
+        health = mon._check_position_data_freshness(self._make_pos())
+        assert health.oracle_status == "OK"
+
+    def test_fresh_oracle_returns_ok(self):
+        """not math.isinf(5.0) branch with age < threshold → oracle_status OK."""
+        mon = self._make_mon(spot_age=5.0)
+        health = mon._check_position_data_freshness(self._make_pos())
+        assert health.oracle_status == "OK"
+
+    def test_stale_oracle_returns_stale(self):
+        """not math.isinf(60.0) branch with age > MOMENTUM_SPOT_MAX_AGE_SECS → STALE."""
+        config.MOMENTUM_SPOT_MAX_AGE_SECS = 45.0
+        mon = self._make_mon(spot_age=60.0)
+        with patch("monitor.asyncio.create_task"):
+            health = mon._check_position_data_freshness(self._make_pos())
+        assert health.oracle_status == "STALE"
+
+    def test_no_spot_client_returns_missing(self):
+        """spot_client=None → oracle_status MISSING (no math path hit, but sanity check)."""
+        mon, pm, _ = _make_monitor(spot_client=None)
+        pm.get_book.return_value = None
+        health = mon._check_position_data_freshness(self._make_pos())
+        assert health.oracle_status == "MISSING"

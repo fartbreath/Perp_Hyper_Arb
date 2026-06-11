@@ -229,6 +229,7 @@ class TestWSMessageHandling:
         self.client._price_callbacks = []
         self.client._paper_mode = True
         self.client._running = True
+        self.client._best_bid_ask_owners = {}
 
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
@@ -1708,6 +1709,10 @@ class TestWSShard:
             async def send(self, msg: str) -> None:
                 sent.append(msg)
 
+        fake_ws = FakeWS()
+        shard._ws = fake_ws
+        shard.connected = True
+
         call_count = 0
 
         async def fake_sleep(secs):
@@ -1719,7 +1724,7 @@ class TestWSShard:
         async def run():
             with patch("pm_client.asyncio.sleep", side_effect=fake_sleep):
                 try:
-                    await shard._ping_loop(FakeWS())
+                    await shard._ping_loop(fake_ws)
                 except asyncio.CancelledError:
                     pass
 

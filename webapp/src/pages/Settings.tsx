@@ -832,6 +832,17 @@ export default function Settings() {
 
         {GAP}
 
+        <FloatInput
+          label="Oracle ITM Floor (%)"
+          description="Suppress hl_mark_sl when the Chainlink oracle confirms the position is more than this % ITM. Prevents HL perp mark noise from exiting winning positions when Chainlink already shows a solid ITM margin. 0.003 = suppress when oracle delta > 0.003% (≈ $2 for BTC). Set to 0 to disable."
+          value={data.momentum_hl_mark_sl_oracle_itm_floor_pct ?? 0.0}
+          step={0.001}
+          unit="%"
+          onSubmit={(v) => apply({ momentum_hl_mark_sl_oracle_itm_floor_pct: v })}
+        />
+
+        {GAP}
+
         {/* Signal B: HL Perp Depth Imbalance */}
         <h4 style={{ marginBottom: "0.5rem", color: "#334155" }}>Signal B — HL Futures Order Book Pressure</h4>
         <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
@@ -2503,7 +2514,8 @@ export default function Settings() {
           <div className="card">
             <h3>Momentum — Advanced Settings</h3>
             <p className="settings-desc" style={{ marginBottom: "0.75rem" }}>
-              Optional enhancements to the momentum scanner. All are disabled by default.
+              Optional enhancements to the momentum scanner. M-10, M-11, and M-13 are enabled by
+              default; all others are disabled by default.
             </p>
 
             <SectionHead title="Phase B — Resolution Oracle" />
@@ -2757,7 +2769,7 @@ export default function Settings() {
                 {GAP}
                 <Toggle
                   label="Suppress Until Entry Window"
-                  description="When ON, upfrac exit is suppressed while TTE is above the entry window for the market type (e.g. >120s for 5m buckets). Prevents the stale pre-promotion EWMA — carried from the oracle bounce that triggered the loser exit — from firing immediately on Opening Neutral promoted positions."
+                  description="When ON, upfrac exit is suppressed while TTE is above the entry window for the market type (e.g. >120s for 5m buckets). Prevents a cold-start EWMA — built before the position entered the monitor's scope — from triggering a false early exit. Most relevant for Opening Neutral positions promoted to momentum, where the EWMA inherits oracle activity from before the promotion."
                   value={data.momentum_upfrac_suppress_until_entry_window ?? false}
                   onChange={(v) => apply({ momentum_upfrac_suppress_until_entry_window: v })}
                 />

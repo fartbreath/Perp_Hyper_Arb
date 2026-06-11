@@ -576,6 +576,7 @@ export interface ConfigData {
   momentum_hl_mark_sl_enabled?: boolean;
   momentum_hl_mark_sl_threshold_pct?: number;
   momentum_hl_mark_sl_max_tte?: number;
+  momentum_hl_mark_sl_oracle_itm_floor_pct?: number;
   momentum_hl_depth_sl_enabled?: boolean;
   momentum_hl_depth_sl_imbalance_threshold?: number;
   momentum_hl_depth_sl_max_tte?: number;
@@ -735,6 +736,9 @@ function usePolling<T>(
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const inflightRef = useRef(false);
+  // Track whether we've ever successfully received data so we can fast-retry
+  // during server startup (models still loading) without spamming once live.
+  const hasDataRef = useRef(false);
 
   const fetchData = useCallback(async () => {
     if (inflightRef.current) return; // skip tick if previous fetch still running
@@ -743,6 +747,7 @@ function usePolling<T>(
       const res = await fetch(`${BASE_URL}${path}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
+      hasDataRef.current = true;
       setData(json);
       setError(null);
     } catch (e: unknown) {
@@ -758,6 +763,15 @@ function usePolling<T>(
     const timer = setInterval(fetchData, interval);
     return () => clearInterval(timer);
   }, [fetchData, interval]);
+
+  // Fast retry (5 s) when the server is still starting up: fires whenever
+  // there is an error and we have never yet received a successful response.
+  // Once hasDataRef is true the condition never triggers again.
+  useEffect(() => {
+    if (!error || hasDataRef.current) return;
+    const retryTimer = setTimeout(fetchData, 5_000);
+    return () => clearTimeout(retryTimer);
+  }, [error, fetchData]);
 
   return { data, error, loading, refresh: fetchData };
 }
@@ -814,7 +828,9 @@ function useSSE<T>(
 export const useHealth = () => useSSE<HealthData>("health", "/health");
 export const usePositions = () => useSSE<{ positions: Position[]; count: number }>("positions", "/positions");
 export const useRisk = () => useSSE<RiskData>("risk", "/risk");
-export const useMarkets = () => useSSE<{ markets: Market[]; count: number }>("markets", "/markets");
+// Markets are polled via REST (10 s) — excluded from the SSE bundle because
+// ~4000 markets serialise to ~1-4 MB per push, causing browser GC-pressure OOM.
+export const useMarkets = () => usePolling<{ markets: Market[]; count: number }>("/markets", 10_000);
 export const useFunding = () => useSSE<{ funding: Record<string, FundingEntry> }>("funding", "/funding");
 export const useSignals = (limit = 50) => useSSE<{ signals: Signal[]; total: number }>("signals", `/signals?limit=${limit}`);
 export const useMakerQuotes = () => useSSE<{ quotes: MakerQuote[]; count: number; strategy_enabled: boolean }>("maker_quotes", "/maker/quotes");

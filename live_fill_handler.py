@@ -586,12 +586,18 @@ class LiveFillHandler:
                 #   A) Market resolved while WS was down — tokens redeemed/
                 #      settled and no longer in wallet.  Must close at the
                 #      real settlement price so PnL is correct.
-                #   B) Order never materialised, or position was manually
+                #   B) Market not yet resolved — position absent for unknown
+                #      reason (WS gap, PM API lag).  Leave in memory so the
+                #      normal on_resolved() path settles it at the correct
+                #      price.  Closing at $0 here would record a false loss
+                #      when the market subsequently resolves WIN.
+                #   C) Order never materialised, or position was manually
                 #      closed at an unknown price.  Close at $0 conservatively.
                 # fetch_market_resolution is the authoritative check:
                 #   1.0 = YES/UP won, 0.0 = NO/DOWN won, None = not resolved.
                 _ghost_exit_price = 0.0
                 _ghost_resolved_outcome = ""
+                _ghost_should_dismiss = False
                 try:
                     _resolved_yes = await self._pm.fetch_market_resolution(pos.market_id)
                     if _resolved_yes is not None:
@@ -602,6 +608,7 @@ class LiveFillHandler:
                         )
                         _ghost_exit_price = 1.0 if _token_won else 0.0
                         _ghost_resolved_outcome = "WIN" if _token_won else "LOSS"
+                        _ghost_should_dismiss = True
                         log.warning(
                             "Reconciliation: ghost position — market resolved while"
                             " WS was down; closing at settlement price",
@@ -613,9 +620,13 @@ class LiveFillHandler:
                             outcome=_ghost_resolved_outcome,
                         )
                     else:
+                        # Market not yet resolved — leave the position in memory.
+                        # on_resolved() will settle it correctly when the market
+                        # expires.  Closing at $0 here causes false losses when
+                        # the position subsequently resolves WIN.
                         log.warning(
                             "Reconciliation: ghost position — market not yet resolved;"
-                            " closing at $0 (absent from PM wallet, cause unknown)",
+                            " keeping in memory for resolution handler",
                             token_id=tid[:24],
                             market_id=pos.market_id[:24],
                             side=pos.side,
@@ -623,10 +634,12 @@ class LiveFillHandler:
                 except Exception as _e:
                     log.warning(
                         "Reconciliation: could not check resolution for ghost position;"
-                        " defaulting to $0 close",
+                        " keeping in memory (resolution handler will settle)",
                         token_id=tid[:24],
                         exc=str(_e),
                     )
+                if not _ghost_should_dismiss:
+                    continue
                 closed = self._risk.close_position(
                     pos.market_id, exit_price=_ghost_exit_price, side=pos.side,
                     exit_reason="ghost_dismissed",

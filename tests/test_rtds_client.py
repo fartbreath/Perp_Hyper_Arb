@@ -122,7 +122,7 @@ class TestRTDSReconnectStorm:
         client._tracked_coins = {"BTC", "ETH"}
         client._last_reconnect_at = time.time() - 90.0  # cooldown expired
 
-        old_ts = time.time() - 60.0  # 60 s ago — well past the 45 s stale threshold
+        old_ts = time.time() - 130.0  # 130 s ago — well past the 120 s stale threshold
         client._prices["BTC"] = SpotPrice("BTC", 50000.0, old_ts)
         client._prices["ETH"] = SpotPrice("ETH", 3000.0, old_ts)
         client._ws = MagicMock()
@@ -141,7 +141,7 @@ class TestRTDSReconnectStorm:
         _run(_go())
 
         assert client._reconnect_requested, (
-            "Health loop must set _reconnect_requested when all prices are stale >= 45 s "
+            "Health loop must set _reconnect_requested when all prices are stale >= 120 s "
             "and the cooldown has expired."
         )
 

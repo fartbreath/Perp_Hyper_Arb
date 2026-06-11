@@ -58,6 +58,12 @@ TRACKED_UNDERLYINGS: list[str] = [
     "BTC", "ETH", "SOL", "BNB", "DOGE", "HYPE", "XRP",
 ]
 
+# Binance bookTicker WebSocket — used as the primary spot oracle for 1h/daily/weekly
+# markets (which settle on Binance candle close prices, not Chainlink).
+# A snapshot older than BINANCE_BOOKTICKER_STALE_SECS is treated as stale and the
+# RTDS exchange-aggregated feed is used as fallback.
+BINANCE_BOOKTICKER_STALE_SECS: float = 10.0
+
 # How often (seconds) to refresh the market list from Gamma API
 MARKET_REFRESH_INTERVAL: int = 15
 
@@ -705,9 +711,10 @@ MOMENTUM_DELTA_SL_TOKEN_VETO_FLOOR: float = 0.0  # disabled by default; set via 
 # Independent SL signal: fires when the HL perp mark price crosses the strike
 # while the Chainlink oracle is still above it.  The perp CLOB leads the
 # oracle by 2-5 seconds on real directional moves.  All-off by default.
-MOMENTUM_HL_MARK_SL_ENABLED:       bool  = False
-MOMENTUM_HL_MARK_SL_THRESHOLD_PCT: float = 0.0   # fire when mark divergence < this (0.0 = mark crossed strike; negative = allow slack)
-MOMENTUM_HL_MARK_SL_MAX_TTE:       int   = 30    # only active when tte_seconds < this
+MOMENTUM_HL_MARK_SL_ENABLED:             bool  = False
+MOMENTUM_HL_MARK_SL_THRESHOLD_PCT:       float = 0.0   # fire when mark divergence < this (0.0 = mark crossed strike; negative = allow slack)
+MOMENTUM_HL_MARK_SL_MAX_TTE:             int   = 30    # only active when tte_seconds < this
+MOMENTUM_HL_MARK_SL_ORACLE_ITM_FLOOR_PCT: float = 0.0  # suppress hl_mark_sl when Chainlink oracle delta > this % (0.0 = disabled)
 
 # ── Early Warning SL: HL Perp Depth Imbalance ────────────────────────────────
 # Independent SL signal: fires when the HL perp book is heavily positioned
@@ -744,6 +751,13 @@ MOMENTUM_NEAR_EXPIRY_TIME_STOP_SECS: int = 90        # TTE threshold (seconds)
 # 0.92 token is at risk of a terminal collapse (as seen in the ETH DOWN case).
 # Set to 0 to disable (suppress always applies up to the time-stop threshold).
 MOMENTUM_NEAR_EXPIRY_SUPPRESS_BYPASS_TTE: int = 30
+
+# Hysteresis: number of *consecutive* ticks where delta < 0 AND TTE < time-stop
+# threshold before the near-expiry stop fires.  Analysis shows false positives
+# have median 2 negative-delta ticks (transient oracle noise), while the one
+# genuine save had 112 consecutive ticks.  Requiring ≥ 3 consecutive ticks
+# eliminates virtually all transient crosses while preserving real saves.
+MOMENTUM_NEAR_EXPIRY_MIN_CONSECUTIVE_TICKS: int = 3
 
 # Phase B — Two-oracle strategy: near-expiry delta SL uses only the on-chain
 # AggregatorV3 feed (ChainlinkWSClient) instead of freshest-wins (which normally
@@ -835,11 +849,25 @@ MOMENTUM_MAX_CONCURRENT: int = 20
 # Pre-subscription lookahead: also subscribe to bucket markets that haven't
 # started yet but are within this many additional durations of their start.
 # 0 = only started markets (safe minimum).
-# 4 = also subscribe to the next 4 bucket slots ahead (e.g. next 20 min of 5-min
-#     buckets, next 1h of 15-min buckets, etc.).  Bounded — adds ~40 extra tokens
-#     per scan cycle, not thousands.  Useful for data collection to capture
-#     price-vs-TTE curves before the entry window opens.
+# Used as the global default; MOMENTUM_PRESUB_LOOKAHEAD_BY_TYPE overrides it
+# per market type.
 MOMENTUM_PRESUB_LOOKAHEAD: int = 4
+
+# Per-type presub lookahead (replaces MOMENTUM_PRESUB_LOOKAHEAD for each listed
+# type).  Motivation: a uniform 4-period lookahead is appropriate for 5m buckets
+# (catches the next 20 min) but wildly excessive for weekly markets (4 × 7 days =
+# 28 days of pre-subscriptions = hundreds of tokens never traded).  The scanner
+# refresh fires every 30 s and on every PM market-discovery event, so large-
+# duration types need zero pre-subscription — the refresh catches them the moment
+# they become active.  Types not listed here fall back to MOMENTUM_PRESUB_LOOKAHEAD.
+MOMENTUM_PRESUB_LOOKAHEAD_BY_TYPE: dict[str, int] = {
+    "bucket_5m":    1,   # 1 period = 5 min ahead (refresh at 30s makes this plenty)
+    "bucket_15m":   1,   # 1 period = 15 min ahead
+    "bucket_1h":    1,   # 1 period = 1 h ahead
+    "bucket_4h":    1,   # 1 period = 4 h ahead
+    "bucket_daily": 0,   # subscribe only when active; 30s refresh catches it in time
+    "bucket_weekly": 0,  # subscribe only when active; 30s refresh catches it in time
+}
 
 # How many days of bucket markets the momentum scanner subscribes to via PM WS,
 # independently of the maker's MAKER_MAX_TTE_DAYS window.  Wider than the maker
@@ -959,11 +987,15 @@ MOMENTUM_PROB_SL_ORACLE_STALE_SECS: float = 10.0  # suppress prob-SL when oracle
 CHAINLINK_SILENCE_WATCHDOG_SECS: int = 30
 
 # Maximum age of a ChainlinkStreams snapshot before SpotOracle falls through
-# to the RTDS relay.  ChainlinkStreams pushes ~2–3 updates/sec per coin, so
-# anything older than 3 s indicates a zombie feed (connected but no new data).
-# SpotOracle switches back to ChainlinkStreams automatically the moment a fresh
-# snapshot arrives — no sticky state.
-CHAINLINK_STREAMS_STALE_SECS: float = 3.0
+# to the RTDS relay.  Observed cadence is ~0.6 updates/sec on average per coin
+# (~153 k events / 72 h), with inter-event gaps up to ~10 s during quiet prices.
+# The threshold must be well above the maximum normal gap to avoid false fallthrough
+# to the RTDS relay during routine Data Streams quiet periods.  The AggregatorV3
+# heartbeat (27 min) is the absolute ceiling; 30 s is a conservative operational
+# ceiling and matches the on-chain AggregatorV3 deviation heartbeat.
+# The old value (3 s) was tighter than the average interval and caused frequent
+# false fallthrough — the root cause of dual-source false stop-losses.
+CHAINLINK_STREAMS_STALE_SECS: float = 30.0
 
 # ── Kalshi signal confirmation layer ──────────────────────────────────────
 # When KALSHI_ENABLED=True, the scanner fetches matching Kalshi market prices
@@ -1054,6 +1086,7 @@ MODEL_C_PATH: str = str(Path(__file__).parent / "analysis" / "model_c_v0.pkl")
 
 # Model D — Config Policy Optimizer (ML-D4)
 MODEL_D_ENABLED: bool = False            # ML-D4: enable Model D shadow scoring (default off)
+MODEL_D_SIMULATE: bool = True            # ML-D4: True = log recommendations only, never apply to live trading
 MODEL_D_PATH: str = str(Path(__file__).parent / "analysis" / "model_d_v0.pkl")
 MODEL_D_MAX_DELTA_PCT: float = 0.5       # ML-D4: max config adjustment as fraction of live value (±50%)
 
